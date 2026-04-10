@@ -7,7 +7,7 @@
 //!   nanochat --data train.txt --steps 5000
 //!   nanochat --data train.txt --steps 5000 --chat
 
-use modgrad_runtime::regional::*;
+use modgrad_ctm::graph::*;
 use std::io::Read;
 
 fn main() {

@@ -32,12 +32,8 @@ path = "src/lib.rs"
 name = "isis"
 path = "src/main.rs"
 
-[[bin]]
-name = "isisd"
-path = "src/bin/isisd.rs"
-
 [features]
-default = ["onnx"]
+default = []
 onnx = ["dep:ort", "modgrad-io/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 cuda = ["dep:cudarc", "modgrad-compute/cuda"]

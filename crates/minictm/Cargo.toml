@@ -2,13 +2,18 @@
 name = "minictm"
 version = "0.1.0"
 edition = "2024"
-description = "nanoGPT but for CTMs — minimal example of modgrad SDK"
+description = "nanoGPT but for CTMs — build your own brain with the modgrad SDK"
 license = "MIT"
 
 [[bin]]
 name = "minictm"
 path = "src/main.rs"
 
+# Uses ONLY the SDK crates — no runtime, no isis, no opinions.
+# This is how you build your own AGI runtime on modgrad.
 [dependencies]
-modgrad-runtime = { path = "../modgrad-runtime" }
+modgrad-ctm = { path = "../modgrad-ctm" }
 modgrad-compute = { path = "../modgrad-compute" }
+modgrad-training = { path = "../modgrad-training" }
+modgrad-persist = { path = "../modgrad-persist" }
+serde = { version = "1", features = ["derive"] }

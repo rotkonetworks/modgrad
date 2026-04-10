@@ -1,29 +1,28 @@
-//! RegionalCtm: 8 CTM instances connected in a graph.
+//! CTM Graph: compose N CTMs into a directed graph with BPTT.
 //!
-//! Each brain region is a full SDK CTM with its own neuron pool, NLM,
-//! sync accumulator, and MHA. Regions communicate via inter-region
-//! synapse projections. A global sync accumulator spans all regions
-//! for the final readout.
+//! This is the core composition layer of the modgrad SDK. You decide:
+//! - How many nodes (regions) and their sizes
+//! - How they connect (directed graph)
+//! - Vocabulary / output dimension
+//! - Training: full BPTT through all nodes and connections
 //!
-//! Architecture per outer tick:
-//!   1. Each region builds its observation from source regions' outputs
-//!   2. Each region runs its internal CTM forward (parallel across regions)
-//!   3. Global sync accumulates over all regions' activated states
-//!   4. Output projection: global_sync → prediction logits
+//! Also provides:
+//! - Unified token space (text + image + audio + video + actions)
+//! - NeuralComputer: interactive generate→observe→generate loop
+//! - AdamW optimizer for the graph
+//! - Save/load via modgrad-persist
 //!
-//! BPTT backward reverses this: output_proj → global_sync → per-region
-//! backward (using SDK primitives) → inter-region synapse backward.
+//! isis uses this with 8 brain-inspired regions. minictm uses 1-4.
+//! You can use it however you want.
 
 use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
 use modgrad_compute::neuron::{Linear, SimpleRng};
-use modgrad_ctm::config::CtmConfig;
-use modgrad_ctm::weights::{CtmWeights, CtmState};
-use modgrad_ctm::forward::ctm_forward;
-use modgrad_ctm::train::{Ctm, CtmCache, CtmGradients, RegionBackwardResult, backward_from_activated};
+use crate::config::CtmConfig;
+use crate::weights::{CtmWeights, CtmState};
+use crate::forward::ctm_forward;
+use crate::train::{Ctm, CtmCache, CtmGradients, RegionBackwardResult, backward_from_activated};
 use modgrad_traits::{Brain, TokenInput};
-// AdamW is implemented inline here (RegionalAdamW) rather than using the SDK's flat-buffer
-// AdamW, because the regional model has complex nested weight structures.
 
 // ─── Unified token space ──────────────────────────────────
 
@@ -633,7 +632,7 @@ pub struct RegionalGradients {
     /// Embedding table gradients (sparse — only touched tokens get nonzero).
     pub embed_grad: Vec<f32>,
     /// Per-region CTM gradients (accumulated via SDK backward).
-    pub region_grads: Vec<modgrad_ctm::train::CtmGradients>,
+    pub region_grads: Vec<crate::train::CtmGradients>,
     /// Connection synapse gradients: dW, db per connection.
     pub connection_dw: Vec<Vec<f32>>,
     pub connection_db: Vec<Vec<f32>>,
@@ -652,7 +651,7 @@ impl RegionalGradients {
         Self {
             embed_grad: vec![0.0; w.embeddings.len()],
             region_grads: w.regions.iter()
-                .map(|rw| modgrad_ctm::train::CtmGradients::zeros(rw))
+                .map(|rw| crate::train::CtmGradients::zeros(rw))
                 .collect(),
             connection_dw: w.connection_synapses.iter()
                 .map(|s| vec![0.0; s.weight.len()]).collect(),
@@ -1608,82 +1607,8 @@ pub fn video_to_tokens(
     result
 }
 
-/// Extract frames from raw video bytes at a given FPS.
-/// Returns (frames, audio_samples) or None if decoding fails.
-///
-/// For now: reads a directory of frame PNG/JPGs + a WAV file.
-/// Real implementation would use ffmpeg.
-pub fn extract_video_frames(
-    video_dir: &str,
-    target_fps: f32,
-) -> (Vec<VideoFrame>, Vec<(f32, Vec<usize>)>) {
-    use modgrad_codec::vqvae::VqVae;
-    use modgrad_codec::audio_codec::AudioCodec;
-
-    let vae = VqVae::new(4096, 64);
-    let audio_codec = AudioCodec::new_24khz();
-    let mut frames = Vec::new();
-    let mut audio_chunks = Vec::new();
-
-    // Read frame files (sorted by name → sorted by time)
-    let mut frame_paths: Vec<_> = std::fs::read_dir(video_dir)
-        .into_iter().flatten().flatten()
-        .filter(|e| {
-            let p = e.path();
-            p.extension().map(|x| x == "bin" || x == "raw" || x == "ppm").unwrap_or(false)
-        })
-        .map(|e| e.path())
-        .collect();
-    frame_paths.sort();
-
-    let frame_interval = 1.0 / target_fps;
-    let mut prev_codes: Option<Vec<usize>> = None;
-    for (i, path) in frame_paths.iter().enumerate() {
-        if let Ok(data) = std::fs::read(path) {
-            if data.len() >= 3072 {
-                let pixels: Vec<f32> = data[..3072].iter()
-                    .map(|&b| b as f32 / 255.0).collect();
-                let codes = vae.tokenize(&pixels);
-
-                // Skip near-duplicate frames: if >80% of codes match previous, drop it.
-                // This is our I-frame/P-frame heuristic — only emit changed frames.
-                let dominated = if let Some(prev) = &prev_codes {
-                    let same = codes.iter().zip(prev).filter(|(a, b)| a == b).count();
-                    same > codes.len() * 4 / 5
-                } else {
-                    false
-                };
-
-                if !dominated {
-                    prev_codes = Some(codes.clone());
-                    frames.push(VideoFrame {
-                        time_seconds: i as f32 * frame_interval,
-                        image_codes: codes,
-                    });
-                }
-            }
-        }
-    }
-
-    // Read audio file if present
-    let audio_path = std::path::Path::new(video_dir).join("audio.wav");
-    if let Ok(data) = std::fs::read(&audio_path) {
-        if data.len() > 44 && &data[..4] == b"RIFF" {
-            let samples: Vec<f32> = data[44..].chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-                .collect();
-
-            let codes = audio_codec.tokenize(&samples);
-            // Split into 1-second chunks (75 codes/sec at 24kHz)
-            let codes_per_sec = 75;
-            for (i, chunk) in codes.chunks(codes_per_sec).enumerate() {
-                audio_chunks.push((i as f32, chunk.to_vec()));
-            }
-        }
-    }
-
-    (frames, audio_chunks)
-}
+// Note: extract_video_frames (codec-dependent) lives in the runtime, not the SDK.
+// Use VideoFrame + video_to_tokens with your own codec to build video token sequences.
 
 // ── Action tokenization ──────────────────────────────────
 

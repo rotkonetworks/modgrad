@@ -10,3 +10,5 @@ modgrad-traits = { path = "../modgrad-traits" }
 modgrad-compute = { path = "../modgrad-compute" }
 modgrad-persist = { path = "../modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
+rayon = "1"
+bincode = "1"

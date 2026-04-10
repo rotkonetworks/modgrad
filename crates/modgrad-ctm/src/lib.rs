@@ -1,7 +1,9 @@
 //! Continuous Thought Machine — faithful implementation of Sakana AI's CTM.
 //!
-//! Single neuron pool, U-Net synapse, multihead attention, sync readout.
-//! Implements the Brain trait from modgrad-traits.
+//! Two levels:
+//!   - Single CTM: one neuron pool, U-Net synapse, MHA, sync readout, full BPTT.
+//!   - CTM Graph: compose N CTMs into a directed graph. Embedding table, AdamW,
+//!     token space, NeuralComputer. This is the main entry point for building brains.
 //!
 //! Reference: arxiv 2505.05522
 
@@ -10,6 +12,7 @@ pub mod synapse;
 pub mod weights;
 pub mod forward;
 pub mod train;
+pub mod graph;
 
 pub use config::CtmConfig;
 pub use weights::{CtmWeights, CtmState};

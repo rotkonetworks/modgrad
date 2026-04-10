@@ -1,54 +1,24 @@
-//! isis runtime — our default model built on the modgrad SDK.
+//! isis runtime — our brain built on the modgrad SDK.
 //!
-//! Composes SDK architectures (CTM, Transformer) with isis-specific
-//! mechanisms: homeostasis, autonomic regulation, sleep cycles,
-//! curriculum learning, and capability governance.
+//! isis is one composition of the SDK. It provides:
+//!   - 8-region brain presets (four_region, eight_region)
+//!   - Curriculum-based staged training
+//!   - Real-time audio/camera I/O
+//!   - TCP debug socket for live inspection
+//!
+//! The core graph composition, tokens, NeuralComputer, and AdamW
+//! live in the SDK (modgrad-ctm::graph). isis re-exports them.
 
-// Core CTM brain (isis-specific composition)
-pub mod config;
-pub mod neuron;
-pub mod ctm;
-pub mod weights;
-pub mod forward;
-pub mod session;
-pub mod synapse;
-pub mod sync;
-pub mod tick_state;
-pub mod train_bptt;
+// Re-export the SDK graph module as `regional` for backwards compat
+pub use modgrad_ctm::graph as regional;
 
-// Learning & memory
-pub mod learning;
-pub mod memory;
-pub mod techniques;
-
-// Organism composition
-pub mod organism;
-pub mod brain;
-pub mod homeostasis;
-pub mod autonomic;
-pub mod episode;
+// isis-specific
 pub mod curriculum;
-pub mod neuvola;
-pub mod pedagogy;
 
-// Evaluation & tuning
-pub mod eval;
-pub mod tuning;
-pub mod accel;
-
-// Architecture (isis-specific compositions)
-pub mod cortex;
-pub mod bridge;
-
-// Regional CTM (hierarchical: 8 CTMs in a graph)
-pub mod regional;
-// Actor-based regional CTM (each region in its own thread)
-pub mod actors;
-// Real-time I/O for the Neural Computer
+// Real-time I/O (generic but lives here for now)
 pub mod nc_io;
-// TCP debug socket for live inspection
 pub mod nc_socket;
 
-// IO glue (depends on runtime types)
-pub mod filter;
-pub mod daemon;
+// Actor model (generic)
+pub mod actors;
+

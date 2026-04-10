@@ -2428,7 +2428,10 @@ name = "minictm"
 version = "0.1.0"
 dependencies = [
  "modgrad-compute",
- "modgrad-runtime",
+ "modgrad-ctm",
+ "modgrad-persist",
+ "modgrad-training",
+ "serde",
 ]
 
 [[package]]
@@ -2522,9 +2525,11 @@ dependencies = [
 name = "modgrad-ctm"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "modgrad-compute",
  "modgrad-persist",
  "modgrad-traits",
+ "rayon",
  "serde",
 ]
 
