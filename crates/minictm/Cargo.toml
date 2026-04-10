@@ -1,12 +1,12 @@
 [package]
-name = "nanochat-rs"
-version = "0.2.0"
+name = "minictm"
+version = "0.1.0"
 edition = "2024"
-description = "Train a CTM on text using the modgrad SDK — minimal example"
+description = "nanoGPT but for CTMs — minimal example of modgrad SDK"
 license = "MIT"
 
 [[bin]]
-name = "nanochat"
+name = "minictm"
 path = "src/main.rs"
 
 [dependencies]

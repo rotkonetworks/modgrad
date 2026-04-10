@@ -1,0 +1,96 @@
+// isis memory bank — FlatBuffers schema
+// Supports f32/f16/i8 key quantization for production deployment
+
+namespace isis.fb;
+
+// Key quantization formats
+enum KeyFormat : byte {
+    F32 = 0,
+    F16 = 1,
+    I8  = 2,
+}
+
+// Exact model identity — keys are ONLY valid for this exact config.
+table ModelId {
+    model: string;       // HuggingFace model name (e.g. "Qwen/Qwen2.5-0.5B")
+    backend: string;     // Inference backend (e.g. "onnx", "gguf", "transformers")
+    quant: string;       // Weight quantization (e.g. "f32", "f16", "q4_k_m")
+    hidden_dim: uint32;  // Hidden state dimension (e.g. 896)
+    extraction: string;  // Hidden state extraction point (e.g. "pre_mlp_layer23")
+}
+
+// A memory key stored in the chosen precision
+table KeyData {
+    format: KeyFormat;
+    // Exactly one of these is populated based on format
+    f32_data: [float];    // dim × 4 bytes
+    f16_data: [uint16];   // dim × 2 bytes (IEEE 754 half)
+    i8_data:  [int8];     // dim × 1 byte  (scaled to [-127, 127])
+    // Scale factor for i8 dequantization: real = i8 * scale
+    i8_scale: float;
+}
+
+table SuppressEntry {
+    token_id: uint32;
+    bias: float;
+}
+
+table LogitBias {
+    token_id: uint32;
+    token: string;
+    strength: float;
+    suppress: [SuppressEntry];
+}
+
+table ContentKey {
+    key: KeyData;
+    token: string;
+    position: int32;
+}
+
+table Episode {
+    prompt: string;
+    answer: string;
+    alter: string;
+    keys: [ContentKey];
+    logit_biases: [LogitBias];
+    strength: float;
+    recall_count: uint32;
+    created_at: float64;
+    consolidated: bool;
+}
+
+table Alter {
+    name: string;
+    episodes: [Episode];
+}
+
+table Rule {
+    instruction: string;
+    priority: float;
+    trigger: string;
+    active: bool;
+}
+
+table Avoidance {
+    pattern: string;
+    reason: string;
+    key: KeyData;
+    suppress_token_ids: [uint32];
+    strength: float;
+    active: bool;
+}
+
+table MemoryBank {
+    version: uint32;
+    model_id: ModelId;   // Exact model identity
+    threshold: float;
+    key_format: KeyFormat;
+    alters: [Alter];
+    rules: [Rule];
+    avoidances: [Avoidance];
+}
+
+root_type MemoryBank;
+file_identifier "isis";
+file_extension "fb";

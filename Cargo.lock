@@ -2424,6 +2424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minictm"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-runtime",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2685,13 +2693,6 @@ dependencies = [
  "termcolor",
  "thiserror 2.0.18",
  "unicode-xid",
-]
-
-[[package]]
-name = "nanochat-rs"
-version = "0.1.0"
-dependencies = [
- "modgrad",
 ]
 
 [[package]]

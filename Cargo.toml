@@ -12,7 +12,7 @@ members = [
     "crates/modgrad-transformer",
     "crates/modgrad-io",
     "crates/modgrad-runtime",
-    "crates/nanochat-rs",
+    "crates/minictm",
     "debugger",
     "extra/remu",
 ]
