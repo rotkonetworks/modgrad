@@ -12,8 +12,8 @@ path = "src/main.rs"
 # Uses ONLY the SDK crates — no runtime, no isis, no opinions.
 # This is how you build your own AGI runtime on modgrad.
 [dependencies]
-modgrad-ctm = { path = "../modgrad-ctm" }
-modgrad-compute = { path = "../modgrad-compute" }
-modgrad-training = { path = "../modgrad-training" }
-modgrad-persist = { path = "../modgrad-persist" }
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-persist = { path = "../../crates/modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
