@@ -1,0 +1,21 @@
+[package]
+name = "modgrad-compute"
+version = "0.1.0"
+edition = "2024"
+description = "Compute primitives for the modgrad ML SDK: Linear, ops, tensor"
+license = "MIT"
+
+[features]
+cuda = ["modgrad-device/cuda", "dep:cudarc", "dep:candle-kernels"]
+
+[dependencies]
+modgrad-device = { path = "../modgrad-device" }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+# CUDA (optional)
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std", "driver", "cublas", "nvrtc",
+    "fallback-dynamic-loading", "cuda-12060",
+] }
+candle-kernels = { path = "../../../candle/candle-kernels", optional = true }

@@ -1,0 +1,12 @@
+[package]
+name = "modgrad-codec"
+version = "0.1.0"
+edition = "2024"
+description = "Modality codecs for the modgrad ML SDK: vision, audio, text"
+license = "MIT"
+
+[dependencies]
+modgrad-compute = { path = "../modgrad-compute" }
+modgrad-persist = { path = "../modgrad-persist" }
+serde = { version = "1", features = ["derive"] }
+rayon = "1"

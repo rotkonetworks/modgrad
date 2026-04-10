@@ -1,0 +1,19 @@
+[package]
+name = "modgrad-device"
+version = "0.1.0"
+edition = "2024"
+description = "GPU/hardware backends for the modgrad ML SDK"
+license = "MIT"
+
+[features]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+libc = "0.2"
+rayon = "1"
+
+# CUDA compute (NVIDIA)
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std", "driver", "cublas", "nvrtc",
+    "fallback-dynamic-loading", "cuda-12060",
+] }

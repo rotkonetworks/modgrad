@@ -1,0 +1,44 @@
+/target
+
+# Models (large ONNX files)
+models/*.onnx
+models/*.onnx.data
+
+# Binary artifacts & checkpoints
+*.bin
+*.feat
+*.fb
+*.parquet
+*.sock
+
+# Stream files (lazy data loader)
+*.stream.*
+
+# Training text data
+train_*.txt
+staged_curriculum.txt
+curriculum.txt
+
+# JSON checkpoints & metrics
+organism*.json
+child*.json
+brain*.json
+test_memory.json
+isis_metrics.prom
+*.jsonl
+
+# Datasets (large)
+datasets/qec_brain.json
+
+# SPIR-V compiled shaders
+shaders/*.spv
+
+# GPU kernel build artifacts
+*.o
+
+# Benchmarks (external deps & venvs)
+benchmarks/fusion-blossom/
+benchmarks/.venv/
+
+# QEC generated data
+data/qec/Data_PAEMS*

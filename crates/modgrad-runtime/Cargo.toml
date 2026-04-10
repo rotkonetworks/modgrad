@@ -1,0 +1,31 @@
+[package]
+name = "modgrad-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "isis runtime — the default brain built on the modgrad SDK"
+license = "MIT"
+
+[features]
+cuda = ["modgrad-device/cuda"]
+sdp = ["dep:clarabel"]
+
+[dependencies]
+modgrad-traits = { path = "../modgrad-traits" }
+modgrad-compute = { path = "../modgrad-compute" }
+modgrad-ctm = { path = "../modgrad-ctm" }
+modgrad-codec = { path = "../modgrad-codec" }
+modgrad-device = { path = "../modgrad-device" }
+modgrad-io = { path = "../modgrad-io" }
+modgrad-persist = { path = "../modgrad-persist" }
+modgrad-training = { path = "../modgrad-training" }
+modgrad-transformer = { path = "../modgrad-transformer" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+rayon = "1"
+half = "2"
+fusion-blossom = { path = "../../../fusion-blossom" }
+ctrlc = "3"
+
+# Conic solver for SDP (Angeris bound, tight)
+clarabel = { version = "0.11", optional = true, default-features = false }

@@ -1,0 +1,97 @@
+[workspace]
+members = [
+    ".",
+    "crates/modgrad-traits",
+    "crates/modgrad-device",
+    "crates/modgrad-persist",
+    "crates/modgrad-compute",
+    "crates/modgrad-ctm",
+    "crates/modgrad-codec",
+    "crates/modgrad-data",
+    "crates/modgrad-training",
+    "crates/modgrad-transformer",
+    "crates/modgrad-io",
+    "crates/modgrad-runtime",
+    "crates/nanochat-rs",
+    "debugger",
+    "extra/remu",
+]
+
+[package]
+name = "modgrad"
+version = "0.1.0"
+edition = "2024"
+description = "Modular gradient SDK for building general intelligence"
+license = "MIT"
+
+[lib]
+name = "modgrad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "isis"
+path = "src/main.rs"
+
+[[bin]]
+name = "isisd"
+path = "src/bin/isisd.rs"
+
+[features]
+default = ["onnx"]
+onnx = ["dep:ort", "modgrad-io/onnx"]
+gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
+cuda = ["dep:cudarc", "modgrad-compute/cuda"]
+sdp = ["dep:clarabel", "modgrad-runtime/sdp"]
+telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "modgrad-io/telemetry"]
+
+[dependencies]
+modgrad-traits = { path = "crates/modgrad-traits" }
+modgrad-device = { path = "crates/modgrad-device" }
+modgrad-persist = { path = "crates/modgrad-persist" }
+modgrad-compute = { path = "crates/modgrad-compute" }
+modgrad-ctm = { path = "crates/modgrad-ctm" }
+modgrad-codec = { path = "crates/modgrad-codec" }
+modgrad-data = { path = "crates/modgrad-data" }
+modgrad-training = { path = "crates/modgrad-training" }
+modgrad-transformer = { path = "crates/modgrad-transformer" }
+modgrad-io = { path = "crates/modgrad-io" }
+modgrad-runtime = { path = "crates/modgrad-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+toml = "0.8"
+tokenizers = "0.21"
+flatbuffers = "25.2.10"
+half = "2"
+rayon = "1"
+fusion-blossom = { path = "../fusion-blossom" }
+libc = "0.2"
+ctrlc = "3"
+clap = { version = "4", features = ["derive"] }
+
+# ONNX backend
+ort = { version = "2.0.0-rc.12", optional = true }
+
+# GGUF backend (candle)
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+
+# Conic solver for SDP (Angeris bound, tight)
+clarabel = { version = "0.11", optional = true, default-features = false }
+
+# QUIC transport for telemetry (optional)
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", optional = true, features = ["rt", "net", "io-util", "macros"] }
+
+# CUDA compute (NVIDIA: H100, H200, A100, etc.)
+# cudarc: dynamic loading + pinned CUDA version so it compiles
+# without nvcc. On NVIDIA machines, replace cuda-12060 with your version.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std", "driver", "cublas", "nvrtc",
+    "fallback-dynamic-loading", "cuda-12060",
+] }
+
+[dev-dependencies]
+remu = { path = "extra/remu" }

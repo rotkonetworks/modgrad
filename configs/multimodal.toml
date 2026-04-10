@@ -1,0 +1,40 @@
+# isis experiment config: multimodal text + image + audio
+# Usage: isis train --config configs/multimodal.toml
+
+[model]
+d_model = 256
+d_input = 128
+iterations = 8
+synapse_depth = 4
+heads = 8
+memory_length = 16
+deep_nlms = true
+memory_hidden_dims = 8
+n_synch_out = 128
+n_synch_action = 128
+early_exit = true
+certainty_threshold = 0.95
+
+[training]
+total_steps = 50000
+micro_batch = 8
+accum_steps = 4
+lr = 0.0003
+optimizer = "adamw"
+weight_decay = 0.01
+warmup_steps = 2000
+save_every = 5000
+log_every = 200
+grad_clip = 1.0
+checkpoint_dir = "checkpoints/multimodal"
+loss = "thinking"
+seed = 42
+
+[data]
+text = ["train_climbmix.txt"]
+images = ["cifar10_train_pixels.feat"]
+audio = []
+context_len = 64
+text_weight = 0.6
+image_weight = 0.3
+audio_weight = 0.1

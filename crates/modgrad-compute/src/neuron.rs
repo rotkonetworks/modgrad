@@ -1,0 +1,256 @@
+//! Generic compute primitives: Linear, activations, RNG.
+//!
+//! Pure building blocks with no runtime dependency.
+//! isis-specific neuron layers (NeuronLayer, NeuronLayerWeights, etc.)
+//! live in `crate::runtime::neuron`.
+
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use super::ops::dot;
+
+// ─── Activation functions ──────────────────────────────────
+
+/// GLU activation: x[..half] * sigmoid(x[half..])
+#[inline(always)]
+pub fn glu(x: &[f32]) -> Vec<f32> {
+    let half = x.len() / 2;
+    let mut out = Vec::with_capacity(half);
+    for i in 0..half {
+        // Fast sigmoid: avoid exp() for small values
+        let v = x[half + i];
+        let gate = if v > 6.0 { 1.0 }
+            else if v < -6.0 { 0.0 }
+            else { 1.0 / (1.0 + (-v).exp()) };
+        out.push(x[i] * gate);
+    }
+    out
+}
+
+/// GLU in-place: write result into `out` slice, avoiding allocation.
+#[inline(always)]
+pub fn glu_into(x: &[f32], out: &mut [f32]) {
+    let half = x.len() / 2;
+    for i in 0..half.min(out.len()) {
+        let v = x[half + i];
+        let gate = if v > 6.0 { 1.0 }
+            else if v < -6.0 { 0.0 }
+            else { 1.0 / (1.0 + (-v).exp()) };
+        out[i] = x[i] * gate;
+    }
+}
+
+pub fn layer_norm(x: &mut [f32]) {
+    let n = x.len() as f32;
+    let mean: f32 = x.iter().sum::<f32>() / n;
+    let var: f32 = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+    let std = (var + 1e-5).sqrt();
+    for v in x.iter_mut() {
+        *v = (*v - mean) / std;
+    }
+}
+
+// ─── Weight matrices ────────────────────────────────────────
+
+/// Dense linear layer: y = Wx + b
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Linear {
+    pub weight: Vec<f32>,  // [out_dim × in_dim] row-major
+    pub bias: Vec<f32>,    // [out_dim]
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+impl Linear {
+    pub fn new(in_dim: usize, out_dim: usize) -> Self {
+        // Kaiming init
+        let scale = (2.0 / in_dim as f32).sqrt();
+        let mut rng = SimpleRng::new(in_dim as u64 ^ out_dim as u64);
+        let weight: Vec<f32> = (0..out_dim * in_dim)
+            .map(|_| rng.next_normal() * scale)
+            .collect();
+        let bias = vec![0.0; out_dim];
+        Self { weight, bias, in_dim, out_dim }
+    }
+
+    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        // Try GPU for large matrices: KFD (AMD) → CUDA (NVIDIA) → Vulkan → CPU
+        // Threshold: 10M flops. Below this, CPU is faster including kernel launch.
+        if self.in_dim * self.out_dim >= 10_000_000 {
+            let mut y = vec![0.0f32; self.out_dim];
+            if modgrad_device::kfd::accel::try_matvec(
+                x, &self.weight, &self.bias, &mut y,
+                self.out_dim as u32, self.in_dim as u32,
+            ) {
+                return y;
+            }
+            if modgrad_device::cuda::try_matvec(
+                x, &self.weight, &self.bias, &mut y,
+                self.out_dim as u32, self.in_dim as u32,
+            ) {
+                return y;
+            }
+            if modgrad_device::gpu::try_matvec(
+                x, &self.weight, &self.bias, &mut y,
+                self.out_dim as u32, self.in_dim as u32,
+            ) {
+                return y;
+            }
+        }
+
+        // CPU fallback
+        let mut y = Vec::with_capacity(self.out_dim);
+        for r in 0..self.out_dim {
+            let row = &self.weight[r * self.in_dim..(r + 1) * self.in_dim];
+            y.push(self.bias[r] + dot(row, x));
+        }
+        y
+    }
+}
+
+/// Minimal PRNG for weight init.
+#[derive(Debug, Clone)]
+pub struct SimpleRng(u64);
+
+impl SimpleRng {
+    pub fn new(seed: u64) -> Self { Self(seed.wrapping_add(1)) }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    pub fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    pub fn next_normal(&mut self) -> f32 {
+        // Box-Muller
+        let u1 = self.next_f32().max(1e-10);
+        let u2 = self.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+}
+
+// ─── SuperLinear (per-neuron MLP) ───────────────────────────
+
+/// Per-neuron parallel MLP: each neuron has its own weight matrix.
+/// Input: [n_neurons, memory_length] → Output: [n_neurons, out_per_neuron]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperLinear {
+    /// Weights: [n_neurons × out_per_neuron × in_per_neuron]
+    pub weights: Vec<f32>,
+    pub biases: Vec<f32>,  // [n_neurons × out_per_neuron]
+    pub n_neurons: usize,
+    pub in_per: usize,
+    pub out_per: usize,
+}
+
+impl SuperLinear {
+    pub fn new(n_neurons: usize, in_per: usize, out_per: usize) -> Self {
+        let scale = (2.0 / in_per as f32).sqrt();
+        let mut rng = SimpleRng::new((n_neurons * in_per * out_per) as u64);
+        let weights: Vec<f32> = (0..n_neurons * out_per * in_per)
+            .map(|_| rng.next_normal() * scale)
+            .collect();
+        let biases = vec![0.0; n_neurons * out_per];
+        Self { weights, biases, n_neurons, in_per, out_per }
+    }
+
+    /// Forward: trace[n_neurons][in_per] → activated[n_neurons][out_per]
+    ///
+    /// Dispatch priority: CUDA → Vulkan → rayon (CPU parallel) → sequential.
+    pub fn forward(&self, trace: &[f32]) -> Vec<f32> {
+        let n_neurons = self.n_neurons;
+        let in_per = self.in_per;
+        let out_per = self.out_per;
+        let total_flops = n_neurons * in_per * out_per;
+
+        // Try GPU first (only worth it for large dispatches)
+        if total_flops >= 100_000 {
+            let mut out = vec![0.0f32; n_neurons * out_per];
+            // CUDA (NVIDIA) first
+            if modgrad_device::cuda::try_superlinear(
+                trace, &self.weights, &self.biases, &mut out,
+                n_neurons as u32, in_per as u32, out_per as u32,
+            ) {
+                return out;
+            }
+            // Vulkan (AMD/Intel/portable) fallback
+            if modgrad_device::gpu::try_superlinear(
+                trace, &self.weights, &self.biases, &mut out,
+                n_neurons as u32, in_per as u32, out_per as u32,
+            ) {
+                return out;
+            }
+        }
+
+        // CPU parallel (rayon) for medium workloads
+        if total_flops >= 100_000 {
+            // Parallel: chunks of neurons distributed across threads.
+            // Each thread processes a batch to amortize rayon scheduling overhead.
+            let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
+            let mut out = vec![0.0f32; n_neurons * out_per];
+            out.par_chunks_mut(chunk_size * out_per)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let n_start = chunk_idx * chunk_size;
+                    let n_end = (n_start + chunk_size).min(n_neurons);
+                    for n in n_start..n_end {
+                        let t = &trace[n * in_per..(n + 1) * in_per];
+                        let w_base = n * out_per * in_per;
+                        let local_off = (n - n_start) * out_per;
+                        for o in 0..out_per {
+                            let w = &self.weights[w_base + o * in_per..w_base + (o + 1) * in_per];
+                            out_chunk[local_off + o] = self.biases[n * out_per + o] + dot(w, t);
+                        }
+                    }
+                });
+            out
+        } else {
+            // Sequential for small neuron counts (rayon overhead > compute)
+            let mut out = vec![0.0f32; n_neurons * out_per];
+            for n in 0..n_neurons {
+                let t = &trace[n * in_per..(n + 1) * in_per];
+                let w_base = n * out_per * in_per;
+                let o_base = n * out_per;
+                for o in 0..out_per {
+                    let w = &self.weights[w_base + o * in_per..w_base + (o + 1) * in_per];
+                    out[o_base + o] = self.biases[o_base + o] + dot(w, t);
+                }
+            }
+            out
+        }
+    }
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+pub fn concat(slices: &[&[f32]]) -> Vec<f32> {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for s in slices {
+        out.extend_from_slice(s);
+    }
+    out
+}
+
+pub fn maybe_broadcast(local: &[f32], global: &[f32], receives: bool) -> Vec<f32> {
+    if receives {
+        concat(&[local, global])
+    } else {
+        local.to_vec()
+    }
+}
+
+/// Simple scaled dot-product attention: query × observation.
+/// query: [n_sync], observation: [d_input]
+/// Returns: [d_input] weighted observation.
+pub fn simple_attention(query: &[f32], observation: &[f32], d_input: usize) -> Vec<f32> {
+    // For single KV pair, attention is just a scaled gate
+    let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+    let scale = 1.0 / (d_input as f32).sqrt();
+    // Use mean of query as attention weight
+    let weight = (query.iter().sum::<f32>() / q_norm * scale).tanh();
+    observation.iter().map(|&v| v * weight).collect()
+}

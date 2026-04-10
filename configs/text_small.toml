@@ -1,0 +1,33 @@
+# isis experiment config: small text-only model
+# Usage: isis train --config configs/text_small.toml
+
+[model]
+d_model = 128
+d_input = 128
+iterations = 4
+synapse_depth = 3
+heads = 4
+memory_length = 8
+deep_nlms = true
+memory_hidden_dims = 4
+n_synch_out = 64
+n_synch_action = 64
+
+[training]
+total_steps = 10000
+micro_batch = 16
+lr = 0.001
+optimizer = "adamw"
+weight_decay = 0.01
+warmup_steps = 500
+save_every = 2000
+log_every = 100
+grad_clip = 1.0
+checkpoint_dir = "checkpoints/text_small"
+loss = "ctm"
+seed = 42
+
+[data]
+text = ["train_climbmix.txt"]
+context_len = 64
+text_weight = 1.0

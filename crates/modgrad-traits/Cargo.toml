@@ -1,0 +1,9 @@
+[package]
+name = "modgrad-traits"
+version = "0.1.0"
+edition = "2024"
+description = "Core traits for the modgrad ML SDK: Brain, LossFn, Optimizer"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

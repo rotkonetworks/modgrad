@@ -1,0 +1,13 @@
+[package]
+name = "nanochat-rs"
+version = "0.1.0"
+edition = "2024"
+description = "nanochat reimplemented in Rust using the modgrad SDK"
+license = "MIT"
+
+[[bin]]
+name = "nanochat"
+path = "src/main.rs"
+
+[dependencies]
+modgrad = { path = "../.." }

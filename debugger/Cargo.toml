@@ -1,0 +1,16 @@
+[package]
+name = "modgrad-debugger"
+version = "0.1.0"
+edition = "2024"
+description = "Live neural computer debugger — connects to any modgrad NC via TCP"
+
+[[bin]]
+name = "modgrad-debugger"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-runtime = { path = "../crates/modgrad-runtime" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+egui = "0.31"

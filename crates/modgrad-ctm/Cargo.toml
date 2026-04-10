@@ -1,0 +1,12 @@
+[package]
+name = "modgrad-ctm"
+version = "0.1.0"
+edition = "2024"
+description = "Continuous Thought Machine architecture for the modgrad ML SDK"
+license = "MIT"
+
+[dependencies]
+modgrad-traits = { path = "../modgrad-traits" }
+modgrad-compute = { path = "../modgrad-compute" }
+modgrad-persist = { path = "../modgrad-persist" }
+serde = { version = "1", features = ["derive"] }
