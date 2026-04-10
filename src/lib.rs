@@ -22,6 +22,7 @@ pub use modgrad_training::optim;
 pub use modgrad_data::tokenize;
 pub use modgrad_data::tokens;
 pub use modgrad_data::stream;
+pub use modgrad_data::text_gen;
 
 // Codec
 pub use modgrad_codec::vqvae;

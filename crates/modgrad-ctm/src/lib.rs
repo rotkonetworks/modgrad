@@ -15,6 +15,7 @@ pub mod train;
 pub mod graph;
 pub mod memory;
 pub mod bio;
+pub mod curriculum;
 
 pub use config::CtmConfig;
 pub use weights::{CtmWeights, CtmState};
