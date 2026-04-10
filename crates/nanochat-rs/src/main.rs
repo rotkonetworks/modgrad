@@ -1,134 +1,145 @@
-//! nanochat-rs — train a GPT on text using the modgrad SDK.
+//! nanochat — train a CTM on text, then chat with it.
+//!
+//! Minimal example of the modgrad SDK. No curriculum, no multimodal —
+//! just raw text → regional CTM → next byte prediction.
 //!
 //! Usage:
-//!   cargo run --release -p nanochat-rs -- --data train.txt --steps 200
+//!   nanochat --data train.txt --steps 5000
+//!   nanochat --data train.txt --steps 5000 --chat
 
-use modgrad::traits::{Brain, LastTickCE, LossFn, SeqInput};
-use modgrad::trainer::{train, TrainConfig, Sample, SampleProvider, StderrLogger};
-use modgrad::optim::ConstantLR;
-use modgrad::transformer::config::*;
-use modgrad::transformer::dims::*;
-use modgrad::transformer::weights::{GptWeights, BlockWeights};
-use modgrad::transformer::offload::WeightOffloader;
-use modgrad::transformer::rope::RotaryEmbedding;
-use modgrad::transformer::train::{Transformer, TransformerWeights};
-use modgrad::neuron::SimpleRng;
-
+use modgrad_runtime::regional::*;
 use std::io::Read;
-
-// ─── Data ─────────────────────────────────────────────────────
-
-struct ByteData { data: Vec<u8>, pos: usize, seq_len: usize }
-
-impl SampleProvider<SeqInput, usize> for ByteData {
-    fn next_sample(&mut self) -> Option<Sample<SeqInput, usize>> {
-        if self.pos + self.seq_len + 1 > self.data.len() { return None; }
-        let ids: Vec<u32> = self.data[self.pos..self.pos + self.seq_len]
-            .iter().map(|&b| b as u32).collect();
-        let target = self.data[self.pos + self.seq_len] as usize;
-        self.pos += 1;
-        Some(Sample { input: SeqInput { token_ids: ids }, target })
-    }
-    fn reset(&mut self) { self.pos = 0; }
-}
-
-// ─── Main ─────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut data_path = "train_climbmix.txt".to_string();
-    let mut steps = 200usize;
-    let mut depth = 4usize;
-    let mut lr = 3e-4f32;
-    let mut seq_len = 64usize;
+    let mut data_path = "train_climbmix_5m.txt".to_string();
+    let mut steps = 2000usize;
+    let mut embed_dim = 32usize;
+    let mut regions = 4usize;
+    let mut ticks = 2usize;
+    let mut lr = 3e-3f32;
+    let mut context = 32usize;
+    let mut chat = false;
+    let mut checkpoint: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--data" => { data_path = args[i+1].clone(); i += 2; }
             "--steps" => { steps = args[i+1].parse().unwrap(); i += 2; }
-            "--depth" => { depth = args[i+1].parse().unwrap(); i += 2; }
+            "--embed" => { embed_dim = args[i+1].parse().unwrap(); i += 2; }
+            "--regions" => { regions = args[i+1].parse().unwrap(); i += 2; }
+            "--ticks" => { ticks = args[i+1].parse().unwrap(); i += 2; }
             "--lr" => { lr = args[i+1].parse().unwrap(); i += 2; }
-            "--seq-len" => { seq_len = args[i+1].parse().unwrap(); i += 2; }
+            "--context" => { context = args[i+1].parse().unwrap(); i += 2; }
+            "--chat" => { chat = true; i += 1; }
+            "--checkpoint" | "-c" => { checkpoint = Some(args[i+1].clone()); i += 2; }
             _ => { i += 1; }
         }
     }
 
-    // Config — nanochat scaling: width = 128 * depth
-    let n_embd = (128 * depth).max(256).min(4096);
-    let hd = 64;
-    let config = GptConfig {
-        model_dim: ModelDim::new(n_embd),
-        num_heads: NumHeads::new(n_embd / hd),
-        num_kv_heads: NumKvHeads::new(n_embd / hd),
-        head_dim: HeadDim::new(hd),
-        num_layers: NumLayers::new(depth),
-        vocab_size: VocabSize::new(256),
-        mlp_dim: MlpDim::new(4 * n_embd),
-        max_seq_len: SeqLen::new(seq_len),
-        ..Default::default()
-    };
-
-    // Init weights
-    let mut rng = SimpleRng::new(42);
-    let md = n_embd;
-    let kv = config.num_kv_heads.get() * hd;
-    let mlp = 4 * n_embd;
-    let s = |fan: usize| (2.0 / fan as f32).sqrt();
-    let r = |rng: &mut SimpleRng, n: usize, sc: f32| -> Vec<f32> {
-        (0..n).map(|_| rng.next_normal() * sc).collect()
-    };
-
-    let blocks: Vec<BlockWeights> = (0..depth).map(|li| {
-        let layer_idx = LayerIdx::new(li, config.num_layers).unwrap();
-        let (ve_t, ve_g) = if config.has_value_embed(layer_idx) {
-            (Some(r(&mut rng, 256 * kv, s(kv))),
-             Some(r(&mut rng, config.num_kv_heads.get() * config.value_embed.gate_channels, s(12))))
-        } else { (None, None) };
-        BlockWeights {
-            wq: r(&mut rng, md*md, s(md)), wk: r(&mut rng, kv*md, s(md)),
-            wv: r(&mut rng, kv*md, s(md)), wo: r(&mut rng, md*md, s(md)),
-            mlp_fc: r(&mut rng, mlp*md, s(md)), mlp_proj: r(&mut rng, md*mlp, s(mlp)),
-            ve_table: ve_t, ve_gate: ve_g,
+    // Load or create model
+    let mut w = if let Some(ref path) = checkpoint {
+        if std::path::Path::new(path).exists() {
+            eprintln!("Loading {path}...");
+            RegionalWeights::load(path).expect("failed to load")
+        } else {
+            create_model(embed_dim, regions, ticks)
         }
-    }).collect();
-
-    let norm_scale = vec![1.0f32; md];
-    let offloader = WeightOffloader::from_weights(
-        GptWeights {
-            token_embed: r(&mut rng, 256 * md, s(md)),
-            lm_head: r(&mut rng, 256 * md, s(md)),
-            final_norm_scale: norm_scale.clone(),
-            smear_gate: r(&mut rng, md * config.smear.gate_channels, s(24)),
-            blocks,
-        },
-        &config, 0,
-    );
-    let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
-
-    let mut weights = TransformerWeights {
-        offloader, config: config.clone(), rope, norm_scale,
+    } else {
+        create_model(embed_dim, regions, ticks)
+    };
+    let opt_path = checkpoint.as_deref().unwrap_or("nanochat.bin")
+        .replace(".bin", ".opt.bin");
+    let mut opt = if std::path::Path::new(&opt_path).exists() {
+        RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
+    } else {
+        RegionalAdamW::new(&w).with_lr(lr).with_clip(5.0)
     };
 
-    let n_params: usize = weights.offloader.layers.iter().map(|l| l.data.len()).sum::<usize>()
-        + weights.offloader.embed.len() + weights.offloader.lm_head.len();
-    eprintln!("nanochat-rs: depth={depth} d_model={md} params={:.1}M seq_len={seq_len}",
-        n_params as f64 / 1e6);
+    w.print_summary();
 
-    // Data
+    if chat {
+        run_chat(&w);
+        return;
+    }
+
+    // Load data
     let mut text = Vec::new();
-    std::fs::File::open(&data_path).unwrap().read_to_end(&mut text).unwrap();
-    eprintln!("data: {data_path} ({:.1}MB)\n", text.len() as f64 / 1e6);
-    let mut data = ByteData { data: text, pos: 0, seq_len };
+    std::fs::File::open(&data_path)
+        .unwrap_or_else(|e| { eprintln!("Can't open {data_path}: {e}"); std::process::exit(1); })
+        .read_to_end(&mut text).unwrap();
+    eprintln!("data: {data_path} ({:.1}MB)", text.len() as f64 / 1e6);
 
-    // Train — one call
-    let report = train::<Transformer, _, _, _, _>(
-        &mut weights, &mut data, &LastTickCE,
-        &ConstantLR { lr },
-        &mut None, &mut StderrLogger,
-        &TrainConfig { total_steps: steps, micro_batch: 1, log_every: 20,
-                       token_dim: md, ..Default::default() },
-    );
+    // Train
+    let mut grads = RegionalGradients::zeros(&w);
+    let mut losses = Vec::new();
 
-    eprintln!("done: loss={:.3} in {:.1}s", report.final_loss, report.elapsed_secs);
+    for step in 0..steps {
+        let offset = (step * context) % (text.len() - context - 1);
+        let chunk = &text[offset..offset + context + 1];
+
+        grads.zero();
+        let mut step_loss = 0.0f32;
+        let mut correct = 0usize;
+
+        for pos in 0..context {
+            let token = chunk[pos] as usize;
+            let target = chunk[pos + 1] as usize;
+            let (loss, pred) = regional_train_token(&w, &mut grads, token, target);
+            step_loss += loss;
+            if pred == target { correct += 1; }
+        }
+
+        opt.step(&mut w, &grads);
+        step_loss /= context as f32;
+        losses.push(step_loss);
+
+        if step % 100 == 0 || step == steps - 1 {
+            let avg = if losses.len() >= 50 {
+                losses[losses.len()-50..].iter().sum::<f32>() / 50.0
+            } else {
+                losses.iter().sum::<f32>() / losses.len() as f32
+            };
+            eprintln!("step {step:5}: loss={step_loss:.3} avg50={avg:.3} acc={correct}/{context}");
+        }
+    }
+
+    // Save
+    let save_path = checkpoint.as_deref().unwrap_or("nanochat.bin");
+    w.save(save_path).expect("save failed");
+    opt.save(&opt_path).expect("opt save failed");
+    eprintln!("Saved to {save_path}");
+
+    // Generate
+    eprintln!("\n--- Generation ---");
+    for prompt in &["the ", "hello ", "in the "] {
+        let mut nc = NeuralComputer::new(w.clone());
+        let out = nc.chat(prompt, 60, 0.7);
+        eprintln!("  \"{prompt}\" → \"{out}\"");
+    }
+}
+
+fn create_model(embed_dim: usize, regions: usize, ticks: usize) -> RegionalWeights {
+    let cfg = if regions <= 4 {
+        RegionalConfig::four_region(embed_dim, 256, ticks)
+    } else {
+        RegionalConfig::eight_region(embed_dim, 256, ticks)
+    };
+    RegionalWeights::new(cfg)
+}
+
+fn run_chat(w: &RegionalWeights) {
+    let mut nc = NeuralComputer::new(w.clone());
+    eprintln!("Chat mode. Type text, ctrl-D to quit.\n");
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        eprint!("> ");
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        line.clear();
+        if stdin.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        let response = nc.chat(line.trim(), 100, 0.7);
+        println!("{response}");
+    }
 }
