@@ -10,15 +10,15 @@ cuda = ["modgrad-device/cuda"]
 sdp = ["dep:clarabel"]
 
 [dependencies]
-modgrad-traits = { path = "../modgrad-traits" }
-modgrad-compute = { path = "../modgrad-compute" }
-modgrad-ctm = { path = "../modgrad-ctm" }
-modgrad-codec = { path = "../modgrad-codec" }
-modgrad-device = { path = "../modgrad-device" }
-modgrad-io = { path = "../modgrad-io" }
-modgrad-persist = { path = "../modgrad-persist" }
-modgrad-training = { path = "../modgrad-training" }
-modgrad-transformer = { path = "../modgrad-transformer" }
+modgrad-traits = { path = "../../crates/modgrad-traits" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-codec = { path = "../../crates/modgrad-codec" }
+modgrad-device = { path = "../../crates/modgrad-device" }
+modgrad-io = { path = "../../crates/modgrad-io" }
+modgrad-persist = { path = "../../crates/modgrad-persist" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-transformer = { path = "../../crates/modgrad-transformer" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"

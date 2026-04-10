@@ -11,7 +11,7 @@ members = [
     "crates/modgrad-training",
     "crates/modgrad-transformer",
     "crates/modgrad-io",
-    "crates/modgrad-runtime",
+    "isis/runtime",
     "examples/minictm",
     "debugger",
     "extra/remu",
@@ -51,7 +51,7 @@ modgrad-data = { path = "crates/modgrad-data" }
 modgrad-training = { path = "crates/modgrad-training" }
 modgrad-transformer = { path = "crates/modgrad-transformer" }
 modgrad-io = { path = "crates/modgrad-io" }
-modgrad-runtime = { path = "crates/modgrad-runtime" }
+modgrad-runtime = { path = "isis/runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
