@@ -16,7 +16,6 @@ pub mod salience;
 pub mod neuromod;
 pub mod three_factor;
 
-// Preserved — uncomment when imports are updated
-// pub mod autonomic;
-// pub mod homeostasis;
-// pub mod consolidation;
+// pub mod autonomic; // needs modgrad-io types
+pub mod homeostasis;
+pub mod consolidation;

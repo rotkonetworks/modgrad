@@ -13,8 +13,50 @@
 //!   RED    (0.8-1.0): critical, forced sleep imminent
 //!   FORCED (>1.0):    cannot process, must sleep
 
-use super::tuning::HomeostasisParams;
 use serde::{Deserialize, Serialize};
+
+/// Tuning parameters for homeostasis. All values are f32 with sane defaults.
+/// Use `val()` to extract the value (allows future governance/clamping).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeostasisParams {
+    pub activation_ema: Param,
+    pub divergence_increment: Param,
+    pub divergence_decrement: Param,
+    pub w_activation: Param,
+    pub w_divergence: Param,
+    pub w_drift: Param,
+    pub w_buffer: Param,
+    pub w_emotional: Param,
+    pub w_surprise: Param,
+    pub quality_degradation: Param,
+    pub yellow_threshold: Param,
+    pub red_threshold: Param,
+    pub forced_threshold: Param,
+}
+
+impl Default for HomeostasisParams {
+    fn default() -> Self {
+        Self {
+            activation_ema: Param(0.95),
+            divergence_increment: Param(0.02),
+            divergence_decrement: Param(0.005),
+            w_activation: Param(0.25),
+            w_divergence: Param(0.15),
+            w_drift: Param(0.20),
+            w_buffer: Param(0.20),
+            w_emotional: Param(0.10),
+            w_surprise: Param(0.10),
+            quality_degradation: Param(0.6),
+            yellow_threshold: Param(0.5),
+            red_threshold: Param(0.8),
+            forced_threshold: Param(1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Param(pub f32);
+impl Param { pub fn val(&self) -> f32 { self.0 } }
 
 /// Sleep pressure state. Accumulates from neural activity, cleared by sleep.
 ///
