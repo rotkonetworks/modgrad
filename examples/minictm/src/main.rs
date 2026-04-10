@@ -81,33 +81,38 @@ fn main() {
     // ── Training ──────────────────────────────────────────
 
     if use_curriculum {
-        // Capability-gated curriculum
         let stages = byte_curriculum();
 
-        // Build training data: mix stage-specific data with real text if available
-        let mut data = Vec::new();
-        // Stage-specific data first (teaches exactly what tests measure)
-        data.extend(generate_byte_class_data(50_000));
-        data.extend(generate_bigram_data(50_000));
-        data.extend(generate_word_data(100_000));
-        data.extend(generate_coherent_data(200_000));
+        // Per-stage training data — each stage gets its own focused data
+        // + real text mixed into later stages
+        let real_text = data_path.as_ref().and_then(|path| {
+            let mut text = Vec::new();
+            std::fs::File::open(path).ok()?.read_to_end(&mut text).ok()?;
+            eprintln!("+ {:.1}MB real text from {path}", text.len() as f64 / 1e6);
+            Some(text)
+        });
 
-        // Real text on top if available
-        if let Some(ref path) = data_path {
-            if let Ok(mut f) = std::fs::File::open(path) {
-                let mut text = Vec::new();
-                f.read_to_end(&mut text).ok();
-                let limit = text.len().min(2_000_000);
-                data.extend_from_slice(&text[..limit]);
-                eprintln!("+ {:.1}MB real text from {path}", limit as f64 / 1e6);
-            }
+        let mut stage_data: Vec<Vec<u8>> = vec![
+            generate_byte_class_data(100_000),
+            generate_bigram_data(100_000),
+            generate_word_data(200_000),
+            generate_coherent_data(300_000),
+        ];
+
+        // Mix real text into later stages (word completion + coherent)
+        if let Some(ref text) = real_text {
+            let limit = text.len().min(1_000_000);
+            stage_data[2].extend_from_slice(&text[..limit]);
+            stage_data[3].extend_from_slice(&text[..text.len().min(2_000_000)]);
         }
 
-        eprintln!("Training data: {:.1}MB ({} stages)\n",
-            data.len() as f64 / 1e6, stages.len());
+        for (i, d) in stage_data.iter().enumerate() {
+            eprintln!("  stage {i} ({}): {:.1}KB", stages[i].name, d.len() as f64 / 1024.0);
+        }
+        eprintln!();
 
         let reached = curriculum::run_curriculum(
-            &mut w, &mut opt, &data, &stages, context,
+            &mut w, &mut opt, &stage_data, &stages, context,
             &mut |msg| eprintln!("{msg}"),
         );
 
