@@ -1,223 +1,145 @@
-# isis
+# modgrad
 
-**intermediate system to intermediate system**
+**modular gradient SDK for building general intelligence**
 
-gradient-free neuroplasticity for language models. a 4-region continuous thought machine that learns through hebbian plasticity and sleep consolidation — no backpropagation.
-
-## what it does
-
-isis bolts onto a frozen language model (or grows from scratch) and adds:
-
-- **episodic memory** — teach facts, recall them via cosine key matching
-- **deliberation** — 4-region ctm thinks across multiple ticks before responding
-- **sleep consolidation** — least-squares weight optimization during nrem, emotional processing during rem
-- **plural identity** — per-alter ctm weights, amnesia barriers, asymmetric memory access
-- **self-monitoring** — homeostasis tracks sleep pressure from native neural signals, not timers
+a hierarchical continuous thought machine trained with backpropagation through time. 8 brain regions, each a full CTM, connected in a directed graph. multimodal: text, images, audio, video, actions — unified in one token space, one model, one loss function.
 
 ## architecture
 
 ```
-frozen backbone (onnx/gguf)
-  → hidden state
-    → ctm v2 (4 regions, K ticks, hebbian plasticity)
-      → input region  (v1/s1, fast, wide)
-      → attention region (thalamus, gating, no broadcast)
-      → output region (association cortex, evidence accumulation)
-      → motor region  (m1/bg, drift-diffusion threshold)
-    → sync convergence → confidence signal
-    → episodic memory (cosine recall, valence, reconsolidation)
-    → logit injection → output token
+observation (any modality)
+  → embedding table (9134 tokens)
+  → inter-region synapse projections
+  → 8 CTM regions (parallel, different tick rates):
+      input ←→ attention ←→ output ←→ motor    (cortical loop)
+      cerebellum, basal_ganglia, insula, hippocampus  (subcortical)
+  → global sync accumulator (spans all regions)
+  → output projection → next token prediction
+  → BPTT through all ticks, all regions, all connections
+  → AdamW optimizer
 ```
 
-or without a backbone:
+each region runs the full sakana CTM algorithm:
+- multihead attention over observation
+- synapse U-Net (residual skip connections)
+- NLM trace memory (shift register, variable depth per region)
+- sync accumulator readout (random neuron pairing)
+- variable-depth thinking (ticks with early exit on certainty)
+
+## token space
 
 ```
-raw bytes
-  → learned embeddings (dna: randomly initialized)
-  → sensory layer (trained via least-squares from parent hidden states)
-  → ctm v2 (same architecture)
-  → output projection → next byte
+  0..255        bytes (text, raw data)
+  256..263      delimiters (<img> </img> <aud> </aud> <vid> </vid>)
+  264..4359     image VQ codes (4096, from VQ-VAE encoder)
+  4360..8455    audio VQ codes (4096, from WavTokenizer-style codec)
+  8456..8855    timestamps (0.00s..199.50s at 0.5s resolution)
+  8856..9133    action tokens (mouse/keyboard events + coordinates)
 ```
 
-## two modes
+one model learns all modalities through the same next-token prediction loss.
 
-### backbone mode
+## neural computer
 
-attach isis to any frozen language model. the backbone handles perception and language. isis handles memory, deliberation, and identity.
+the model is the computer. computation, memory, and I/O unified in the CTM's latent state.
 
 ```bash
-# teach facts through the backbone
-isis chat models isis.json
+# interactive mode
+isis nc model.bin
+isis nc model.bin --audio mic.wav --camera frames/ --audio-out speak.wav
 
-# full pipeline test: backbone → ctm → memory → sleep → recall
-isis e2e models
+# commands
+nc> the cat sat on        # text in → text out
+nc> /click 0.5 0.3        # mouse action
+nc> /key enter             # keyboard action
+nc> /ctrl c                # modifier combo
 ```
 
-### tabula rasa mode
-
-no backbone. the organism starts blank and learns from experience. like a newborn — right architecture, zero knowledge.
+## training
 
 ```bash
-# develop from raw text (self-supervised)
-isis develop train_data.txt organism.bin
+# text-only (learns English byte prediction)
+isis train model.bin
 
-# develop with parent guidance (backbone teaches the child)
-isis parent models child.bin
+# multimodal (text + synthetic image/audio/action pairs)
+isis train model.bin --multimodal
 
-# learn from precomputed parent hidden states (fast)
-isis learn parent_states.bin child.bin
+# with real data
+isis train model.bin --multimodal --images cifar.bin --audio clips/ --video vids/
 
-# probe what it understands
-isis probe child.bin
+# watch training live
+isis train model.bin --debug-port 4747
+modgrad-debugger 127.0.0.1:4747
 ```
 
-## brain regions
+training uses BPTT through the full CTM tick loop + AdamW. no hebbian, no sleep consolidation, no biological learning rules — pure gradient descent. optional auxiliary losses (cerebellar prediction, hippocampal contrastive, BG temporal difference) can be toggled for experimentation.
 
-| region | neurons | memory | ticks | role |
-|--------|---------|--------|-------|------|
-| input (v1/s1) | 31% | short | few | perceive, fast feature detection |
-| attention (thalamus) | 27% | long | many | route, gate, no broadcast |
-| output (assoc cortex) | 27% | long | many | accumulate evidence, understand |
-| motor (m1/bg) | 14% | short | few | decide, drift-diffusion threshold |
+## debugger
 
-20% of neurons per region are inhibitory (gaba), creating competition and winner-take-all dynamics.
+live 3D brain visualization over TCP:
 
-## sleep
+- neuron particles colored by region, sized by activation
+- token stream color-coded by modality
+- NLM trace heatmaps per region
+- global sync bar chart
+- command center: pause/resume/step, inject tokens, inspect state
+- auto-reconnect, works with any modgrad model
 
-two phases, like real sleep:
-
-**nrem (slow-wave):**
-- least-squares synapse weight optimization
-- sensory layer consolidation from parent traces
-- graduation testing: episodic → semantic
-- logit projector training
-
-**rem (dreaming):**
-- high-surprise experience replay
-- subconscious fear memory processing (auto-tuned plasticity)
-- avoidance pattern pruning (hate prevention)
-- emotional health diagnosis
-
-sleep is not on a timer. it's driven by native pressure signals:
-- activation energy (how hard neurons fired)
-- sync divergence (can't reach decisions)
-- hebbian drift (outputs getting noisy)
-- buffer overflow (consolidation overdue)
-- unprocessed emotions (rem needed)
-
-the organism observes its own pressure and can choose to sleep or push through. past threshold, sleep is forced.
-
-## memory lifecycle
-
-```
-teach → episodic snapshot (isis.json/isis.fb)
-  → recall via cosine match + ctm confidence gating
-  → sleep → least-squares consolidation into ctm weights
-  → graduation: consolidation_score crosses threshold
-  → episodic injection fades, ctm produces from own weights
-  → eventual pruning: knowledge lives only in ctm
+```bash
+modgrad-debugger 127.0.0.1:4747
 ```
 
-fear memories resist consolidation (slow decay, high threshold). the autonomic system processes them during rem with elevated plasticity — the psilocybin analogue. valence shifts gradually: fear → negative → neutral.
+## workspace
 
-## emotional health
+14 crates:
 
-the autonomic system monitors:
-- **ptsd risk**: fear memories > 30% of total
-- **depressive risk**: negative+fear > 50%
-- **hate risk**: avoidance patterns over-generalizing (cosine > 0.7)
-- **hypervigilance**: too many active avoidances
-
-`safe_to_deploy()` returns false if any diagnosis is present.
-
-## neuromodulators
-
-| signal | source | modulates | range |
-|--------|--------|-----------|-------|
-| dopamine | surprise (prediction error) | sync accumulation | [0.5, 1.0] |
-| serotonin | energy × novelty | consolidation priority | [0.1, 1.0] |
-| norepinephrine | explicit importance | memory strength | [0.0, 3.0] |
-
-## formats
-
-| format | extension | use case |
-|--------|-----------|----------|
-| json | .json | human-readable memory banks |
-| flatbuffers | .fb | production (f32/f16/i8 quantized keys) |
-| binary | .bin | organism checkpoints (named weight sections) |
-| prometheus | .prom | metrics scraping |
-| jsonl | .jsonl | time series telemetry |
-
-memory banks are model-specific. the `model_id` field tracks exactly which backbone produced the keys:
-```json
-{
-  "model_id": {
-    "model": "Qwen/Qwen2.5-0.5B",
-    "backend": "onnx",
-    "quant": "f32",
-    "hidden_dim": 896,
-    "extraction": "pre_mlp_layer23",
-    "eos_token_id": 151643
-  }
-}
-```
-
-## parent-child teaching
-
-the backbone is the parent. the organism is the child. the parent demonstrates understanding, the child learns to match.
-
-```
-parent processes "the cat sat" → hidden state (meaning)
-child processes same text → its own representation (initially random)
-teaching signal = cosine similarity between parent and child
-hebbian update: blend child embedding toward parent representation
-sleep: least-squares sensory layer training against parent targets
-```
-
-angeris bound diagnostic: 78% of parent representation is linearly recoverable from child embeddings after training. the remaining 22% is nonlinear/contextual — handled by the ctm's multi-tick deliberation.
-
-## performance
-
-- avx-512 optimized dot product (16-wide unroll)
-- rayon parallel superlinear (per-neuron mlp) for large configs
-- vulkan compute shaders for gpu dispatch (superlinear + matvec)
-- parallel least-squares solver (row-parallel xtx/xty + column-parallel cholesky solve)
-- adaptive flop threshold: gpu → rayon → sequential fallback
-- binary organism format: ~5x smaller than json, ~100x faster save/load
+| crate | what |
+|-------|------|
+| `modgrad-traits` | core traits (`Brain`, `TokenInput`) |
+| `modgrad-compute` | `Linear`, ops, tensor, GPU dispatch |
+| `modgrad-ctm` | continuous thought machine with full BPTT |
+| `modgrad-codec` | VQ-VAE (images), AudioCodec (speech), FSQ |
+| `modgrad-data` | tokenization, mixed-modality streaming |
+| `modgrad-device` | CPU / CUDA / AMD KFD backends |
+| `modgrad-io` | telemetry, flatbuffers, ONNX/GGUF |
+| `modgrad-persist` | bincode/JSON serialization, quantization |
+| `modgrad-training` | AdamW, Adam, SGD, schedulers |
+| `modgrad-transformer` | transformer blocks, attention, RoPE |
+| `modgrad-runtime` | isis: 8-region hierarchical CTM, NC, debug socket |
+| `nanochat-rs` | lightweight chat inference |
+| `debugger` | live 3D brain visualizer (egui + TCP) |
+| `remu` | RDNA3 GPU emulator for kernel testing |
 
 ## building
 
 ```bash
-cargo build --release                    # cpu only
-cargo build --release --features gpu     # with vulkan compute
-cargo test                               # 61 tests
+cargo build --release                      # CPU only
+cargo build --release --features cuda      # with NVIDIA GPU
+cargo test --release                       # run tests
 ```
 
-requires:
-- rust 2024 edition
-- onnxruntime (for backbone mode)
-- libvulkan.so (for gpu feature, optional)
-- glslangvalidator (to recompile shaders, optional)
+requires rust 2024 edition.
 
-## dna configs
+## brain regions
 
-| config | neurons | params | context | ticks | use |
-|--------|---------|--------|---------|-------|-----|
-| tiny | 64 | 74k | 64 | 8 | testing |
-| small | 256 | 705k | 128 | 4 | fast experiments |
-| medium | 256 | ~1m | 64 | 16 | deep thinking |
-| large | 4096 | ~137m | 256 | 12 | language learning |
-| child_of(n) | 256 | varies | 128 | 8 | matched to parent dim |
+| region | d_model | memory | role |
+|--------|---------|--------|------|
+| input | 64 | 4 | raw observation + motor feedback |
+| attention | 64 | 8 | gating, routing |
+| output | 64 | 16 | evidence accumulation |
+| motor | 64 | 4 | action selection |
+| cerebellum | 8 | 4 | forward model (prediction error) |
+| basal ganglia | 8 | 8 | value estimation (critic) |
+| insula | 8 | 4 | interoception |
+| hippocampus | 8 | 16 | episodic binding (long memory) |
 
 ## references
 
-- sakana ai ctm paper (arxiv 2505.05522)
-- angeris (2022) "a note on generalizing power bounds for physical design"
-- eriksen (2013) "your server as a function"
-- complementary learning systems (mcclelland et al.)
-- nader (2003) "memory traces unbound" (reconsolidation)
-- reinders et al. (2006) did fmri studies (plural systems)
+- sakana AI CTM (arxiv 2505.05522) — continuous thought machine
+- qwen3-VL — text timestamps for video, interleaved MRoPE
+- meta neural computers (2026) — the model as the running computer
+- chameleon (meta) — unified discrete token space for multimodal generation
 
 ## license
 
-mit
+MIT
