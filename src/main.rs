@@ -61,6 +61,34 @@ enum Commands {
         #[arg(long)]
         debug_port: Option<u16>,
     },
+    /// Generate text from a trained model
+    Generate {
+        #[arg(default_value = "model.bin")]
+        checkpoint: String,
+        /// Prompt text
+        #[arg(default_value = "the ")]
+        prompt: String,
+        #[arg(short, long, default_value = "200")]
+        max_tokens: usize,
+        #[arg(short, long, default_value = "0.8")]
+        temperature: f32,
+    },
+    /// Run as a headless daemon (NC service on TCP port)
+    Daemon {
+        #[arg(default_value = "model.bin")]
+        checkpoint: String,
+        #[arg(short, long, default_value = "4747")]
+        port: u16,
+    },
+    /// Send a command to a running daemon
+    Send {
+        /// Text to inject
+        text: String,
+        #[arg(long, default_value = "127.0.0.1:4747")]
+        addr: String,
+    },
+    /// Show available compute devices
+    Devices,
 }
 
 fn main() {
@@ -75,6 +103,156 @@ fn main() {
                 audio.as_deref(), camera.as_deref(), camera_fps,
                 audio_out.as_deref(), image_out.as_deref(), debug_port);
         }
+        Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
+            run_generate(&checkpoint, &prompt, max_tokens, temperature);
+        }
+        Commands::Daemon { checkpoint, port } => {
+            run_daemon(&checkpoint, port);
+        }
+        Commands::Send { text, addr } => {
+            send_command(&text, &addr);
+        }
+        Commands::Devices => {
+            show_devices();
+        }
+    }
+}
+
+// ─── Generate ─────────────────────────────────────────────
+
+fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: f32) {
+    let w = RegionalWeights::load(checkpoint)
+        .unwrap_or_else(|e| { eprintln!("Failed to load {checkpoint}: {e}"); std::process::exit(1); });
+    w.print_summary();
+
+    let mut nc = NeuralComputer::new(w);
+    let response = nc.chat(prompt, max_tokens, temperature);
+    print!("{prompt}{response}");
+    println!();
+}
+
+// ─── Daemon ───────────────────────────────────────────────
+
+fn run_daemon(checkpoint: &str, port: u16) {
+    let w = if std::path::Path::new(checkpoint).exists() {
+        eprintln!("Loading {checkpoint}...");
+        RegionalWeights::load(checkpoint)
+            .unwrap_or_else(|e| { eprintln!("Failed: {e}"); std::process::exit(1); })
+    } else {
+        eprintln!("No checkpoint at {checkpoint}, creating fresh 8-region model...");
+        let cfg = RegionalConfig::eight_region(32, 256, 2);
+        RegionalWeights::new(cfg)
+    };
+    w.print_summary();
+
+    let mut nc = NeuralComputer::new(w);
+
+    // Start debug server (this IS the daemon — accepts commands via the debug protocol)
+    let view = nc_socket::NcDebugView::from_nc(&nc);
+    let view = std::sync::Arc::new(std::sync::Mutex::new(view));
+    let handle = nc_socket::start_debug_server(port, view.clone());
+
+    eprintln!("Daemon running on port {port}. Ctrl+C to stop.");
+    eprintln!("Connect with: modgrad-debugger 127.0.0.1:{port}");
+    eprintln!("Or send text: isis send \"hello world\" --addr 127.0.0.1:{port}");
+
+    // Block forever, updating state when debug clients inject tokens
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nShutting down...");
+        r.store(false, std::sync::atomic::Ordering::SeqCst);
+    }).ok();
+
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        // Check for injected tokens from debug clients
+        if let Some(event) = handle.poll_control() {
+            match event {
+                nc_socket::DebugEvent::Inject(tokens) => {
+                    let response = nc.act(&tokens, 256, 0.8);
+                    // Update view for debugger
+                    if let Ok(mut v) = view.try_lock() {
+                        *v = nc_socket::NcDebugView::from_nc(&nc);
+                    }
+                    // Print response as text
+                    for &t in &response {
+                        if t < 256 { print!("{}", t as u8 as char); }
+                    }
+                    io::stdout().flush().ok();
+                }
+                nc_socket::DebugEvent::Pause | nc_socket::DebugEvent::Resume => {}
+                nc_socket::DebugEvent::Step(token) => {
+                    nc.step(token);
+                    if let Ok(mut v) = view.try_lock() {
+                        *v = nc_socket::NcDebugView::from_nc(&nc);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Save on exit
+    if let Err(e) = nc.weights.save(checkpoint) {
+        eprintln!("Save failed: {e}");
+    } else {
+        eprintln!("Saved to {checkpoint}");
+    }
+}
+
+// ─── Send ─────────────────────────────────────────────────
+
+fn send_command(text: &str, addr: &str) {
+    use std::io::{Read, Write as IoWrite};
+    use std::net::TcpStream;
+
+    let mut stream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Can't connect to {addr}: {e}"); std::process::exit(1); }
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+
+    // Send InjectText request via debug protocol
+    let req = nc_socket::DebugRequest::InjectText { text: text.to_string() };
+    let data = bincode::serialize(&req).expect("serialize failed");
+    let len = data.len() as u32;
+    stream.write_all(&len.to_le_bytes()).ok();
+    stream.write_all(&data).ok();
+    stream.flush().ok();
+
+    // Read response
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).is_ok() {
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        if stream.read_exact(&mut buf).is_ok() {
+            if let Ok(resp) = bincode::deserialize::<nc_socket::DebugResponse>(&buf) {
+                match resp {
+                    nc_socket::DebugResponse::Ok => eprintln!("Sent."),
+                    nc_socket::DebugResponse::Error { msg } => eprintln!("Error: {msg}"),
+                    _ => eprintln!("Response: {resp:?}"),
+                }
+            }
+        }
+    }
+}
+
+// ─── Devices ──────────────────────────────────────────────
+
+fn show_devices() {
+    eprintln!("Compute devices:");
+    eprintln!("  CPU: available (rayon, {} threads)", rayon::current_num_threads());
+
+    #[cfg(feature = "cuda")]
+    eprintln!("  CUDA: enabled");
+    #[cfg(not(feature = "cuda"))]
+    eprintln!("  CUDA: disabled (build with --features cuda)");
+
+    // Check KFD (AMD GPU)
+    if std::path::Path::new("/dev/kfd").exists() {
+        eprintln!("  AMD KFD: /dev/kfd present");
+    } else {
+        eprintln!("  AMD KFD: not available");
     }
 }
 fn generate_multimodal_pairs() -> Vec<Vec<usize>> {
