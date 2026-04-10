@@ -42,3 +42,10 @@ benchmarks/.venv/
 
 # QEC generated data
 data/qec/Data_PAEMS*
+
+# Data files
+data/
+models/
+schema/
+schemas/
+cifar10_classes.txt
