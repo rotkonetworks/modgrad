@@ -1,9 +1,19 @@
-//! isis challenges: English-specific test games for the curriculum.
+//! isis challenges: English-specific test games and training loop.
 //!
-//! These gate advancement — the model must prove capability, not just low loss.
+//! The SDK provides `evaluate()` and `TestCase` — generic primitives.
+//! This module provides isis-specific challenges, stages, and the training loop.
 
 use modgrad_ctm::graph::*;
-use modgrad_ctm::curriculum::ChallengeResult;
+use modgrad_ctm::curriculum::{self, ChallengeResult, TestCase};
+
+/// One stage of isis curriculum.
+pub struct Stage {
+    pub name: &'static str,
+    pub challenge: fn(&mut NeuralComputer) -> ChallengeResult,
+    pub pass_threshold: f32,
+    pub max_steps: usize,
+    pub test_every: usize,
+}
 
 /// Challenge: given a byte, can the model predict common followers?
 /// Tests bigram knowledge: "th"→"e", "in"→"g", " t"→"h", etc.
@@ -196,8 +206,7 @@ pub fn challenge_coherent_generation(nc: &mut NeuralComputer) -> ChallengeResult
 
 /// Default byte-first curriculum for English text learning.
 /// Graduation requires real mastery — not low loss, demonstrated capability.
-pub fn byte_curriculum() -> Vec<modgrad_ctm::curriculum::Stage> {
-    use modgrad_ctm::curriculum::Stage;
+pub fn byte_curriculum() -> Vec<Stage> {
     vec![
         Stage {
             name: "byte_classes",
@@ -228,4 +237,79 @@ pub fn byte_curriculum() -> Vec<modgrad_ctm::curriculum::Stage> {
             test_every: 10000,
         },
     ]
+}
+
+/// Run staged training with capability gates.
+/// Returns highest stage graduated.
+pub fn run_curriculum(
+    w: &mut RegionalWeights,
+    opt: &mut RegionalAdamW,
+    stage_data: &[Vec<u8>],
+    stages: &[Stage],
+    context_len: usize,
+    log: &mut dyn FnMut(&str),
+) -> usize {
+    assert_eq!(stage_data.len(), stages.len(), "need one data vec per stage");
+    let mut grads = RegionalGradients::zeros(w);
+    let mut global_step = 0usize;
+    let base_lr = opt.lr;
+
+    for si in 0..stages.len() {
+        let mut data = Vec::new();
+        for d in &stage_data[..=si] { data.extend_from_slice(d); }
+
+        opt.lr = base_lr * 0.7f32.powi(si as i32);
+        let stage = &stages[si];
+        log(&format!("\n=== Stage {si}: {} (pass: {:.0}%, lr: {:.5}) ===",
+            stage.name, stage.pass_threshold * 100.0, opt.lr));
+
+        let mut stage_step = 0;
+        let mut graduated = false;
+
+        while stage_step < stage.max_steps {
+            let offset = (global_step * context_len) % data.len().saturating_sub(context_len + 1).max(1);
+            let end = (offset + context_len + 1).min(data.len());
+            if end - offset < context_len + 1 { global_step += 1; stage_step += 1; continue; }
+            let chunk = &data[offset..end];
+
+            grads.zero();
+            let mut loss = 0.0f32;
+            let mut correct = 0;
+            for pos in 0..context_len {
+                let (l, pred) = regional_train_token(w, &mut grads, chunk[pos] as usize, chunk[pos+1] as usize);
+                loss += l;
+                if pred == chunk[pos+1] as usize { correct += 1; }
+            }
+            opt.step(w, &grads);
+            loss /= context_len as f32;
+            global_step += 1;
+            stage_step += 1;
+
+            if stage_step % 500 == 0 {
+                log(&format!("  step {stage_step}: loss={loss:.3} acc={correct}/{context_len}"));
+            }
+
+            if stage_step % stage.test_every == 0 {
+                let mut nc = NeuralComputer::new(w.clone());
+                let result = (stage.challenge)(&mut nc);
+                let marker = if result.passed(stage.pass_threshold) { "PASS" } else { "FAIL" };
+                log(&format!("  TEST [{marker}]: {}", result.summary));
+
+                if result.passed(stage.pass_threshold) {
+                    log(&format!("  GRADUATED {} at step {stage_step}!", stage.name));
+                    graduated = true;
+                    break;
+                }
+            }
+        }
+
+        if !graduated {
+            log(&format!("  {} not graduated after {} steps", stage.name, stage.max_steps));
+            opt.lr = base_lr;
+            return si;
+        }
+    }
+
+    opt.lr = base_lr;
+    stages.len()
 }

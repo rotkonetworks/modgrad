@@ -1,34 +1,30 @@
-//! Capability-gated curriculum: the model earns advancement by passing tests.
+//! Capability-gated training primitives.
 //!
-//! No loss thresholds. No arbitrary step counts. The model must demonstrate
-//! actual capability before advancing to the next stage.
+//! The SDK provides types and evaluation. Runtimes provide the loop.
 //!
-//! Each stage has:
-//!   - Training data generator
-//!   - A challenge (test game) that gates advancement
-//!   - The challenge returns a score; pass threshold is configurable
-//!
-//! The stage order is configurable. Default is byte→text (computer-native).
-//! Human-inspired order would be: voice→image→video→byte→text.
-//! The pipeline doesn't care — it runs stages in whatever order you give it.
-//!
-//! Design: each challenge is a pure function. No traits, no dynamic dispatch.
-//! Compose them however you want.
+//! ```rust
+//! // Runtime code — NOT in the SDK:
+//! let tests = load_tests("bigrams.json");
+//! loop {
+//!     train_step(&mut w, &mut grads, token, target);
+//!     opt.step(&mut w, &grads);
+//!     if step % 1000 == 0 {
+//!         let result = evaluate(&mut nc, &tests);
+//!         if result.passed(0.75) { break; }
+//!     }
+//! }
+//! ```
 
-use crate::graph::*;
+use crate::graph::NeuralComputer;
 
-// ── Challenge results ─────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────
 
-/// Result of running a challenge.
+/// Result of evaluating a model against a set of tests.
 #[derive(Debug, Clone)]
 pub struct ChallengeResult {
-    /// Score from 0.0 (total failure) to 1.0 (perfect).
     pub score: f32,
-    /// Number of test cases attempted.
     pub total: usize,
-    /// Number correct.
     pub correct: usize,
-    /// Human-readable summary.
     pub summary: String,
 }
 
@@ -38,160 +34,91 @@ impl ChallengeResult {
     }
 }
 
-// ── Built-in challenges ───────────────────────────────────
-
-pub struct Stage {
-    pub name: &'static str,
-    /// Challenge function that gates advancement.
-    pub challenge: fn(&mut NeuralComputer) -> ChallengeResult,
-    /// Score needed to pass (0.0 - 1.0).
-    pub pass_threshold: f32,
-    /// Maximum training steps before giving up on this stage.
-    pub max_steps: usize,
-    /// How often to run the challenge (every N steps).
-    pub test_every: usize,
+/// One test case: feed context tokens, check if predicted token is in the accept set.
+pub struct TestCase {
+    /// Tokens to feed as context.
+    pub context: Vec<usize>,
+    /// Any of these tokens counts as correct.
+    pub accept: Vec<usize>,
 }
 
-/// Graduation result for one test cycle.
-#[derive(Debug)]
-pub struct GraduationReport {
-    /// Per-stage scores (index = stage index).
-    pub scores: Vec<ChallengeResult>,
-    /// Did all stages up to and including `target_stage` pass?
-    pub graduated: bool,
-    /// Which stage (if any) regressed below threshold?
-    pub regression: Option<usize>,
-}
+// ── Evaluation ────────────────────────────────────────────
 
-/// Run the full curriculum with graduation gates.
+/// Evaluate: feed each test's context, check if argmax prediction is accepted.
 ///
-/// To graduate from stage N, the model must:
-///   1. Pass stage N's challenge above threshold
-///   2. ALSO pass ALL stages 0..N-1 (no regression)
-///   3. If any previous stage regresses, retrain on mixed data until recovered
+/// This is the general-purpose evaluator. Works for any modality, any language,
+/// any task. The runtime provides the test cases.
 ///
-/// Data accumulates: stage N trains on data[0] + data[1] + ... + data[N].
-/// LR decays 0.7× per stage to protect earlier learning.
-///
-/// `stage_data`: per-stage training data. Stage i trains on concat(stage_data[0..=i]).
-/// Returns the highest stage graduated.
-pub fn run_curriculum(
-    w: &mut RegionalWeights,
-    opt: &mut RegionalAdamW,
-    stage_data: &[Vec<u8>],
-    stages: &[Stage],
-    context_len: usize,
-    log: &mut dyn FnMut(&str),
-) -> usize {
-    assert_eq!(stage_data.len(), stages.len(), "need one data vec per stage");
-    let mut grads = RegionalGradients::zeros(w);
-    let mut global_step = 0usize;
-    let base_lr = opt.lr;
+/// ```rust
+/// let tests = vec![
+///     TestCase { context: vec![116, 104], accept: vec![101] },  // "th" → "e"
+///     TestCase { context: vec![32, 116], accept: vec![104] },   // " t" → "h"
+/// ];
+/// let result = evaluate(&mut nc, &tests);
+/// ```
+pub fn evaluate(nc: &mut NeuralComputer, tests: &[TestCase]) -> ChallengeResult {
+    let mut correct = 0;
+    let total = tests.len();
 
-    for si in 0..stages.len() {
-        // Accumulate data: train on ALL stages up to current
-        let mut data = Vec::new();
-        for d in &stage_data[..=si] {
-            data.extend_from_slice(d);
-        }
+    for test in tests {
+        nc.reset();
+        let logits = nc.observe(&test.context);
+        let pred = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
 
-        // Decay LR per stage
-        opt.lr = base_lr * 0.7f32.powi(si as i32);
-
-        let stage = &stages[si];
-        log(&format!("\n=== Stage {si}: {} (pass: {:.0}%, max: {} steps, lr: {:.5}) ===",
-            stage.name, stage.pass_threshold * 100.0, stage.max_steps, opt.lr));
-        log(&format!("  Training on {:.1}KB accumulated data", data.len() as f64 / 1024.0));
-
-        let mut stage_step = 0;
-        let mut graduated = false;
-
-        while stage_step < stage.max_steps {
-            // Train one step on accumulated data
-            let offset = (global_step * context_len) % data.len().saturating_sub(context_len + 1).max(1);
-            let end = (offset + context_len + 1).min(data.len());
-            if end - offset < context_len + 1 { global_step += 1; stage_step += 1; continue; }
-            let chunk = &data[offset..end];
-
-            grads.zero();
-            let mut loss = 0.0f32;
-            let mut correct = 0;
-            for pos in 0..context_len {
-                let token = chunk[pos] as usize;
-                let target = chunk[pos + 1] as usize;
-                let (l, pred) = regional_train_token(w, &mut grads, token, target);
-                loss += l;
-                if pred == target { correct += 1; }
-            }
-            opt.step(w, &grads);
-
-            loss /= context_len as f32;
-            global_step += 1;
-            stage_step += 1;
-
-            if stage_step % 500 == 0 {
-                log(&format!("  step {stage_step}: loss={loss:.3} acc={correct}/{context_len}"));
-            }
-
-            // Graduation exam
-            if stage_step % stage.test_every == 0 {
-                let report = graduation_exam(w, stages, si);
-
-                // Log all scores
-                for (i, r) in report.scores.iter().enumerate() {
-                    let marker = if r.passed(stages[i].pass_threshold) { "✓" } else { "✗" };
-                    log(&format!("  {marker} {}: {}", stages[i].name, r.summary));
-                }
-
-                if report.graduated {
-                    log(&format!("  ★ GRADUATED {} at step {stage_step}!", stage.name));
-                    graduated = true;
-                    break;
-                } else if let Some(reg) = report.regression {
-                    log(&format!("  ↓ regression in {} — continuing training", stages[reg].name));
-                }
-            }
-        }
-
-        if !graduated {
-            log(&format!("  Stage {} not graduated after {} steps", stage.name, stage.max_steps));
-            // Restore LR
-            opt.lr = base_lr;
-            return si;
+        if test.accept.contains(&pred) {
+            correct += 1;
         }
     }
 
-    opt.lr = base_lr;
-    stages.len()
+    let score = if total > 0 { correct as f32 / total as f32 } else { 0.0 };
+    ChallengeResult {
+        score,
+        total,
+        correct,
+        summary: format!("{correct}/{total} ({:.0}%)", score * 100.0),
+    }
 }
 
-/// Run graduation exam: test current stage AND all previous stages.
-fn graduation_exam(
-    w: &RegionalWeights,
-    stages: &[Stage],
-    target_stage: usize,
-) -> GraduationReport {
-    let mut scores = Vec::new();
-    let mut all_passed = true;
-    let mut regression = None;
+/// Evaluate text generation: feed prompt, check what fraction of
+/// generated words appear in a provided vocabulary.
+///
+/// `vocab`: set of acceptable words (lowercase).
+/// `prompts`: text prompts to complete.
+/// `max_tokens`: how many tokens to generate per prompt.
+pub fn evaluate_generation(
+    nc: &mut NeuralComputer,
+    prompts: &[&str],
+    vocab: &[&str],
+    max_tokens: usize,
+) -> ChallengeResult {
+    let mut total_words = 0usize;
+    let mut real_words = 0usize;
 
-    for i in 0..=target_stage {
-        let mut nc = NeuralComputer::new(w.clone());
-        let result = (stages[i].challenge)(&mut nc);
-        let passed = result.passed(stages[i].pass_threshold);
-        if !passed {
-            all_passed = false;
-            if i < target_stage && regression.is_none() {
-                regression = Some(i);
+    for prompt in prompts {
+        nc.reset();
+        let output = nc.chat(prompt, max_tokens, 0.5);
+
+        for word in output.split_whitespace() {
+            let clean: String = word.chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_lowercase();
+            if clean.is_empty() { continue; }
+            total_words += 1;
+            if vocab.contains(&clean.as_str()) {
+                real_words += 1;
             }
         }
-        scores.push(result);
     }
 
-    GraduationReport {
-        scores,
-        graduated: all_passed,
-        regression,
+    let score = if total_words > 0 { real_words as f32 / total_words as f32 } else { 0.0 };
+    ChallengeResult {
+        score,
+        total: total_words,
+        correct: real_words,
+        summary: format!("{real_words}/{total_words} valid words ({:.0}%)", score * 100.0),
     }
 }
-

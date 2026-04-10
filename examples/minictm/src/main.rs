@@ -12,8 +12,7 @@
 //!   minictm -c model.bin --chat                       # just chat
 
 use modgrad_ctm::graph::*;
-use modgrad_ctm::curriculum;
-use modgrad_runtime::challenges::{self, byte_curriculum};
+use modgrad_runtime::challenges::{self, byte_curriculum, run_curriculum};
 use std::io::Read;
 
 fn main() {
@@ -112,7 +111,7 @@ fn main() {
         }
         eprintln!();
 
-        let reached = curriculum::run_curriculum(
+        let reached = run_curriculum(
             &mut w, &mut opt, &stage_data, &stages, context,
             &mut |msg| eprintln!("{msg}"),
         );
