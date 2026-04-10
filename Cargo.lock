@@ -2430,6 +2430,7 @@ dependencies = [
  "modgrad-compute",
  "modgrad-ctm",
  "modgrad-persist",
+ "modgrad-runtime",
  "modgrad-training",
  "serde",
 ]

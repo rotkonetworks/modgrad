@@ -15,6 +15,7 @@ pub use modgrad_ctm::graph as regional;
 // isis-specific
 pub mod curriculum;
 pub mod training_data;
+pub mod challenges;
 
 // Real-time I/O (generic but lives here for now)
 pub mod nc_io;

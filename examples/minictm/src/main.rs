@@ -12,7 +12,8 @@
 //!   minictm -c model.bin --chat                       # just chat
 
 use modgrad_ctm::graph::*;
-use modgrad_ctm::curriculum::{self, byte_curriculum, ChallengeResult};
+use modgrad_ctm::curriculum;
+use modgrad_runtime::challenges::{self, byte_curriculum};
 use std::io::Read;
 
 fn main() {
@@ -217,19 +218,19 @@ fn run_tests(w: &RegionalWeights) {
     eprintln!("\n=== Capability Tests ===");
 
     let mut nc = NeuralComputer::new(w.clone());
-    let r1 = curriculum::challenge_byte_classes(&mut nc);
+    let r1 = challenges::challenge_byte_classes(&mut nc);
     eprintln!("  {}", r1.summary);
 
     let mut nc = NeuralComputer::new(w.clone());
-    let r2 = curriculum::challenge_bigrams(&mut nc);
+    let r2 = challenges::challenge_bigrams(&mut nc);
     eprintln!("  {}", r2.summary);
 
     let mut nc = NeuralComputer::new(w.clone());
-    let r3 = curriculum::challenge_word_completion(&mut nc);
+    let r3 = challenges::challenge_word_completion(&mut nc);
     eprintln!("  {}", r3.summary);
 
     let mut nc = NeuralComputer::new(w.clone());
-    let r4 = curriculum::challenge_coherent_generation(&mut nc);
+    let r4 = challenges::challenge_coherent_generation(&mut nc);
     eprintln!("  {}", r4.summary);
 
     let total = r1.score + r2.score + r3.score + r4.score;

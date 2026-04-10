@@ -9,11 +9,11 @@ license = "MIT"
 name = "minictm"
 path = "src/main.rs"
 
-# Uses ONLY the SDK crates — no runtime, no isis, no opinions.
-# This is how you build your own AGI runtime on modgrad.
+# SDK crates + isis runtime for English challenges
 [dependencies]
 modgrad-ctm = { path = "../../crates/modgrad-ctm" }
 modgrad-compute = { path = "../../crates/modgrad-compute" }
 modgrad-training = { path = "../../crates/modgrad-training" }
 modgrad-persist = { path = "../../crates/modgrad-persist" }
+modgrad-runtime = { path = "../../isis/runtime" }
 serde = { version = "1", features = ["derive"] }

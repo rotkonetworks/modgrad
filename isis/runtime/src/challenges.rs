@@ -1,0 +1,231 @@
+//! isis challenges: English-specific test games for the curriculum.
+//!
+//! These gate advancement — the model must prove capability, not just low loss.
+
+use modgrad_ctm::graph::*;
+use modgrad_ctm::curriculum::ChallengeResult;
+
+/// Challenge: given a byte, can the model predict common followers?
+/// Tests bigram knowledge: "th"→"e", "in"→"g", " t"→"h", etc.
+pub fn challenge_bigrams(nc: &mut NeuralComputer) -> ChallengeResult {
+    let tests: Vec<(&[u8], &[u8])> = vec![
+        (b"th", b"e"),
+        (b"he", b" "),
+        (b"in", b"g"),
+        (b"an", b"d"),
+        (b"er", b" "),
+        (b"on", b" e"),
+        (b"re", b" "),
+        (b"th", b"a"),
+        (b" t", b"h"),
+        (b" a", b" n"),
+        (b"en", b"t"),
+        (b"at", b" "),
+        (b"ou", b"r"),
+        (b"is", b" "),
+        (b"to", b" "),
+        (b"it", b" "),
+        (b"st", b" "),
+        (b"or", b" "),
+        (b"ar", b"e"),
+        (b"nd", b" "),
+    ];
+
+    let mut correct = 0;
+    let total = tests.len();
+
+    for (context, valid_next) in &tests {
+        nc.reset();
+        let logits = nc.observe(&text_to_tokens(context));
+        let pred = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+
+        if valid_next.contains(&(pred as u8)) {
+            correct += 1;
+        }
+    }
+
+    let score = correct as f32 / total as f32;
+    ChallengeResult {
+        score,
+        total,
+        correct,
+        summary: format!("bigrams: {correct}/{total} ({:.0}%)", score * 100.0),
+    }
+}
+
+/// Challenge: given a character class, predict the right class.
+/// "A"→uppercase, "5"→digit, " "→space, "."→punctuation.
+pub fn challenge_byte_classes(nc: &mut NeuralComputer) -> ChallengeResult {
+    let tests: Vec<(u8, fn(u8) -> bool)> = vec![
+        (b'A', |b| b.is_ascii_lowercase() || b == b' '),  // after uppercase, expect lowercase or space
+        (b'z', |b| b.is_ascii_lowercase() || b == b' ' || b == b'.'),
+        (b' ', |b| b.is_ascii_alphabetic()),  // after space, expect letter
+        (b'.', |b| b == b' ' || b == b'\n'),  // after period, expect space or newline
+        (b'0', |b| b.is_ascii_digit() || b == b'.' || b == b',' || b == b' '),
+        (b'\n', |b| b.is_ascii_alphabetic() || b == b'\n' || b == b' '),
+        (b'(', |b| b.is_ascii_alphanumeric()),
+        (b'"', |b| b.is_ascii_alphabetic() || b == b' '),
+    ];
+
+    let mut correct = 0;
+    let total = tests.len();
+
+    for (input, is_valid) in &tests {
+        nc.reset();
+        let logits = nc.step(*input as usize);
+        let pred = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i).unwrap_or(0) as u8;
+
+        if is_valid(pred) {
+            correct += 1;
+        }
+    }
+
+    let score = correct as f32 / total as f32;
+    ChallengeResult {
+        score,
+        total,
+        correct,
+        summary: format!("byte classes: {correct}/{total} ({:.0}%)", score * 100.0),
+    }
+}
+
+/// Challenge: complete common English words.
+/// "th" → "the" or "that" or "this", "wh" → "what" or "when" or "which", etc.
+pub fn challenge_word_completion(nc: &mut NeuralComputer) -> ChallengeResult {
+    let tests: Vec<(&[u8], Vec<&[u8]>)> = vec![
+        (b"the ", vec![b"c", b"m", b"f", b"b", b"s", b"w", b"p", b"d", b"r", b"l", b"n", b"o", b"a", b"e", b"t"]),
+        (b"is ", vec![b"a", b"t", b"n", b"i", b"s"]),
+        (b"and ", vec![b"t", b"a", b"i", b"s", b"w", b"h"]),
+        (b"of ", vec![b"t", b"a", b"i", b"s"]),
+        (b"to ", vec![b"t", b"a", b"b", b"s", b"m", b"g", b"d", b"p"]),
+        (b"in ", vec![b"t", b"a", b"i", b"s"]),
+        (b"for ", vec![b"t", b"a", b"e", b"s"]),
+        (b"cat ", vec![b"s", b"a", b"i", b"w"]),
+    ];
+
+    let mut correct = 0;
+    let total = tests.len();
+
+    for (prefix, valid_next) in &tests {
+        nc.reset();
+        let logits = nc.observe(&text_to_tokens(prefix));
+        let pred = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+
+        if valid_next.iter().any(|v| v[0] == pred as u8) {
+            correct += 1;
+        }
+    }
+
+    let score = correct as f32 / total as f32;
+    ChallengeResult {
+        score,
+        total,
+        correct,
+        summary: format!("word completion: {correct}/{total} ({:.0}%)", score * 100.0),
+    }
+}
+
+/// Challenge: generate text containing real English words.
+///
+/// Not "is it printable ASCII" — that's trivial.
+/// Actually checks: do the generated words exist in a basic English vocabulary?
+pub fn challenge_coherent_generation(nc: &mut NeuralComputer) -> ChallengeResult {
+    // 100 most common English words — the model must produce THESE, not random ASCII
+    const COMMON_WORDS: &[&str] = &[
+        "the", "be", "to", "of", "and", "a", "in", "that", "have", "i",
+        "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+        "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
+        "or", "an", "will", "my", "one", "all", "would", "there", "their", "what",
+        "so", "up", "out", "if", "about", "who", "get", "which", "go", "me",
+        "when", "make", "can", "like", "time", "no", "just", "him", "know", "take",
+        "come", "could", "than", "look", "day", "had", "has", "was", "is", "are",
+        "were", "been", "did", "its", "into", "our", "then", "them", "very",
+        "cat", "sat", "on", "mat", "dog", "ran", "old", "new", "big", "red",
+        "man", "see", "now", "way", "may", "how", "two", "did", "got", "let",
+    ];
+
+    let prompts = ["the ", "in the ", "it is ", "he was ", "she said "];
+    let mut total_words = 0usize;
+    let mut real_words = 0usize;
+
+    for prompt in &prompts {
+        nc.reset();
+        let output = nc.chat(prompt, 40, 0.5);
+
+        // Split on spaces and check each token against vocabulary
+        let words: Vec<&str> = output.split_whitespace()
+            .filter(|w| w.len() >= 1 && w.len() <= 10)
+            .collect();
+
+        for word in &words {
+            total_words += 1;
+            // Strip trailing punctuation for matching
+            let clean: String = word.chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_lowercase();
+            if clean.len() >= 1 && COMMON_WORDS.contains(&clean.as_str()) {
+                real_words += 1;
+            }
+        }
+    }
+
+    let score = if total_words > 0 {
+        real_words as f32 / total_words as f32
+    } else {
+        0.0
+    };
+
+    ChallengeResult {
+        score,
+        total: total_words,
+        correct: real_words,
+        summary: format!("coherent generation: {real_words}/{total_words} real words ({:.0}%)", score * 100.0),
+    }
+}
+
+// ── Stage definition ──────────────────────────────────────
+
+/// One stage of the curriculum.
+
+/// Default byte-first curriculum for English text learning.
+/// Graduation requires real mastery — not low loss, demonstrated capability.
+pub fn byte_curriculum() -> Vec<modgrad_ctm::curriculum::Stage> {
+    use modgrad_ctm::curriculum::Stage;
+    vec![
+        Stage {
+            name: "byte_classes",
+            challenge: challenge_byte_classes,
+            pass_threshold: 0.75,
+            max_steps: 20000,
+            test_every: 2000,
+        },
+        Stage {
+            name: "bigrams",
+            challenge: challenge_bigrams,
+            pass_threshold: 0.30,
+            max_steps: 40000,
+            test_every: 4000,
+        },
+        Stage {
+            name: "word_completion",
+            challenge: challenge_word_completion,
+            pass_threshold: 0.50,
+            max_steps: 60000,
+            test_every: 5000,
+        },
+        Stage {
+            name: "coherent_generation",
+            challenge: challenge_coherent_generation,
+            pass_threshold: 0.60,
+            max_steps: 100000,
+            test_every: 10000,
+        },
+    ]
+}
