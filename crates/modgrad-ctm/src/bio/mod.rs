@@ -1,16 +1,14 @@
-//! Bio-inspired learning rules — reference implementations.
+//! Bio-inspired learning primitives.
 //!
-//! These implement neuroscience-inspired learning as auxiliary signals:
-//! - `cerebellar`: Delta rule forward model (predict observation from motor)
-//! - `three_factor`: REINFORCE with eligibility traces + salience gating
-//! - `neuromod`: Dopamine/serotonin/norepinephrine dynamics
+//! Standalone pure functions and structs — no runtime coupling.
+//! Use these as auxiliary signals alongside BPTT, or on their own.
+//!
+//! - `cerebellar`: Delta rule forward model + dopamine dynamics
 //! - `salience`: RPE × motor conflict → learning rate gate
-//!
-//! Originally designed for the Hebbian system. Being adapted for use as
-//! toggleable auxiliary losses alongside BPTT (see graph::AuxLossConfig).
+//! - `neuromod`: Dopamine/serotonin/norepinephrine state machine
+//! - `three_factor`: REINFORCE with Titans-style eligibility traces
 
-// TODO: update imports to use SDK types
-// pub mod cerebellar;
-// pub mod three_factor;
-// pub mod neuromod;
-// pub mod salience;
+pub mod cerebellar;
+pub mod salience;
+pub mod neuromod;
+pub mod three_factor;

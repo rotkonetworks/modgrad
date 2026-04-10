@@ -1,29 +1,32 @@
-//! Salience computation: RPE × motor conflict.
+//! Salience: how important is this moment for learning?
 //!
-//! Determines how "important" the current tick is for learning.
-//! High salience → learn hard. Low salience → skip update.
+//! RPE (reward prediction error) × motor conflict.
+//! High salience → learn hard. Low salience → skip.
 //!
-//! Biological basis: anterior insula (interoceptive surprise) +
-//! anterior cingulate cortex (response conflict monitoring).
+//! Biological basis: anterior insula + anterior cingulate cortex.
 
-use super::TickContext;
-
-/// Salience signal from reward prediction error × motor conflict.
+/// Salience signal.
 pub struct Salience {
+    /// Raw salience [0, ~2].
     pub value: f32,
-    pub gate: f32,       // 0.0 if below threshold, else value
+    /// Gated: 0 if below threshold, else value.
+    pub gate: f32,
     pub motor_conflict: f32,
     pub reward_rpe: f32,
 }
 
-/// Compute salience for the current tick.
-pub fn compute(ctx: &TickContext, da: f32, reward_baseline: f32) -> Salience {
-    let reward_rpe = (da - reward_baseline).abs();
+/// Compute salience from dopamine level and motor output.
+///
+/// `dopamine`: current DA
+/// `reward_baseline`: running average DA
+/// `motor_output`: motor region activations (conflict = close top-2)
+pub fn compute(dopamine: f32, reward_baseline: f32, motor_output: &[f32]) -> Salience {
+    let reward_rpe = (dopamine - reward_baseline).abs();
 
-    let mut motor_sorted: Vec<f32> = ctx.new_motor.iter().map(|x| x.abs()).collect();
-    motor_sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    let motor_conflict = if motor_sorted.len() >= 2 {
-        1.0 / (1.0 + (motor_sorted[0] - motor_sorted[1]) * 5.0)
+    let mut sorted: Vec<f32> = motor_output.iter().map(|x| x.abs()).collect();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let motor_conflict = if sorted.len() >= 2 {
+        1.0 / (1.0 + (sorted[0] - sorted[1]) * 5.0)
     } else {
         1.0
     };
@@ -32,4 +35,22 @@ pub fn compute(ctx: &TickContext, da: f32, reward_baseline: f32) -> Salience {
     let gate = if value > 0.05 { value } else { 0.0 };
 
     Salience { value, gate, motor_conflict, reward_rpe }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_rpe_high_salience() {
+        let s = compute(2.0, 1.0, &[0.5, 0.5]);
+        assert!(s.value > 0.5);
+        assert!(s.gate > 0.0);
+    }
+
+    #[test]
+    fn low_surprise_clear_action() {
+        let s = compute(1.0, 1.0, &[0.9, 0.1]);
+        assert!(s.value < 0.1);
+    }
 }

@@ -13,6 +13,8 @@ pub mod weights;
 pub mod forward;
 pub mod train;
 pub mod graph;
+pub mod memory;
+pub mod bio;
 
 pub use config::CtmConfig;
 pub use weights::{CtmWeights, CtmState};
