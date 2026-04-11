@@ -341,7 +341,7 @@ impl RegionalRouter {
             } else {
                 // Top-k by weight
                 let mut indexed: Vec<(usize, f32)> = w.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 indexed[..k].iter().map(|(i, _)| *i).collect()
             };
 
@@ -1400,7 +1400,7 @@ pub fn regional_train_step(
         .map(|tc| w.output_proj.forward(&tc.global_sync))
         .collect();
     let pred_class = predictions.last().unwrap().iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
 
     let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
@@ -1751,7 +1751,7 @@ pub fn regional_train_step_full(
         .map(|tc| w.output_proj.forward(&tc.global_sync))
         .collect();
     let pred_class = predictions.last().unwrap().iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
 
     let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
@@ -2135,6 +2135,49 @@ pub fn regional_train_token(
     (loss, pred)
 }
 
+/// Dream phase: free-running rollout with regret correction.
+///
+/// Generates `dream_len` tokens autoregressively from `seed_token`,
+/// comparing each generated token against the `ground_truth` continuation.
+/// The model uses its OWN predictions as input (free-running), not ground truth
+/// (teacher forcing). This tests whether the internal world model is coherent.
+///
+/// Inspired by embryonic spontaneous neural activity — the network tests its
+/// own circuits before birth. The dream gradient is weighted by `weight` to
+/// avoid overwhelming the data-driven signal.
+///
+/// Returns (dream_loss, gradients accumulated into `grads`).
+pub fn dream_step(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    seed_token: usize,
+    ground_truth: &[usize],  // actual continuation from data
+    dream_len: usize,
+    weight: f32,              // gradient scaling (e.g. 0.3)
+) -> f32 {
+    let len = dream_len.min(ground_truth.len());
+    let mut current_token = seed_token;
+    let mut total_loss = 0.0f32;
+
+    for d in 0..len {
+        let obs = w.embed(current_token).to_vec();
+        let (loss, pred, d_obs) = regional_train_step_full(w, grads, &obs, ground_truth[d]);
+
+        // Scale gradients by dream weight
+        let embed_d = w.config.raw_obs_dim;
+        let offset = current_token * embed_d;
+        for j in 0..embed_d {
+            grads.embed_grad[offset + j] += d_obs[j] * weight;
+        }
+
+        total_loss += loss;
+        // Free-running: use model's prediction, not ground truth
+        current_token = pred;
+    }
+
+    total_loss / len.max(1) as f32
+}
+
 /// Multi-byte training: train on a chunk, all heads predict future bytes.
 ///
 /// For a chunk [b0, b1, b2, ..., bN]:
@@ -2213,7 +2256,7 @@ fn cross_entropy_with_logits(logits: &[f32], target: usize) -> (f32, usize) {
     let sum: f32 = exp_s.iter().sum();
     let loss = -(exp_s.get(target).copied().unwrap_or(1e-8) / sum).max(1e-8).ln();
     let pred = logits.iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
     (loss, pred)
 }
@@ -2424,7 +2467,7 @@ impl NeuralComputer {
     pub fn sample(&mut self, logits: &[f32], temperature: f32) -> usize {
         if temperature <= 0.0 || logits.is_empty() {
             return logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i).unwrap_or(0);
         }
 

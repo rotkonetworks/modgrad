@@ -991,6 +991,19 @@ fn learn(
 
         opt.step(&mut w, &grads);
 
+        // ── Dream phase: free-running rollout with regret correction ──
+        // Like embryonic spontaneous neural activity — tests circuit coherence.
+        if step % 20 == 0 && n_data > context_len * 2 {
+            let seed_pos = ((step * 7919) as usize) % (n_data - 9);
+            let ground_truth = &all_tokens[seed_pos + 1..seed_pos + 9];
+            let mut dream_grads = RegionalGradients::zeros(&w);
+            let _dream_loss = dream_step(
+                &w, &mut dream_grads, all_tokens[seed_pos],
+                ground_truth, 8, 0.3,
+            );
+            dream_grads.apply(&mut w, opt.lr * 0.3, 1.0);
+        }
+
         loss_sum += chunk_loss / n as f32;
         correct_sum += chunk_correct;
         tokens_since_report += n;
@@ -998,13 +1011,21 @@ fn learn(
         step += 1;
         offset += context_len; // advance through data
 
-        // Update debug view
+        // Update debug view: run inference with router disabled to avoid NaN
         if let Some(ref view) = debug_nc {
-            if step % 10 == 0 {
+            if step % 100 == 0 {
                 if let Ok(mut guard) = view.try_lock() {
-                    guard.region_params = w.regions.iter().map(|r| r.n_params()).collect();
-                    guard.total_params = w.n_params();
                     guard.history = vec![step as usize];
+                    // Temporarily disable router for stable inference snapshot
+                    let saved_router = w.router.take();
+                    let mut ss = RegionalState::new(&w);
+                    let obs = w.embed(chunk[n.saturating_sub(1)]);
+                    let snap = regional_forward(&w, &mut ss, obs);
+                    w.router = saved_router;
+                    guard.region_activations = snap.region_activations;
+                    guard.global_sync = snap.global_sync;
+                    guard.exit_lambdas = snap.exit_lambdas;
+                    guard.ticks_used = snap.ticks_used;
                 }
             }
         }
