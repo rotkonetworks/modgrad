@@ -37,6 +37,9 @@ enum Commands {
         video: Option<String>,
         #[arg(long, default_value = "2.0")]
         video_fps: f32,
+        /// Enable GPU dispatch (KFD/CUDA/Vulkan) for linear ops.
+        #[arg(long)]
+        gpu: bool,
         #[arg(long)]
         debug_port: Option<u16>,
     },
@@ -99,6 +102,9 @@ enum Commands {
         /// Vocabulary size. 256 = raw bytes, 8192 = VQGAN visual tokens.
         #[arg(long, default_value = "256")]
         vocab: usize,
+        /// Enable GPU dispatch (KFD/CUDA/Vulkan) for linear ops.
+        #[arg(long)]
+        gpu: bool,
         #[arg(long)]
         debug_port: Option<u16>,
     },
@@ -109,7 +115,8 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Train { checkpoint, curriculum, multimodal, images, audio, video, video_fps, debug_port } => {
+        Commands::Train { checkpoint, curriculum, multimodal, images, audio, video, video_fps, gpu, debug_port } => {
+            if gpu { modgrad_compute::neuron::enable_gpu(); }
             develop_staged(&checkpoint, curriculum.as_deref(), multimodal,
                 images.as_deref(), audio.as_deref(), video.as_deref(), video_fps, debug_port);
         }
@@ -121,7 +128,8 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
-        Commands::Learn { checkpoint, data, context, vocab, debug_port } => {
+        Commands::Learn { checkpoint, data, context, vocab, gpu, debug_port } => {
+            if gpu { modgrad_compute::neuron::enable_gpu(); }
             learn(&checkpoint, &data, context, vocab, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {

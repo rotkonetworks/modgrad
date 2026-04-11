@@ -6,8 +6,21 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::ops::dot;
+
+/// Global GPU enable flag. Off by default. Caller sets via `enable_gpu()`.
+static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable GPU dispatch for Linear::forward(). Call once at startup.
+pub fn enable_gpu() { GPU_ENABLED.store(true, Ordering::Relaxed); }
+
+/// Disable GPU dispatch.
+pub fn disable_gpu() { GPU_ENABLED.store(false, Ordering::Relaxed); }
+
+/// Check if GPU dispatch is enabled.
+pub fn gpu_enabled() -> bool { GPU_ENABLED.load(Ordering::Relaxed) }
 
 // ─── Activation functions ──────────────────────────────────
 
@@ -75,8 +88,9 @@ impl Linear {
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         // Try GPU for large matrices: KFD (AMD) → CUDA (NVIDIA) → Vulkan → CPU
-        // Threshold: 10M flops. Below this, CPU is faster including kernel launch.
-        if self.in_dim * self.out_dim >= 10_000_000 {
+        if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && self.in_dim * self.out_dim >= 50_000
+        {
             let mut y = vec![0.0f32; self.out_dim];
             if modgrad_device::kfd::accel::try_matvec(
                 x, &self.weight, &self.bias, &mut y,
