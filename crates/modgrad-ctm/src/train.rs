@@ -40,24 +40,24 @@ fn try_gpu_backward_dx(linear: &Linear, d_out: &[f32]) -> Option<Vec<f32>> {
 
     let dev = get_device()?;
 
-    // Upload d_out to scratch
+    // Upload d_out to BACKWARD scratch (separate from forward scratch)
     let d_out_bytes = d_out.len() * 4;
-    if cache.scratch_x_cap < d_out_bytes {
-        cache.scratch_x = dev.upload_f32(d_out).ok();
-        cache.scratch_x_cap = ((d_out_bytes + 4095) & !4095).max(4096);
-    } else if let Some(ref xb) = cache.scratch_x {
+    if cache.scratch_bwd_x_cap < d_out_bytes {
+        cache.scratch_bwd_x = dev.upload_f32(d_out).ok();
+        cache.scratch_bwd_x_cap = ((d_out_bytes + 4095) & !4095).max(4096);
+    } else if let Some(ref xb) = cache.scratch_bwd_x {
         xb.write_f32(0, d_out);
     }
 
     let d_in_bytes = linear.in_dim * 4;
-    if cache.scratch_y_cap < d_in_bytes {
-        cache.scratch_y = dev.alloc_output(((d_in_bytes + 4095) & !4095).max(4096)).ok();
-        cache.scratch_y_cap = ((d_in_bytes + 4095) & !4095).max(4096);
-    } else if let Some(ref yb) = cache.scratch_y {
+    if cache.scratch_bwd_y_cap < d_in_bytes {
+        cache.scratch_bwd_y = dev.alloc_output(((d_in_bytes + 4095) & !4095).max(4096)).ok();
+        cache.scratch_bwd_y_cap = ((d_in_bytes + 4095) & !4095).max(4096);
+    } else if let Some(ref yb) = cache.scratch_bwd_y {
         unsafe { std::ptr::write_bytes(yb.cpu_ptr, 0, d_in_bytes); }
     }
 
-    let (x_buf, y_buf) = match (&cache.scratch_x, &cache.scratch_y) {
+    let (x_buf, y_buf) = match (&cache.scratch_bwd_x, &cache.scratch_bwd_y) {
         (Some(x), Some(y)) => (x, y),
         _ => return None,
     };
@@ -102,7 +102,7 @@ pub(crate) fn linear_backward(
     }
     // d_input = W^T @ d_out — try GPU-resident W^T, fall back to CPU
     if modgrad_compute::neuron::gpu_enabled()
-        && in_dim * out_dim >= 500_000
+        && in_dim * out_dim >= 2_000_000
     {
         if let Some(d_input) = try_gpu_backward_dx(linear, d_out) {
             return d_input;

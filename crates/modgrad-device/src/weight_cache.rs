@@ -33,11 +33,16 @@ pub struct DeviceEntry {
 /// The global GPU weight registry.
 pub struct DeviceWeightCache {
     entries: HashMap<u64, DeviceEntry>,
-    /// Reusable scratch buffers (avoid alloc per dispatch).
+    /// Forward scratch buffers.
     pub scratch_x: Option<GpuBuffer>,
     pub scratch_x_cap: usize,
     pub scratch_y: Option<GpuBuffer>,
     pub scratch_y_cap: usize,
+    /// Backward scratch buffers (separate from forward to avoid clobbering).
+    pub scratch_bwd_x: Option<GpuBuffer>,
+    pub scratch_bwd_x_cap: usize,
+    pub scratch_bwd_y: Option<GpuBuffer>,
+    pub scratch_bwd_y_cap: usize,
     pub scratch_args: Option<GpuBuffer>,
 }
 
@@ -47,6 +52,8 @@ impl DeviceWeightCache {
             entries: HashMap::new(),
             scratch_x: None, scratch_x_cap: 0,
             scratch_y: None, scratch_y_cap: 0,
+            scratch_bwd_x: None, scratch_bwd_x_cap: 0,
+            scratch_bwd_y: None, scratch_bwd_y_cap: 0,
             scratch_args: None,
         }
     }

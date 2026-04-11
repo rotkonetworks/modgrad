@@ -184,7 +184,7 @@ impl Linear {
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         // Try GPU-resident weights (no per-call upload)
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 500_000
+            && self.in_dim * self.out_dim >= 2_000_000
         {
             if let Some(y) = self.try_gpu_forward(x) {
                 return y;
