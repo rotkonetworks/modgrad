@@ -843,3 +843,20 @@ impl std::fmt::Display for Device {
         write!(f, "{}", self.name())
     }
 }
+
+// ─── Global backend singleton ─────────────────────────────
+
+use std::sync::OnceLock;
+
+static BACKEND: OnceLock<Box<dyn ComputeBackend>> = OnceLock::new();
+
+/// Get the global compute backend. Defaults to CpuBackend.
+pub fn backend() -> &'static dyn ComputeBackend {
+    BACKEND.get_or_init(|| Box::new(CpuBackend::new())).as_ref()
+}
+
+/// Set the global compute backend. Must be called before first use.
+/// Returns Err if already initialized.
+pub fn set_backend(b: Box<dyn ComputeBackend>) -> Result<(), Box<dyn ComputeBackend>> {
+    BACKEND.set(b)
+}

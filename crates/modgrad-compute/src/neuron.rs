@@ -86,21 +86,12 @@ impl Linear {
     }
 
     /// Forward into pre-allocated output buffer. Zero allocation.
+    /// Dispatches through the global ComputeBackend (CPU, GPU, etc).
     pub fn forward_into(&self, x: &[f32], y: &mut [f32]) {
-        if GPU_ENABLED.load(Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 8_000_000
-        {
-            if modgrad_device::kfd::accel::try_matvec(
-                x, &self.weight, &self.bias, y,
-                self.out_dim as u32, self.in_dim as u32,
-            ) {
-                return;
-            }
-        }
-        for r in 0..self.out_dim {
-            let row = &self.weight[r * self.in_dim..(r + 1) * self.in_dim];
-            y[r] = self.bias[r] + dot(row, x);
-        }
+        super::backend::backend().matvec(
+            &self.weight, &self.bias, x, y,
+            self.out_dim, self.in_dim,
+        );
     }
 
     /// Allocating forward (backward compat). Prefer forward_into.
@@ -161,30 +152,21 @@ impl SuperLinear {
     }
 
     /// Forward into pre-allocated buffer. Zero allocation.
+    /// Dispatches through the global ComputeBackend.
     pub fn forward_into(&self, trace: &[f32], out: &mut [f32]) {
+        super::backend::backend().superlinear(
+            &self.weights, &self.biases, trace, out,
+            self.n_neurons, self.out_per, self.in_per,
+        );
+    }
+
+    /// CPU-only forward (used by backends internally).
+    pub fn forward_cpu(&self, trace: &[f32], out: &mut [f32]) {
         let n_neurons = self.n_neurons;
         let in_per = self.in_per;
         let out_per = self.out_per;
-        let total_flops = n_neurons * in_per * out_per;
 
-        // Try GPU
-        if GPU_ENABLED.load(Ordering::Relaxed) && total_flops >= 100_000 {
-            if modgrad_device::kfd::accel::try_superlinear(
-                trace, &self.weights, &self.biases, out,
-                n_neurons as u32, in_per as u32, out_per as u32,
-            ) { return; }
-            if modgrad_device::cuda::try_superlinear(
-                trace, &self.weights, &self.biases, out,
-                n_neurons as u32, in_per as u32, out_per as u32,
-            ) { return; }
-            if modgrad_device::gpu::try_superlinear(
-                trace, &self.weights, &self.biases, out,
-                n_neurons as u32, in_per as u32, out_per as u32,
-            ) { return; }
-        }
-
-        // CPU parallel for medium+ workloads
-        if total_flops >= 100_000 {
+        if n_neurons * in_per * out_per >= 100_000 {
             let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
             out.par_chunks_mut(chunk_size * out_per)
                 .enumerate()
