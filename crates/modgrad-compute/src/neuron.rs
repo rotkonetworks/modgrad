@@ -182,13 +182,12 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
-        // Try GPU dispatch for large matrices
+        // GPU: MegaTrain-style streaming (layer-wise, one dispatch at a time)
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
             && self.in_dim * self.out_dim >= 10_000_000
         {
-            // Use proven try_matvec path (with its own weight caching)
             let mut y = vec![0.0f32; self.out_dim];
-            if modgrad_device::kfd::accel::try_matvec(
+            if modgrad_device::kfd::accel::try_stream_matvec(
                 x, &self.weight, &self.bias, &mut y,
                 self.out_dim as u32, self.in_dim as u32,
             ) {

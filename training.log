@@ -17,3 +17,12 @@ RegionalCtm: 8 regions, 8 connections
 Learning... (Ctrl+C to save and stop)
 
 step    100 | loss 8.624 | acc 0.2% | 3200 tokens | data 0%
+step    200 | loss 7.900 | acc 0.9% | 6400 tokens | data 0%
+step    300 | loss 7.395 | acc 0.8% | 9600 tokens | data 0%
+step    400 | loss 7.110 | acc 1.5% | 12800 tokens | data 0%
+step    500 | loss 6.961 | acc 1.0% | 16000 tokens | data 0%
+step    600 | loss 6.847 | acc 1.7% | 19200 tokens | data 0%
+step    700 | loss 6.627 | acc 1.5% | 22400 tokens | data 0%
+step    800 | loss 6.620 | acc 1.6% | 25600 tokens | data 0%
+step    900 | loss 6.564 | acc 2.5% | 28800 tokens | data 0%
+step   1000 | loss 6.577 | acc 1.5% | 32000 tokens | data 0%

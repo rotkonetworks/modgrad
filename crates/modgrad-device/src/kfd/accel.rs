@@ -116,8 +116,27 @@ impl KfdAccel {
 /// Global singleton — opened once, lives forever.
 static KFD: OnceLock<Mutex<Option<KfdAccel>>> = OnceLock::new();
 
+/// Stream engine singleton — MegaTrain-style layer-wise streaming.
+static STREAM: OnceLock<Mutex<Option<StreamAccel>>> = OnceLock::new();
+
 /// Once a dispatch times out, stop trying GPU for this session.
 static KFD_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// MegaTrain-style: device + stream engine. One dispatch at a time.
+struct StreamAccel {
+    dev: HsaDevice,
+    engine: super::stream::StreamEngine,
+}
+
+fn get_stream() -> &'static Mutex<Option<StreamAccel>> {
+    STREAM.get_or_init(|| {
+        let accel = HsaDevice::open().ok().map(|dev| StreamAccel {
+            dev,
+            engine: super::stream::StreamEngine::new(),
+        });
+        Mutex::new(accel)
+    })
+}
 
 fn get_accel() -> &'static Mutex<Option<KfdAccel>> {
     KFD.get_or_init(|| {
@@ -417,6 +436,70 @@ impl DeviceRef {
             return false;
         }
         accel.dev.submit_wait(2000)
+    }
+}
+
+/// Stream-based matvec: layer-wise streaming, one dispatch at a time.
+/// No weight caching — weights stream through ping-pong buffers.
+/// Avoids the concurrency issues of the resident cache approach.
+pub fn try_stream_matvec(
+    x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
+    out_dim: u32, in_dim: u32,
+) -> bool {
+    if KFD_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut guard = match get_stream().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let sa = match guard.as_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    match sa.engine.matvec(
+        &mut sa.dev, weight, bias, x,
+        out_dim as usize, in_dim as usize,
+    ) {
+        Some(y) => {
+            out[..out_dim as usize].copy_from_slice(&y);
+            true
+        }
+        None => {
+            eprintln!("kfd: stream matvec {}x{} failed — disabling", out_dim, in_dim);
+            KFD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// Stream-based backward: d_input = W^T @ d_out.
+pub fn try_stream_matvec_t(
+    d_out: &[f32], weight: &[f32], d_input: &mut [f32],
+    out_dim: u32, in_dim: u32,
+) -> bool {
+    if KFD_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut guard = match get_stream().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let sa = match guard.as_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    match sa.engine.matvec_t(
+        &mut sa.dev, weight, d_out,
+        out_dim as usize, in_dim as usize,
+    ) {
+        Some(dx) => {
+            d_input[..in_dim as usize].copy_from_slice(&dx);
+            true
+        }
+        None => false,
     }
 }
 

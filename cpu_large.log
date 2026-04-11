@@ -1,0 +1,19 @@
+  + /steam/rotko/VisualPlanning/dataset/maze/tokenized_dataset/SFT/train_dataset.jsonl (14459 token pairs)
+Data: 7403008 tokens, vocab: 8192
+Creating large model (d_model=512, ~200M params)...
+RegionalCtm: 8 regions, 8 connections
+  input: d_model=512, d_input=128, memory=64, params=3304449
+  attention: d_model=512, d_input=128, memory=64, params=3304449
+  output: d_model=512, d_input=128, memory=64, params=3304449
+  motor: d_model=512, d_input=128, memory=64, params=3304449
+  cerebellum: d_model=64, d_input=128, memory=32, params=186929
+  basal_ganglia: d_model=64, d_input=128, memory=32, params=186929
+  insula: d_model=64, d_input=128, memory=32, params=186929
+  hippocampus: d_model=64, d_input=128, memory=64, params=389681
+  global_sync: 1024 pairs
+  vocab: 8192
+  prediction heads: 8 (1 + 7 extra)
+  total params: 83347145
+
+Learning... (Ctrl+C to save and stop)
+

@@ -18,6 +18,7 @@ pub mod queue;
 pub mod dispatch;
 pub mod compute;
 pub mod accel;
+pub mod stream;
 
 use memory::{GpuAllocator, GpuBuffer};
 use queue::ComputeQueue;
