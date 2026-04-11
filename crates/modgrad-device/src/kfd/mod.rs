@@ -24,18 +24,37 @@ use queue::ComputeQueue;
 use dispatch::{CodeObject, GpuProgram, KernArgs};
 use std::os::unix::io::RawFd;
 
-/// compiled rdna3 kernels (gfx1102), hand-written asm.
-/// test_store: y[i] = 42.0 (minimal proof kernel)
-const TEST_STORE_CO: &[u8] = include_bytes!("kernels/test_store.co");
-/// matvec: y = W*x + b (raw asm, no hidden opencl args)
-const MATVEC_CO: &[u8] = include_bytes!("kernels/matvec_asm.co");
-/// matmul_blocked: TM=128 TT4x4 — best for M >= 1536
-const MATMUL_BLOCKED_CO: &[u8] = include_bytes!("kernels/matmul_blocked.co");
-/// matmul_small: TM=32 TT2x2 PLR — best for M < 1536
-const MATMUL_SMALL_CO: &[u8] = include_bytes!("kernels/matmul_small.co");
-/// superlinear_fwd: per-neuron batched matvec for NLM
-/// Y[n*O+o] = B[n*O+o] + sum_k W[n*O*K+o*K+k] * X[n*K+k]
-const SUPERLINEAR_CO: &[u8] = include_bytes!("kernels/superlinear.co");
+// ─── GPU kernel registry ───────────────────────────────────
+//
+// Kernels are pre-compiled code objects (.co) for specific GPU targets.
+// To add a new GPU target (e.g. gfx1100, gfx1101):
+//   1. Reassemble each .s file with: clang -mcpu=gfxNNNN ...
+//   2. Add the .co files under kernels/gfxNNNN/
+//   3. Add an entry to kernel_objects_for_target() below
+//
+// The ISA is identical across RDNA3 variants — only the ELF
+// target triple changes. PM4 encoding is GFX11-wide.
+
+/// Return compiled kernel code objects for the given gfx_target_version.
+/// Falls back to gfx1102 for any unrecognized RDNA3 target.
+fn kernel_objects_for_target(gfx_version: u32) -> Vec<&'static [u8]> {
+    match gfx_version {
+        // RDNA3: gfx1100 (Navi31), gfx1101 (Navi32), gfx1102 (Navi33)
+        // Currently only gfx1102 binaries are compiled.
+        // To support others: compile with -mcpu=gfx1100/gfx1101 and add here.
+        0x110000 | 0x110001 | 0x110002 => vec![
+            include_bytes!("kernels/test_store.co"),
+            include_bytes!("kernels/matvec_asm.co"),
+            include_bytes!("kernels/matmul_blocked.co"),
+            include_bytes!("kernels/matmul_small.co"),
+            include_bytes!("kernels/superlinear.co"),
+        ],
+        _ => {
+            eprintln!("    warning: no pre-compiled kernels for gfx{:x}", gfx_version);
+            vec![]
+        }
+    }
+}
 
 // ─── Node properties ────────────────────────────────────────
 
@@ -367,10 +386,10 @@ impl HsaDevice {
         let signal = alloc.alloc_gtt(4096)?;
         signal.write(0, &[0u8; 8]);
 
-        // load compiled gpu kernels (raw asm)
-        // each code object owns its GpuBuffer — store them all to keep code in VRAM
+        // Load compiled GPU kernels for this target.
+        // Each code object owns its GpuBuffer — store them all to keep code in VRAM.
         let mut code_objects: Vec<CodeObject> = Vec::new();
-        for co_bytes in [TEST_STORE_CO, MATVEC_CO, MATMUL_BLOCKED_CO, MATMUL_SMALL_CO, SUPERLINEAR_CO] {
+        for co_bytes in kernel_objects_for_target(gpu.gfx_target_version) {
             match CodeObject::load(&alloc, co_bytes) {
                 Ok(co) => code_objects.push(co),
                 Err(e) => eprintln!("    warning: kernel load failed: {}", e),

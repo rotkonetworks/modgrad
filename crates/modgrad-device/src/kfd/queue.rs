@@ -2,6 +2,13 @@
 //!
 //! PM4 (Packet Manager 4) is the command packet format for GFX/compute.
 //! We use QUEUE_TYPE_COMPUTE (raw PM4) rather than AQL for simplicity.
+//!
+//! TARGET: GFX11 (RDNA3) — gfx1100/gfx1101/gfx1102.
+//! Register offsets, GCR bit layouts, and WRITE_DATA encoding are
+//! GFX11-specific. To support other generations:
+//!   - GFX10 (RDNA2): different GCR_CNTL layout in ACQUIRE_MEM
+//!   - GFX12 (RDNA4): may have new packet formats
+//! The ioctl layer (mod.rs, ioctl.rs, memory.rs) is generation-agnostic.
 
 use super::ioctl;
 use super::memory::{GpuAllocator, GpuBuffer};
