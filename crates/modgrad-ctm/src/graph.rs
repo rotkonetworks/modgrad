@@ -267,7 +267,7 @@ impl RegionalRouter {
             .collect();
 
         // Router MLP: [n_sync*2 + tick_embed_dim] → [n * n]
-        let route_proj = Linear::new(n_sync * 2 + t, n * n);
+        let route_proj = Linear::new(n_sync + t, n * n);
 
         Self {
             config, n_regions: n,
@@ -1355,7 +1355,7 @@ impl TrainWorkspace {
         Self {
             region_obs,
             connection_inputs,
-            global_sync: vec![0.0f32; n_sync * 2],
+            global_sync: vec![0.0f32; n_sync],
             all_activations: vec![0.0f32; total_neurons],
             prediction: vec![0.0f32; cfg.out_dims],
             d_global_sync: vec![0.0f32; n_sync],

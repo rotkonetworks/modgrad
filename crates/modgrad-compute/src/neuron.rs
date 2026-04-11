@@ -156,7 +156,7 @@ impl SuperLinear {
     pub fn forward_into(&self, trace: &[f32], out: &mut [f32]) {
         super::backend::backend().superlinear(
             &self.weights, &self.biases, trace, out,
-            self.n_neurons, self.out_per, self.in_per,
+            self.n_neurons, self.in_per, self.out_per,
         );
     }
 

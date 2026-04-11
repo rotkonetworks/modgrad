@@ -420,11 +420,12 @@ impl ComputeBackend for CpuBackend {
                 .enumerate()
                 .for_each(|(ci, chunk)| {
                     let r_start = ci * chunk_rows;
-                    for (j, out) in chunk.iter_mut().enumerate() {
-                        let r = r_start + j;
-                        if r < out_dim {
-                            let row = &weight[r * in_dim..(r + 1) * in_dim];
-                            *out = bias[r] + dot(row, &x[..in_dim]);
+                    let r_end = (r_start + chunk.len()).min(out_dim);
+                    for r in r_start..r_end {
+                        let row_start = r * in_dim;
+                        let row_end = row_start + in_dim;
+                        if row_end <= weight.len() {
+                            chunk[r - r_start] = bias[r] + dot(&weight[row_start..row_end], &x[..in_dim]);
                         }
                     }
                 });
@@ -462,10 +463,12 @@ impl ComputeBackend for CpuBackend {
         debug_assert!(trace.len() >= n_neurons * in_per);
         debug_assert!(output.len() >= n_neurons * out_per);
 
+        let total = n_neurons * out_per;
+        debug_assert!(output.len() >= total, "superlinear output too small: {} < {}", output.len(), total);
         let total_flops = n_neurons * in_per * out_per;
-        if total_flops >= self.config.par_threshold {
+        if total_flops >= self.config.par_threshold && total <= output.len() {
             let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
-            output[..n_neurons * out_per]
+            output[..total]
                 .par_chunks_mut(chunk_size * out_per)
                 .enumerate()
                 .for_each(|(chunk_idx, out_chunk)| {
