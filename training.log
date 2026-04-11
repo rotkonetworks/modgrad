@@ -17,3 +17,5 @@ RegionalCtm: 8 regions, 8 connections
 
 Learning... (Ctrl+C to save and stop)
 
+step    100 | loss 8.369 | acc 1.1% | 3200 tokens | data 0%
+step    200 | loss 7.738 | acc 1.8% | 6400 tokens | data 0%

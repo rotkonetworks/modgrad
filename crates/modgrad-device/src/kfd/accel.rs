@@ -346,6 +346,79 @@ pub fn try_matvec_t(
     true
 }
 
+/// Get a reference to the KFD device for direct GPU buffer operations.
+/// Used by DeviceWeightCache for upload/alloc without going through try_matvec.
+pub fn get_device() -> Option<DeviceRef> {
+    let guard = match get_accel().lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    if guard.is_some() { Some(DeviceRef) } else { None }
+}
+
+/// Handle for direct GPU operations. Locks the device on each call.
+pub struct DeviceRef;
+
+impl DeviceRef {
+    pub fn upload_f32(&self, data: &[f32]) -> std::io::Result<super::memory::GpuBuffer> {
+        let mut guard = get_accel().lock().map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::Other, "lock failed"))?;
+        let accel = guard.as_mut().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound, "no device"))?;
+        accel.dev.upload_f32(data)
+    }
+
+    pub fn alloc_output(&self, size_bytes: usize) -> std::io::Result<super::memory::GpuBuffer> {
+        let mut guard = get_accel().lock().map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::Other, "lock failed"))?;
+        let accel = guard.as_mut().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound, "no device"))?;
+        accel.dev.alloc_output(size_bytes)
+    }
+
+    /// Dispatch matvec using pre-uploaded GPU buffers. No CPU data involved.
+    pub fn dispatch_matvec(
+        &self,
+        w: &super::memory::GpuBuffer,
+        bias: &super::memory::GpuBuffer,
+        x: &super::memory::GpuBuffer,
+        y: &super::memory::GpuBuffer,
+        out_dim: u32, in_dim: u32,
+    ) -> bool {
+        let mut guard = match get_accel().lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let accel = match guard.as_mut() {
+            Some(a) => a,
+            None => return false,
+        };
+
+        if accel.args_buf.is_none() {
+            accel.args_buf = accel.dev.alloc.alloc_vram(4096).ok();
+        }
+        let args_buf = match &accel.args_buf {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let nwg = (out_dim + 255) / 256;
+        let mut kargs = [0u8; 48];
+        kargs[0..8].copy_from_slice(&w.va_addr.to_le_bytes());
+        kargs[8..16].copy_from_slice(&bias.va_addr.to_le_bytes());
+        kargs[16..24].copy_from_slice(&x.va_addr.to_le_bytes());
+        kargs[24..32].copy_from_slice(&y.va_addr.to_le_bytes());
+        kargs[32..36].copy_from_slice(&out_dim.to_le_bytes());
+        kargs[36..40].copy_from_slice(&in_dim.to_le_bytes());
+        args_buf.write(0, &kargs[..40]);
+
+        if !accel.dev.dispatch_enqueue("matvec", args_buf, [nwg, 1, 1], [256, 1, 1]) {
+            return false;
+        }
+        accel.dev.submit_wait(2000)
+    }
+}
+
 /// Check if KFD GPU is available.
 pub fn available() -> bool {
     let guard = match get_accel().lock() {

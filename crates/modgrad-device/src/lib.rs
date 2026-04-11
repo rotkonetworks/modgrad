@@ -6,3 +6,4 @@ pub mod device;
 pub mod cuda;
 pub mod gpu;
 pub mod kfd;
+pub mod weight_cache;
