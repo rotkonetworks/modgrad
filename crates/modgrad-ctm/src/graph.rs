@@ -435,13 +435,11 @@ pub struct RegionalConfig {
 }
 
 impl RegionalConfig {
-    /// Default 8-region brain topology.
+    /// Default 8-region brain topology (~81M params).
     ///
-    /// `obs_dim`: raw observation dimension (e.g. embed_dim from tokenizer).
-    /// `out_dims`: output dimension (e.g. vocab_size).
-    /// `ticks`: number of outer ticks (each region runs its own inner ticks).
+    /// Cortical: d_model=512, memory=64. Subcortical: d_model=64, memory=32.
+    /// Fits in 8GB VRAM for VRAM-resident training.
     pub fn eight_region(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
-        // Region indices
         const INPUT: usize = 0;
         const ATTENTION: usize = 1;
         const OUTPUT: usize = 2;
@@ -451,20 +449,25 @@ impl RegionalConfig {
         const INSULA: usize = 6;
         const HIPPOCAMPUS: usize = 7;
 
-        // Each region's d_input is determined by its incoming connections.
-        // For now, we use obs_dim as the universal projection target.
-        // The inter-region synapses project concat(sources) → region.d_input.
         let d = obs_dim;
 
         let regions = vec![
-            CtmConfig::input_region(d, ticks),
-            CtmConfig::attention_region(d, ticks),
-            CtmConfig::output_region(d, ticks),
-            CtmConfig::motor_region(d, ticks),
-            CtmConfig::cerebellum_region(d, ticks),
-            CtmConfig::basal_ganglia_region(d, ticks),
-            CtmConfig::insula_region(d, ticks),
-            CtmConfig::hippocampus_region(d, ticks),
+            CtmConfig::region("input", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 64, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
         ];
 
         let names = vec![
@@ -472,25 +475,19 @@ impl RegionalConfig {
             "cerebellum", "basal_ganglia", "insula", "hippocampus",
         ].into_iter().map(String::from).collect();
 
-        // Connection graph: who feeds whom
-        // Each connection's synapse will project concat(from sync_outs) → target d_input
         let connections = vec![
-            // Cortical loop — input receives observation + motor feedback
             Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
             Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
             Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
             Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            // Subcortical — cerebellum receives observation for prediction error
             Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
             Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            // Interoceptive
             Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
             Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
         ];
 
-        // Total activated neurons across all regions — for global sync
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
-        let n_global_sync = total_neurons.min(256);
+        let n_global_sync = total_neurons.min(1024);
 
         Self {
             regions,
