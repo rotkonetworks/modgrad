@@ -1883,6 +1883,9 @@ pub struct NeuralComputer {
     pub max_history: usize,
     /// RNG state for sampling.
     rng_state: u64,
+    /// Exit metrics from the last forward pass (for debug/telemetry).
+    pub last_exit_lambdas: Vec<f32>,
+    pub last_ticks_used: usize,
 }
 
 impl NeuralComputer {
@@ -1899,6 +1902,8 @@ impl NeuralComputer {
             history: Vec::new(),
             max_history: 4096,
             rng_state: seed,
+            last_exit_lambdas: Vec::new(),
+            last_ticks_used: 0,
         }
     }
 
@@ -1916,6 +1921,8 @@ impl NeuralComputer {
         if self.history.len() > self.max_history {
             self.history.drain(..self.history.len() - self.max_history);
         }
+        self.last_exit_lambdas = output.exit_lambdas;
+        self.last_ticks_used = output.ticks_used;
         output.predictions.into_iter().last().unwrap_or_default()
     }
 

@@ -78,6 +78,8 @@ struct App {
     region_outputs: Vec<Vec<f32>>,
     global_sync: Vec<f32>,
     history_len: usize,
+    exit_lambdas: Vec<f32>,
+    ticks_used: usize,
 
     // Token history (from GetHistory)
     recent_tokens: Vec<usize>,
@@ -136,6 +138,8 @@ impl App {
             region_activations: Vec::new(),
             region_outputs: Vec::new(),
             global_sync: Vec::new(),
+            exit_lambdas: Vec::new(),
+            ticks_used: 0,
             history_len: 0,
             recent_tokens: Vec::new(),
             trace_region: 0,
@@ -203,11 +207,14 @@ impl App {
         match client.request(&DebugRequest::GetState) {
             Ok(DebugResponse::State {
                 region_activations, region_outputs, global_sync, history_len,
+                exit_lambdas, ticks_used,
             }) => {
                 self.region_activations = region_activations;
                 self.region_outputs = region_outputs;
                 self.global_sync = global_sync;
                 self.history_len = history_len;
+                self.exit_lambdas = exit_lambdas;
+                self.ticks_used = ticks_used;
                 true
             }
             Err(_) => false,
@@ -678,6 +685,32 @@ impl App {
                     Pos2::new(rect.min.x + (j + 1) as f32 * w, bot));
                 ui.painter().rect_filled(r, 0.0, c);
             }
+        }
+
+        // Exit gate telemetry
+        if !self.exit_lambdas.is_empty() {
+            ui.separator();
+            ui.heading("Exit Gate");
+            ui.label(format!("Ticks used: {}/{}", self.ticks_used,
+                self.exit_lambdas.len().max(self.ticks_used)));
+
+            // Per-tick lambda bars
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(280.0, 30.0), egui::Sense::hover());
+            let n = self.exit_lambdas.len().max(1);
+            let w = rect.width() / n as f32;
+            for (j, &lam) in self.exit_lambdas.iter().enumerate() {
+                let bar_h = lam * rect.height();
+                let c = if j < self.ticks_used {
+                    Color32::from_rgb(0x44, 0xdd, 0x66) // green = tick ran
+                } else {
+                    Color32::from_rgb(0x88, 0x88, 0x88) // grey = skipped
+                };
+                let r = egui::Rect::from_min_max(
+                    Pos2::new(rect.min.x + j as f32 * w, rect.max.y - bar_h),
+                    Pos2::new(rect.min.x + (j + 1) as f32 * w - 1.0, rect.max.y));
+                ui.painter().rect_filled(r, 1.0, c);
+            }
+            ui.label("λ per tick (height = exit probability)");
         }
     }
 

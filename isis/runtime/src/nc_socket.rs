@@ -79,6 +79,10 @@ pub enum DebugResponse {
         global_sync: Vec<f32>,
         /// Total tokens processed.
         history_len: usize,
+        /// Outer exit gate: per-tick lambda values from last forward.
+        exit_lambdas: Vec<f32>,
+        /// How many outer ticks actually ran on last forward.
+        ticks_used: usize,
     },
     /// NLM trace for one region: [d_model × memory_length].
     Trace {
@@ -228,6 +232,10 @@ pub struct NcDebugView {
     pub global_sync: Vec<f32>,
     pub history: Vec<usize>,
     pub traces: Vec<Vec<f32>>, // per-region NLM traces
+    /// Outer exit gate lambdas from last forward pass.
+    pub exit_lambdas: Vec<f32>,
+    /// How many outer ticks ran on last forward.
+    pub ticks_used: usize,
 }
 
 impl NcDebugView {
@@ -251,6 +259,8 @@ impl NcDebugView {
             history: nc.history.clone(),
             traces: nc.state.region_states.iter()
                 .map(|s| s.trace.clone()).collect(),
+            exit_lambdas: nc.last_exit_lambdas.clone(),
+            ticks_used: nc.last_ticks_used,
         }
     }
 }
@@ -287,6 +297,8 @@ fn handle_client(
                 region_outputs: view.region_outputs.clone(),
                 global_sync: view.global_sync.clone(),
                 history_len: view.history.len(),
+                exit_lambdas: view.exit_lambdas.clone(),
+                ticks_used: view.ticks_used,
             },
 
             DebugRequest::GetTrace { region } => {
