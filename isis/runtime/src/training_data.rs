@@ -81,6 +81,126 @@ pub fn generate_coherent_data(n_bytes: usize) -> Vec<u8> {
     cycle_patterns(patterns, n_bytes)
 }
 
+/// Stage 5 data: ASCII maze solving.
+/// Teaches: spatial reasoning from sequential byte input.
+///
+/// Format: maze grid (# = wall, . = path, S = start, E = end) followed by
+/// a newline and the solution route as direction characters (U/D/L/R).
+///
+/// Example:
+///   #####
+///   #S..#
+///   #.#.#
+///   #..E#
+///   #####
+///   RRDDRD
+///
+/// The CTM must learn to predict the route bytes given the maze layout.
+pub fn generate_maze_data(n_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n_bytes);
+    let mut rng = 42u64;
+    let size = 11; // small mazes for byte-level training
+
+    while out.len() < n_bytes {
+        let maze = gen_text_maze(size, &mut rng);
+        out.extend_from_slice(maze.as_bytes());
+        out.push(b'\n');
+    }
+    out.truncate(n_bytes);
+    out
+}
+
+/// Generate one ASCII maze with its solution route.
+fn gen_text_maze(size: usize, rng: &mut u64) -> String {
+    let size = size | 1; // force odd
+    let mut grid = vec![true; size * size]; // all walls
+
+    let next_rng = |rng: &mut u64| -> u64 {
+        *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *rng
+    };
+
+    // Carve passages: iterative DFS
+    let start = (1, 1);
+    grid[start.0 * size + start.1] = false;
+    let mut stack = vec![start];
+
+    while let Some(&(r, c)) = stack.last() {
+        let mut neighbors = Vec::new();
+        for &(dr, dc) in &[(-2i32, 0), (2, 0), (0, -2), (0, 2)] {
+            let nr = r as i32 + dr;
+            let nc = c as i32 + dc;
+            if nr > 0 && nr < size as i32 - 1 && nc > 0 && nc < size as i32 - 1 {
+                let (nr, nc) = (nr as usize, nc as usize);
+                if grid[nr * size + nc] { neighbors.push((nr, nc)); }
+            }
+        }
+        if neighbors.is_empty() {
+            stack.pop();
+        } else {
+            let idx = (next_rng(rng) >> 33) as usize % neighbors.len();
+            let (nr, nc) = neighbors[idx];
+            grid[(r + nr) / 2 * size + (c + nc) / 2] = false;
+            grid[nr * size + nc] = false;
+            stack.push((nr, nc));
+        }
+    }
+
+    let end = (size - 2, size - 2);
+
+    // BFS shortest path
+    let mut visited = vec![false; size * size];
+    let mut parent: Vec<Option<(usize, usize, u8)>> = vec![None; size * size];
+    let mut queue = std::collections::VecDeque::new();
+    visited[start.0 * size + start.1] = true;
+    queue.push_back(start);
+
+    let dirs: [(i32, i32, u8); 4] = [(-1, 0, b'U'), (1, 0, b'D'), (0, -1, b'L'), (0, 1, b'R')];
+    while let Some((r, c)) = queue.pop_front() {
+        if (r, c) == end { break; }
+        for &(dr, dc, ch) in &dirs {
+            let nr = r as i32 + dr;
+            let nc = c as i32 + dc;
+            if nr >= 0 && nr < size as i32 && nc >= 0 && nc < size as i32 {
+                let (nr, nc) = (nr as usize, nc as usize);
+                let idx = nr * size + nc;
+                if !grid[idx] && !visited[idx] {
+                    visited[idx] = true;
+                    parent[idx] = Some((r, c, ch));
+                    queue.push_back((nr, nc));
+                }
+            }
+        }
+    }
+
+    // Reconstruct route
+    let mut route = Vec::new();
+    let mut cur = end;
+    while cur != start {
+        let idx = cur.0 * size + cur.1;
+        if let Some((pr, pc, ch)) = parent[idx] {
+            route.push(ch);
+            cur = (pr, pc);
+        } else { break; }
+    }
+    route.reverse();
+
+    // Render as ASCII
+    let mut s = String::with_capacity(size * (size + 1) + route.len() + 2);
+    for r in 0..size {
+        for c in 0..size {
+            if (r, c) == start { s.push('S'); }
+            else if (r, c) == end { s.push('E'); }
+            else if grid[r * size + c] { s.push('#'); }
+            else { s.push('.'); }
+        }
+        s.push('\n');
+    }
+    s.push_str(std::str::from_utf8(&route).unwrap_or(""));
+    s.push('\n');
+    s
+}
+
 /// Helper: cycle through patterns to fill n_bytes.
 fn cycle_patterns(patterns: &[&[u8]], n_bytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n_bytes);
@@ -108,6 +228,20 @@ mod tests {
         assert_eq!(generate_bigram_data(10000).len(), 10000);
         assert_eq!(generate_word_data(10000).len(), 10000);
         assert_eq!(generate_coherent_data(10000).len(), 10000);
+    }
+
+    #[test]
+    fn maze_data_generates_valid_mazes() {
+        let data = generate_maze_data(2000);
+        let text = std::str::from_utf8(&data).unwrap();
+        // Should contain maze chars and route chars
+        assert!(text.contains('#'));
+        assert!(text.contains('S'));
+        assert!(text.contains('E'));
+        assert!(text.contains('.'));
+        // Should contain at least one route direction
+        assert!(text.contains('U') || text.contains('D') || text.contains('L') || text.contains('R'));
+        eprintln!("Maze sample:\n{}", &text[..text.len().min(400)]);
     }
 
     #[test]

@@ -107,6 +107,7 @@ fn main() {
             generate_bigram_data(100_000),
             generate_word_data(200_000),
             generate_coherent_data(300_000),
+            generate_maze_data(200_000),
         ];
 
         // Mix real text into later stages (word completion + coherent)
@@ -256,9 +257,13 @@ fn run_tests(w: &RegionalWeights) {
     let r4 = challenges::challenge_coherent_generation(&mut nc);
     eprintln!("  {}", r4.summary);
 
-    let total = r1.score + r2.score + r3.score + r4.score;
+    let mut nc = NeuralComputer::new(w.clone());
+    let r5 = challenges::challenge_maze_solving(&mut nc);
+    eprintln!("  {}", r5.summary);
+
+    let total = r1.score + r2.score + r3.score + r4.score + r5.score;
     eprintln!("  ────────────────────────");
-    eprintln!("  Total: {:.0}% across 4 challenges", total / 4.0 * 100.0);
+    eprintln!("  Total: {:.0}% across 5 challenges", total / 5.0 * 100.0);
 }
 
 // ── Training data generators (inline for standalone example) ──
@@ -324,6 +329,10 @@ fn cycle(patterns: &[&[u8]], n: usize) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+fn generate_maze_data(n: usize) -> Vec<u8> {
+    modgrad_runtime::training_data::generate_maze_data(n)
 }
 
 fn print_help() {

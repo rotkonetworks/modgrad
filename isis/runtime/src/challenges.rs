@@ -200,11 +200,66 @@ pub fn challenge_coherent_generation(nc: &mut NeuralComputer) -> ChallengeResult
     }
 }
 
+/// Challenge: given an ASCII maze, can the model predict the first route direction?
+/// Tests spatial reasoning from sequential byte input.
+///
+/// Feeds the maze grid bytes, then checks if the prediction after the
+/// last grid byte (newline before route) matches the correct first direction.
+pub fn challenge_maze_solving(nc: &mut NeuralComputer) -> ChallengeResult {
+    let mut correct = 0usize;
+    let n_tests = 20;
+    let mut rng = 12345u64;
+
+    for _ in 0..n_tests {
+        nc.reset();
+
+        // Generate a small maze
+        let maze_text = crate::training_data::generate_maze_data(200);
+        // Find the first complete maze+route in the data
+        let text = std::str::from_utf8(&maze_text).unwrap_or("");
+        // Split by double newline or find route line (all U/D/L/R chars)
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Find the route line (contains only U/D/L/R)
+        let mut maze_bytes = Vec::new();
+        let mut route_first = None;
+        for line in &lines {
+            let is_route = !line.is_empty() && line.chars().all(|c| "UDLR".contains(c));
+            if is_route && route_first.is_none() {
+                route_first = Some(line.as_bytes()[0]);
+                break;
+            }
+            maze_bytes.extend_from_slice(line.as_bytes());
+            maze_bytes.push(b'\n');
+        }
+
+        if let Some(expected) = route_first {
+            // Feed maze bytes, get prediction for first route char
+            let logits = nc.observe(&maze_bytes.iter().map(|&b| b as usize).collect::<Vec<_>>());
+            let pred = logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i).unwrap_or(0);
+            if pred == expected as usize { correct += 1; }
+        }
+
+        // Advance RNG
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+    }
+
+    let score = correct as f32 / n_tests as f32;
+    ChallengeResult {
+        score,
+        total: n_tests,
+        correct,
+        summary: format!("maze solving: {correct}/{n_tests} first steps correct ({:.0}%)", score * 100.0),
+    }
+}
+
 // ── Stage definition ──────────────────────────────────────
 
 /// One stage of the curriculum.
 
-/// Default byte-first curriculum for English text learning.
+/// Default byte-first curriculum for English text learning + maze reasoning.
 /// Graduation requires real mastery — not low loss, demonstrated capability.
 pub fn byte_curriculum() -> Vec<Stage> {
     vec![
@@ -233,6 +288,13 @@ pub fn byte_curriculum() -> Vec<Stage> {
             name: "coherent_generation",
             challenge: challenge_coherent_generation,
             pass_threshold: 0.60,
+            max_steps: 100000,
+            test_every: 10000,
+        },
+        Stage {
+            name: "maze_solving",
+            challenge: challenge_maze_solving,
+            pass_threshold: 0.40, // 40% first-step acc (random = 25% for UDLR)
             max_steps: 100000,
             test_every: 10000,
         },
