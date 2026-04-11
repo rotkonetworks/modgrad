@@ -2,8 +2,6 @@
 //!
 //! Replaces InferenceService (ONNX wrapper) with a composable pipeline
 //! of TransformerBlocks, each implementing Filter. Design follows:
-//!   - hdevalence: newtypes, typestate
-//!   - philpax: trait-based APIs, builders
 //!   - composable pure-function pipelines
 
 pub mod dims;

@@ -87,6 +87,18 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:4747")]
         addr: String,
     },
+    /// Learn from raw data — no curriculum, no phases, just bytes
+    Learn {
+        #[arg(default_value = "model.bin")]
+        checkpoint: String,
+        /// Directory or file(s) to learn from. Reads everything as bytes.
+        #[arg(required = true)]
+        data: Vec<String>,
+        #[arg(long, default_value = "32")]
+        context: usize,
+        #[arg(long)]
+        debug_port: Option<u16>,
+    },
     /// Show available compute devices
     Devices,
 }
@@ -105,6 +117,9 @@ fn main() {
         }
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
+        }
+        Commands::Learn { checkpoint, data, context, debug_port } => {
+            learn(&checkpoint, &data, context, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {
             run_daemon(&checkpoint, port);
@@ -779,6 +794,184 @@ fn develop_staged(
     opt.save(&opt_path).expect("failed to save optimizer");
     let size = std::fs::metadata(save_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("\nFinal save to {save_path} ({size} bytes, {total_tokens} tokens)");
+}
+
+/// Learn from raw bytes. No curriculum, no phases, no graduation.
+/// Reads every file in the given paths as a byte stream and predicts next bytes.
+/// The model's exit gate, regional specialization, and sync dynamics
+/// self-organize around whatever structure exists in the data.
+fn learn(
+    save_path: &str,
+    data_paths: &[String],
+    context_len: usize,
+    debug_port: Option<u16>,
+) {
+    // Gather all data as raw bytes
+    let mut all_bytes: Vec<u8> = Vec::new();
+    for path in data_paths {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            // Read all files in directory recursively
+            if let Ok(entries) = std::fs::read_dir(p) {
+                let mut files: Vec<_> = entries.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .collect();
+                files.sort_by_key(|e| e.path());
+                for entry in files {
+                    if let Ok(data) = std::fs::read(entry.path()) {
+                        eprintln!("  + {} ({} bytes)", entry.path().display(), data.len());
+                        all_bytes.extend_from_slice(&data);
+                    }
+                }
+            }
+        } else if let Ok(data) = std::fs::read(path) {
+            eprintln!("  + {path} ({} bytes)", data.len());
+            all_bytes.extend_from_slice(&data);
+        }
+    }
+
+    if all_bytes.is_empty() {
+        eprintln!("No data found. Provide files or directories.");
+        return;
+    }
+
+    eprintln!("Data: {:.2}MB total", all_bytes.len() as f64 / 1e6);
+
+    // Model size from filename (same convention as develop_staged)
+    let (embed_dim, n_regions, ticks) = if save_path.contains("large") {
+        (128, 8, 4)
+    } else if save_path.contains("medium") {
+        (64, 8, 3)
+    } else if save_path.contains("tiny") {
+        (16, 4, 2)
+    } else {
+        (32, 8, 2)
+    };
+
+    // Load or create model
+    let mut w = if std::path::Path::new(save_path).exists() {
+        eprintln!("Loading {save_path}...");
+        RegionalWeights::load(save_path).expect("failed to load")
+    } else {
+        let cfg = if n_regions <= 4 {
+            RegionalConfig::four_region(embed_dim, VOCAB_TEXT, ticks)
+        } else {
+            RegionalConfig::eight_region(embed_dim, VOCAB_TEXT, ticks)
+        };
+        RegionalWeights::new(cfg)
+    };
+    w.print_summary();
+
+    let opt_path = save_path.replace(".bin", ".opt.bin");
+    let mut opt = if std::path::Path::new(&opt_path).exists() {
+        RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
+    } else {
+        RegionalAdamW::new(&w).with_lr(3e-3).with_wd(0.001).with_clip(5.0)
+    };
+
+    // Ctrl+C → save and exit
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nSaving...");
+        r.store(false, std::sync::atomic::Ordering::SeqCst);
+    }).ok();
+
+    // Debug server
+    let debug_nc: Option<std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>> =
+        if let Some(port) = debug_port {
+            let nc_tmp = NeuralComputer::new(w.clone());
+            let view = nc_socket::NcDebugView::from_nc(&nc_tmp);
+            let view = std::sync::Arc::new(std::sync::Mutex::new(view));
+            let _handle = nc_socket::start_debug_server(port, view.clone());
+            eprintln!("Debugger on port {port}");
+            Some(view)
+        } else {
+            None
+        };
+
+    // ── Learn ──
+    let mut grads = RegionalGradients::zeros(&w);
+    let mut total_tokens = opt.step as u64;
+    let mut step = 0u64;
+    let mut loss_sum = 0.0f32;
+    let mut correct_sum = 0usize;
+    let mut tokens_since_report = 0usize;
+    let n_data = all_bytes.len();
+    let mut offset = 0usize;
+
+    eprintln!("\nLearning... (Ctrl+C to save and stop)\n");
+
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        // Next chunk from the byte stream (wraps around)
+        let end = (offset + context_len + 1).min(n_data);
+        if end - offset < 2 {
+            offset = 0; // wrap
+            continue;
+        }
+        let chunk = &all_bytes[offset..end];
+
+        grads.zero();
+        let mut chunk_loss = 0.0f32;
+        let mut chunk_correct = 0usize;
+        let n = chunk.len() - 1;
+
+        for pos in 0..n {
+            let (loss, pred) = regional_train_token(&w, &mut grads, chunk[pos] as usize, chunk[pos + 1] as usize);
+            chunk_loss += loss;
+            if pred == chunk[pos + 1] as usize { chunk_correct += 1; }
+        }
+
+        opt.step(&mut w, &grads);
+
+        loss_sum += chunk_loss / n as f32;
+        correct_sum += chunk_correct;
+        tokens_since_report += n;
+        total_tokens += n as u64;
+        step += 1;
+        offset += context_len; // advance through data
+
+        // Update debug view
+        if let Some(ref view) = debug_nc {
+            if step % 10 == 0 {
+                if let Ok(mut guard) = view.try_lock() {
+                    guard.region_params = w.regions.iter().map(|r| r.n_params()).collect();
+                    guard.total_params = w.n_params();
+                    guard.history = vec![step as usize];
+                }
+            }
+        }
+
+        // Report
+        if step % 100 == 0 {
+            let avg_loss = loss_sum / 100.0;
+            let avg_acc = correct_sum as f32 / tokens_since_report.max(1) as f32;
+            let progress = (offset as f64 / n_data as f64 * 100.0).min(100.0);
+            eprintln!("step {step:6} | loss {avg_loss:.3} | acc {avg_acc:.1}% | {total_tokens} tokens | data {progress:.0}%",
+                avg_acc = avg_acc * 100.0);
+            loss_sum = 0.0;
+            correct_sum = 0;
+            tokens_since_report = 0;
+        }
+
+        // Save periodically
+        if step % 5000 == 0 {
+            w.save(save_path).expect("save failed");
+            opt.save(&opt_path).expect("opt save failed");
+            eprintln!("  [saved]");
+        }
+
+        // Wrap around when we've seen all data
+        if offset >= n_data {
+            offset = 0;
+            eprintln!("  --- epoch complete ---");
+        }
+    }
+
+    // Final save
+    w.save(save_path).expect("save failed");
+    opt.save(&opt_path).expect("opt save failed");
+    eprintln!("\nSaved to {save_path} ({total_tokens} tokens learned)");
 }
 
 /// Sync diversity diagnostic: measure how different sync patterns are across prompts.

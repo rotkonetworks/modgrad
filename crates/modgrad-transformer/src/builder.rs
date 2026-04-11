@@ -1,4 +1,4 @@
-//! TransformerBuilder: philpax-style builder for constructing a GptModel.
+//! TransformerBuilder: builder for constructing a GptModel.
 //!
 //! Usage:
 //! ```ignore
