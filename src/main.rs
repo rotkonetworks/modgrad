@@ -990,6 +990,7 @@ fn learn(
 
     // ── Learn ──
     let mut grads = RegionalGradients::zeros(&w);
+    let mut workspace = TrainWorkspace::new(&w);
     let mut total_tokens = opt.step as u64;
     let mut step = 0u64;
     let mut loss_sum = 0.0f32;
@@ -1015,7 +1016,7 @@ fn learn(
         let n = chunk.len() - 1;
 
         for pos in 0..n {
-            let (loss, pred) = regional_train_token(&w, &mut grads, chunk[pos], chunk[pos + 1]);
+            let (loss, pred) = regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1]);
             chunk_loss += loss;
             if pred == chunk[pos + 1] { chunk_correct += 1; }
         }
