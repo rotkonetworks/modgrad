@@ -1,23 +1,37 @@
-//! MegaTrain-style streaming engine: double-buffered GPU dispatch.
+//! GPU compute engine with two modes:
 //!
-//! Parameters live in CPU RAM. GPU has two ping-pong weight buffers.
-//! While GPU computes with buffer A, CPU uploads next layer into buffer B.
-//! On next call, roles swap — zero stall time.
+//! **Stream mode** (--gpu): Upload weights per-call through ping-pong buffers.
+//!   Best for PCIe x16 where transfer overlaps compute.
 //!
-//! Key invariant: GPU memory bounded by 2 × max_layer_size + x + y + args.
+//! **VRAM mode** (--vram): Upload weights once, keep in VRAM permanently.
+//!   Best for PCIe x4 where transfer dominates. Re-upload only after
+//!   optimizer step (one bulk transfer vs thousands of per-op transfers).
+//!
+//! Both modes share the same dispatch_kernel path. The only difference
+//! is whether weights are uploaded (stream) or looked up (vram).
 
 use super::memory::GpuBuffer;
 use super::HsaDevice;
+use std::collections::HashMap;
 
-/// Double-buffered streaming engine.
+/// Cached weight entry in VRAM.
+struct VramEntry {
+    buf: GpuBuffer,       // W + bias contiguous
+    w_bytes: usize,       // offset where bias starts
+}
+
+/// GPU compute engine.
 pub struct StreamEngine {
-    /// Two weight buffers (A/B ping-pong).
+    /// VRAM mode: cached weights keyed by (ptr, len).
+    /// Empty in stream mode — weights upload per-call.
+    vram_cache: HashMap<(usize, usize), VramEntry>,
+    /// Whether to cache weights in VRAM (true) or stream per-call (false).
+    pub vram_mode: bool,
+    /// Two weight buffers for stream mode (A/B ping-pong).
     w_buf: [Option<GpuBuffer>; 2],
     w_cap: [usize; 2],
-    /// Which buffer holds the CURRENT dispatch's weights (0 or 1).
-    /// The other buffer is free for prefetching.
     active: usize,
-    /// Input/output/args — shared across dispatches.
+    /// Shared input/output/args buffers.
     x_buf: Option<GpuBuffer>,
     x_cap: usize,
     y_buf: Option<GpuBuffer>,
@@ -28,6 +42,8 @@ pub struct StreamEngine {
 impl StreamEngine {
     pub fn new() -> Self {
         Self {
+            vram_cache: HashMap::new(),
+            vram_mode: false,
             w_buf: [None, None],
             w_cap: [0, 0],
             active: 0,
@@ -35,6 +51,11 @@ impl StreamEngine {
             y_buf: None, y_cap: 0,
             args_buf: None,
         }
+    }
+
+    /// Invalidate VRAM cache. Call after optimizer step updates CPU weights.
+    pub fn invalidate(&mut self) {
+        self.vram_cache.clear();
     }
 
     /// Ensure a weight buffer is large enough.
@@ -72,44 +93,68 @@ impl StreamEngine {
         self.args_buf.is_some()
     }
 
-    /// Upload weight+bias to the active buffer, dispatch kernel, read result.
-    /// Flips active buffer after dispatch for ping-pong on next call.
+    /// Get or upload weight+bias buffer. In VRAM mode, caches permanently.
+    /// In stream mode, uploads to ping-pong buffer each call.
+    /// Returns (w_va, bias_va).
+    fn prepare_weights(
+        &mut self, dev: &HsaDevice,
+        weight_data: &[f32], bias_data: &[f32],
+    ) -> Option<(u64, u64)> {
+        let w_bytes = weight_data.len() * 4;
+        let b_bytes = bias_data.len() * 4;
+
+        if self.vram_mode {
+            // VRAM mode: cache by pointer identity, upload once
+            let key = (weight_data.as_ptr() as usize, weight_data.len());
+            if !self.vram_cache.contains_key(&key) {
+                let total = w_bytes + b_bytes;
+                let cap = ((total + 4095) & !4095) as u64;
+                let buf = dev.alloc.alloc_vram(cap).ok()?;
+                buf.write_f32(0, weight_data);
+                buf.write_f32(w_bytes, bias_data);
+                self.vram_cache.insert(key, VramEntry { buf, w_bytes });
+            }
+            let entry = self.vram_cache.get(&key)?;
+            Some((entry.buf.va_addr, entry.buf.va_addr + entry.w_bytes as u64))
+        } else {
+            // Stream mode: upload to ping-pong buffer
+            let idx = self.active;
+            self.ensure_w(idx, w_bytes + b_bytes, dev);
+            let wbuf = self.w_buf[idx].as_ref()?;
+            wbuf.write_f32(0, weight_data);
+            wbuf.write_f32(w_bytes, bias_data);
+            Some((wbuf.va_addr, wbuf.va_addr + w_bytes as u64))
+        }
+    }
+
+    /// Dispatch a kernel with weight/bias/input/output.
     fn dispatch_kernel(
         &mut self, dev: &mut HsaDevice,
         kernel: &str,
         weight_data: &[f32], bias_data: &[f32],
         x_data: &[f32],
-        extra_args: &[u32],  // kernel-specific u32 args after the 4 pointers
+        extra_args: &[u32],
         nwg: u32,
         out_count: usize,
     ) -> Option<Vec<f32>> {
-        let w_bytes = weight_data.len() * 4;
-        let idx = self.active;
+        // Prepare weights (cached in VRAM mode, uploaded in stream mode)
+        let (w_va, bias_va) = self.prepare_weights(dev, weight_data, bias_data)?;
 
-        // Ensure all buffers before borrowing any
-        self.ensure_w(idx, w_bytes + bias_data.len() * 4, dev);
+        // Prepare input/output/args
         self.ensure_x(x_data.len() * 4, dev);
         self.ensure_y(out_count * 4, dev);
         self.ensure_args(dev);
 
-        // Upload weights + bias
-        let wbuf = self.w_buf[idx].as_ref()?;
-        wbuf.write_f32(0, weight_data);
-        wbuf.write_f32(w_bytes, bias_data);
-
-        // Upload input
         let xbuf = self.x_buf.as_ref()?;
         xbuf.write_f32(0, x_data);
 
-        // Zero output
         let ybuf = self.y_buf.as_ref()?;
         unsafe { std::ptr::write_bytes(ybuf.cpu_ptr, 0, out_count * 4); }
 
-        // Build kernargs: 4 pointers + extra u32s
+        // Build kernargs
         let args = self.args_buf.as_ref()?;
-        let bias_va = wbuf.va_addr + w_bytes as u64;
         let mut kargs = [0u8; 64];
-        kargs[0..8].copy_from_slice(&wbuf.va_addr.to_le_bytes());
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
         kargs[8..16].copy_from_slice(&bias_va.to_le_bytes());
         kargs[16..24].copy_from_slice(&xbuf.va_addr.to_le_bytes());
         kargs[24..32].copy_from_slice(&ybuf.va_addr.to_le_bytes());
@@ -117,8 +162,7 @@ impl StreamEngine {
             let off = 32 + i * 4;
             kargs[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
-        let total_bytes = 32 + extra_args.len() * 4;
-        args.write(0, &kargs[..total_bytes]);
+        args.write(0, &kargs[..32 + extra_args.len() * 4]);
 
         // Dispatch + wait
         if !dev.dispatch_enqueue(kernel, args, [nwg, 1, 1], [256, 1, 1]) {
@@ -135,7 +179,8 @@ impl StreamEngine {
         let mut y = vec![0.0f32; out_count];
         y.copy_from_slice(y_slice);
 
-        self.active = 1 - self.active;
+        // Flip ping-pong in stream mode only
+        if !self.vram_mode { self.active = 1 - self.active; }
         Some(y)
     }
 

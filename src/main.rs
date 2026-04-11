@@ -102,16 +102,19 @@ enum Commands {
         /// Vocabulary size. 256 = raw bytes, 8192 = VQGAN visual tokens.
         #[arg(long, default_value = "256")]
         vocab: usize,
-        /// Enable GPU dispatch (KFD/CUDA/Vulkan) for linear ops.
+        /// GPU hybrid: stream weights per-call (PCIe x16).
         #[arg(long)]
         gpu: bool,
-        /// Medium model (~55M params, d_model=256). CPU+GPU balanced.
+        /// GPU VRAM: keep weights in VRAM, zero PCIe during training (PCIe x4).
+        #[arg(long)]
+        vram: bool,
+        /// Medium model (~37M params, d_model=256).
         #[arg(long)]
         medium: bool,
-        /// Large model (~81M params, d_model=512). Full GPU.
+        /// Large model (~81M params, d_model=512).
         #[arg(long)]
         large: bool,
-        /// Billion-scale (~1B params, d_model=1024). Needs ~19GB RAM.
+        /// Billion-scale (~223M params, d_model=1024).
         #[arg(long)]
         billion: bool,
         #[arg(long)]
@@ -137,8 +140,9 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
-        Commands::Learn { checkpoint, data, context, vocab, gpu, medium, large, billion, debug_port } => {
-            if gpu { modgrad_compute::neuron::enable_gpu(); }
+        Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port } => {
+            if gpu || vram { modgrad_compute::neuron::enable_gpu(); }
+            if vram { modgrad_device::kfd::accel::enable_vram_mode(); }
             learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {
@@ -1017,6 +1021,8 @@ fn learn(
         }
 
         opt.step(&mut w, &grads);
+        // VRAM mode: weights changed, invalidate GPU cache for re-upload
+        modgrad_device::kfd::accel::invalidate_cache();
 
         // ── Dream phase: free-running rollout with regret correction ──
         // Like embryonic spontaneous neural activity — tests circuit coherence.

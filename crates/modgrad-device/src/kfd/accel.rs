@@ -1,19 +1,18 @@
-//! KFD GPU acceleration: stateless streaming dispatch.
+//! KFD GPU acceleration: three modes.
 //!
-//! MegaTrain-style: GPU is a transient compute engine.
-//! Weights stream in, result streams out, no persistent state.
-//! One dispatch at a time — no concurrency, no cache coherence.
+//! CPU:    no GPU, pure Rust (default when --gpu/--vram not passed)
+//! HYBRID: stream weights per-call (--gpu). Good for PCIe x16.
+//! VRAM:   upload once, keep in VRAM (--vram). Good for PCIe x4.
 //!
-//! API:
+//! API (same for all modes):
 //!   try_matvec(x, w, b, out, m, k)   → y = Wx + b
 //!   try_matvec_t(d_out, w, dx, m, k) → dx = W^T @ d_out
-//!
-//! Both return true if GPU handled it, false for CPU fallback.
+//!   try_superlinear(...)              → batched per-neuron matvec
+//!   invalidate_cache()                → call after optimizer step (VRAM mode)
 
 use super::HsaDevice;
 use std::sync::{Mutex, OnceLock};
 
-/// GPU singleton: device + stream engine.
 struct Gpu {
     dev: HsaDevice,
     engine: super::stream::StreamEngine,
@@ -33,7 +32,18 @@ fn gpu() -> &'static Mutex<Option<Gpu>> {
     })
 }
 
-/// y = W @ x + b. Stateless: stream weights in, compute, stream result out.
+/// Enable VRAM-resident mode. Call once at startup before any dispatch.
+/// Weights are cached in VRAM on first use, never re-uploaded until
+/// invalidate_cache() is called after optimizer step.
+pub fn enable_vram_mode() {
+    if let Ok(mut guard) = gpu().lock() {
+        if let Some(ref mut g) = *guard {
+            g.engine.vram_mode = true;
+        }
+    }
+}
+
+/// y = W @ x + b.
 pub fn try_matvec(
     x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
     out_dim: u32, in_dim: u32,
@@ -51,7 +61,7 @@ pub fn try_matvec(
     }
 }
 
-/// dx = W^T @ d_out. Stateless backward.
+/// dx = W^T @ d_out.
 pub fn try_matvec_t(
     d_out: &[f32], weight: &[f32], d_input: &mut [f32],
     out_dim: u32, in_dim: u32,
@@ -66,17 +76,24 @@ pub fn try_matvec_t(
     }
 }
 
-/// SuperLinear forward: batched per-neuron matvec on GPU.
-/// Only dispatches when total flops justify the PCIe transfer cost.
+/// SuperLinear: batched per-neuron matvec.
+/// In VRAM mode: no flops threshold (weights are cached, no PCIe cost).
+/// In stream mode: 8M flops minimum (PCIe transfer must be justified).
 pub fn try_superlinear(
     trace: &[f32], weights: &[f32], biases: &[f32], out: &mut [f32],
     n_neurons: u32, in_per: u32, out_per: u32,
 ) -> bool {
-    // PCIe x8 at ~16GB/s: streaming weights costs ~0.5ms per MB.
-    // Only dispatch when compute time > transfer time.
-    let flops = n_neurons as usize * in_per as usize * out_per as usize;
-    if flops < 8_000_000 { return false; }
     if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+
+    let flops = n_neurons as usize * in_per as usize * out_per as usize;
+
+    // In stream mode, check threshold. In VRAM mode, always dispatch.
+    {
+        let guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+        let g = match guard.as_ref() { Some(g) => g, None => return false };
+        if !g.engine.vram_mode && flops < 8_000_000 { return false; }
+    }
+
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -85,8 +102,7 @@ pub fn try_superlinear(
         n_neurons as usize, out_per as usize, in_per as usize,
     ) {
         Some(y) => {
-            let n = (n_neurons * out_per) as usize;
-            out[..n].copy_from_slice(&y);
+            out[..(n_neurons * out_per) as usize].copy_from_slice(&y);
             true
         }
         None => {
@@ -101,5 +117,12 @@ pub fn available() -> bool {
     match gpu().lock() { Ok(g) => g.is_some(), Err(_) => false }
 }
 
-/// No-op (no cache to invalidate in stateless design).
-pub fn invalidate_cache() {}
+/// Invalidate VRAM weight cache. Call after optimizer step.
+/// In stream mode, this is a no-op (nothing cached).
+pub fn invalidate_cache() {
+    if let Ok(mut guard) = gpu().lock() {
+        if let Some(ref mut g) = *guard {
+            g.engine.invalidate();
+        }
+    }
+}
