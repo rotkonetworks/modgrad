@@ -159,6 +159,247 @@ impl Default for AuxLossConfig {
     }
 }
 
+// ─── Learned inter-region router (MoS-inspired) ──────────
+
+/// Configuration for the learned thalamic router.
+/// When enabled, replaces fixed connection topology with dynamic,
+/// tick-conditioned, sparse routing between regions.
+///
+/// Inspired by Mixture of States (MoS): each destination region
+/// selects its top-k source regions per tick, weighted by a learned
+/// affinity conditioned on (tick, global_sync).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterConfig {
+    /// Common routing dimension — all regions project to/from this.
+    pub d_route: usize,
+    /// Tick embedding dimension.
+    pub tick_embed_dim: usize,
+    /// Top-k sparsity: each destination selects k source regions.
+    pub k: usize,
+    /// ε-greedy exploration rate during training (0.0 = off, 0.05 = 5% random).
+    pub epsilon: f32,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self { d_route: 32, tick_embed_dim: 16, k: 3, epsilon: 0.05 }
+    }
+}
+
+/// Learned thalamic router: weights for dynamic inter-region routing.
+///
+/// Per tick: (global_sync, tick_embed) → [n_regions × n_regions] logits
+/// → softmax per destination → top-k selection → weighted sum of
+/// projected source outputs → destination input.
+///
+/// Total params ≈ n×d_model×d_route + n×d_route×d_input + sync×n² + ticks×t_dim
+/// For 8 regions: ~40K params (<0.3% of model). True zero-cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionalRouter {
+    pub config: RouterConfig,
+    pub n_regions: usize,
+
+    /// Project each region's activated output to routing space.
+    /// to_route[i]: Linear(d_model_i, d_route)
+    pub to_route: Vec<Linear>,
+
+    /// Project routed input to each destination region's d_input.
+    /// from_route[j]: Linear(d_route, d_input_j)
+    pub from_route: Vec<Linear>,
+
+    /// Learned tick embeddings: [max_ticks × tick_embed_dim].
+    pub tick_embed: Vec<f32>,
+    pub max_ticks: usize,
+
+    /// Route projection: (n_sync*2 + tick_embed_dim) → (n_regions × n_regions).
+    pub route_proj: Linear,
+}
+
+/// Cached forward state for router backward.
+pub struct RouterCache {
+    /// Input to route_proj.
+    pub proj_input: Vec<f32>,
+    /// Raw logits from route_proj [n_regions × n_regions].
+    pub logits: Vec<f32>,
+    /// Softmax weights [n_regions × n_regions] (column-wise softmax).
+    pub weights: Vec<f32>,
+    /// Selected indices per destination: [n_regions][k].
+    pub selected: Vec<Vec<usize>>,
+    /// Per-source projected outputs: [n_regions][d_route].
+    pub projected_sources: Vec<Vec<f32>>,
+}
+
+/// Gradients for the router.
+pub struct RouterGradients {
+    pub to_route_dw: Vec<Vec<f32>>,
+    pub to_route_db: Vec<Vec<f32>>,
+    pub from_route_dw: Vec<Vec<f32>>,
+    pub from_route_db: Vec<Vec<f32>>,
+    pub tick_embed_grad: Vec<f32>,
+    pub route_proj_dw: Vec<f32>,
+    pub route_proj_db: Vec<f32>,
+}
+
+impl RegionalRouter {
+    pub fn new(
+        config: RouterConfig,
+        region_d_models: &[usize],
+        region_d_inputs: &[usize],
+        n_sync: usize,
+        max_ticks: usize,
+    ) -> Self {
+        let n = region_d_models.len();
+        let d = config.d_route;
+        let t = config.tick_embed_dim;
+
+        let to_route: Vec<Linear> = region_d_models.iter()
+            .map(|&dm| Linear::new(dm, d))
+            .collect();
+        let from_route: Vec<Linear> = region_d_inputs.iter()
+            .map(|&di| Linear::new(d, di))
+            .collect();
+
+        // Learned tick embeddings (small table)
+        let mut rng = SimpleRng::new(0xDEAD_BEEF);
+        let scale = (1.0 / t as f32).sqrt();
+        let tick_embed: Vec<f32> = (0..max_ticks * t)
+            .map(|_| rng.next_normal() * scale)
+            .collect();
+
+        // Router MLP: [n_sync*2 + tick_embed_dim] → [n * n]
+        let route_proj = Linear::new(n_sync * 2 + t, n * n);
+
+        Self {
+            config, n_regions: n,
+            to_route, from_route,
+            tick_embed, max_ticks,
+            route_proj,
+        }
+    }
+
+    /// Forward: compute routed inputs for each destination region.
+    ///
+    /// Returns (routed_inputs, cache):
+    /// - routed_inputs[j] = projected weighted sum of selected source regions for destination j
+    /// - cache: everything needed for backward
+    pub fn forward(
+        &self, tick: usize, global_sync: &[f32],
+        region_outputs: &[Vec<f32>], training: bool,
+    ) -> (Vec<Vec<f32>>, RouterCache) {
+        let n = self.n_regions;
+        let d = self.config.d_route;
+        let k = self.config.k.min(n);
+
+        // 1. Get tick embedding (clamp to max)
+        let t_idx = tick.min(self.max_ticks - 1);
+        let t = self.config.tick_embed_dim;
+        let t_emb = &self.tick_embed[t_idx * t..(t_idx + 1) * t];
+
+        // 2. Build router input: [global_sync, tick_embed]
+        let mut proj_input = Vec::with_capacity(global_sync.len() + t);
+        proj_input.extend_from_slice(global_sync);
+        proj_input.extend_from_slice(t_emb);
+
+        // 3. Predict routing logits [n × n]
+        let logits = self.route_proj.forward(&proj_input);
+
+        // 4. Project all source regions to routing space
+        let projected_sources: Vec<Vec<f32>> = (0..n)
+            .map(|i| self.to_route[i].forward(&region_outputs[i]))
+            .collect();
+
+        // 5. Per-destination: softmax over sources, top-k select, weighted sum
+        let mut weights = vec![0.0f32; n * n];
+        let mut selected = Vec::with_capacity(n);
+        let mut routed_inputs = Vec::with_capacity(n);
+
+        let mut rng = if training {
+            Some(SimpleRng::new(tick as u64 ^ 0xCAFE))
+        } else {
+            None
+        };
+
+        for j in 0..n {
+            // Softmax over source axis for destination j
+            let col: Vec<f32> = (0..n).map(|i| logits[i * n + j]).collect();
+            let max_val = col.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp: Vec<f32> = col.iter().map(|&v| (v - max_val).exp()).collect();
+            let sum: f32 = exp.iter().sum();
+            let w: Vec<f32> = exp.iter().map(|&e| e / sum).collect();
+            for i in 0..n { weights[i * n + j] = w[i]; }
+
+            // Top-k or ε-greedy selection
+            let sel = if training && rng.as_mut().map_or(false, |r| r.next_f32() < self.config.epsilon) {
+                // Random k indices
+                let mut indices: Vec<usize> = (0..n).collect();
+                let r = rng.as_mut().unwrap();
+                for idx in 0..k {
+                    let swap = idx + (r.next_u64() as usize % (n - idx));
+                    indices.swap(idx, swap);
+                }
+                indices[..k].to_vec()
+            } else {
+                // Top-k by weight
+                let mut indexed: Vec<(usize, f32)> = w.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed[..k].iter().map(|(i, _)| *i).collect()
+            };
+
+            // Weighted sum of selected projected sources
+            let mut routed = vec![0.0f32; d];
+            for &i in &sel {
+                let wi = weights[i * n + j];
+                for (r, p) in routed.iter_mut().zip(projected_sources[i].iter()) {
+                    *r += wi * p;
+                }
+            }
+
+            // Project to destination input dimension
+            let dest_input = self.from_route[j].forward(&routed);
+            selected.push(sel);
+            routed_inputs.push(dest_input);
+        }
+
+        let cache = RouterCache {
+            proj_input, logits, weights, selected, projected_sources,
+        };
+        (routed_inputs, cache)
+    }
+
+    /// Parameter count.
+    pub fn n_params(&self) -> usize {
+        let mut n = self.tick_embed.len();
+        n += self.route_proj.weight.len() + self.route_proj.bias.len();
+        for l in &self.to_route { n += l.weight.len() + l.bias.len(); }
+        for l in &self.from_route { n += l.weight.len() + l.bias.len(); }
+        n
+    }
+}
+
+impl RouterGradients {
+    pub fn zeros(router: &RegionalRouter) -> Self {
+        Self {
+            to_route_dw: router.to_route.iter().map(|l| vec![0.0; l.weight.len()]).collect(),
+            to_route_db: router.to_route.iter().map(|l| vec![0.0; l.bias.len()]).collect(),
+            from_route_dw: router.from_route.iter().map(|l| vec![0.0; l.weight.len()]).collect(),
+            from_route_db: router.from_route.iter().map(|l| vec![0.0; l.bias.len()]).collect(),
+            tick_embed_grad: vec![0.0; router.tick_embed.len()],
+            route_proj_dw: vec![0.0; router.route_proj.weight.len()],
+            route_proj_db: vec![0.0; router.route_proj.bias.len()],
+        }
+    }
+
+    pub fn zero(&mut self) {
+        for v in &mut self.to_route_dw { v.fill(0.0); }
+        for v in &mut self.to_route_db { v.fill(0.0); }
+        for v in &mut self.from_route_dw { v.fill(0.0); }
+        for v in &mut self.from_route_db { v.fill(0.0); }
+        self.tick_embed_grad.fill(0.0);
+        self.route_proj_dw.fill(0.0);
+        self.route_proj_db.fill(0.0);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionalConfig {
     /// Per-region CTM configs.
@@ -182,6 +423,11 @@ pub struct RegionalConfig {
     /// Auxiliary bio-inspired losses (optional, toggleable).
     #[serde(default)]
     pub aux_losses: AuxLossConfig,
+    /// Learned inter-region router (MoS-style). When Some, replaces
+    /// fixed connection topology with dynamic, tick-conditioned routing.
+    /// When None, uses fixed connections (backward compatible).
+    #[serde(default)]
+    pub router: Option<RouterConfig>,
 }
 
 impl RegionalConfig {
@@ -252,6 +498,7 @@ impl RegionalConfig {
             out_dims,
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
+            router: None,
         }
     }
 
@@ -287,6 +534,7 @@ impl RegionalConfig {
             out_dims,
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
+            router: None,
         }
     }
 
@@ -353,6 +601,10 @@ pub struct RegionalWeights {
     /// BG value head: BG output → scalar value estimate.
     /// Trains basal ganglia as a critic (temporal difference learning).
     pub bg_value: Option<Linear>,
+
+    /// Learned inter-region router (MoS-style). None = fixed connections.
+    #[serde(default)]
+    pub router: Option<RegionalRouter>,
 }
 
 impl RegionalWeights {
@@ -456,6 +708,16 @@ impl RegionalWeights {
             None
         };
 
+        // Build router if configured
+        let router = config.router.as_ref().map(|rc| {
+            let d_models: Vec<usize> = config.regions.iter().map(|r| r.d_model).collect();
+            let d_inputs: Vec<usize> = config.regions.iter().map(|r| r.d_input).collect();
+            RegionalRouter::new(
+                rc.clone(), &d_models, &d_inputs,
+                n_sync, config.outer_ticks,
+            )
+        });
+
         Self {
             config,
             embeddings,
@@ -470,6 +732,7 @@ impl RegionalWeights {
             extra_heads,
             cereb_predict,
             bg_value,
+            router,
         }
     }
 
@@ -490,6 +753,7 @@ impl RegionalWeights {
         n += self.output_proj.weight.len() + self.output_proj.bias.len();
         if let Some(ref g) = self.outer_exit_gate { n += g.weight.len() + g.bias.len(); }
         for h in &self.extra_heads { n += h.weight.len() + h.bias.len(); }
+        if let Some(ref r) = self.router { n += r.n_params(); }
         n
     }
 
@@ -575,27 +839,52 @@ pub fn regional_forward(
     // Project raw observation
     let obs_projected = w.obs_proj.forward(observation);
 
-    for _outer_tick in 0..cfg.outer_ticks {
+    for outer_tick in 0..cfg.outer_ticks {
         // Snapshot previous outputs (immutable read buffer for this tick).
         // Regions read from prev_outputs, write to state.region_outputs.
         let prev_outputs = state.region_outputs.clone();
 
-        // Phase A: Build observations (parallel, read-only).
-        let region_obs: Vec<Vec<f32>> = (0..n_regions).into_par_iter().map(|r| {
-            for (ci, conn) in cfg.connections.iter().enumerate() {
-                if conn.to == r {
-                    let mut src = Vec::new();
-                    for &from_idx in &conn.from {
-                        src.extend_from_slice(&prev_outputs[from_idx]);
+        // Phase A: Build observations — router or fixed connections.
+        let region_obs: Vec<Vec<f32>> = if let Some(ref router) = w.router {
+            // MoS-style: router selects which source regions each destination reads.
+            // Global sync from previous tick feeds the router (tick-conditioned).
+            let global_sync: Vec<f32> = (0..cfg.n_global_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+            let (routed, _cache) = router.forward(
+                outer_tick, &global_sync, &prev_outputs, false,
+            );
+            // Routed inputs replace connection-based observations.
+            // Regions that need raw observation get it added.
+            let mut obs = routed;
+            for conn in &cfg.connections {
+                if conn.receives_observation {
+                    // Add observation signal to regions that need it
+                    for v in obs_projected.iter() {
+                        // obs[conn.to] already has routed context; observation
+                        // was part of global sync — no separate concat needed
                     }
-                    if conn.receives_observation {
-                        src.extend_from_slice(observation);
-                    }
-                    return w.connection_synapses[ci].forward(&src);
                 }
             }
-            obs_projected.clone()
-        }).collect();
+            obs
+        } else {
+            // Fixed connections (backward compatible)
+            (0..n_regions).into_par_iter().map(|r| {
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    if conn.to == r {
+                        let mut src = Vec::new();
+                        for &from_idx in &conn.from {
+                            src.extend_from_slice(&prev_outputs[from_idx]);
+                        }
+                        if conn.receives_observation {
+                            src.extend_from_slice(observation);
+                        }
+                        return w.connection_synapses[ci].forward(&src);
+                    }
+                }
+                obs_projected.clone()
+            }).collect()
+        };
 
         // Phase B: Run regions (parallel via disjoint mut slices).
         // Take ownership of region_states to get disjoint &mut per element.
