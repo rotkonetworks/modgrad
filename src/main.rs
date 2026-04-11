@@ -955,11 +955,11 @@ fn learn(
         RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
     } else {
         {
-            // Scale learning rate with model size: smaller lr for larger models
-            let lr = if w.n_params() > 50_000_000 { 3e-4 }
-                     else if w.n_params() > 10_000_000 { 1e-3 }
-                     else { 3e-3 };
-            RegionalAdamW::new(&w).with_lr(lr).with_wd(0.001).with_clip(1.0)
+            // Scale lr and grad clip with model size
+            let (lr, clip) = if w.n_params() > 50_000_000 { (3e-4, 1.0) }
+                             else if w.n_params() > 10_000_000 { (1e-3, 2.0) }
+                             else { (3e-3, 5.0) };
+            RegionalAdamW::new(&w).with_lr(lr).with_wd(0.001).with_clip(clip)
         }
     };
 
