@@ -2541,6 +2541,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "modgrad-compute",
+ "modgrad-device",
  "modgrad-persist",
  "modgrad-traits",
  "rayon",

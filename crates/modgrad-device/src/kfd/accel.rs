@@ -24,11 +24,13 @@ const MIN_FLOPS: usize = 10_000_000;
 
 /// Cached weight matrix in VRAM.
 struct CachedWeight {
-    w_row: GpuBuffer,
-    w_col: GpuBuffer,
+    w_row: GpuBuffer,    // W [out_dim × in_dim] row-major
+    w_t: GpuBuffer,      // W^T [in_dim × out_dim] row-major (for backward dx)
     bias: GpuBuffer,
-    m: u32,
-    k: u32,
+    bias_zero: GpuBuffer, // zero bias for backward dispatch
+    w_col: GpuBuffer,    // unused legacy
+    m: u32,              // out_dim
+    k: u32,              // in_dim
     m_pad: u32,
     k_pad: u32,
 }
@@ -95,8 +97,15 @@ impl KfdAccel {
         let w_col = self.dev.upload_f32(&padded_col).ok()?;
         let bias_buf = self.dev.upload_f32(&padded_bias).ok()?;
 
+        // Transpose + zero bias for backward
+        let w_t = self.dev.upload_f32(&padded_col).unwrap_or_else(|_| {
+            self.dev.upload_f32(&[0.0f32]).unwrap()
+        });
+        let bias_zero = self.dev.upload_f32(&vec![0.0f32; k_pad as usize]).unwrap_or_else(|_| {
+            self.dev.upload_f32(&[0.0f32]).unwrap()
+        });
         self.cache.insert(key, CachedWeight {
-            w_row, w_col, bias: bias_buf,
+            w_row, w_t, bias: bias_buf, bias_zero, w_col,
             m: out_dim, k: in_dim, m_pad, k_pad,
         });
         Some(key)
@@ -149,7 +158,7 @@ pub fn try_matvec(
         None => return false,
     };
 
-    // Upload weight + bias (cached by pointer identity)
+    // Upload weight + bias + transpose (cached by pointer identity)
     let key = (weight.as_ptr() as usize, weight.len());
     if !accel.cache.contains_key(&key) {
         let w_buf = match accel.dev.upload_f32(weight) {
@@ -160,13 +169,30 @@ pub fn try_matvec(
             Ok(b) => b,
             Err(_) => return false,
         };
-        // col-major not needed for matvec, store as dummy
+        // Transpose: W^T[j * out_dim + i] = W[i * in_dim + j]
+        // Used by backward pass: dx = W^T @ d_out
+        let m = out_dim as usize;
+        let k = in_dim as usize;
+        let mut w_t_data = vec![0.0f32; k * m];
+        for i in 0..m {
+            for j in 0..k {
+                w_t_data[j * m + i] = weight[i * k + j];
+            }
+        }
+        let w_t_buf = match accel.dev.upload_f32(&w_t_data) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let b_zero = match accel.dev.upload_f32(&vec![0.0f32; k]) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
         let w_col = match accel.dev.upload_f32(&[0.0f32]) {
             Ok(b) => b,
             Err(_) => return false,
         };
         accel.cache.insert(key, CachedWeight {
-            w_row: w_buf, w_col, bias: b_buf,
+            w_row: w_buf, w_t: w_t_buf, bias: b_buf, bias_zero: b_zero, w_col,
             m: out_dim, k: in_dim, m_pad: out_dim, k_pad: in_dim,
         });
     }
@@ -230,6 +256,93 @@ pub fn try_matvec(
         std::slice::from_raw_parts(y_buf.cpu_ptr as *const f32, out_dim as usize)
     };
     out[..out_dim as usize].copy_from_slice(y_slice);
+    true
+}
+
+/// Compute d_input = W^T @ d_out on GPU (backward input gradient).
+///
+/// Same kernel as try_matvec, but uses the cached transposed weight.
+/// W is [out_dim × in_dim], W^T is [in_dim × out_dim].
+/// d_out is [out_dim], d_input is [in_dim].
+pub fn try_matvec_t(
+    d_out: &[f32], weight: &[f32], d_input: &mut [f32],
+    out_dim: u32, in_dim: u32,
+) -> bool {
+    if (out_dim as usize * in_dim as usize) < MIN_FLOPS {
+        return false;
+    }
+    if KFD_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+
+    let mut guard = match get_accel().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let accel = match guard.as_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    // Weight must already be cached (from a prior forward call)
+    let key = (weight.as_ptr() as usize, weight.len());
+    let cached = match accel.cache.get(&key) {
+        Some(c) => c,
+        None => return false, // not cached — forward wasn't called yet
+    };
+
+    // Reuse scratch buffers for d_out input and d_input output
+    let d_out_bytes = d_out.len() * 4;
+    if accel.x_buf_cap < d_out_bytes {
+        accel.x_buf = accel.dev.upload_f32(d_out).ok();
+        accel.x_buf_cap = ((d_out_bytes + 4095) & !4095).max(4096);
+    } else if let Some(ref xb) = accel.x_buf {
+        xb.write_f32(0, d_out);
+    }
+
+    let d_in_bytes = in_dim as usize * 4;
+    if accel.y_buf_cap < d_in_bytes {
+        accel.y_buf = accel.dev.alloc_output(((d_in_bytes + 4095) & !4095).max(4096)).ok();
+        accel.y_buf_cap = ((d_in_bytes + 4095) & !4095).max(4096);
+    } else if let Some(ref yb) = accel.y_buf {
+        unsafe { std::ptr::write_bytes(yb.cpu_ptr, 0, d_in_bytes); }
+    }
+
+    let (x_buf, y_buf) = match (&accel.x_buf, &accel.y_buf) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return false,
+    };
+
+    // Dispatch: matvec(W^T, d_out) → d_input
+    // W^T is [in_dim × out_dim], so matvec output dim = in_dim
+    let nwg = (in_dim + 255) / 256;
+    if accel.args_buf.is_none() {
+        accel.args_buf = accel.dev.alloc.alloc_vram(4096).ok();
+    }
+    let args_buf = match &accel.args_buf {
+        Some(b) => b,
+        None => return false,
+    };
+    let mut kargs = [0u8; 48];
+    kargs[0..8].copy_from_slice(&cached.w_t.va_addr.to_le_bytes());
+    kargs[8..16].copy_from_slice(&cached.bias_zero.va_addr.to_le_bytes());
+    kargs[16..24].copy_from_slice(&x_buf.va_addr.to_le_bytes());
+    kargs[24..32].copy_from_slice(&y_buf.va_addr.to_le_bytes());
+    kargs[32..36].copy_from_slice(&in_dim.to_le_bytes());
+    kargs[36..40].copy_from_slice(&out_dim.to_le_bytes());
+    args_buf.write(0, &kargs[..40]);
+
+    if !accel.dev.dispatch_enqueue("matvec", args_buf, [nwg, 1, 1], [256, 1, 1]) {
+        return false;
+    }
+    if !accel.dev.submit_wait(2000) {
+        return false;
+    }
+
+    let y_slice = unsafe {
+        std::slice::from_raw_parts(y_buf.cpu_ptr as *const f32, in_dim as usize)
+    };
+    d_input[..in_dim as usize].copy_from_slice(y_slice);
     true
 }
 

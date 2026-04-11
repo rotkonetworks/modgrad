@@ -24,22 +24,43 @@ pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, Li
 }
 
 /// Returns d_input. Accumulates into d_weight, d_bias.
+///
+/// Tries GPU for d_input (dx = W^T @ d_out) when the op is large enough.
+/// Weight gradient (dW) stays on CPU (accumulation pattern).
 pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
     let in_dim = linear.in_dim;
     let out_dim = linear.out_dim;
-    // d_bias
+    // d_bias (trivial)
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
-    // d_weight, d_input
-    let mut d_input = vec![0.0f32; in_dim];
+    // d_weight (outer product, accumulate on CPU)
     for i in 0..out_dim {
         let d = d_out[i];
         if d.abs() < 1e-12 { continue; }
         let row = i * in_dim;
         for j in 0..in_dim {
             d_weight[row + j] += d * cache.input[j];
+        }
+    }
+    // d_input = W^T @ d_out — try GPU, fall back to CPU
+    if modgrad_compute::neuron::gpu_enabled() {
+        let mut d_input = vec![0.0f32; in_dim];
+        if modgrad_device::kfd::accel::try_matvec_t(
+            d_out, &linear.weight, &mut d_input,
+            out_dim as u32, in_dim as u32,
+        ) {
+            return d_input;
+        }
+    }
+    // CPU fallback
+    let mut d_input = vec![0.0f32; in_dim];
+    for i in 0..out_dim {
+        let d = d_out[i];
+        if d.abs() < 1e-12 { continue; }
+        let row = i * in_dim;
+        for j in 0..in_dim {
             d_input[j] += d * linear.weight[row + j];
         }
     }
