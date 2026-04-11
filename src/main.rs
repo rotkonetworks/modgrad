@@ -87,15 +87,18 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:4747")]
         addr: String,
     },
-    /// Learn from raw data — no curriculum, no phases, just bytes
+    /// Learn from raw data — no curriculum, no phases, just tokens
     Learn {
         #[arg(default_value = "model.bin")]
         checkpoint: String,
-        /// Directory or file(s) to learn from. Reads everything as bytes.
+        /// Directory, file(s), or .jsonl with token pairs to learn from.
         #[arg(required = true)]
         data: Vec<String>,
         #[arg(long, default_value = "32")]
         context: usize,
+        /// Vocabulary size. 256 = raw bytes, 8192 = VQGAN visual tokens.
+        #[arg(long, default_value = "256")]
+        vocab: usize,
         #[arg(long)]
         debug_port: Option<u16>,
     },
@@ -118,8 +121,8 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
-        Commands::Learn { checkpoint, data, context, debug_port } => {
-            learn(&checkpoint, &data, context, debug_port);
+        Commands::Learn { checkpoint, data, context, vocab, debug_port } => {
+            learn(&checkpoint, &data, context, vocab, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {
             run_daemon(&checkpoint, port);
@@ -270,6 +273,21 @@ fn show_devices() {
         eprintln!("  AMD KFD: not available");
     }
 }
+/// Extract a JSON array of integers from a line by key name.
+/// Minimal parser — avoids pulling in serde_json for a simple pattern.
+fn extract_json_array(line: &str, key: &str) -> Option<Vec<usize>> {
+    let pattern = format!("\"{}\":", key);
+    let start = line.find(&pattern)?;
+    let after_key = &line[start + pattern.len()..];
+    let bracket_start = after_key.find('[')?;
+    let bracket_end = after_key.find(']')?;
+    let inner = &after_key[bracket_start + 1..bracket_end];
+    let tokens: Vec<usize> = inner.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if tokens.is_empty() { None } else { Some(tokens) }
+}
+
 fn generate_multimodal_pairs() -> Vec<Vec<usize>> {
     // graph types imported at crate level
     use modgrad_codec::vqvae::VqVae;
@@ -804,38 +822,79 @@ fn learn(
     save_path: &str,
     data_paths: &[String],
     context_len: usize,
+    vocab: usize,
     debug_port: Option<u16>,
 ) {
-    // Gather all data as raw bytes
-    let mut all_bytes: Vec<u8> = Vec::new();
+    // Gather all data as token sequences.
+    // Two modes:
+    //   - .jsonl files: read {input_tokens, output_tokens} pairs, concatenate into sequences
+    //   - everything else: read as raw bytes (each byte is a token 0-255)
+    let mut all_tokens: Vec<usize> = Vec::new();
+
     for path in data_paths {
         let p = std::path::Path::new(path);
-        if p.is_dir() {
-            // Read all files in directory recursively
+
+        if p.extension().map_or(false, |e| e == "jsonl") {
+            // JSONL: each line has input_tokens + output_tokens
+            if let Ok(text) = std::fs::read_to_string(p) {
+                let mut n_samples = 0usize;
+                for line in text.lines() {
+                    if line.is_empty() { continue; }
+                    // Minimal JSON parsing — extract token arrays
+                    if let (Some(input), Some(output)) = (
+                        extract_json_array(line, "input_tokens"),
+                        extract_json_array(line, "output_tokens"),
+                    ) {
+                        all_tokens.extend_from_slice(&input);
+                        all_tokens.extend_from_slice(&output);
+                        n_samples += 1;
+                    }
+                }
+                eprintln!("  + {path} ({n_samples} token pairs)");
+            }
+        } else if p.is_dir() {
             if let Ok(entries) = std::fs::read_dir(p) {
                 let mut files: Vec<_> = entries.filter_map(|e| e.ok())
                     .filter(|e| e.path().is_file())
                     .collect();
                 files.sort_by_key(|e| e.path());
                 for entry in files {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        eprintln!("  + {} ({} bytes)", entry.path().display(), data.len());
-                        all_bytes.extend_from_slice(&data);
+                    let ep = entry.path();
+                    if ep.extension().map_or(false, |e| e == "jsonl") {
+                        // Recurse into JSONL files in directory
+                        if let Ok(text) = std::fs::read_to_string(&ep) {
+                            let mut n = 0usize;
+                            for line in text.lines() {
+                                if line.is_empty() { continue; }
+                                if let (Some(input), Some(output)) = (
+                                    extract_json_array(line, "input_tokens"),
+                                    extract_json_array(line, "output_tokens"),
+                                ) {
+                                    all_tokens.extend_from_slice(&input);
+                                    all_tokens.extend_from_slice(&output);
+                                    n += 1;
+                                }
+                            }
+                            eprintln!("  + {} ({n} token pairs)", ep.display());
+                        }
+                    } else if let Ok(data) = std::fs::read(&ep) {
+                        eprintln!("  + {} ({} bytes)", ep.display(), data.len());
+                        for &b in &data { all_tokens.push(b as usize); }
                     }
                 }
             }
         } else if let Ok(data) = std::fs::read(path) {
             eprintln!("  + {path} ({} bytes)", data.len());
-            all_bytes.extend_from_slice(&data);
+            for &b in &data { all_tokens.push(b as usize); }
         }
     }
 
-    if all_bytes.is_empty() {
-        eprintln!("No data found. Provide files or directories.");
+    if all_tokens.is_empty() {
+        eprintln!("No data found. Provide files, directories, or .jsonl token pairs.");
         return;
     }
 
-    eprintln!("Data: {:.2}MB total", all_bytes.len() as f64 / 1e6);
+    eprintln!("Data: {} tokens, vocab: {}", all_tokens.len(), vocab);
 
     // Model size from filename (same convention as develop_staged)
     let (embed_dim, n_regions, ticks) = if save_path.contains("large") {
@@ -854,9 +913,9 @@ fn learn(
         RegionalWeights::load(save_path).expect("failed to load")
     } else {
         let cfg = if n_regions <= 4 {
-            RegionalConfig::four_region(embed_dim, VOCAB_TEXT, ticks)
+            RegionalConfig::four_region(embed_dim, vocab, ticks)
         } else {
-            RegionalConfig::eight_region(embed_dim, VOCAB_TEXT, ticks)
+            RegionalConfig::eight_region(embed_dim, vocab, ticks)
         };
         RegionalWeights::new(cfg)
     };
@@ -897,19 +956,19 @@ fn learn(
     let mut loss_sum = 0.0f32;
     let mut correct_sum = 0usize;
     let mut tokens_since_report = 0usize;
-    let n_data = all_bytes.len();
+    let n_data = all_tokens.len();
     let mut offset = 0usize;
 
     eprintln!("\nLearning... (Ctrl+C to save and stop)\n");
 
     while running.load(std::sync::atomic::Ordering::SeqCst) {
-        // Next chunk from the byte stream (wraps around)
+        // Next chunk from the token stream (wraps around)
         let end = (offset + context_len + 1).min(n_data);
         if end - offset < 2 {
             offset = 0; // wrap
             continue;
         }
-        let chunk = &all_bytes[offset..end];
+        let chunk = &all_tokens[offset..end];
 
         grads.zero();
         let mut chunk_loss = 0.0f32;
@@ -917,9 +976,9 @@ fn learn(
         let n = chunk.len() - 1;
 
         for pos in 0..n {
-            let (loss, pred) = regional_train_token(&w, &mut grads, chunk[pos] as usize, chunk[pos + 1] as usize);
+            let (loss, pred) = regional_train_token(&w, &mut grads, chunk[pos], chunk[pos + 1]);
             chunk_loss += loss;
-            if pred == chunk[pos + 1] as usize { chunk_correct += 1; }
+            if pred == chunk[pos + 1] { chunk_correct += 1; }
         }
 
         opt.step(&mut w, &grads);
