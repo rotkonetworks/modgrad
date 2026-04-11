@@ -28,6 +28,8 @@ fn main() {
     let mut use_curriculum = false;
     let mut test_only = false;
     let mut checkpoint: Option<String> = None;
+    let mut adaptive_exit = false;
+    let mut exit_beta = 0.1f32;
 
     let mut i = 1;
     while i < args.len() {
@@ -43,6 +45,8 @@ fn main() {
             "--curriculum" => { use_curriculum = true; i += 1; }
             "--test" => { test_only = true; i += 1; }
             "--checkpoint" | "-c" => { checkpoint = Some(args[i+1].clone()); i += 2; }
+            "--adaptive-exit" => { adaptive_exit = true; i += 1; }
+            "--exit-beta" => { exit_beta = args[i+1].parse().unwrap(); i += 2; }
             "--help" | "-h" => { print_help(); return; }
             _ => { i += 1; }
         }
@@ -50,11 +54,17 @@ fn main() {
 
     // Load or create model
     let save_path = checkpoint.clone().unwrap_or_else(|| "minictm.bin".to_string());
+    let exit_strategy = if adaptive_exit {
+        modgrad_ctm::config::ExitStrategy::AdaptiveGate { beta: exit_beta, threshold: 0.5 }
+    } else {
+        modgrad_ctm::config::ExitStrategy::None
+    };
+
     let mut w = if std::path::Path::new(&save_path).exists() {
         eprintln!("Loading {save_path}...");
         RegionalWeights::load(&save_path).expect("failed to load")
     } else {
-        create_model(embed_dim, regions, ticks)
+        create_model(embed_dim, regions, ticks, &exit_strategy)
     };
 
     let opt_path = save_path.replace(".bin", ".opt.bin");
@@ -189,12 +199,26 @@ fn main() {
     }
 }
 
-fn create_model(embed_dim: usize, regions: usize, ticks: usize) -> RegionalWeights {
-    let cfg = if regions <= 4 {
+fn create_model(
+    embed_dim: usize, regions: usize, ticks: usize,
+    exit_strategy: &modgrad_ctm::config::ExitStrategy,
+) -> RegionalWeights {
+    let mut cfg = if regions <= 4 {
         RegionalConfig::four_region(embed_dim, 256, ticks)
     } else {
         RegionalConfig::eight_region(embed_dim, 256, ticks)
     };
+    // Set outer-level exit strategy
+    cfg.exit_strategy = exit_strategy.clone();
+    // Set inner-level exit strategy on all regions
+    for region in &mut cfg.regions {
+        region.exit_strategy = exit_strategy.clone();
+    }
+    if exit_strategy.has_gate() {
+        eprintln!("Adaptive exit: ON (beta={}, threshold={})",
+            exit_strategy.beta(),
+            exit_strategy.threshold().unwrap_or(0.5));
+    }
     RegionalWeights::new(cfg)
 }
 

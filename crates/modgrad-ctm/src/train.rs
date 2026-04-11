@@ -17,14 +17,14 @@ use super::weights::CtmWeights;
 
 // ─── Linear ────────────────────────────────────────────────
 
-struct LinearCache { input: Vec<f32> }
+pub(crate) struct LinearCache { pub(crate) input: Vec<f32> }
 
-fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, LinearCache) {
+pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, LinearCache) {
     (linear.forward(x), LinearCache { input: x.to_vec() })
 }
 
 /// Returns d_input. Accumulates into d_weight, d_bias.
-fn linear_backward(
+pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
@@ -202,7 +202,7 @@ struct UNetCache {
     skip_ln_caches: Vec<LnCache>,
 }
 
-struct UNetGrads {
+pub struct UNetGrads {
     first: BlockGrads,
     downs: Vec<BlockGrads>,
     ups: Vec<BlockGrads>,
@@ -600,6 +600,9 @@ struct TickCache {
     sync_out: Vec<f32>,
     beta_out: Vec<f32>,
     out_lin: LinearCache,
+    // Adaptive exit gate cache (None when gate is off)
+    exit_gate_lin: Option<LinearCache>,
+    exit_lambda: f32,  // σ(gate_logit), 0.0 when gate is off
 }
 
 /// All gradients for CtmWeights.
@@ -625,6 +628,9 @@ pub struct CtmGradients {
     pub d_decay_action: Vec<f32>,
     pub out_proj_w: Vec<f32>,
     pub out_proj_b: Vec<f32>,
+    // Adaptive exit gate gradients
+    pub exit_gate_w: Option<Vec<f32>>,
+    pub exit_gate_b: Option<Vec<f32>>,
 }
 
 impl CtmGradients {
@@ -651,6 +657,8 @@ impl CtmGradients {
             d_decay_action: vec![0.0; w.decay_params_action.len()],
             out_proj_w: vec![0.0; w.output_proj.weight.len()],
             out_proj_b: vec![0.0; w.output_proj.bias.len()],
+            exit_gate_w: w.exit_gate.as_ref().map(|g| vec![0.0; g.weight.len()]),
+            exit_gate_b: w.exit_gate.as_ref().map(|g| vec![0.0; g.bias.len()]),
         }
     }
 
@@ -677,6 +685,8 @@ impl CtmGradients {
         self.d_decay_action.fill(0.0);
         self.out_proj_w.fill(0.0);
         self.out_proj_b.fill(0.0);
+        if let Some(w) = &mut self.exit_gate_w { w.fill(0.0); }
+        if let Some(b) = &mut self.exit_gate_b { b.fill(0.0); }
     }
 
     /// SGD update: w -= lr * grad. Clips gradients by norm.
@@ -718,6 +728,12 @@ impl CtmGradients {
         sgd(&mut w.mha_out_proj.bias, &self.mha_out_b);
         sgd(&mut w.output_proj.weight, &self.out_proj_w);
         sgd(&mut w.output_proj.bias, &self.out_proj_b);
+        if let Some(gate) = &mut w.exit_gate {
+            if let (Some(gw), Some(gb)) = (&self.exit_gate_w, &self.exit_gate_b) {
+                sgd(&mut gate.weight, gw);
+                sgd(&mut gate.bias, gb);
+            }
+        }
     }
 }
 
@@ -764,6 +780,128 @@ fn ctm_loss(predictions: &[Vec<f32>], certainties: &[[f32; 2]], target: usize)
     }
 
     (loss, d_preds)
+}
+
+/// LoopLM-style adaptive exit loss.
+///
+/// L = Σ p(t) * CE[t]  −  β * H(p)
+///
+/// p(t) is a proper distribution derived from per-tick gate lambdas via
+/// survival probabilities. Gradient through lambdas is exact (chain rule
+/// through the survival product), not a REINFORCE approximation.
+///
+/// Returns (total_loss, d_preds weighted by exit probs, d_lambdas for gate).
+/// d_lambdas are w.r.t. the gate *logit* (pre-sigmoid), so callers pass them
+/// directly to linear_backward.
+pub(crate) fn adaptive_exit_loss(
+    predictions: &[Vec<f32>],
+    lambdas: &[f32],    // per-tick exit probabilities from gate (post-sigmoid)
+    target: usize,
+    beta: f32,
+) -> (f32, Vec<Vec<f32>>, Vec<f32>) {
+    let k = predictions.len();
+    assert_eq!(k, lambdas.len());
+
+    let ce: Vec<(f32, Vec<f32>)> = predictions.iter()
+        .map(|p| cross_entropy_grad(p, target)).collect();
+
+    // ── Exit distribution: p(t) = λ_t * S_{t-1}, p(K) = S_{K-1}
+    // S_t = Π_{j≤t} (1 − λ_j)
+    let mut surv = vec![0.0f32; k]; // S_{t-1} for each t
+    surv[0] = 1.0;
+    for t in 1..k {
+        surv[t] = surv[t - 1] * (1.0 - lambdas[t - 1]);
+    }
+
+    let mut p = vec![0.0f32; k];
+    for t in 0..k - 1 {
+        p[t] = lambdas[t] * surv[t];
+    }
+    p[k - 1] = surv[k - 1] * (1.0 - lambdas[k - 1]); // remaining mass
+    // For k-1 this simplifies to S_{k-1} when λ_{k-1} = 0, but in general
+    // the last lambda can be nonzero. Assign all remaining survival mass:
+    p[k - 1] = surv[k - 1]; // last step gets S_{k-2} * (1 - λ_{k-2}) = surv[k-1]
+    // Correction: p[k-1] should be whatever mass hasn't exited.
+    // S_{k-1} = Π_{j<k-1} (1 - λ_j). p[k-1] = S_{k-1}. This is correct.
+
+    debug_assert!(
+        (p.iter().sum::<f32>() - 1.0).abs() < 0.01,
+        "exit distribution does not sum to 1: sum = {}", p.iter().sum::<f32>()
+    );
+
+    // ── Forward: expected loss and entropy
+    let task_loss: f32 = (0..k).map(|t| p[t] * ce[t].0).sum();
+    let entropy: f32 = -(0..k)
+        .map(|t| if p[t] > 1e-8 { p[t] * p[t].ln() } else { 0.0 })
+        .sum::<f32>();
+    let total_loss = task_loss - beta * entropy;
+
+    // ── d_preds: weighted by exit probability
+    let d_preds: Vec<Vec<f32>> = (0..k).map(|t| {
+        ce[t].1.iter().map(|&g| p[t] * g).collect()
+    }).collect();
+
+    // ── d_lambdas: exact gradient via chain rule through survival product.
+    //
+    // d_loss/d_λ_t (pre-sigmoid, i.e. w.r.t. the logit z where λ = σ(z)):
+    //
+    // p(t) = λ_t * S_{t-1}             → dp(t)/dλ_t = S_{t-1}
+    // p(s) = λ_s * S_{s-1} for s > t   → dp(s)/dλ_t = -p(s) / (1 - λ_t)
+    //    because S_{s-1} contains factor (1 - λ_t)
+    // p(K-1) = S_{K-1}                 → dp(K-1)/dλ_t = -S_{K-1} / (1 - λ_t)
+    //
+    // Suffix loss = Σ_{s>t} p(s) * CE[s] / Σ_{s>t} p(s)
+    //             = expected CE conditioned on surviving past tick t.
+    //
+    // d(task_loss)/dλ_t = S_{t-1} * CE[t]  −  S_{t-1} * suffix_loss
+    //                   = S_{t-1} * (CE[t] − suffix_loss)
+    //
+    // d(entropy)/dλ_t follows similar structure via d(-p·ln(p))/dp = -(1+ln(p)).
+    //
+    // Multiply by σ'(z) = λ(1−λ) to get d/dz.
+    let mut d_lambdas = vec![0.0f32; k];
+
+    // Precompute suffix: Σ_{s=t+1..k} p(s) * CE[s] and Σ_{s=t+1..k} p(s)
+    let mut suffix_weighted = 0.0f32; // Σ p(s)*CE[s] for s > t
+    let mut suffix_mass = 0.0f32;     // Σ p(s) for s > t
+
+    // Walk backwards to build suffix sums, then walk forward for gradients
+    let mut suffix_w = vec![0.0f32; k]; // suffix_weighted at position t
+    let mut suffix_m = vec![0.0f32; k]; // suffix_mass at position t
+    for t in (0..k).rev() {
+        suffix_w[t] = suffix_weighted;
+        suffix_m[t] = suffix_mass;
+        suffix_weighted += p[t] * ce[t].0;
+        suffix_mass += p[t];
+    }
+
+    for t in 0..k - 1 {
+        let one_minus = (1.0 - lambdas[t]).max(1e-8);
+
+        // Task loss gradient
+        let suffix_expected = if suffix_m[t] > 1e-8 {
+            suffix_w[t] / suffix_m[t]
+        } else {
+            ce[k - 1].0
+        };
+        let d_task = surv[t] * (ce[t].0 - suffix_expected);
+
+        // Entropy gradient: Σ_s dp(s)/dλ_t * (-(1 + ln p(s)))
+        // = S_{t-1} * (-(1+ln p(t))) + Σ_{s>t} (-p(s)/(1-λ_t)) * (-(1+ln p(s)))
+        // = S_{t-1} * (-(1+ln p(t))) + (1/(1-λ_t)) * Σ_{s>t} p(s)*(1+ln p(s))
+        let neg_1_ln_t = if p[t] > 1e-8 { -(1.0 + p[t].ln()) } else { 0.0 };
+        let suffix_ent: f32 = (t + 1..k)
+            .map(|s| if p[s] > 1e-8 { p[s] * (1.0 + p[s].ln()) } else { 0.0 })
+            .sum();
+        let d_entropy = surv[t] * neg_1_ln_t + suffix_ent / one_minus;
+
+        // Combine: d_loss/dλ = d_task - β * d_entropy
+        // Then chain through sigmoid: d_loss/dz = d_loss/dλ * λ(1-λ)
+        let sig_deriv = lambdas[t] * (1.0 - lambdas[t]);
+        d_lambdas[t] = sig_deriv * (d_task + beta * d_entropy);
+    }
+
+    (total_loss, d_preds, d_lambdas)
 }
 
 // ─── Training step ─────────────────────────────────────────
@@ -882,12 +1020,22 @@ pub fn train_step(
         // Output proj
         let (_pred, out_lin) = linear_forward_cached(&w.output_proj, &sync_out);
 
+        // Exit gate (adaptive exit)
+        let (exit_gate_lin, exit_lambda) = if let Some(ref gate) = w.exit_gate {
+            let (gate_logit, gate_lin) = linear_forward_cached(gate, &sync_out);
+            let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+            (Some(gate_lin), lambda)
+        } else {
+            (None, 0.0)
+        };
+
         tick_caches.push(TickCache {
             activated_prev, sync_action, beta_action: ba,
             q, q_lin, mha_cache, attn_out,
             unet_cache, pre_act: pre_act.clone(),
             nlm_cache, activated_post: activated.clone(),
             sync_out, beta_out: beta_out.clone(), out_lin,
+            exit_gate_lin, exit_lambda,
         });
     }
 
@@ -901,7 +1049,27 @@ pub fn train_step(
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i).unwrap_or(0);
 
-    let (loss, d_preds) = ctm_loss(&predictions, &certainties, target);
+    // Choose loss based on exit strategy
+    let (loss, d_preds) = if let Some(ref gate) = w.exit_gate {
+        let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+        let beta = cfg.exit_strategy.beta();
+        let (loss, d_preds, d_lambdas) = adaptive_exit_loss(
+            &predictions, &lambdas, target, beta);
+
+        // Backward through exit gate (detached from main BPTT)
+        for (tick, d_lambda) in d_lambdas.iter().enumerate() {
+            if let Some(ref gate_lin) = tick_caches[tick].exit_gate_lin {
+                let d_gate_logit = vec![*d_lambda];
+                let gw = grads.exit_gate_w.as_mut().unwrap();
+                let gb = grads.exit_gate_b.as_mut().unwrap();
+                let _d_sync = linear_backward(gate, &d_gate_logit, gate_lin, gw, gb);
+            }
+        }
+
+        (loss, d_preds)
+    } else {
+        ctm_loss(&predictions, &certainties, target)
+    };
 
     // ── Backward through tick loop ──
     let mut d_activated = vec![0.0f32; d];
@@ -1119,12 +1287,22 @@ impl Brain for Ctm {
             predictions.push(pred);
             certainties.push(cert);
 
+            // Exit gate (adaptive exit)
+            let (exit_gate_lin, exit_lambda) = if let Some(ref gate) = w.exit_gate {
+                let (gate_logit, gate_lin) = linear_forward_cached(gate, &sync_out);
+                let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+                (Some(gate_lin), lambda)
+            } else {
+                (None, 0.0)
+            };
+
             tick_caches.push(TickCache {
                 activated_prev, sync_action, beta_action: ba,
                 q, q_lin, mha_cache, attn_out,
                 unet_cache, pre_act: pre_act.clone(),
                 nlm_cache, activated_post: state.activated.clone(),
                 sync_out, beta_out: state.beta_out.clone(), out_lin,
+                exit_gate_lin, exit_lambda,
             });
         }
 
@@ -1370,7 +1548,8 @@ pub fn backward_from_activated(
     RegionBackwardResult { grads, d_observation }
 }
 
-fn accumulate_gradients(dst: &mut CtmGradients, src: &CtmGradients) {
+/// Accumulate sample gradients into batch gradients.
+pub fn accumulate_gradients(dst: &mut CtmGradients, src: &CtmGradients) {
     let add = |d: &mut [f32], s: &[f32]| { for (d, s) in d.iter_mut().zip(s) { *d += s; } };
     // UNet grads
     add(&mut dst.unet.first.d_weight, &src.unet.first.d_weight);
@@ -1408,5 +1587,7 @@ fn accumulate_gradients(dst: &mut CtmGradients, src: &CtmGradients) {
     add(&mut dst.mha_out_b, &src.mha_out_b);
     add(&mut dst.out_proj_w, &src.out_proj_w);
     add(&mut dst.out_proj_b, &src.out_proj_b);
+    if let (Some(dw), Some(sw)) = (&mut dst.exit_gate_w, &src.exit_gate_w) { add(dw, sw); }
+    if let (Some(db), Some(sb)) = (&mut dst.exit_gate_b, &src.exit_gate_b) { add(db, sb); }
 }
 

@@ -15,6 +15,11 @@ pub struct CtmOutput {
     pub certainties: Vec<[f32; 2]>,
     /// Final sync output.
     pub sync_out: Vec<f32>,
+    /// Adaptive exit: per-tick instantaneous exit probability λ_t ∈ (0,1).
+    /// Empty when exit gate is off.
+    pub exit_lambdas: Vec<f32>,
+    /// How many ticks actually ran (may be < iterations if early exit).
+    pub ticks_used: usize,
 }
 
 /// Faithful Ctm CTM forward pass.
@@ -61,6 +66,9 @@ pub fn ctm_forward(
 
     let mut predictions = Vec::with_capacity(k);
     let mut certainties = Vec::with_capacity(k);
+    let mut exit_lambdas: Vec<f32> = Vec::new();
+    let mut exit_cdf = 0.0f32;
+    let mut survival = 1.0f32;
 
     // ── 4. Tick loop ──
     for _tick in 0..k {
@@ -109,14 +117,29 @@ pub fn ctm_forward(
         predictions.push(pred);
         certainties.push(cert);
 
-        // Early exit: stop thinking when confident enough
-        if cfg.early_exit && cert[1] > cfg.certainty_threshold {
-            break;
+        // (h) Exit decision
+        match &cfg.exit_strategy {
+            crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
+                if let Some(ref gate) = w.exit_gate {
+                    let gate_logit = gate.forward(&sync_out);
+                    let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+                    exit_lambdas.push(lambda);
+                    let p_exit = lambda * survival;
+                    exit_cdf += p_exit;
+                    survival *= 1.0 - lambda;
+                    if exit_cdf > *threshold { break; }
+                }
+            }
+            crate::config::ExitStrategy::Certainty { threshold } => {
+                if cert[1] > *threshold { break; }
+            }
+            crate::config::ExitStrategy::None => {}
         }
     }
 
+    let ticks_used = predictions.len();
     let sync_out = sync_read(&state.alpha_out, &state.beta_out);
-    CtmOutput { predictions, certainties, sync_out }
+    CtmOutput { predictions, certainties, sync_out, exit_lambdas, ticks_used }
 }
 
 // ─── Sync (random-pairing) ─────────────────────────────────

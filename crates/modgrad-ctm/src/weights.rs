@@ -46,6 +46,12 @@ pub struct CtmWeights {
 
     // ── Output projector ──
     pub output_proj: Linear,           // synch_out_size → out_dims
+
+    // ── Adaptive exit gate (LoopLM-style) ──
+    // Present iff exit_strategy is AdaptiveGate.
+    // sync_out → 1 → sigmoid → per-tick halting probability.
+    #[serde(default)]
+    pub exit_gate: Option<Linear>,     // synch_out_size → 1
 }
 
 impl CtmWeights {
@@ -111,6 +117,11 @@ impl CtmWeights {
             decay_params_out,
             decay_params_action,
             output_proj: Linear::new(config.synch_size_out(), config.out_dims),
+            exit_gate: if config.exit_strategy.has_gate() {
+                Some(Linear::new(config.synch_size_out(), 1))
+            } else {
+                None
+            },
             config,
         }
     }
@@ -141,6 +152,7 @@ impl CtmWeights {
         n += self.mha_out_proj.weight.len() + self.mha_out_proj.bias.len();
         n += self.decay_params_out.len() + self.decay_params_action.len();
         n += self.output_proj.weight.len() + self.output_proj.bias.len();
+        if let Some(ref g) = self.exit_gate { n += g.weight.len() + g.bias.len(); }
         n
     }
 }

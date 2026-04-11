@@ -1,0 +1,15 @@
+[package]
+name = "parity"
+version = "0.1.0"
+edition = "2024"
+description = "Parity benchmark for CTM — measures tick depth vs accuracy"
+
+[[bin]]
+name = "parity"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-persist = { path = "../../crates/modgrad-persist" }

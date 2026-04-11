@@ -8,5 +8,6 @@ license = "MIT"
 [dependencies]
 modgrad-compute = { path = "../modgrad-compute" }
 modgrad-persist = { path = "../modgrad-persist" }
+modgrad-traits = { path = "../modgrad-traits" }
 serde = { version = "1", features = ["derive"] }
 rayon = "1"

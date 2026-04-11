@@ -13,6 +13,8 @@ members = [
     "crates/modgrad-io",
     "isis/runtime",
     "examples/minictm",
+    "examples/parity",
+    "examples/mazes",
     "debugger",
     "extra/remu",
 ]

@@ -52,6 +52,53 @@ pub struct SeqInput {
     pub token_ids: Vec<u32>,
 }
 
+// ─── Encoder trait ─────────────────────────────────────────
+
+/// Converts raw sensory input into TokenInput for a Brain.
+///
+/// This is the composition point between modalities and architectures.
+/// The embedding table is an Encoder (token ID → vector).
+/// The visual retina is an Encoder (pixels → spatial tokens).
+/// A future audio encoder is an Encoder (waveform → spectral tokens).
+///
+/// All encoders produce the same type: TokenInput. The Brain doesn't
+/// know or care whether its input came from text, images, or audio.
+pub trait Encoder {
+    /// The raw input type this encoder consumes.
+    type Raw: ?Sized;
+
+    /// Convert raw input into token vectors for the Brain.
+    fn encode(&self, raw: &Self::Raw) -> TokenInput;
+
+    /// Output dimension per token.
+    fn token_dim(&self) -> usize;
+}
+
+/// Embedding table encoder: token ID → vector lookup.
+pub struct EmbeddingEncoder<'a> {
+    pub table: &'a [f32], // [vocab_size × dim]
+    pub dim: usize,
+}
+
+impl<'a> Encoder for EmbeddingEncoder<'a> {
+    type Raw = [usize]; // sequence of token IDs
+
+    fn encode(&self, raw: &[usize]) -> TokenInput {
+        let mut tokens = Vec::with_capacity(raw.len() * self.dim);
+        for &id in raw {
+            let offset = id * self.dim;
+            tokens.extend_from_slice(&self.table[offset..offset + self.dim]);
+        }
+        TokenInput {
+            n_tokens: raw.len(),
+            token_dim: self.dim,
+            tokens,
+        }
+    }
+
+    fn token_dim(&self) -> usize { self.dim }
+}
+
 // ─── Brain trait ────────────────────────────────────────────
 
 /// The core brain interface — a service from Input to BrainOutput.
@@ -373,6 +420,118 @@ impl LossFn for RewardLoss {
 
         let mut d_preds = vec![vec![0.0f32; out_dim]; k];
         d_preds[k - 1] = grad;
+        (loss, d_preds)
+    }
+}
+
+/// Route prediction loss: per-position CE on output reshaped as [route_len × n_classes].
+///
+/// The brain outputs a flat vector of `route_len * n_classes` logits.
+/// This loss reshapes it, computes CE at each position against the target
+/// direction, and uses an auto-curriculum: only train on the correct prefix
+/// + `lookahead` steps beyond it. This lets the model learn the route
+///   incrementally from start to finish.
+///
+/// Matches the Python CTM maze_loss with curriculum.
+pub struct RouteLoss {
+    /// Number of classes per position (e.g. 5 for Up/Down/Left/Right/Wait).
+    pub n_classes: usize,
+    /// How far past the correct prefix to train (curriculum lookahead).
+    pub lookahead: usize,
+}
+
+impl RouteLoss {
+    pub fn maze() -> Self {
+        Self { n_classes: 5, lookahead: 5 }
+    }
+}
+
+impl LossFn for RouteLoss {
+    type Target = [usize]; // direction per route step
+
+    fn compute(
+        &self,
+        predictions: &[Vec<f32>],
+        certainties: &[[f32; 2]],
+        target: &[usize],
+    ) -> (f32, Vec<Vec<f32>>) {
+        let k = predictions.len(); // number of ticks
+        if k == 0 { return (0.0, Vec::new()); }
+        let out_dim = predictions[0].len();
+        let route_len = target.len();
+        let nc = self.n_classes;
+        assert!(out_dim >= route_len * nc, "output dim {} < route_len {} × n_classes {}", out_dim, route_len, nc);
+
+        // Compute per-position CE loss at each tick
+        // losses[t][pos] = CE at position pos for tick t's prediction
+        let mut per_tick_pos_loss: Vec<Vec<f32>> = Vec::with_capacity(k);
+        let mut per_tick_pos_grad: Vec<Vec<Vec<f32>>> = Vec::with_capacity(k);
+
+        for pred in predictions {
+            let mut pos_losses = Vec::with_capacity(route_len);
+            let mut pos_grads = Vec::with_capacity(route_len);
+
+            for (pos, &tgt) in target.iter().enumerate() {
+                let offset = pos * nc;
+                let logits = &pred[offset..offset + nc];
+                let (loss, grad) = cross_entropy_grad(logits, tgt);
+                pos_losses.push(loss);
+                pos_grads.push(grad);
+            }
+            per_tick_pos_loss.push(pos_losses);
+            per_tick_pos_grad.push(pos_grads);
+        }
+
+        // Find the tick to use: min-loss tick and most-certain tick (CTM-style)
+        let tick_losses: Vec<f32> = (0..k).map(|t| {
+            per_tick_pos_loss[t].iter().sum::<f32>() / route_len as f32
+        }).collect();
+
+        let min_tick = (0..k).min_by(|&a, &b|
+            tick_losses[a].partial_cmp(&tick_losses[b]).unwrap()).unwrap_or(k - 1);
+        let cert_tick = if certainties.len() == k {
+            (0..k).max_by(|&a, &b|
+                certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()).unwrap_or(k - 1)
+        } else {
+            k - 1
+        };
+
+        // Auto-curriculum: find correct prefix at min_tick, train up to prefix + lookahead
+        let mut prefix_len = 0usize;
+        for (pos, &tgt) in target.iter().enumerate() {
+            let offset = pos * nc;
+            let logits = &predictions[min_tick][offset..offset + nc];
+            let pred_class = logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i).unwrap_or(0);
+            if pred_class == tgt && pos == prefix_len {
+                prefix_len += 1;
+            } else {
+                break;
+            }
+        }
+        let train_upto = (prefix_len + self.lookahead).min(route_len);
+
+        // Compute masked loss: only positions 0..train_upto contribute
+        let masked_loss = |t: usize| -> f32 {
+            per_tick_pos_loss[t][..train_upto].iter().sum::<f32>() / train_upto.max(1) as f32
+        };
+
+        let loss = (masked_loss(min_tick) + masked_loss(cert_tick)) / 2.0;
+
+        // Gradients: half from min_tick, half from cert_tick, masked by curriculum
+        let mut d_preds = vec![vec![0.0f32; out_dim]; k];
+
+        for &tick in &[min_tick, cert_tick] {
+            let scale = 0.5 / train_upto.max(1) as f32;
+            for (pos, grad) in per_tick_pos_grad[tick][..train_upto].iter().enumerate() {
+                let offset = pos * nc;
+                for (c, &g) in grad.iter().enumerate() {
+                    d_preds[tick][offset + c] += scale * g;
+                }
+            }
+        }
+
         (loss, d_preds)
     }
 }

@@ -2384,6 +2384,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mazes"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-persist",
+ "modgrad-training",
+ "modgrad-traits",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2507,6 +2519,7 @@ version = "0.1.0"
 dependencies = [
  "modgrad-compute",
  "modgrad-persist",
+ "modgrad-traits",
  "rayon",
  "serde",
 ]
@@ -3293,6 +3306,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "parity"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-persist",
+ "modgrad-training",
 ]
 
 [[package]]

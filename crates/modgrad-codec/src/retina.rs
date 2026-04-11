@@ -514,6 +514,20 @@ impl VisualRetina {
     /// For ImageNet-scale (224×224×3)
     pub fn imagenet() -> Self { Self::new(224, 224) }
 
+    /// For mazes and small grid-world images: preserves spatial resolution.
+    ///
+    /// Uses stride 1 on V2/V4 so spatial dimensions are not aggressively
+    /// reduced. A 39×39 maze → V1(stride 2): 20×20 → V2(stride 1): 20×20
+    /// → V4(stride 1): 20×20 = 400 spatial tokens of 128-dim.
+    /// An 11×11 maze → 6×6 = 36 tokens. Much better than 4 with all stride-2.
+    pub fn maze(h: usize, w: usize) -> Self {
+        let mut v1 = Conv2d::new(3, 32, 3, 2, 1); // stride 2: halve spatial
+        init_retinal_filters(&mut v1);
+        let v2 = Conv2d::new(32, 64, 3, 1, 1);    // stride 1: preserve spatial
+        let v4 = Conv2d::new(64, 128, 3, 1, 1);   // stride 1: preserve spatial
+        Self { v1, v2, v4, pool_dim: 128, input_h: h, input_w: w }
+    }
+
     /// Train the visual retina with Hebbian sparse coding.
     /// Each layer learns features from the previous layer's output,
     /// bottom-up: V1 trains on pixels, V2 on V1 features, V4 on V2 features.
@@ -577,6 +591,62 @@ impl VisualRetina {
 
         errors
     }
+}
+
+impl VisualRetina {
+    /// Output spatial feature tokens for attention-based processing.
+    ///
+    /// Instead of global avg pool → single vector, this returns the V4 feature
+    /// map as a sequence of spatial tokens: each (x,y) position becomes one token.
+    ///
+    /// Returns (tokens, n_tokens, token_dim) where:
+    ///   tokens: flattened [n_tokens × token_dim]
+    ///   n_tokens: h4 × w4 (spatial positions in V4 output)
+    ///   token_dim: V4 out_channels (128)
+    ///
+    /// This is the equivalent of ResNet backbone → flatten(2) → transpose(1,2)
+    /// in the Python CTM. The CTM attends over these spatial tokens.
+    pub fn spatial_tokens(&self, raw: &[f32]) -> (Vec<f32>, usize, usize) {
+        let h = self.input_h;
+        let w = self.input_w;
+
+        let (mut v1_out, h1, w1) = self.v1.forward(raw, h, w);
+        leaky_relu(&mut v1_out);
+
+        let (mut v2_out, h2, w2) = self.v2.forward(&v1_out, h1, w1);
+        leaky_relu(&mut v2_out);
+
+        let (mut v4_out, h4, w4) = self.v4.forward(&v2_out, h2, w2);
+        leaky_relu(&mut v4_out);
+
+        let channels = self.v4.out_channels; // 128
+        let n_tokens = h4 * w4;
+
+        // Transpose from CHW [channels × h4 × w4] to token sequence [n_tokens × channels]
+        // Each spatial position (y, x) becomes one token
+        let mut tokens = vec![0.0f32; n_tokens * channels];
+        for y in 0..h4 {
+            for x in 0..w4 {
+                let token_idx = y * w4 + x;
+                for c in 0..channels {
+                    tokens[token_idx * channels + c] = v4_out[c * h4 * w4 + y * w4 + x];
+                }
+            }
+        }
+
+        (tokens, n_tokens, channels)
+    }
+}
+
+impl modgrad_traits::Encoder for VisualRetina {
+    type Raw = [f32]; // pixels: [3 × H × W] flattened
+
+    fn encode(&self, raw: &[f32]) -> modgrad_traits::TokenInput {
+        let (tokens, n_tokens, token_dim) = self.spatial_tokens(raw);
+        modgrad_traits::TokenInput { tokens, n_tokens, token_dim }
+    }
+
+    fn token_dim(&self) -> usize { self.v4.out_channels }
 }
 
 impl Retina for VisualRetina {

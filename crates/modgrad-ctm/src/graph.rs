@@ -169,6 +169,10 @@ pub struct RegionalConfig {
     pub connections: Vec<Connection>,
     /// How many outer ticks to run.
     pub outer_ticks: usize,
+    /// How the outer tick loop decides when to stop.
+    /// Each region's inner ticks have their own exit_strategy independently.
+    #[serde(default)]
+    pub exit_strategy: crate::config::ExitStrategy,
     /// Global sync pair count (spans all regions).
     pub n_global_sync: usize,
     /// Final output dimension (vocab size, num classes, etc.).
@@ -243,6 +247,7 @@ impl RegionalConfig {
             region_names: names,
             connections,
             outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync,
             out_dims,
             raw_obs_dim: obs_dim,
@@ -277,6 +282,7 @@ impl RegionalConfig {
             region_names: names,
             connections,
             outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync: total_neurons.min(256),
             out_dims,
             raw_obs_dim: obs_dim,
@@ -325,6 +331,11 @@ pub struct RegionalWeights {
 
     /// Output projection: global_sync → next byte logits (head 0).
     pub output_proj: Linear,
+
+    /// Outer-level adaptive exit gate: global_sync → scalar → sigmoid.
+    /// Present iff exit_strategy is AdaptiveGate.
+    #[serde(default)]
+    pub outer_exit_gate: Option<Linear>,
 
     /// Multi-byte prediction heads (EvaByte-style): predict bytes 2..N ahead.
     /// Head i predicts byte at position current+i+2.
@@ -405,6 +416,13 @@ impl RegionalWeights {
         // Output projection (head 0: next byte)
         let output_proj = Linear::new(n_sync, config.out_dims);
 
+        // Outer-level adaptive exit gate
+        let outer_exit_gate = if config.exit_strategy.has_gate() {
+            Some(Linear::new(n_sync, 1))
+        } else {
+            None
+        };
+
         // Multi-byte prediction heads (heads 1..N: predict bytes 2..N+1 ahead)
         // Default: 7 extra heads (8 total, like EvaByte)
         let n_extra = 7;
@@ -448,6 +466,7 @@ impl RegionalWeights {
             global_sync_right,
             global_decay,
             output_proj,
+            outer_exit_gate,
             extra_heads,
             cereb_predict,
             bg_value,
@@ -469,6 +488,7 @@ impl RegionalWeights {
         n += self.obs_proj.weight.len() + self.obs_proj.bias.len();
         n += self.global_decay.len();
         n += self.output_proj.weight.len() + self.output_proj.bias.len();
+        if let Some(ref g) = self.outer_exit_gate { n += g.weight.len() + g.bias.len(); }
         for h in &self.extra_heads { n += h.weight.len() + h.bias.len(); }
         n
     }
@@ -530,6 +550,10 @@ pub struct RegionalOutput {
     pub global_sync: Vec<f32>,
     /// Per-region activated states (for telemetry/debugging).
     pub region_activations: Vec<Vec<f32>>,
+    /// Outer-level exit lambdas (empty when exit gate is off).
+    pub exit_lambdas: Vec<f32>,
+    /// How many outer ticks actually ran (may be < outer_ticks if early exit).
+    pub ticks_used: usize,
 }
 
 /// Run the regional CTM forward pass.
@@ -544,6 +568,9 @@ pub fn regional_forward(
     let cfg = &w.config;
     let n_regions = cfg.regions.len();
     let mut predictions = Vec::with_capacity(cfg.outer_ticks);
+    let mut exit_lambdas: Vec<f32> = Vec::new();
+    let mut exit_cdf = 0.0f32;
+    let mut survival = 1.0f32;
 
     // Project raw observation
     let obs_projected = w.obs_proj.forward(observation);
@@ -610,16 +637,35 @@ pub fn regional_forward(
         // Phase 4: Output prediction
         let prediction = w.output_proj.forward(&global_sync);
         predictions.push(prediction);
+
+        // Phase 5: Exit decision
+        match &cfg.exit_strategy {
+            crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
+                if let Some(ref gate) = w.outer_exit_gate {
+                    let gate_logit = gate.forward(&global_sync);
+                    let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+                    exit_lambdas.push(lambda);
+                    let p_exit = lambda * survival;
+                    exit_cdf += p_exit;
+                    survival *= 1.0 - lambda;
+                    if exit_cdf > *threshold { break; }
+                }
+            }
+            _ => {}
+        }
     }
 
     let global_sync: Vec<f32> = (0..cfg.n_global_sync)
         .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
         .collect();
 
+    let ticks_used = predictions.len();
     RegionalOutput {
         predictions,
         global_sync,
         region_activations: state.region_outputs.clone(),
+        exit_lambdas,
+        ticks_used,
     }
 }
 
@@ -640,6 +686,10 @@ struct OuterTickCache {
     global_beta: Vec<f32>,
     /// Connection synapse inputs (for synapse backward).
     connection_inputs: Vec<Vec<f32>>,
+    /// Outer exit gate: cached forward for proper backward. None when gate is off.
+    exit_gate_cache: Option<crate::train::LinearCache>,
+    /// Outer exit gate lambda (0.0 when gate is off).
+    exit_lambda: f32,
 }
 
 /// Gradients for the entire RegionalCtm.
@@ -659,6 +709,9 @@ pub struct RegionalGradients {
     /// Output projection gradients.
     pub output_proj_dw: Vec<f32>,
     pub output_proj_db: Vec<f32>,
+    /// Outer exit gate gradients.
+    pub outer_exit_gate_dw: Option<Vec<f32>>,
+    pub outer_exit_gate_db: Option<Vec<f32>>,
 }
 
 impl RegionalGradients {
@@ -677,6 +730,8 @@ impl RegionalGradients {
             global_decay_grad: vec![0.0; w.global_decay.len()],
             output_proj_dw: vec![0.0; w.output_proj.weight.len()],
             output_proj_db: vec![0.0; w.output_proj.bias.len()],
+            outer_exit_gate_dw: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.weight.len()]),
+            outer_exit_gate_db: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.bias.len()]),
         }
     }
 
@@ -691,6 +746,8 @@ impl RegionalGradients {
         self.global_decay_grad.fill(0.0);
         self.output_proj_dw.fill(0.0);
         self.output_proj_db.fill(0.0);
+        if let Some(w) = &mut self.outer_exit_gate_dw { w.fill(0.0); }
+        if let Some(b) = &mut self.outer_exit_gate_db { b.fill(0.0); }
     }
 
     /// Apply gradients with SGD + gradient clipping (for tests / simple usage).
@@ -730,6 +787,12 @@ impl RegionalGradients {
         sgd(&mut w.output_proj.weight, &self.output_proj_dw, lr);
         sgd(&mut w.output_proj.bias, &self.output_proj_db, lr);
         sgd(&mut w.global_decay, &self.global_decay_grad, lr);
+        if let Some(gate) = &mut w.outer_exit_gate {
+            if let (Some(gw), Some(gb)) = (&self.outer_exit_gate_dw, &self.outer_exit_gate_db) {
+                sgd(&mut gate.weight, gw, lr);
+                sgd(&mut gate.bias, gb, lr);
+            }
+        }
     }
 
 }
@@ -985,6 +1048,15 @@ pub fn regional_train_step(
             .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
             .collect();
 
+        // Outer exit gate
+        let (exit_gate_cache, exit_lambda) = if let Some(ref gate) = w.outer_exit_gate {
+            let (logit, cache) = crate::train::linear_forward_cached(gate, &global_sync);
+            let lambda = 1.0 / (1.0 + (-logit[0]).exp());
+            (Some(cache), lambda)
+        } else {
+            (None, 0.0)
+        };
+
         tick_caches.push(OuterTickCache {
             region_obs,
             region_activated: state.region_outputs.clone(),
@@ -993,10 +1065,12 @@ pub fn regional_train_step(
             global_sync: global_sync.clone(),
             global_beta: state.global_beta.clone(),
             connection_inputs,
+            exit_gate_cache,
+            exit_lambda,
         });
     }
 
-    // ── CTM loss: (min_tick_CE + most_certain_tick_CE) / 2 ──
+    // ── Loss: adaptive exit or legacy CTM ──
     let n_ticks = tick_caches.len();
     let predictions: Vec<Vec<f32>> = tick_caches.iter()
         .map(|tc| w.output_proj.forward(&tc.global_sync))
@@ -1004,7 +1078,27 @@ pub fn regional_train_step(
     let pred_class = predictions.last().unwrap().iter().enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i).unwrap_or(0);
-    let (loss, d_per_tick) = ctm_loss_regional(&predictions, target);
+
+    let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
+        let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+        let beta = cfg.exit_strategy.beta();
+        let (loss, d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
+            &predictions, &lambdas, target, beta);
+
+        // Backward through outer exit gate (detached from main BPTT)
+        for (t, d_lambda) in d_lambdas.iter().enumerate() {
+            if let Some(ref cache) = tick_caches[t].exit_gate_cache {
+                let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                let _d_sync = crate::train::linear_backward(
+                    gate, &[*d_lambda], cache, gw, gb);
+            }
+        }
+
+        (loss, d_preds)
+    } else {
+        ctm_loss_regional(&predictions, target)
+    };
 
     // ── Backward through ALL outer ticks ──
     let add = |d: &mut [f32], s: &[f32]| {
@@ -1205,6 +1299,15 @@ pub fn regional_train_step_full(
             .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
             .collect();
 
+        // Outer exit gate
+        let (exit_gate_cache, exit_lambda) = if let Some(ref gate) = w.outer_exit_gate {
+            let (logit, cache) = crate::train::linear_forward_cached(gate, &global_sync);
+            let lambda = 1.0 / (1.0 + (-logit[0]).exp());
+            (Some(cache), lambda)
+        } else {
+            (None, 0.0)
+        };
+
         tick_caches.push(OuterTickCache {
             region_obs,
             region_activated: state.region_outputs.clone(),
@@ -1213,17 +1316,36 @@ pub fn regional_train_step_full(
             global_sync: global_sync.clone(),
             global_beta: state.global_beta.clone(),
             connection_inputs,
+            exit_gate_cache,
+            exit_lambda,
         });
     }
 
-    // ── CTM loss ──
+    // ── Loss ──
     let predictions: Vec<Vec<f32>> = tick_caches.iter()
         .map(|tc| w.output_proj.forward(&tc.global_sync))
         .collect();
     let pred_class = predictions.last().unwrap().iter().enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i).unwrap_or(0);
-    let (loss, d_per_tick) = ctm_loss_regional(&predictions, target);
+
+    let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
+        let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+        let beta = cfg.exit_strategy.beta();
+        let (loss, d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
+            &predictions, &lambdas, target, beta);
+        for (t, d_lambda) in d_lambdas.iter().enumerate() {
+            if let Some(ref cache) = tick_caches[t].exit_gate_cache {
+                let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                let _d_sync = crate::train::linear_backward(
+                    gate, &[*d_lambda], cache, gw, gb);
+            }
+        }
+        (loss, d_preds)
+    } else {
+        ctm_loss_regional(&predictions, target)
+    };
 
     // ── Backward ── (same as regional_train_step, but accumulates d_observation)
     let add = |d: &mut [f32], s: &[f32]| {

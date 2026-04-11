@@ -1,0 +1,17 @@
+[package]
+name = "mazes"
+version = "0.1.0"
+edition = "2024"
+description = "Maze solving benchmark for CTM — visual reasoning with spatial attention"
+
+[[bin]]
+name = "mazes"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-persist = { path = "../../crates/modgrad-persist" }
+modgrad-codec = { path = "../../crates/modgrad-codec" }
+modgrad-traits = { path = "../../crates/modgrad-traits" }

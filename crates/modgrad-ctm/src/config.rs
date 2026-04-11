@@ -34,18 +34,63 @@ pub struct CtmConfig {
     pub n_random_pairing_self: usize,
     /// U-Net minimum bottleneck width.
     pub min_width: usize,
-    /// Enable certainty-based early exit (variable thinking length).
-    /// When true, the tick loop exits early if certainty exceeds threshold.
-    /// The brain decides when it's confident enough to stop thinking.
+    /// How the tick loop decides when to stop thinking.
     #[serde(default)]
-    pub early_exit: bool,
-    /// Certainty threshold for early exit (0.0 to 1.0).
-    /// Higher = more thinking before stopping. 0.95 = stop when 95% certain.
-    #[serde(default = "default_certainty_threshold")]
-    pub certainty_threshold: f32,
+    pub exit_strategy: ExitStrategy,
 }
 
-fn default_certainty_threshold() -> f32 { 0.95 }
+/// Tick-loop exit strategy. Exactly one mechanism — no overlap, no ambiguity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ExitStrategy {
+    /// Run all ticks unconditionally.
+    None,
+    /// Stop when entropy-derived certainty exceeds a fixed threshold.
+    Certainty {
+        /// 0.0–1.0. Higher = more thinking. Default 0.95.
+        threshold: f32,
+    },
+    /// Learned exit gate (Ouro/LoopLM-style).
+    /// A Linear(sync_out → 1 → sigmoid) produces per-tick halting probability.
+    /// Training uses entropy-regularized weighted loss across all ticks.
+    /// Inference exits when cumulative exit probability exceeds `threshold`.
+    AdaptiveGate {
+        /// KL coefficient (β). Larger = more exploration across tick depths.
+        /// Ouro uses 0.1 early, 0.05 later.
+        beta: f32,
+        /// CDF threshold for inference early-exit. 0.5 = exit when majority
+        /// probability reached. 0.9 = keep going unless very confident.
+        threshold: f32,
+    },
+}
+
+impl Default for ExitStrategy {
+    fn default() -> Self { ExitStrategy::None }
+}
+
+impl ExitStrategy {
+    /// Whether a learned exit gate should be allocated in weights.
+    pub fn has_gate(&self) -> bool {
+        matches!(self, ExitStrategy::AdaptiveGate { .. })
+    }
+
+    /// Beta coefficient, if adaptive.
+    pub fn beta(&self) -> f32 {
+        match self {
+            ExitStrategy::AdaptiveGate { beta, .. } => *beta,
+            _ => 0.0,
+        }
+    }
+
+    /// Inference exit threshold, if any exit strategy is active.
+    pub fn threshold(&self) -> Option<f32> {
+        match self {
+            ExitStrategy::None => Option::None,
+            ExitStrategy::Certainty { threshold } => Some(*threshold),
+            ExitStrategy::AdaptiveGate { threshold, .. } => Some(*threshold),
+        }
+    }
+}
 
 impl Default for CtmConfig {
     fn default() -> Self {
@@ -63,8 +108,7 @@ impl Default for CtmConfig {
             out_dims: 10,
             n_random_pairing_self: 0,
             min_width: 16,
-            early_exit: false,
-            certainty_threshold: 0.95,
+            exit_strategy: ExitStrategy::None,
         }
     }
 }
@@ -96,6 +140,7 @@ impl CtmConfig {
         memory_length: usize,
         deep_nlms: bool,
         iterations: usize,
+        exit_strategy: ExitStrategy,
     ) -> Self {
         let synapse_depth = if d_model >= 32 { 3 } else { 1 };
         let min_width = (d_model / 4).max(4);
@@ -117,50 +162,64 @@ impl CtmConfig {
             out_dims: d_model, // region output = activated state
             n_random_pairing_self: 0,
             min_width,
-            early_exit: false,
-            certainty_threshold: 0.95,
+            exit_strategy,
         }
     }
 
     // ─── Preset region configs ─────────────────────────────────
+    //
+    // Per-region beta values (from Jones × Darlow analysis):
+    //   Peripheral (input, cerebellum, insula, motor): beta=0.05 — fast, exit early
+    //   Deliberative (attention, output, basal ganglia): beta=0.1 — needs iteration
+    //   Memory (hippocampus): beta=0.15 — longest deliberation, memory-dependent
+    //
+    // All thresholds set to 0.99 — never exit early during inference until validated.
 
-    /// Input region: wide, shallow NLM, short memory, fast.
+    /// Input region: wide, shallow NLM, short memory, fast. (β=0.05)
     pub fn input_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("input", 64, d_input, 4, false, ticks)
+        Self::region("input", 64, d_input, 4, false, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 })
     }
 
-    /// Attention region: medium, deep NLM, longer memory.
+    /// Attention region: medium, deep NLM, longer memory. (β=0.1)
     pub fn attention_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("attention", 64, d_input, 8, true, ticks)
+        Self::region("attention", 64, d_input, 8, true, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 })
     }
 
-    /// Output region: medium, deep NLM, longest memory (evidence accumulation).
+    /// Output region: medium, deep NLM, longest memory (evidence accumulation). (β=0.1)
     pub fn output_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("output", 64, d_input, 16, true, ticks)
+        Self::region("output", 64, d_input, 16, true, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 })
     }
 
-    /// Motor region: small, shallow, short memory, decisive.
+    /// Motor region: small, shallow, short memory, decisive. (β=0.05)
     pub fn motor_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("motor", 64, d_input, 4, false, ticks)
+        Self::region("motor", 64, d_input, 4, false, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 })
     }
 
-    /// Cerebellum: tiny, fast forward model.
+    /// Cerebellum: tiny, fast forward model. (β=0.05)
     pub fn cerebellum_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("cerebellum", 8, d_input, 4, false, ticks)
+        Self::region("cerebellum", 8, d_input, 4, false, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 })
     }
 
-    /// Basal ganglia: tiny, action selection.
+    /// Basal ganglia: tiny, action selection. (β=0.1)
     pub fn basal_ganglia_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("basal_ganglia", 8, d_input, 8, false, ticks)
+        Self::region("basal_ganglia", 8, d_input, 8, false, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 })
     }
 
-    /// Insula: tiny, interoceptive state.
+    /// Insula: tiny, interoceptive state. (β=0.05)
     pub fn insula_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("insula", 8, d_input, 4, false, ticks)
+        Self::region("insula", 8, d_input, 4, false, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 })
     }
 
-    /// Hippocampus: tiny but deep NLM, long memory for pattern completion.
+    /// Hippocampus: tiny but deep NLM, long memory for pattern completion. (β=0.15)
     pub fn hippocampus_region(d_input: usize, ticks: usize) -> Self {
-        Self::region("hippocampus", 8, d_input, 16, true, ticks)
+        Self::region("hippocampus", 8, d_input, 16, true, ticks,
+            ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 })
     }
 }
