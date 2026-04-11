@@ -22,6 +22,7 @@ pub const PACKET3_ACQUIRE_MEM: u32 = 0x58;
 pub const PACKET3_RELEASE_MEM: u32 = 0x49;
 pub const PACKET3_WAIT_REG_MEM: u32 = 0x3C;
 pub const PACKET3_EVENT_WRITE: u32 = 0x46;
+pub const PACKET3_WRITE_DATA: u32 = 0x37;
 
 // SET_SH_REG base for GFX11
 pub const SH_REG_BASE: u32 = 0x2C00;
@@ -209,7 +210,7 @@ impl ComputeQueue {
     }
 
     /// Write a PM4 type 3 packet.
-    fn pkt3(&mut self, opcode: u32, vals: &[u32]) {
+    pub fn pkt3(&mut self, opcode: u32, vals: &[u32]) {
         self.check_ring_space(1 + vals.len() as u64);
         self.q(pkt3(opcode, vals.len() as u32));
         for &v in vals {
@@ -238,34 +239,37 @@ impl ComputeQueue {
         ]);
     }
 
-    /// Write a completion signal + send interrupt to KFD.
-    /// Must send TWO RELEASE_MEM packets (matching tinygrad):
-    ///   1. Write signal value to signal_addr (with cache flush)
-    ///   2. Write event_id to event mailbox (interrupt notification)
-    /// Without the second packet, MES hangs on queue destruction.
+    /// Flush GPU L2 cache to VRAM so CPU can read kernel output.
+    /// Must be called after dispatch, before CPU readback.
+    pub fn cache_wb(&mut self) {
+        self.pkt3(PACKET3_ACQUIRE_MEM, &[
+            0,          // CP_COHER_CNTL
+            0xFFFFFFFF, // COHER_SIZE lo
+            0xFFFFFFFF, // COHER_SIZE hi
+            0,          // COHER_BASE lo
+            0,          // COHER_BASE hi
+            0,          // POLL_INTERVAL
+            // GCR_CNTL: GL2_WB(15) | GL2_INV(14) | GLV_INV(9) | GLM_WB(4) | GLM_INV(5)
+            // + GL1 invalidate bits [6:8]
+            0x0000C3F0,
+        ]);
+    }
+
+    /// Write a completion signal via WRITE_DATA.
+    ///
+    /// On GFX11 MES-managed compute queues, RELEASE_MEM with interrupt causes
+    /// the MES to deschedule the queue, preventing subsequent submits from
+    /// being processed. We avoid RELEASE_MEM entirely and use WRITE_DATA
+    /// (direct CP memory write) + spin-polling for completion.
     pub fn signal(&mut self, signal_addr: u64, signal_value: u32,
-                  event_mailbox_ptr: u64, event_id: u32) {
-        // Packet 1: write signal value WITH cache flush, NO interrupt
-        self.pkt3(PACKET3_RELEASE_MEM, &[
-            0x0070f514, // event_type=20, event_index=5, GCR cache flush
-            0x20000000, // data_sel=1(32bit), int_sel=0(none)
+                  _event_mailbox_ptr: u64, _event_id: u32) {
+        // WRITE_DATA: direct memory write from CP ME.
+        // DST_SEL=5 (memory async), WR_CONFIRM=1 (wait for write completion)
+        self.pkt3(PACKET3_WRITE_DATA, &[
+            (5 << 8) | (1 << 20), // dst_sel=5, wr_confirm=1
             signal_addr as u32,
             (signal_addr >> 32) as u32,
             signal_value,
-            0,
-            0,
-        ]);
-
-        // Packet 2: cache flush + event mailbox + interrupt
-        // by the time this executes, packet 1's signal write is done
-        self.pkt3(PACKET3_RELEASE_MEM, &[
-            0x0070f514, // event_type=20, event_index=5, GCR cache flush
-            0x22000000, // data_sel=1(32bit), int_sel=2(interrupt after write)
-            event_mailbox_ptr as u32,
-            (event_mailbox_ptr >> 32) as u32,
-            event_id,
-            0,
-            event_id, // ctxid = event_id
         ]);
     }
 

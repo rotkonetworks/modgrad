@@ -89,7 +89,7 @@ impl Linear {
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         // Try GPU for large matrices: KFD (AMD) → CUDA (NVIDIA) → Vulkan → CPU
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 50_000
+            && self.in_dim * self.out_dim >= 10_000_000
         {
             let mut y = vec![0.0f32; self.out_dim];
             if modgrad_device::kfd::accel::try_matvec(

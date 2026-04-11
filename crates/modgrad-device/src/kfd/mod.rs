@@ -361,8 +361,10 @@ impl HsaDevice {
         // Scratch buffer for compute dispatch (2MB, VRAM)
         let scratch = alloc.alloc_vram(2 * 1024 * 1024)?;
 
-        // Signal buffer must be GPU-writable (flags 0xF0000004 matching tinygrad)
-        let signal = alloc.alloc_userptr_public(4096)?;
+        // Signal buffer: GPU writes via WRITE_DATA, CPU reads via volatile.
+        // GTT+COHERENT+UNCACHED — system memory, immediately visible to CPU.
+        // WRITE_DATA (not RELEASE_MEM) for the data write, RELEASE_MEM for interrupt only.
+        let signal = alloc.alloc_gtt(4096)?;
         signal.write(0, &[0u8; 8]);
 
         // load compiled gpu kernels (raw asm)
@@ -401,7 +403,7 @@ impl HsaDevice {
             eprintln!("    gpu clocks: auto (no sysfs write access)");
         }
 
-        Ok(HsaDevice {
+        let mut dev = HsaDevice {
             kfd_fd,
             drm_fd,
             cpu,
@@ -422,7 +424,20 @@ impl HsaDevice {
                 kfd_fd, drm_fd,
                 sysfs_device: if clocks_locked { Some(sysfs_device) } else { None },
             },
-        })
+        };
+
+        // Smoke-test: verify signal mechanism works
+        dev.signal_value = 0;
+        unsafe { (dev.signal.cpu_ptr as *mut u32).write_volatile(0); }
+        dev.signal_value += 1;
+        dev.queue.signal(dev.signal.va_addr, dev.signal_value,
+            dev.queue_event_mailbox_ptr, dev.queue_event_id);
+        dev.queue.submit();
+        if !dev.wait_gpu(1000) {
+            eprintln!("    GPU signal: FAIL");
+        }
+
+        Ok(dev)
     }
 
     /// Allocate a VRAM buffer and upload f32 data.
@@ -480,6 +495,7 @@ impl HsaDevice {
             grid, block,
             entry.desc.group_segment_size,
         );
+        self.queue.cache_wb();
         self.queue.signal(self.signal.va_addr, self.signal_value,
             self.queue_event_mailbox_ptr, self.queue_event_id);
         self.queue.submit();
@@ -506,10 +522,12 @@ impl HsaDevice {
         true
     }
 
-    /// Signal + submit + wait via kfd event interrupt.
+    /// Cache flush + signal + submit + wait.
     /// Call after dispatch_enqueue batch. Blocks until all dispatches complete.
+    /// Flushes GPU L2 cache to VRAM so CPU can read results.
     pub fn submit_wait(&mut self, timeout_ms: u32) -> bool {
         self.signal_value += 1;
+        self.queue.cache_wb();
         self.queue.signal(self.signal.va_addr, self.signal_value,
             self.queue_event_mailbox_ptr, self.queue_event_id);
         self.queue.submit();
@@ -519,46 +537,22 @@ impl HsaDevice {
     /// Submit all queued packets and return a future for the last signal.
     pub fn submit(&mut self) -> compute::GpuFuture {
         self.signal_value += 1;
+        self.queue.cache_wb();
         self.queue.signal(self.signal.va_addr, self.signal_value,
             self.queue_event_mailbox_ptr, self.queue_event_id);
         self.queue.submit();
         compute::GpuFuture::new(&self.signal, self.signal_value)
     }
 
-    /// Wait for the last signal via kfd event interrupt.
-    /// The GPU's RELEASE_MEM packet fires an interrupt when the signal
-    /// is written. The kfd driver wakes us — zero PCIe round-trips.
+    /// Wait for the last signal via spin-polling.
+    ///
+    /// WRITE_DATA sets the signal value in GTT memory (coherent+uncached).
+    /// We spin-poll with backoff until the value appears. This avoids
+    /// RELEASE_MEM which causes MES queue descheduling on GFX11.
     pub fn wait_gpu(&mut self, timeout_ms: u32) -> bool {
-        // fast path: check if already done (single volatile read)
         let sig_ptr = self.signal.cpu_ptr as *const u32;
-        let val = unsafe { sig_ptr.read_volatile() };
-        if val >= self.signal_value { return true; }
-
-        let mut event = ioctl::EventData::default();
-        event.event_id = self.queue_event_id;
-        match ioctl::wait_events(self.kfd_fd, &mut [event], false, timeout_ms) {
-            Ok(_) => {
-                let v = unsafe { sig_ptr.read_volatile() };
-                if v < self.signal_value {
-                    // event fired but signal not ready — brief spin
-                    for _ in 0..10_000_000 {
-                        let v2 = unsafe { sig_ptr.read_volatile() };
-                        if v2 >= self.signal_value { return true; }
-                        std::hint::spin_loop();
-                    }
-                    let v3 = unsafe { sig_ptr.read_volatile() };
-                    eprintln!("wait_gpu: event ok but signal={} < {}", v3, self.signal_value);
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(e) => {
-                let val = unsafe { sig_ptr.read_volatile() };
-                eprintln!("wait_gpu: err={} signal={} expected={}", e, val, self.signal_value);
-                val >= self.signal_value
-            }
-        }
+        ComputeQueue::poll_signal(sig_ptr, self.signal_value,
+            timeout_ms as u64 * 1000)
     }
 
     /// dispatch a kernel by name and wait for completion (blocking).
@@ -584,6 +578,7 @@ impl HsaDevice {
             grid, block,
             entry.desc.group_segment_size,
         );
+        self.queue.cache_wb();
         self.queue.signal(self.signal.va_addr, self.signal_value,
             self.queue_event_mailbox_ptr, self.queue_event_id);
 

@@ -20,7 +20,11 @@
 .type matvec, @function
 matvec:
     // s[0:1] = kernarg pointer
-    // v0 = workitem id
+    // s2 = workgroup_id_x (system SGPR, from TGID_X_EN in rsrc2)
+    // v0 = local workitem id (0..block_size-1)
+
+    // save workgroup id before kernarg loads overwrite s2
+    s_mov_b32 s20, s2
 
     // load all kernargs
     s_load_b64   s[2:3],   s[0:1], 0x00    // W ptr
@@ -29,6 +33,12 @@ matvec:
     s_load_b64   s[8:9],   s[0:1], 0x18    // y ptr
     s_load_b64   s[10:11], s[0:1], 0x20    // out_dim(lo) | in_dim(hi)
     s_waitcnt    lgkmcnt(0)
+
+    // compute global thread id: row = wg_id * block_size + local_id
+    // block_size is in COMPUTE_NUM_THREAD_X (set by dispatch), but we
+    // know it's 256 from the dispatch call. Use s_lshl for *256.
+    s_lshl_b32 s21, s20, 8              // s21 = wg_id * 256
+    v_add_nc_u32 v0, s21, v0            // v0 = global_id = wg_id*256 + local_id
 
     // s10 = out_dim, s11 = in_dim (loaded as b64 from offset 0x20)
     // bounds check: if v0 >= out_dim, skip
@@ -104,11 +114,12 @@ matvec:
     .amdhsa_kernarg_size 40
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_next_free_vgpr 20
-    .amdhsa_next_free_sgpr 15
+    .amdhsa_next_free_sgpr 22
     .amdhsa_float_denorm_mode_32 3
     .amdhsa_float_denorm_mode_16_64 3
     .amdhsa_wavefront_size32 1
     .amdhsa_system_vgpr_workitem_id 0
+    .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_ieee_mode 1
 .end_amdhsa_kernel
 
@@ -124,7 +135,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .wavefront_size:  32
-    .sgpr_count:      15
+    .sgpr_count:      22
     .vgpr_count:      20
     .max_flat_workgroup_size: 256
     .args:
