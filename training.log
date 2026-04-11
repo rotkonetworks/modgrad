@@ -1,0 +1,125 @@
+  + /steam/rotko/VisualPlanning/dataset/maze/tokenized_dataset/SFT/train_dataset.jsonl (14459 token pairs)
+Data: 7403008 tokens, vocab: 8192
+RegionalCtm: 8 regions, 8 connections
+  input: d_model=64, d_input=32, memory=4, params=25105
+  attention: d_model=64, d_input=32, memory=8, params=29969
+  output: d_model=64, d_input=32, memory=16, params=43793
+  motor: d_model=64, d_input=32, memory=4, params=25105
+  cerebellum: d_model=8, d_input=32, memory=4, params=6193
+  basal_ganglia: d_model=8, d_input=32, memory=8, params=6289
+  insula: d_model=8, d_input=32, memory=4, params=6193
+  hippocampus: d_model=8, d_input=32, memory=16, params=8529
+  global_sync: 256 pairs
+  vocab: 8192
+  prediction heads: 8 (1 + 7 extra)
+  total params: 17280681
+
+Learning... (Ctrl+C to save and stop)
+
+step    100 | loss 8.715 | acc 0.2% | 3200 tokens | data 0%
+step    200 | loss 8.192 | acc 0.4% | 6400 tokens | data 0%
+step    300 | loss 7.789 | acc 0.4% | 9600 tokens | data 0%
+step    400 | loss 7.442 | acc 0.7% | 12800 tokens | data 0%
+step    500 | loss 7.049 | acc 1.1% | 16000 tokens | data 0%
+step    600 | loss 6.786 | acc 1.5% | 19200 tokens | data 0%
+step    700 | loss 6.501 | acc 2.4% | 22400 tokens | data 0%
+step    800 | loss 6.482 | acc 3.5% | 25600 tokens | data 0%
+step    900 | loss 6.538 | acc 3.5% | 28800 tokens | data 0%
+step   1000 | loss 6.711 | acc 1.8% | 32000 tokens | data 0%
+step   1100 | loss 6.725 | acc 2.4% | 35200 tokens | data 0%
+step   1200 | loss 6.749 | acc 4.1% | 38400 tokens | data 1%
+step   1300 | loss 6.959 | acc 3.2% | 41600 tokens | data 1%
+step   1400 | loss 6.787 | acc 3.9% | 44800 tokens | data 1%
+step   1500 | loss 6.954 | acc 3.4% | 48000 tokens | data 1%
+step   1600 | loss 6.784 | acc 5.1% | 51200 tokens | data 1%
+step   1700 | loss 6.986 | acc 4.9% | 54400 tokens | data 1%
+step   1800 | loss 6.756 | acc 6.3% | 57600 tokens | data 1%
+step   1900 | loss 7.059 | acc 3.9% | 60800 tokens | data 1%
+step   2000 | loss 7.007 | acc 4.1% | 64000 tokens | data 1%
+step   2100 | loss 6.775 | acc 6.4% | 67200 tokens | data 1%
+step   2200 | loss 6.998 | acc 7.3% | 70400 tokens | data 1%
+step   2300 | loss 6.741 | acc 7.2% | 73600 tokens | data 1%
+step   2400 | loss 6.909 | acc 5.3% | 76800 tokens | data 1%
+step   2500 | loss 6.925 | acc 5.0% | 80000 tokens | data 1%
+step   2600 | loss 6.877 | acc 3.1% | 83200 tokens | data 1%
+step   2700 | loss 6.908 | acc 3.0% | 86400 tokens | data 1%
+step   2800 | loss 6.762 | acc 7.8% | 89600 tokens | data 1%
+step   2900 | loss 6.870 | acc 3.5% | 92800 tokens | data 1%
+step   3000 | loss 6.835 | acc 3.5% | 96000 tokens | data 1%
+step   3100 | loss 6.871 | acc 2.4% | 99200 tokens | data 1%
+step   3200 | loss 6.852 | acc 4.3% | 102400 tokens | data 1%
+step   3300 | loss 6.770 | acc 5.3% | 105600 tokens | data 1%
+step   3400 | loss 6.839 | acc 4.5% | 108800 tokens | data 1%
+step   3500 | loss 6.988 | acc 2.4% | 112000 tokens | data 2%
+step   3600 | loss 6.890 | acc 2.6% | 115200 tokens | data 2%
+step   3700 | loss 6.733 | acc 4.8% | 118400 tokens | data 2%
+step   3800 | loss 6.684 | acc 5.6% | 121600 tokens | data 2%
+step   3900 | loss 6.840 | acc 4.7% | 124800 tokens | data 2%
+step   4000 | loss 6.895 | acc 4.8% | 128000 tokens | data 2%
+step   4100 | loss 6.663 | acc 7.0% | 131200 tokens | data 2%
+step   4200 | loss 6.693 | acc 6.6% | 134400 tokens | data 2%
+step   4300 | loss 6.794 | acc 5.3% | 137600 tokens | data 2%
+step   4400 | loss 6.789 | acc 5.5% | 140800 tokens | data 2%
+step   4500 | loss 6.728 | acc 3.0% | 144000 tokens | data 2%
+step   4600 | loss 6.612 | acc 4.4% | 147200 tokens | data 2%
+step   4700 | loss 6.918 | acc 5.5% | 150400 tokens | data 2%
+step   4800 | loss 6.659 | acc 3.8% | 153600 tokens | data 2%
+step   4900 | loss 6.556 | acc 7.0% | 156800 tokens | data 2%
+step   5000 | loss 6.888 | acc 5.1% | 160000 tokens | data 2%
+  [saved]
+step   5100 | loss 6.682 | acc 4.6% | 163200 tokens | data 2%
+step   5200 | loss 6.672 | acc 6.9% | 166400 tokens | data 2%
+step   5300 | loss 6.659 | acc 5.0% | 169600 tokens | data 2%
+step   5400 | loss 6.582 | acc 2.7% | 172800 tokens | data 2%
+step   5500 | loss 6.700 | acc 6.8% | 176000 tokens | data 2%
+step   5600 | loss 6.829 | acc 3.5% | 179200 tokens | data 2%
+step   5700 | loss 6.768 | acc 6.8% | 182400 tokens | data 2%
+step   5800 | loss 6.421 | acc 5.4% | 185600 tokens | data 3%
+step   5900 | loss 6.684 | acc 3.8% | 188800 tokens | data 3%
+step   6000 | loss 6.555 | acc 3.6% | 192000 tokens | data 3%
+step   6100 | loss 6.423 | acc 4.4% | 195200 tokens | data 3%
+step   6200 | loss 6.643 | acc 6.5% | 198400 tokens | data 3%
+step   6300 | loss 6.826 | acc 4.4% | 201600 tokens | data 3%
+step   6400 | loss 6.791 | acc 4.3% | 204800 tokens | data 3%
+step   6500 | loss 6.527 | acc 4.5% | 208000 tokens | data 3%
+step   6600 | loss 6.636 | acc 4.5% | 211200 tokens | data 3%
+step   6700 | loss 6.650 | acc 3.2% | 214400 tokens | data 3%
+step   6800 | loss 6.794 | acc 4.1% | 217600 tokens | data 3%
+step   6900 | loss 6.720 | acc 5.3% | 220800 tokens | data 3%
+step   7000 | loss 6.618 | acc 3.4% | 224000 tokens | data 3%
+step   7100 | loss 6.620 | acc 5.7% | 227200 tokens | data 3%
+step   7200 | loss 6.632 | acc 5.4% | 230400 tokens | data 3%
+step   7300 | loss 6.804 | acc 6.0% | 233600 tokens | data 3%
+step   7400 | loss 6.485 | acc 6.5% | 236800 tokens | data 3%
+step   7500 | loss 6.688 | acc 2.2% | 240000 tokens | data 3%
+step   7600 | loss 6.582 | acc 3.3% | 243200 tokens | data 3%
+step   7700 | loss 6.675 | acc 7.3% | 246400 tokens | data 3%
+step   7800 | loss 6.551 | acc 4.2% | 249600 tokens | data 3%
+step   7900 | loss 6.548 | acc 4.6% | 252800 tokens | data 3%
+step   8000 | loss 6.800 | acc 2.9% | 256000 tokens | data 3%
+step   8100 | loss 6.732 | acc 4.2% | 259200 tokens | data 4%
+step   8200 | loss 6.645 | acc 5.8% | 262400 tokens | data 4%
+step   8300 | loss 6.652 | acc 8.0% | 265600 tokens | data 4%
+step   8400 | loss 6.677 | acc 6.5% | 268800 tokens | data 4%
+step   8500 | loss 6.757 | acc 5.9% | 272000 tokens | data 4%
+step   8600 | loss 6.525 | acc 7.5% | 275200 tokens | data 4%
+step   8700 | loss 6.620 | acc 6.0% | 278400 tokens | data 4%
+step   8800 | loss 6.690 | acc 3.4% | 281600 tokens | data 4%
+step   8900 | loss 6.702 | acc 4.3% | 284800 tokens | data 4%
+step   9000 | loss 6.590 | acc 4.7% | 288000 tokens | data 4%
+step   9100 | loss 6.621 | acc 3.7% | 291200 tokens | data 4%
+step   9200 | loss 6.668 | acc 6.6% | 294400 tokens | data 4%
+step   9300 | loss 6.563 | acc 4.3% | 297600 tokens | data 4%
+step   9400 | loss 6.893 | acc 3.2% | 300800 tokens | data 4%
+step   9500 | loss 6.576 | acc 7.0% | 304000 tokens | data 4%
+step   9600 | loss 6.863 | acc 6.6% | 307200 tokens | data 4%
+step   9700 | loss 6.739 | acc 6.6% | 310400 tokens | data 4%
+step   9800 | loss 6.648 | acc 4.0% | 313600 tokens | data 4%
+step   9900 | loss 6.946 | acc 5.3% | 316800 tokens | data 4%
+step  10000 | loss 6.928 | acc 8.0% | 320000 tokens | data 4%
+  [saved]
+step  10100 | loss 6.916 | acc 4.6% | 323200 tokens | data 4%
+step  10200 | loss 6.748 | acc 5.3% | 326400 tokens | data 4%
+step  10300 | loss 7.340 | acc 5.6% | 329600 tokens | data 4%
+step  10400 | loss 7.071 | acc 1.3% | 332800 tokens | data 4%
+step  10500 | loss 7.070 | acc 6.2% | 336000 tokens | data 5%

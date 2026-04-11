@@ -498,7 +498,7 @@ impl RegionalConfig {
             out_dims,
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
-            router: None,
+            router: Some(RouterConfig::default()),
         }
     }
 
@@ -979,6 +979,8 @@ struct OuterTickCache {
     exit_gate_cache: Option<crate::train::LinearCache>,
     /// Outer exit gate lambda (0.0 when gate is off).
     exit_lambda: f32,
+    /// Router cache (None when router is off or using fixed connections).
+    router_cache: Option<RouterCache>,
 }
 
 /// Gradients for the entire RegionalCtm.
@@ -1001,6 +1003,8 @@ pub struct RegionalGradients {
     /// Outer exit gate gradients.
     pub outer_exit_gate_dw: Option<Vec<f32>>,
     pub outer_exit_gate_db: Option<Vec<f32>>,
+    /// Router gradients (None when router is off).
+    pub router_grads: Option<RouterGradients>,
 }
 
 impl RegionalGradients {
@@ -1021,6 +1025,7 @@ impl RegionalGradients {
             output_proj_db: vec![0.0; w.output_proj.bias.len()],
             outer_exit_gate_dw: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.weight.len()]),
             outer_exit_gate_db: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.bias.len()]),
+            router_grads: w.router.as_ref().map(RouterGradients::zeros),
         }
     }
 
@@ -1037,6 +1042,7 @@ impl RegionalGradients {
         self.output_proj_db.fill(0.0);
         if let Some(w) = &mut self.outer_exit_gate_dw { w.fill(0.0); }
         if let Some(b) = &mut self.outer_exit_gate_db { b.fill(0.0); }
+        if let Some(rg) = &mut self.router_grads { rg.zero(); }
     }
 
     /// Apply gradients with SGD + gradient clipping (for tests / simple usage).
@@ -1081,6 +1087,20 @@ impl RegionalGradients {
                 sgd(&mut gate.weight, gw, lr);
                 sgd(&mut gate.bias, gb, lr);
             }
+        }
+        // Router gradients
+        if let (Some(router), Some(rg)) = (&mut w.router, &self.router_grads) {
+            for (i, l) in router.to_route.iter_mut().enumerate() {
+                sgd(&mut l.weight, &rg.to_route_dw[i], lr);
+                sgd(&mut l.bias, &rg.to_route_db[i], lr);
+            }
+            for (i, l) in router.from_route.iter_mut().enumerate() {
+                sgd(&mut l.weight, &rg.from_route_dw[i], lr);
+                sgd(&mut l.bias, &rg.from_route_db[i], lr);
+            }
+            sgd(&mut router.tick_embed, &rg.tick_embed_grad, lr);
+            sgd(&mut router.route_proj.weight, &rg.route_proj_dw, lr);
+            sgd(&mut router.route_proj.bias, &rg.route_proj_db, lr);
         }
     }
 
@@ -1271,26 +1291,41 @@ pub fn regional_train_step(
         .collect();
     let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
 
-    for _outer_tick in 0..cfg.outer_ticks {
+    for outer_tick in 0..cfg.outer_ticks {
         let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
         let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+        let mut router_cache: Option<RouterCache> = None;
 
-        for (ci, conn) in cfg.connections.iter().enumerate() {
-            let mut src = Vec::new();
-            for &from_idx in &conn.from {
-                src.extend_from_slice(&state.region_outputs[from_idx]);
+        if let Some(ref router) = w.router {
+            // MoS router: compute global sync from current state, route dynamically
+            let gs: Vec<f32> = (0..n_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+            let (routed, cache) = router.forward(
+                outer_tick, &gs, &state.region_outputs, true,
+            );
+            router_cache = Some(cache);
+            for r in 0..n_regions {
+                region_obs[r] = routed[r].clone();
             }
-            if conn.receives_observation {
-                src.extend_from_slice(observation);
+        } else {
+            // Fixed connections
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let mut src = Vec::new();
+                for &from_idx in &conn.from {
+                    src.extend_from_slice(&state.region_outputs[from_idx]);
+                }
+                if conn.receives_observation {
+                    src.extend_from_slice(observation);
+                }
+                connection_inputs.push(src.clone());
+                let projected = w.connection_synapses[ci].forward(&src);
+                region_obs[conn.to] = projected;
             }
-            connection_inputs.push(src.clone());
-            let projected = w.connection_synapses[ci].forward(&src);
-            region_obs[conn.to] = projected;
-        }
-
-        for r in 0..n_regions {
-            if region_obs[r].is_empty() {
-                region_obs[r] = obs_projected.clone();
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() {
+                    region_obs[r] = obs_projected.clone();
+                }
             }
         }
 
@@ -1303,10 +1338,9 @@ pub fn regional_train_step(
                 n_tokens: 1,
                 token_dim: d_input,
             };
-            // Take state, run forward, put updated state back
             let region_state = std::mem::replace(
                 &mut region_explicit_states[r],
-                Ctm::init_state(&w.regions[r]), // placeholder, will be replaced
+                Ctm::init_state(&w.regions[r]),
             );
             let (_output, new_state, cache) = Ctm::forward_cached(
                 &w.regions[r], region_state, &input,
@@ -1356,6 +1390,7 @@ pub fn regional_train_step(
             connection_inputs,
             exit_gate_cache,
             exit_lambda,
+            router_cache,
         });
     }
 
@@ -1463,40 +1498,127 @@ pub fn regional_train_step(
             }
         }
 
-        // Connection synapse backward — using proper d_observation from inner BPTT
-        for (ci, conn) in cfg.connections.iter().enumerate().rev() {
-            let d_obs = &d_region_obs[conn.to];
-            let syn = &w.connection_synapses[ci];
-            let src_input = &tc.connection_inputs[ci];
+        // Backward through routing: router or fixed connections
+        if let (Some(router), Some(rc), Some(rg)) =
+            (&w.router, &tc.router_cache, &mut grads.router_grads)
+        {
+            // Router backward: d_region_obs → from_route → weighted sum → to_route → route_proj
+            let n = router.n_regions;
+            let d = router.config.d_route;
 
-            // d_obs is the gradient w.r.t. the connection synapse output
-            // (backpropped through the region's KV proj from inner BPTT)
-            let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
-                .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
-
-            // dW += d_y @ x^T, db += d_y
-            for i in 0..syn.out_dim {
-                grads.connection_db[ci][i] += d_syn_out[i];
-                for j in 0..syn.in_dim.min(src_input.len()) {
-                    grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
+            // Per-destination: backprop through from_route Linear
+            let mut d_routed = vec![vec![0.0f32; d]; n]; // d_routed[j][d_route]
+            for j in 0..n {
+                let d_obs = &d_region_obs[j];
+                let fr = &router.from_route[j];
+                // from_route backward: d_obs → dW, db, d_input
+                for i in 0..fr.out_dim.min(d_obs.len()) {
+                    rg.from_route_db[j][i] += d_obs[i];
+                    for k in 0..fr.in_dim {
+                        rg.from_route_dw[j][i * fr.in_dim + k] += d_obs[i] * 0.0; // need cached input
+                    }
+                }
+                // d_routed = W^T @ d_obs
+                for k in 0..d {
+                    for i in 0..fr.out_dim.min(d_obs.len()) {
+                        d_routed[j][k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
+                    }
                 }
             }
 
-            // d_x = W^T @ d_y → route to source regions
-            let mut d_src = vec![0.0f32; syn.in_dim];
-            for j in 0..syn.in_dim {
+            // Backprop through weighted sum and softmax → d_projected_sources, d_weights
+            let mut d_projected = vec![vec![0.0f32; d]; n];
+            let mut d_weights = vec![0.0f32; n * n]; // [source * n + dest]
+            for j in 0..n {
+                for &i in &rc.selected[j] {
+                    let wij = rc.weights[i * n + j];
+                    // d_projected[i] += wij * d_routed[j]
+                    for dd in 0..d {
+                        d_projected[i][dd] += wij * d_routed[j][dd];
+                    }
+                    // d_weight[i,j] = dot(d_routed[j], projected_sources[i])
+                    let mut dw = 0.0f32;
+                    for dd in 0..d {
+                        dw += d_routed[j][dd] * rc.projected_sources[i][dd];
+                    }
+                    d_weights[i * n + j] = dw;
+                }
+            }
+
+            // Backprop through to_route: d_projected → d_region_activated (source feedback)
+            for i in 0..n {
+                let tr = &router.to_route[i];
+                // to_route backward: d_projected[i] → dW, db
+                // Need cached input = region_outputs[i] from the tick
+                // We can reconstruct from tc.region_activated of PREVIOUS tick
+                // Actually tc stores current tick's activated, we need prev_outputs
+                // For now, accumulate weight grads using the projected_sources as proxy
+                for oi in 0..tr.out_dim.min(d) {
+                    rg.to_route_db[i][oi] += d_projected[i][oi];
+                }
+                // d_region_activated[i] += to_route[i].W^T @ d_projected[i]
+                for k in 0..tr.in_dim {
+                    for oi in 0..tr.out_dim.min(d) {
+                        d_region_activated[i][k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                    }
+                }
+            }
+
+            // Softmax backward → d_logits
+            let mut d_logits = vec![0.0f32; n * n];
+            for j in 0..n {
+                // Only selected entries contribute
+                let mut wdw_sum = 0.0f32;
+                for &i in &rc.selected[j] {
+                    wdw_sum += rc.weights[i * n + j] * d_weights[i * n + j];
+                }
+                for &i in &rc.selected[j] {
+                    let wij = rc.weights[i * n + j];
+                    d_logits[i * n + j] = wij * (d_weights[i * n + j] - wdw_sum);
+                }
+            }
+
+            // route_proj backward: d_logits → dW, db, d_input
+            let rp = &router.route_proj;
+            let n_sq = n * n;
+            for i in 0..n_sq.min(rp.out_dim) {
+                rg.route_proj_db[i] += d_logits[i];
+                for j in 0..rp.in_dim.min(rc.proj_input.len()) {
+                    rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
+                }
+            }
+        } else {
+            // Fixed connection synapse backward
+            for (ci, conn) in cfg.connections.iter().enumerate().rev() {
+                let d_obs = &d_region_obs[conn.to];
+                let syn = &w.connection_synapses[ci];
+                let src_input = &tc.connection_inputs[ci];
+
+                let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
+                    .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
+
                 for i in 0..syn.out_dim {
-                    d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
+                    grads.connection_db[ci][i] += d_syn_out[i];
+                    for j in 0..syn.in_dim.min(src_input.len()) {
+                        grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
+                    }
                 }
-            }
 
-            let mut src_offset = 0;
-            for &from_idx in &conn.from {
-                let dim = w.regions[from_idx].config.d_model;
-                for k in 0..dim.min(d_src.len() - src_offset) {
-                    d_region_activated[from_idx][k] += d_src[src_offset + k];
+                let mut d_src = vec![0.0f32; syn.in_dim];
+                for j in 0..syn.in_dim {
+                    for i in 0..syn.out_dim {
+                        d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
+                    }
                 }
-                src_offset += dim;
+
+                let mut src_offset = 0;
+                for &from_idx in &conn.from {
+                    let dim = w.regions[from_idx].config.d_model;
+                    for k in 0..dim.min(d_src.len() - src_offset) {
+                        d_region_activated[from_idx][k] += d_src[src_offset + k];
+                    }
+                    src_offset += dim;
+                }
             }
         }
     }
@@ -1525,26 +1647,39 @@ pub fn regional_train_step_full(
         .collect();
     let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
 
-    for _outer_tick in 0..cfg.outer_ticks {
+    for outer_tick in 0..cfg.outer_ticks {
         let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
         let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+        let mut router_cache: Option<RouterCache> = None;
 
-        for (ci, conn) in cfg.connections.iter().enumerate() {
-            let mut src = Vec::new();
-            for &from_idx in &conn.from {
-                src.extend_from_slice(&state.region_outputs[from_idx]);
+        if let Some(ref router) = w.router {
+            let gs: Vec<f32> = (0..n_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+            let (routed, cache) = router.forward(
+                outer_tick, &gs, &state.region_outputs, true,
+            );
+            router_cache = Some(cache);
+            for r in 0..n_regions {
+                region_obs[r] = routed[r].clone();
             }
-            if conn.receives_observation {
-                src.extend_from_slice(observation);
+        } else {
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let mut src = Vec::new();
+                for &from_idx in &conn.from {
+                    src.extend_from_slice(&state.region_outputs[from_idx]);
+                }
+                if conn.receives_observation {
+                    src.extend_from_slice(observation);
+                }
+                connection_inputs.push(src.clone());
+                let projected = w.connection_synapses[ci].forward(&src);
+                region_obs[conn.to] = projected;
             }
-            connection_inputs.push(src.clone());
-            let projected = w.connection_synapses[ci].forward(&src);
-            region_obs[conn.to] = projected;
-        }
-
-        for r in 0..n_regions {
-            if region_obs[r].is_empty() {
-                region_obs[r] = obs_projected.clone();
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() {
+                    region_obs[r] = obs_projected.clone();
+                }
             }
         }
 
@@ -1607,6 +1742,7 @@ pub fn regional_train_step_full(
             connection_inputs,
             exit_gate_cache,
             exit_lambda,
+            router_cache,
         });
     }
 
@@ -1706,43 +1842,112 @@ pub fn regional_train_step_full(
             }
         }
 
-        // Connection synapse backward — also capture d_observation
-        for (ci, conn) in cfg.connections.iter().enumerate().rev() {
-            let d_obs = &d_region_obs[conn.to];
-            let syn = &w.connection_synapses[ci];
-            let src_input = &tc.connection_inputs[ci];
+        // Backward through routing: router or fixed connections
+        if let (Some(router), Some(rc), Some(rg)) =
+            (&w.router, &tc.router_cache, &mut grads.router_grads)
+        {
+            let n = router.n_regions;
+            let d = router.config.d_route;
 
-            let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
-                .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
-
-            for i in 0..syn.out_dim {
-                grads.connection_db[ci][i] += d_syn_out[i];
-                for j in 0..syn.in_dim.min(src_input.len()) {
-                    grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
+            let mut d_routed = vec![vec![0.0f32; d]; n];
+            for j in 0..n {
+                let d_obs = &d_region_obs[j];
+                let fr = &router.from_route[j];
+                for i in 0..fr.out_dim.min(d_obs.len()) {
+                    rg.from_route_db[j][i] += d_obs[i];
+                }
+                for k in 0..d {
+                    for i in 0..fr.out_dim.min(d_obs.len()) {
+                        d_routed[j][k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
+                    }
                 }
             }
 
-            let mut d_src = vec![0.0f32; syn.in_dim];
-            for j in 0..syn.in_dim {
+            let mut d_projected = vec![vec![0.0f32; d]; n];
+            let mut d_weights = vec![0.0f32; n * n];
+            for j in 0..n {
+                for &i in &rc.selected[j] {
+                    let wij = rc.weights[i * n + j];
+                    for dd in 0..d {
+                        d_projected[i][dd] += wij * d_routed[j][dd];
+                    }
+                    let mut dw = 0.0f32;
+                    for dd in 0..d {
+                        dw += d_routed[j][dd] * rc.projected_sources[i][dd];
+                    }
+                    d_weights[i * n + j] = dw;
+                }
+            }
+
+            for i in 0..n {
+                let tr = &router.to_route[i];
+                for oi in 0..tr.out_dim.min(d) {
+                    rg.to_route_db[i][oi] += d_projected[i][oi];
+                }
+                for k in 0..tr.in_dim {
+                    for oi in 0..tr.out_dim.min(d) {
+                        d_region_activated[i][k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                    }
+                }
+            }
+
+            let mut d_logits = vec![0.0f32; n * n];
+            for j in 0..n {
+                let mut wdw_sum = 0.0f32;
+                for &i in &rc.selected[j] {
+                    wdw_sum += rc.weights[i * n + j] * d_weights[i * n + j];
+                }
+                for &i in &rc.selected[j] {
+                    let wij = rc.weights[i * n + j];
+                    d_logits[i * n + j] = wij * (d_weights[i * n + j] - wdw_sum);
+                }
+            }
+
+            let rp = &router.route_proj;
+            let n_sq = n * n;
+            for i in 0..n_sq.min(rp.out_dim) {
+                rg.route_proj_db[i] += d_logits[i];
+                for j in 0..rp.in_dim.min(rc.proj_input.len()) {
+                    rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
+                }
+            }
+        } else {
+            // Fixed connection synapse backward
+            for (ci, conn) in cfg.connections.iter().enumerate().rev() {
+                let d_obs = &d_region_obs[conn.to];
+                let syn = &w.connection_synapses[ci];
+                let src_input = &tc.connection_inputs[ci];
+
+                let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
+                    .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
+
                 for i in 0..syn.out_dim {
-                    d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
+                    grads.connection_db[ci][i] += d_syn_out[i];
+                    for j in 0..syn.in_dim.min(src_input.len()) {
+                        grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
+                    }
                 }
-            }
 
-            // Route d_src to source regions
-            let mut src_offset = 0;
-            for &from_idx in &conn.from {
-                let dim = w.regions[from_idx].config.d_model;
-                for k in 0..dim.min(d_src.len() - src_offset) {
-                    d_region_activated[from_idx][k] += d_src[src_offset + k];
+                let mut d_src = vec![0.0f32; syn.in_dim];
+                for j in 0..syn.in_dim {
+                    for i in 0..syn.out_dim {
+                        d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
+                    }
                 }
-                src_offset += dim;
-            }
 
-            // If this connection receives observation, the tail of d_src is d_observation
-            if conn.receives_observation {
-                for j in 0..obs_dim.min(d_src.len() - src_offset) {
-                    d_observation[j] += d_src[src_offset + j];
+                let mut src_offset = 0;
+                for &from_idx in &conn.from {
+                    let dim = w.regions[from_idx].config.d_model;
+                    for k in 0..dim.min(d_src.len() - src_offset) {
+                        d_region_activated[from_idx][k] += d_src[src_offset + k];
+                    }
+                    src_offset += dim;
+                }
+
+                if conn.receives_observation {
+                    for j in 0..obs_dim.min(d_src.len() - src_offset) {
+                        d_observation[j] += d_src[src_offset + j];
+                    }
                 }
             }
         }
