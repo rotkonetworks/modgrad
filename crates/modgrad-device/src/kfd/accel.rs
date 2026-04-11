@@ -66,6 +66,31 @@ pub fn try_matvec_t(
     }
 }
 
+/// SuperLinear forward: batched per-neuron matvec on GPU.
+pub fn try_superlinear(
+    trace: &[f32], weights: &[f32], biases: &[f32], out: &mut [f32],
+    n_neurons: u32, in_per: u32, out_per: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    match g.engine.superlinear(
+        &mut g.dev, weights, biases, trace,
+        n_neurons as usize, out_per as usize, in_per as usize,
+    ) {
+        Some(y) => {
+            let n = (n_neurons * out_per) as usize;
+            out[..n].copy_from_slice(&y);
+            true
+        }
+        None => {
+            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
 /// Check if KFD GPU is available.
 pub fn available() -> bool {
     match gpu().lock() { Ok(g) => g.is_some(), Err(_) => false }

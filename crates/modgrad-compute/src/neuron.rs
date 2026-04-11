@@ -168,9 +168,16 @@ impl SuperLinear {
         let total_flops = n_neurons * in_per * out_per;
 
         // Try GPU first (only worth it for large dispatches)
-        if total_flops >= 100_000 {
+        if GPU_ENABLED.load(Ordering::Relaxed) && total_flops >= 100_000 {
             let mut out = vec![0.0f32; n_neurons * out_per];
-            // CUDA (NVIDIA) first
+            // KFD (AMD) — stateless stream dispatch
+            if modgrad_device::kfd::accel::try_superlinear(
+                trace, &self.weights, &self.biases, &mut out,
+                n_neurons as u32, in_per as u32, out_per as u32,
+            ) {
+                return out;
+            }
+            // CUDA (NVIDIA)
             if modgrad_device::cuda::try_superlinear(
                 trace, &self.weights, &self.biases, &mut out,
                 n_neurons as u32, in_per as u32, out_per as u32,
