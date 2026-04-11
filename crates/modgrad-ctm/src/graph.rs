@@ -542,6 +542,133 @@ impl RegionalConfig {
         }
     }
 
+    /// Medium 8-region: balanced CPU+GPU model (~55M params).
+    /// Prediction heads use GPU (33M flops), SuperLinear on CPU rayon.
+    pub fn eight_region_medium(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let d = obs_dim;
+        let regions = vec![
+            CtmConfig::region("input", 256, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 256, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 256, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 256, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 32, d, 16, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 32, d, 16, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 32, d, 16, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 32, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(512);
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim: obs_dim,
+            aux_losses: AuxLossConfig::default(),
+            router: Some(RouterConfig::default()),
+        }
+    }
+
+    /// Billion-scale 8-region (~1B params, d_model=1024).
+    /// Cortical: d_model=1024, memory=128. Requires ~19GB CPU RAM.
+    /// SuperLinear at 134M flops per stage — fully GPU-bound.
+    pub fn eight_region_billion(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let d = obs_dim;
+        let regions = vec![
+            CtmConfig::region("input", 1024, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 1024, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 1024, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 1024, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 128, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(2048);
+
+        Self {
+            regions, region_names: names, connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync, out_dims, raw_obs_dim: obs_dim,
+            aux_losses: AuxLossConfig::default(),
+            router: Some(RouterConfig::default()),
+        }
+    }
+
     /// Large 8-region: GPU-scale model (~200M params).
     /// Cortical regions: d_model=512, memory=64 → SuperLinear crosses GPU threshold.
     /// Subcortical regions: d_model=64, memory=32 → moderate size.

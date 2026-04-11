@@ -105,9 +105,15 @@ enum Commands {
         /// Enable GPU dispatch (KFD/CUDA/Vulkan) for linear ops.
         #[arg(long)]
         gpu: bool,
-        /// Large model (~200M params, d_model=512). GPU-scale.
+        /// Medium model (~55M params, d_model=256). CPU+GPU balanced.
+        #[arg(long)]
+        medium: bool,
+        /// Large model (~81M params, d_model=512). Full GPU.
         #[arg(long)]
         large: bool,
+        /// Billion-scale (~1B params, d_model=1024). Needs ~19GB RAM.
+        #[arg(long)]
+        billion: bool,
         #[arg(long)]
         debug_port: Option<u16>,
     },
@@ -131,9 +137,9 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
-        Commands::Learn { checkpoint, data, context, vocab, gpu, large, debug_port } => {
+        Commands::Learn { checkpoint, data, context, vocab, gpu, medium, large, billion, debug_port } => {
             if gpu { modgrad_compute::neuron::enable_gpu(); }
-            learn(&checkpoint, &data, context, vocab, large, debug_port);
+            learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {
             run_daemon(&checkpoint, port);
@@ -834,7 +840,9 @@ fn learn(
     data_paths: &[String],
     context_len: usize,
     vocab: usize,
+    medium: bool,
     large: bool,
+    billion: bool,
     debug_port: Option<u16>,
 ) {
     // Gather all data as token sequences.
@@ -924,9 +932,15 @@ fn learn(
         eprintln!("Loading {save_path}...");
         RegionalWeights::load(save_path).expect("failed to load")
     } else {
-        let cfg = if large {
-            eprintln!("Creating large model (d_model=512, ~200M params)...");
+        let cfg = if billion {
+            eprintln!("Creating billion-scale model (d_model=1024, ~1B params)...");
+            RegionalConfig::eight_region_billion(embed_dim, vocab, ticks)
+        } else if large {
+            eprintln!("Creating large model (d_model=512, ~81M params)...");
             RegionalConfig::eight_region_large(embed_dim, vocab, ticks)
+        } else if medium {
+            eprintln!("Creating medium model (d_model=256, ~55M params)...");
+            RegionalConfig::eight_region_medium(embed_dim, vocab, ticks)
         } else if n_regions <= 4 {
             RegionalConfig::four_region(embed_dim, vocab, ticks)
         } else {
