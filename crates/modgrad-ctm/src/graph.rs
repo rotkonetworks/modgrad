@@ -538,6 +538,73 @@ impl RegionalConfig {
         }
     }
 
+    /// Large 8-region: GPU-scale model (~200M params).
+    /// Cortical regions: d_model=512, memory=64 → SuperLinear crosses GPU threshold.
+    /// Subcortical regions: d_model=64, memory=32 → moderate size.
+    pub fn eight_region_large(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let d = obs_dim; // d_input for all regions
+
+        let regions = vec![
+            CtmConfig::region("input", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 512, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 64, d, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 64, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(1024); // raised cap for larger model
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim: obs_dim,
+            aux_losses: AuxLossConfig::default(),
+            router: Some(RouterConfig::default()),
+        }
+    }
+
     /// Multimodal 8-region: text + image + audio tokens.
     /// Same topology as eight_region but with expanded vocab.
     pub fn eight_region_multimodal(embed_dim: usize, ticks: usize) -> Self {
