@@ -100,11 +100,15 @@ pub(crate) fn linear_backward(
             d_weight[row + j] += d * cache.input[j];
         }
     }
-    // d_input = W^T @ d_out — try GPU-resident W^T, fall back to CPU
+    // d_input = W^T @ d_out — try GPU, fall back to CPU
     if modgrad_compute::neuron::gpu_enabled()
         && in_dim * out_dim >= 2_000_000
     {
-        if let Some(d_input) = try_gpu_backward_dx(linear, d_out) {
+        let mut d_input = vec![0.0f32; in_dim];
+        if modgrad_device::kfd::accel::try_matvec_t(
+            d_out, &linear.weight, &mut d_input,
+            out_dim as u32, in_dim as u32,
+        ) {
             return d_input;
         }
     }

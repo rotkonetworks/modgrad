@@ -182,11 +182,16 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
-        // Try GPU-resident weights (no per-call upload)
+        // Try GPU dispatch for large matrices
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 2_000_000
+            && self.in_dim * self.out_dim >= 10_000_000
         {
-            if let Some(y) = self.try_gpu_forward(x) {
+            // Use proven try_matvec path (with its own weight caching)
+            let mut y = vec![0.0f32; self.out_dim];
+            if modgrad_device::kfd::accel::try_matvec(
+                x, &self.weight, &self.bias, &mut y,
+                self.out_dim as u32, self.in_dim as u32,
+            ) {
                 return y;
             }
         }

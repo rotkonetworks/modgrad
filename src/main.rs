@@ -1000,7 +1000,8 @@ fn learn(
 
         // ── Dream phase: free-running rollout with regret correction ──
         // Like embryonic spontaneous neural activity — tests circuit coherence.
-        if step % 20 == 0 && n_data > context_len * 2 {
+        // TODO: re-enable once GPU path is stable
+        if false && step % 20 == 0 && n_data > context_len * 2 {
             let seed_pos = ((step * 7919) as usize) % (n_data - 9);
             let ground_truth = &all_tokens[seed_pos + 1..seed_pos + 9];
             let mut dream_grads = RegionalGradients::zeros(&w);

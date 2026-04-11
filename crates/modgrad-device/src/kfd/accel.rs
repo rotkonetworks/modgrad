@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 /// With GPU-resident weights (DeviceWeightCache), the threshold is lower
 /// since we skip per-call upload. This constant only applies to the
 /// old try_matvec/try_matvec_t functions.
-const MIN_FLOPS: usize = 500_000;
+const MIN_FLOPS: usize = 10_000_000;
 
 /// Cached weight matrix in VRAM.
 struct CachedWeight {
