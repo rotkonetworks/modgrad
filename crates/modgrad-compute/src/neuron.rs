@@ -6,31 +6,12 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::ops::dot;
 
 /// Global GPU enable flag. Off by default. Caller sets via `enable_gpu()`.
 static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
-
-// ─── Weight identity for GPU cache coherence ──────────────
-
-/// Monotonic counter for unique weight IDs.
-static WEIGHT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Stable identity for a Linear layer's GPU cache entry.
-/// Survives optimizer steps (unlike pointer identity which breaks on realloc).
-/// Fresh ID on construction and clone — no aliasing.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WeightId(pub u64);
-
-impl WeightId {
-    pub fn next() -> Self { Self(WEIGHT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)) }
-}
-
-impl Default for WeightId {
-    fn default() -> Self { Self::next() }
-}
 
 /// Enable GPU dispatch for Linear::forward(). Call once at startup.
 pub fn enable_gpu() { GPU_ENABLED.store(true, Ordering::Relaxed); }
@@ -85,35 +66,12 @@ pub fn layer_norm(x: &mut [f32]) {
 // ─── Weight matrices ────────────────────────────────────────
 
 /// Dense linear layer: y = Wx + b
-///
-/// GPU coherence: `weight_id` is a stable handle for the GPU weight cache.
-/// `cpu_gen` is bumped on any CPU-side weight mutation. The GPU cache
-/// compares generations to decide when to re-upload.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Linear {
     pub weight: Vec<f32>,  // [out_dim × in_dim] row-major
     pub bias: Vec<f32>,    // [out_dim]
     pub in_dim: usize,
     pub out_dim: usize,
-    /// Stable ID for GPU weight cache. Fresh on construction/clone/deserialize.
-    #[serde(skip, default = "WeightId::next")]
-    pub weight_id: WeightId,
-    /// Bumped on CPU-side weight mutation. GPU re-uploads when stale.
-    #[serde(skip, default)]
-    pub cpu_gen: u64,
-}
-
-impl Clone for Linear {
-    fn clone(&self) -> Self {
-        Self {
-            weight: self.weight.clone(),
-            bias: self.bias.clone(),
-            in_dim: self.in_dim,
-            out_dim: self.out_dim,
-            weight_id: WeightId::next(), // fresh ID — own GPU cache entry
-            cpu_gen: 0,                  // force re-upload
-        }
-    }
 }
 
 impl Linear {
@@ -124,70 +82,16 @@ impl Linear {
             .map(|_| rng.next_normal() * scale)
             .collect();
         let bias = vec![0.0; out_dim];
-        Self { weight, bias, in_dim, out_dim, weight_id: WeightId::next(), cpu_gen: 0 }
-    }
-
-    /// Mark weights as modified on CPU. GPU cache will re-upload on next use.
-    pub fn mark_dirty(&mut self) { self.cpu_gen += 1; }
-
-    /// GPU-resident forward: weights stay in VRAM, only x uploaded per call.
-    fn try_gpu_forward(&self, x: &[f32]) -> Option<Vec<f32>> {
-        use modgrad_device::weight_cache::weight_cache;
-
-        let mut cache = weight_cache().lock().ok()?;
-        let id = self.weight_id.0;
-
-        // Ensure GPU has current weights (no-op if already uploaded and gen matches)
-        if !cache.ensure_uploaded(id, self.cpu_gen, &self.weight, &self.bias,
-                                   self.out_dim, self.in_dim) {
-            return None;
-        }
-
-        let dev = modgrad_device::kfd::accel::get_device()?;
-
-        // Upload x to scratch (reuse buffer)
-        let x_bytes = x.len() * 4;
-        if cache.scratch_x_cap < x_bytes {
-            cache.scratch_x = dev.upload_f32(x).ok();
-            cache.scratch_x_cap = ((x_bytes + 4095) & !4095).max(4096);
-        } else if let Some(ref xb) = cache.scratch_x {
-            xb.write_f32(0, x);
-        }
-
-        let y_bytes = self.out_dim * 4;
-        if cache.scratch_y_cap < y_bytes {
-            cache.scratch_y = dev.alloc_output(((y_bytes + 4095) & !4095).max(4096)).ok();
-            cache.scratch_y_cap = ((y_bytes + 4095) & !4095).max(4096);
-        } else if let Some(ref yb) = cache.scratch_y {
-            unsafe { std::ptr::write_bytes(yb.cpu_ptr, 0, y_bytes); }
-        }
-
-        let (x_buf, y_buf) = match (&cache.scratch_x, &cache.scratch_y) {
-            (Some(x), Some(y)) => (x, y),
-            _ => return None,
-        };
-
-        let entry = cache.get(id)?;
-        if dev.dispatch_matvec(&entry.weight, &entry.bias, x_buf, y_buf,
-                               self.out_dim as u32, self.in_dim as u32) {
-            let y_slice = unsafe {
-                std::slice::from_raw_parts(y_buf.cpu_ptr as *const f32, self.out_dim)
-            };
-            let mut y = vec![0.0f32; self.out_dim];
-            y.copy_from_slice(y_slice);
-            Some(y)
-        } else {
-            None
-        }
+        Self { weight, bias, in_dim, out_dim }
     }
 
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
-        // GPU: MegaTrain-style streaming (layer-wise, one dispatch at a time)
-        if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        // GPU: stateless streaming dispatch (MegaTrain-style)
+        if GPU_ENABLED.load(Ordering::Relaxed)
             && self.in_dim * self.out_dim >= 8_000_000
         {
             let mut y = vec![0.0f32; self.out_dim];
-            if modgrad_device::kfd::accel::try_stream_matvec(
+            if modgrad_device::kfd::accel::try_matvec(
                 x, &self.weight, &self.bias, &mut y,
                 self.out_dim as u32, self.in_dim as u32,
             ) {

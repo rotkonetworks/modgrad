@@ -23,75 +23,17 @@ pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, Li
     (linear.forward(x), LinearCache { input: x.to_vec() })
 }
 
-/// GPU backward dx using VRAM-resident W^T from the weight cache.
-/// No per-call weight upload — uses the same cached W^T from forward.
-fn try_gpu_backward_dx(linear: &Linear, d_out: &[f32]) -> Option<Vec<f32>> {
-    use modgrad_device::weight_cache::weight_cache;
-    use modgrad_device::kfd::accel::get_device;
-
-    let mut cache = weight_cache().lock().ok()?;
-    let id = linear.weight_id.0;
-
-    // Extract VA addresses from cached entry (drop borrow before scratch mutation)
-    let (wt_va, bz_va) = {
-        let entry = cache.get(id)?;
-        (entry.weight_t.va_addr, entry.bias_zero.va_addr)
-    };
-
-    let dev = get_device()?;
-
-    // Upload d_out to BACKWARD scratch (separate from forward scratch)
-    let d_out_bytes = d_out.len() * 4;
-    if cache.scratch_bwd_x_cap < d_out_bytes {
-        cache.scratch_bwd_x = dev.upload_f32(d_out).ok();
-        cache.scratch_bwd_x_cap = ((d_out_bytes + 4095) & !4095).max(4096);
-    } else if let Some(ref xb) = cache.scratch_bwd_x {
-        xb.write_f32(0, d_out);
-    }
-
-    let d_in_bytes = linear.in_dim * 4;
-    if cache.scratch_bwd_y_cap < d_in_bytes {
-        cache.scratch_bwd_y = dev.alloc_output(((d_in_bytes + 4095) & !4095).max(4096)).ok();
-        cache.scratch_bwd_y_cap = ((d_in_bytes + 4095) & !4095).max(4096);
-    } else if let Some(ref yb) = cache.scratch_bwd_y {
-        unsafe { std::ptr::write_bytes(yb.cpu_ptr, 0, d_in_bytes); }
-    }
-
-    let (x_buf, y_buf) = match (&cache.scratch_bwd_x, &cache.scratch_bwd_y) {
-        (Some(x), Some(y)) => (x, y),
-        _ => return None,
-    };
-
-    // Dispatch: matvec(W^T, d_out) → d_input using cached VA addresses
-    let entry = cache.get(id)?;
-    if dev.dispatch_matvec(
-        &entry.weight_t, &entry.bias_zero, x_buf, y_buf,
-        linear.in_dim as u32, linear.out_dim as u32,
-    ) {
-        let y_slice = unsafe {
-            std::slice::from_raw_parts(y_buf.cpu_ptr as *const f32, linear.in_dim)
-        };
-        let mut d_input = vec![0.0f32; linear.in_dim];
-        d_input.copy_from_slice(y_slice);
-        Some(d_input)
-    } else {
-        None
-    }
-}
-
 /// Returns d_input. Accumulates into d_weight, d_bias.
-///
-/// Tries GPU for d_input (dx = W^T @ d_out) when the op is large enough.
-/// Weight gradient (dW) stays on CPU (accumulation pattern).
+/// GPU-accelerated dx via stateless stream dispatch.
 pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
     let in_dim = linear.in_dim;
     let out_dim = linear.out_dim;
-    // d_bias (trivial)
+    // d_bias
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
-    // d_weight (outer product, accumulate on CPU)
+    // d_weight (outer product, CPU)
     for i in 0..out_dim {
         let d = d_out[i];
         if d.abs() < 1e-12 { continue; }
@@ -100,12 +42,12 @@ pub(crate) fn linear_backward(
             d_weight[row + j] += d * cache.input[j];
         }
     }
-    // d_input = W^T @ d_out — stream engine (MegaTrain-style)
+    // d_input = W^T @ d_out — stateless GPU stream
     if modgrad_compute::neuron::gpu_enabled()
         && in_dim * out_dim >= 8_000_000
     {
         let mut d_input = vec![0.0f32; in_dim];
-        if modgrad_device::kfd::accel::try_stream_matvec_t(
+        if modgrad_device::kfd::accel::try_matvec_t(
             d_out, &linear.weight, &mut d_input,
             out_dim as u32, in_dim as u32,
         ) {
