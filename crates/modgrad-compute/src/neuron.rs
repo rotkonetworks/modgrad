@@ -184,7 +184,7 @@ impl Linear {
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         // GPU: MegaTrain-style streaming (layer-wise, one dispatch at a time)
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 10_000_000
+            && self.in_dim * self.out_dim >= 8_000_000
         {
             let mut y = vec![0.0f32; self.out_dim];
             if modgrad_device::kfd::accel::try_stream_matvec(

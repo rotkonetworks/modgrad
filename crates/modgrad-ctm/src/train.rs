@@ -102,7 +102,7 @@ pub(crate) fn linear_backward(
     }
     // d_input = W^T @ d_out — stream engine (MegaTrain-style)
     if modgrad_compute::neuron::gpu_enabled()
-        && in_dim * out_dim >= 10_000_000
+        && in_dim * out_dim >= 8_000_000
     {
         let mut d_input = vec![0.0f32; in_dim];
         if modgrad_device::kfd::accel::try_stream_matvec_t(

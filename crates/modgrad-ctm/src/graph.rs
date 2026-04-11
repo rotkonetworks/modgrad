@@ -321,10 +321,14 @@ impl RegionalRouter {
 
         for j in 0..n {
             // Softmax over source axis for destination j
-            let col: Vec<f32> = (0..n).map(|i| logits[i * n + j]).collect();
+            let col: Vec<f32> = (0..n).map(|i| {
+                let v = logits[i * n + j];
+                if v.is_finite() { v } else { 0.0 }
+            }).collect();
             let max_val = col.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp: Vec<f32> = col.iter().map(|&v| (v - max_val).exp()).collect();
-            let sum: f32 = exp.iter().sum();
+            let max_val = if max_val.is_finite() { max_val } else { 0.0 };
+            let exp: Vec<f32> = col.iter().map(|&v| (v - max_val).clamp(-30.0, 0.0).exp()).collect();
+            let sum: f32 = exp.iter().sum::<f32>().max(1e-8);
             let w: Vec<f32> = exp.iter().map(|&e| e / sum).collect();
             for i in 0..n { weights[i * n + j] = w[i]; }
 

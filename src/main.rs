@@ -940,7 +940,13 @@ fn learn(
     let mut opt = if std::path::Path::new(&opt_path).exists() {
         RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
     } else {
-        RegionalAdamW::new(&w).with_lr(3e-3).with_wd(0.001).with_clip(5.0)
+        {
+            // Scale learning rate with model size: smaller lr for larger models
+            let lr = if w.n_params() > 50_000_000 { 3e-4 }
+                     else if w.n_params() > 10_000_000 { 1e-3 }
+                     else { 3e-3 };
+            RegionalAdamW::new(&w).with_lr(lr).with_wd(0.001).with_clip(1.0)
+        }
     };
 
     // Ctrl+C → save and exit
