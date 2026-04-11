@@ -67,10 +67,15 @@ pub fn try_matvec_t(
 }
 
 /// SuperLinear forward: batched per-neuron matvec on GPU.
+/// Only dispatches when total flops justify the PCIe transfer cost.
 pub fn try_superlinear(
     trace: &[f32], weights: &[f32], biases: &[f32], out: &mut [f32],
     n_neurons: u32, in_per: u32, out_per: u32,
 ) -> bool {
+    // PCIe x8 at ~16GB/s: streaming weights costs ~0.5ms per MB.
+    // Only dispatch when compute time > transfer time.
+    let flops = n_neurons as usize * in_per as usize * out_per as usize;
+    if flops < 8_000_000 { return false; }
     if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };

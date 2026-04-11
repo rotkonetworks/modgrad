@@ -17,8 +17,8 @@ RegionalCtm: 8 regions, 8 connections
 
 Learning... (Ctrl+C to save and stop)
 
-    kernel 'test_store': kd_va=0x280 file_off=0x280 entry_off=0x1080 code=0x7f6bb8bc7300
-    kernel 'matvec': kd_va=0x500 file_off=0x500 entry_off=0x1100 code=0x7f6bb8bc2600
-    kernel 'matmul_blocked': kd_va=0x580 file_off=0x580 entry_off=0x1080 code=0x7f6bb8bbf600
-    kernel 'matmul_small': kd_va=0x540 file_off=0x540 entry_off=0x10c0 code=0x7f6bb8bbc600
-    kernel 'superlinear_fwd': kd_va=0x580 file_off=0x580 entry_off=0x1080 code=0x7f6bb037b600
+    kernel 'test_store': kd_va=0x280 file_off=0x280 entry_off=0x1080 code=0x7fa3ecb4d300
+    kernel 'matvec': kd_va=0x500 file_off=0x500 entry_off=0x1100 code=0x7fa3ecb48600
+    kernel 'matmul_blocked': kd_va=0x580 file_off=0x580 entry_off=0x1080 code=0x7fa3ecb45600
+    kernel 'matmul_small': kd_va=0x540 file_off=0x540 entry_off=0x10c0 code=0x7fa3ecb42600
+    kernel 'superlinear_fwd': kd_va=0x580 file_off=0x580 entry_off=0x1080 code=0x7fa3e4301600
