@@ -85,26 +85,28 @@ impl Linear {
         Self { weight, bias, in_dim, out_dim }
     }
 
-    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
-        // GPU: stateless streaming dispatch (MegaTrain-style)
+    /// Forward into pre-allocated output buffer. Zero allocation.
+    pub fn forward_into(&self, x: &[f32], y: &mut [f32]) {
         if GPU_ENABLED.load(Ordering::Relaxed)
             && self.in_dim * self.out_dim >= 8_000_000
         {
-            let mut y = vec![0.0f32; self.out_dim];
             if modgrad_device::kfd::accel::try_matvec(
-                x, &self.weight, &self.bias, &mut y,
+                x, &self.weight, &self.bias, y,
                 self.out_dim as u32, self.in_dim as u32,
             ) {
-                return y;
+                return;
             }
         }
-
-        // CPU fallback
-        let mut y = Vec::with_capacity(self.out_dim);
         for r in 0..self.out_dim {
             let row = &self.weight[r * self.in_dim..(r + 1) * self.in_dim];
-            y.push(self.bias[r] + dot(row, x));
+            y[r] = self.bias[r] + dot(row, x);
         }
+    }
+
+    /// Allocating forward (backward compat). Prefer forward_into.
+    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; self.out_dim];
+        self.forward_into(x, &mut y);
         y
     }
 }
@@ -158,47 +160,32 @@ impl SuperLinear {
         Self { weights, biases, n_neurons, in_per, out_per }
     }
 
-    /// Forward: trace[n_neurons][in_per] → activated[n_neurons][out_per]
-    ///
-    /// Dispatch priority: CUDA → Vulkan → rayon (CPU parallel) → sequential.
-    pub fn forward(&self, trace: &[f32]) -> Vec<f32> {
+    /// Forward into pre-allocated buffer. Zero allocation.
+    pub fn forward_into(&self, trace: &[f32], out: &mut [f32]) {
         let n_neurons = self.n_neurons;
         let in_per = self.in_per;
         let out_per = self.out_per;
         let total_flops = n_neurons * in_per * out_per;
 
-        // Try GPU first (only worth it for large dispatches)
+        // Try GPU
         if GPU_ENABLED.load(Ordering::Relaxed) && total_flops >= 100_000 {
-            let mut out = vec![0.0f32; n_neurons * out_per];
-            // KFD (AMD) — stateless stream dispatch
             if modgrad_device::kfd::accel::try_superlinear(
-                trace, &self.weights, &self.biases, &mut out,
+                trace, &self.weights, &self.biases, out,
                 n_neurons as u32, in_per as u32, out_per as u32,
-            ) {
-                return out;
-            }
-            // CUDA (NVIDIA)
+            ) { return; }
             if modgrad_device::cuda::try_superlinear(
-                trace, &self.weights, &self.biases, &mut out,
+                trace, &self.weights, &self.biases, out,
                 n_neurons as u32, in_per as u32, out_per as u32,
-            ) {
-                return out;
-            }
-            // Vulkan (AMD/Intel/portable) fallback
+            ) { return; }
             if modgrad_device::gpu::try_superlinear(
-                trace, &self.weights, &self.biases, &mut out,
+                trace, &self.weights, &self.biases, out,
                 n_neurons as u32, in_per as u32, out_per as u32,
-            ) {
-                return out;
-            }
+            ) { return; }
         }
 
-        // CPU parallel (rayon) for medium workloads
+        // CPU parallel for medium+ workloads
         if total_flops >= 100_000 {
-            // Parallel: chunks of neurons distributed across threads.
-            // Each thread processes a batch to amortize rayon scheduling overhead.
             let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
-            let mut out = vec![0.0f32; n_neurons * out_per];
             out.par_chunks_mut(chunk_size * out_per)
                 .enumerate()
                 .for_each(|(chunk_idx, out_chunk)| {
@@ -214,10 +201,8 @@ impl SuperLinear {
                         }
                     }
                 });
-            out
         } else {
-            // Sequential for small neuron counts (rayon overhead > compute)
-            let mut out = vec![0.0f32; n_neurons * out_per];
+            // Sequential for small neuron counts
             for n in 0..n_neurons {
                 let t = &trace[n * in_per..(n + 1) * in_per];
                 let w_base = n * out_per * in_per;
@@ -227,8 +212,14 @@ impl SuperLinear {
                     out[o_base + o] = self.biases[o_base + o] + dot(w, t);
                 }
             }
-            out
         }
+    }
+
+    /// Allocating forward (backward compat). Prefer forward_into.
+    pub fn forward(&self, trace: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.n_neurons * self.out_per];
+        self.forward_into(trace, &mut out);
+        out
     }
 }
 
