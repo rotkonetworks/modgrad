@@ -141,7 +141,12 @@ fn main() {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
         Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port } => {
-            if gpu || vram { modgrad_compute::neuron::enable_gpu(); }
+            if gpu || vram {
+                modgrad_compute::neuron::enable_gpu();
+                let _ = modgrad_compute::backend::set_backend(
+                    Box::new(modgrad_compute::backend::HybridGpuBackend::new())
+                );
+            }
             if vram { modgrad_device::kfd::accel::enable_vram_mode(); }
             learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port);
         }

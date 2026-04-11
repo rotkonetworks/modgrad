@@ -863,3 +863,65 @@ pub fn backend() -> &'static dyn ComputeBackend {
 pub fn set_backend(b: Box<dyn ComputeBackend>) -> Result<(), Box<dyn ComputeBackend>> {
     BACKEND.set(b)
 }
+
+/// Hybrid backend: GPU for matvec/superlinear, CPU for everything else.
+/// Uses the KFD stream engine for large matrix ops, CpuBackend for the rest.
+pub struct HybridGpuBackend {
+    cpu: CpuBackend,
+}
+
+impl HybridGpuBackend {
+    pub fn new() -> Self {
+        Self { cpu: CpuBackend::new() }
+    }
+}
+
+/// Minimum FMA ops to justify GPU dispatch overhead.
+const GPU_MIN_FLOPS: usize = 1_000_000;
+
+impl ComputeBackend for HybridGpuBackend {
+    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
+              y: &mut [f32], out_dim: usize, in_dim: usize) {
+        if out_dim * in_dim >= GPU_MIN_FLOPS {
+            if modgrad_device::kfd::accel::try_matvec(
+                x, weight, bias, y, out_dim as u32, in_dim as u32,
+            ) { return; }
+        }
+        self.cpu.matvec(weight, bias, x, y, out_dim, in_dim);
+    }
+
+    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
+                   output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
+        if n_neurons * in_per * out_per >= GPU_MIN_FLOPS {
+            if modgrad_device::kfd::accel::try_superlinear(
+                trace, weights, biases, output,
+                n_neurons as u32, in_per as u32, out_per as u32,
+            ) { return; }
+        }
+        self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
+    }
+
+    // Everything else: delegate to CPU (no GPU kernels for these ops yet)
+    fn glu(&self, input: &[f32], output: &mut [f32]) { self.cpu.glu(input, output); }
+    fn silu_inplace(&self, x: &mut [f32]) { self.cpu.silu_inplace(x); }
+    fn layer_norm_inplace(&self, x: &mut [f32]) { self.cpu.layer_norm_inplace(x); }
+    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
+                       output: &mut [f32], scratch: &mut [f32],
+                       out_dim: usize, in_dim: usize) {
+        self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
+    }
+    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
+                   n_neurons: usize, memory_length: usize) {
+        self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
+    }
+    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
+                   activations_left: &[f32], activations_right: &[f32],
+                   phases_left: &[f32], phases_right: &[f32],
+                   decay: &[f32], decay_shift: &[f32],
+                   dopamine: f32, n_pairs: usize, initialized: bool,
+                   sync_out: &mut [f32]) {
+        self.cpu.sync_update(alpha, beta, activations_left, activations_right,
+            phases_left, phases_right, decay, decay_shift, dopamine, n_pairs,
+            initialized, sync_out);
+    }
+}
