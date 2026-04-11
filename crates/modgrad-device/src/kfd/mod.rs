@@ -446,7 +446,7 @@ impl HsaDevice {
             },
         };
 
-        // Smoke-test: verify signal mechanism works
+        // Smoke-test: verify signal + multi-WG dispatch
         dev.signal_value = 0;
         unsafe { (dev.signal.cpu_ptr as *mut u32).write_volatile(0); }
         dev.signal_value += 1;
@@ -455,6 +455,32 @@ impl HsaDevice {
         dev.queue.submit();
         if !dev.wait_gpu(1000) {
             eprintln!("    GPU signal: FAIL");
+        }
+
+        // Multi-WG test: dispatch matvec with increasing WG count
+        for nwg in [1u32, 4, 16, 33] {
+            let m = nwg * 256;
+            let k = 64u32;
+            let w_data = vec![0.01f32; m as usize * k as usize];
+            let b_data = vec![0.0f32; m as usize];
+            let x_data = vec![1.0f32; k as usize];
+            let w_buf = match dev.upload_f32(&w_data) { Ok(b) => b, Err(_) => continue };
+            let b_buf = match dev.upload_f32(&b_data) { Ok(b) => b, Err(_) => continue };
+            let x_buf = match dev.upload_f32(&x_data) { Ok(b) => b, Err(_) => continue };
+            let y_buf = match dev.alloc_output(m as usize * 4 + 64) { Ok(b) => b, Err(_) => continue };
+
+            let mut args = KernArgs::new();
+            args.push_ptr(&w_buf); args.push_ptr(&b_buf);
+            args.push_ptr(&x_buf); args.push_ptr(&y_buf);
+            args.push_u32(m); args.push_u32(k);
+            let args_buf = match args.upload(&dev.alloc) { Ok(b) => b, Err(_) => continue };
+
+            dev.dispatch_enqueue("matvec", &args_buf, [nwg, 1, 1], [256, 1, 1]);
+            let ok = dev.submit_wait(2000);
+            let y0 = if ok { unsafe { (y_buf.cpu_ptr as *const f32).read_volatile() } } else { f32::NAN };
+            eprintln!("    matvec {}WG ({}x{}): {} y0={:.4}",
+                nwg, m, k, if ok { "OK" } else { "HANG" }, y0);
+            if !ok { break; }
         }
 
         Ok(dev)
@@ -542,12 +568,13 @@ impl HsaDevice {
         true
     }
 
-    /// Cache flush + signal + submit + wait.
+    /// Signal + submit + wait.
     /// Call after dispatch_enqueue batch. Blocks until all dispatches complete.
-    /// Flushes GPU L2 cache to VRAM so CPU can read results.
+    /// NOTE: cache_wb removed — it caused MES stalls on GFX11 after many
+    /// sequential dispatches (same class of bug as RELEASE_MEM descheduling).
+    /// The matvec kernel uses flat_store which is coherent through VMMU.
     pub fn submit_wait(&mut self, timeout_ms: u32) -> bool {
         self.signal_value += 1;
-        self.queue.cache_wb();
         self.queue.signal(self.signal.va_addr, self.signal_value,
             self.queue_event_mailbox_ptr, self.queue_event_id);
         self.queue.submit();

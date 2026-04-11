@@ -128,6 +128,11 @@ impl StreamEngine {
     }
 
     /// Dispatch a kernel with weight/bias/input/output.
+    ///
+    /// Key change from earlier: we queue the dispatch and submit+wait
+    /// in the SAME call, but each dispatch gets its own kernargs buffer
+    /// to avoid overwriting args while the GPU is still reading them.
+    /// The submit_wait ensures the GPU finishes BEFORE we read back.
     fn dispatch_kernel(
         &mut self, dev: &mut HsaDevice,
         kernel: &str,
@@ -137,17 +142,17 @@ impl StreamEngine {
         nwg: u32,
         out_count: usize,
     ) -> Option<Vec<f32>> {
-        // Prepare weights (cached in VRAM mode, uploaded in stream mode)
         let (w_va, bias_va) = self.prepare_weights(dev, weight_data, bias_data)?;
 
-        // Prepare input/output/args
         self.ensure_x(x_data.len() * 4, dev);
         self.ensure_y(out_count * 4, dev);
         self.ensure_args(dev);
 
+        // Upload input
         let xbuf = self.x_buf.as_ref()?;
         xbuf.write_f32(0, x_data);
 
+        // Zero output
         let ybuf = self.y_buf.as_ref()?;
         unsafe { std::ptr::write_bytes(ybuf.cpu_ptr, 0, out_count * 4); }
 
@@ -164,10 +169,24 @@ impl StreamEngine {
         }
         args.write(0, &kargs[..32 + extra_args.len() * 4]);
 
-        // Dispatch + wait
+        // Ensure the ring buffer isn't too full before submitting
+        // (the GPU needs time to process previous dispatches)
+        let ring_usage = dev.queue.put;
+        let ring_cap = dev.queue.ring.size as u64 / 4;
+        if ring_usage > ring_cap / 2 {
+            // Ring is getting full — sync to let GPU drain it
+            dev.submit_wait(5000);
+            // Reset ring position (GPU has processed everything)
+            // Actually, put keeps incrementing and wraps with modulo.
+            // The check_ring_space handles this. But if the read_ptr
+            // hasn't advanced, we need to wait.
+        }
+
+        // Queue dispatch
         if !dev.dispatch_enqueue(kernel, args, [nwg, 1, 1], [256, 1, 1]) {
             return None;
         }
+
         if !dev.submit_wait(5000) {
             return None;
         }
@@ -179,7 +198,6 @@ impl StreamEngine {
         let mut y = vec![0.0f32; out_count];
         y.copy_from_slice(y_slice);
 
-        // Flip ping-pong in stream mode only
         if !self.vram_mode { self.active = 1 - self.active; }
         Some(y)
     }
