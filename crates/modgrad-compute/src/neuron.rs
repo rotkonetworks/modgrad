@@ -22,7 +22,7 @@ static WEIGHT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Survives optimizer steps (unlike pointer identity which breaks on realloc).
 /// Fresh ID on construction and clone — no aliasing.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WeightId(u64);
+pub struct WeightId(pub u64);
 
 impl WeightId {
     pub fn next() -> Self { Self(WEIGHT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)) }
@@ -184,7 +184,7 @@ impl Linear {
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         // Try GPU-resident weights (no per-call upload)
         if GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && self.in_dim * self.out_dim >= 10_000_000
+            && self.in_dim * self.out_dim >= 500_000
         {
             if let Some(y) = self.try_gpu_forward(x) {
                 return y;

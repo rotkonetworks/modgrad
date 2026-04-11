@@ -40,9 +40,9 @@ use std::os::unix::io::RawFd;
 fn kernel_objects_for_target(gfx_version: u32) -> Vec<&'static [u8]> {
     match gfx_version {
         // RDNA3: gfx1100 (Navi31), gfx1101 (Navi32), gfx1102 (Navi33)
+        // sysfs gfx_target_version is DECIMAL: 110000, 110001, 110002
         // Currently only gfx1102 binaries are compiled.
-        // To support others: compile with -mcpu=gfx1100/gfx1101 and add here.
-        0x110000 | 0x110001 | 0x110002 => vec![
+        110000 | 110001 | 110002 => vec![
             include_bytes!("kernels/test_store.co"),
             include_bytes!("kernels/matvec_asm.co"),
             include_bytes!("kernels/matmul_blocked.co"),

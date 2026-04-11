@@ -17,10 +17,11 @@ use super::{HsaDevice, memory::GpuBuffer};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Minimum flops to bother with GPU dispatch.
-/// Below ~10M, CPU AVX is faster due to KFD ioctl overhead (~300μs per dispatch).
-/// GPU wins for large matmuls where compute time >> dispatch overhead.
-const MIN_FLOPS: usize = 10_000_000;
+/// Minimum flops for GPU dispatch via the legacy try_matvec path.
+/// With GPU-resident weights (DeviceWeightCache), the threshold is lower
+/// since we skip per-call upload. This constant only applies to the
+/// old try_matvec/try_matvec_t functions.
+const MIN_FLOPS: usize = 500_000;
 
 /// Cached weight matrix in VRAM.
 struct CachedWeight {
