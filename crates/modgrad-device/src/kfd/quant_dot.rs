@@ -147,9 +147,11 @@ pub fn vec_dot_q5k_q8k(q5k_data: &[u8], q8k: &[Q8KBlock], n_blocks: usize) -> f3
             q8_off += 8; a_off += 8;
         }
 
-        // Accumulate with float scales
-        let d_q5 = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
-        let dmin_q5 = f16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        // Accumulate with float scales (clamp NaN block headers)
+        let mut d_q5 = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
+        let mut dmin_q5 = f16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        if d_q5.is_nan() || d_q5.is_infinite() { d_q5 = 0.0; }
+        if dmin_q5.is_nan() || dmin_q5.is_infinite() { dmin_q5 = 0.0; }
         let d = d_q5 * yb.d;
         for l in 0..8 { sums[l] += d * aux32[l] as f32; }
         let dmin = dmin_q5 * yb.d;
@@ -227,8 +229,10 @@ pub fn vec_dot_q4k_q8k(q4k_data: &[u8], q8k: &[Q8KBlock], n_blocks: usize) -> f3
             q4_off += 32;
         }
 
-        let d_q4 = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
-        let dmin_q4 = f16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        let mut d_q4 = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
+        let mut dmin_q4 = f16_to_f32(u16::from_le_bytes([xb[2], xb[3]]));
+        if d_q4.is_nan() || d_q4.is_infinite() { d_q4 = 0.0; }
+        if dmin_q4.is_nan() || dmin_q4.is_infinite() { dmin_q4 = 0.0; }
         let d = d_q4 * yb.d;
         for l in 0..8 { sums[l] += d * aux32[l] as f32; }
         let dmin = dmin_q4 * yb.d;

@@ -54,6 +54,10 @@ path = "serve.rs"
 name = "test_candle"
 path = "test_candle.rs"
 
+[[bin]]
+name = "test_gemma4"
+path = "test_gemma4.rs"
+
 [features]
 default = []
 onnx = ["dep:ort", "modgrad-io/onnx"]
