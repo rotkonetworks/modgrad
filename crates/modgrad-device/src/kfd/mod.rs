@@ -23,6 +23,7 @@ pub mod arena;
 pub mod dispatch_queue;
 pub mod gguf;
 pub mod inference;
+pub mod quant_dot;
 
 use memory::{GpuAllocator, GpuBuffer};
 use queue::ComputeQueue;

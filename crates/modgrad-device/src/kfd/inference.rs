@@ -814,60 +814,45 @@ impl Gemma4Model {
         embedding
     }
 
-    /// CPU Q4_K matvec: y = dequant(W) @ x. Uses mmap'd file data (not VRAM BAR).
+    /// Quantized matvec: y = Q(W) @ x using integer dot products.
+    /// Matches ggml's vec_dot_q5_K_q8_K / vec_dot_q4_K_q8_K.
     fn cpu_q4_matvec(&self, weight_name: &str, x: &[f32], out_dim: usize) -> Vec<f32> {
         let (_, dtype, dims, mmap_ptr) = self.qweight_vram(weight_name);
         let in_dim = dims[0];
         assert!(in_dim <= x.len(),
             "cpu_q4_matvec {}: in_dim={} > x.len()={}, dims={:?}", weight_name, in_dim, x.len(), dims);
-        let (block_bytes, block_elems) = dtype.block_size();
-        let blocks_per_row = (in_dim + block_elems - 1) / block_elems;
+        let (block_bytes, _block_elems) = dtype.block_size();
+        let blocks_per_row = in_dim / 256;
         let row_bytes = blocks_per_row * block_bytes;
+        let total_bytes = out_dim * row_bytes;
 
-        let base_ptr = mmap_ptr;
+        let weight_data = unsafe {
+            std::slice::from_raw_parts(mmap_ptr, total_bytes)
+        };
 
+        let is_q5k = matches!(dtype, GgmlType::Q5_K);
         let mut y = vec![0.0f32; out_dim];
-        let mut row_f32 = vec![0.0f32; in_dim];
-
-        for row in 0..out_dim {
-            let row_data = unsafe {
-                std::slice::from_raw_parts(base_ptr.add(row * row_bytes), row_bytes)
-            };
-            row_f32.fill(0.0);
-            match dtype {
-                GgmlType::Q4_K => dequant_q4k_row(row_data, &mut row_f32, blocks_per_row),
-                GgmlType::Q5_K => dequant_q5k_row(row_data, &mut row_f32, blocks_per_row),
-                _ => {}
-            }
-            y[row] = dot(&row_f32, &x[..in_dim]);
-        }
+        super::quant_dot::qmatvec(weight_data, &x[..in_dim], &mut y, out_dim, in_dim, block_bytes, is_q5k);
         y
     }
 
-    /// CPU Q5_K matvec for embedding output (vocab × d_model).
+    /// Quantized logits: dot(token_embd, hidden) using integer arithmetic.
     fn cpu_q5_matvec_embed(&self, x: &[f32]) -> Vec<f32> {
         let (dtype, dims, base_ptr) = self.qweight_mmap("token_embd.weight");
         let row_elements = dims[0]; // d_model
         let n_rows = dims[1]; // vocab_size
-        let (block_bytes, block_elems) = dtype.block_size();
-        let blocks_per_row = (row_elements + block_elems - 1) / block_elems;
+        let (block_bytes, _) = dtype.block_size();
+        let blocks_per_row = row_elements / 256;
         let row_bytes = blocks_per_row * block_bytes;
+        let total_bytes = n_rows * row_bytes;
 
+        let weight_data = unsafe {
+            std::slice::from_raw_parts(base_ptr, total_bytes)
+        };
+
+        let is_q5k = matches!(dtype, GgmlType::Q5_K);
         let mut logits = vec![0.0f32; n_rows];
-        // Reuse single buffer for dequantized row
-        let mut row_f32 = vec![0.0f32; row_elements];
-        for row in 0..n_rows {
-            let row_data = unsafe {
-                std::slice::from_raw_parts(base_ptr.add(row * row_bytes), row_bytes)
-            };
-            row_f32.fill(0.0);
-            match dtype {
-                GgmlType::Q5_K => dequant_q5k_row(row_data, &mut row_f32, blocks_per_row),
-                GgmlType::Q4_K => dequant_q4k_row(row_data, &mut row_f32, blocks_per_row),
-                _ => {}
-            }
-            logits[row] = dot(&row_f32, &x[..row_elements]);
-        }
+        super::quant_dot::qmatvec(weight_data, &x[..row_elements], &mut logits, n_rows, row_elements, block_bytes, is_q5k);
         logits
     }
 

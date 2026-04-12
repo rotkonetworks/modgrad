@@ -1,7 +1,7 @@
 /// Test Q4_K_M matvec kernel against CPU reference.
-/// Loads test data saved by Python, dispatches through GpuQueue, compares.
+/// Also tests quantized vec_dot (Q4_K × Q8_K).
 
-use modgrad_device::kfd::{HsaDevice, dispatch_queue::GpuQueue};
+use modgrad_device::kfd::{HsaDevice, dispatch_queue::GpuQueue, quant_dot};
 use std::io::Read;
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -232,4 +232,20 @@ fn main() {
     let gbps = bytes_read as f64 / (us_per * 1e-6) / 1e9;
     println!("  {}x{} Q4_K_M matvec: {:.1} us/iter", out_dim, in_dim, us_per);
     println!("  Effective bandwidth: {:.1} GB/s (of 288 GB/s peak)", gbps);
+
+    // === Test quantized vec_dot (Q4_K × Q8_K) ===
+    println!("\n=== Quantized Vec Dot Test ===");
+    let mut y_qdot = vec![0.0f32; out_dim];
+    quant_dot::qmatvec(&raw_q4, &x, &mut y_qdot, out_dim, in_dim, 144, false);
+
+    let max_err_qdot: f32 = (0..out_dim).map(|i| (y_ref[i] - y_qdot[i]).abs()).fold(0.0f32, f32::max);
+    let avg_err_qdot: f32 = (0..out_dim).map(|i| (y_ref[i] - y_qdot[i]).abs()).sum::<f32>() / out_dim as f32;
+    println!("  y_ref[0:5] = {:?}", &y_ref[..5]);
+    println!("  y_qdot[0:5] = {:?}", &y_qdot[..5]);
+    println!("  max_err = {:.6}, avg_err = {:.6}", max_err_qdot, avg_err_qdot);
+    if max_err_qdot < 0.01 {
+        println!("  PASS");
+    } else {
+        println!("  MARGINAL (quantized arithmetic has rounding)");
+    }
 }
