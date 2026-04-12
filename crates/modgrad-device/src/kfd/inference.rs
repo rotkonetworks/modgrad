@@ -602,8 +602,9 @@ impl Gemma4Model {
                 layer
             } else {
                 // Reuse rule from llama.cpp: SWA layers → kv_from_start-2, full → kv_from_start-1
-                let is_swa = self.is_swa.get(layer).copied().unwrap_or(false);
-                if is_swa {
+                // Note: self.is_swa stores raw metadata where True=FULL, so negate
+                let layer_is_swa = !self.is_swa.get(layer).copied().unwrap_or(true);
+                if layer_is_swa {
                     self.n_layer_kv_from_start.saturating_sub(2)
                 } else {
                     self.n_layer_kv_from_start.saturating_sub(1)
@@ -806,9 +807,9 @@ impl Gemma4Model {
             if v.is_nan() || v.is_infinite() { *v = 0.0; }
         }
 
-        // Skip sqrt(d_model) scaling — our f32 dequant of Q5_K produces values
-        // at a different scale than ggml's quantized mul_mat. Without the scaling,
-        // logits land in [-23, 21] which is correct for softcapping.
+        // Scale by sqrt(d_model) — line 20 of reference.
+        let scale = (self.d_model as f32).sqrt();
+        for v in embedding.iter_mut() { *v *= scale; }
         // TODO: verify this produces correct logits
 
         embedding
