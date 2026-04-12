@@ -19,6 +19,10 @@ pub mod dispatch;
 pub mod compute;
 pub mod accel;
 pub mod stream;
+pub mod arena;
+pub mod dispatch_queue;
+pub mod gguf;
+pub mod inference;
 
 use memory::{GpuAllocator, GpuBuffer};
 use queue::ComputeQueue;
@@ -49,6 +53,14 @@ fn kernel_objects_for_target(gfx_version: u32) -> Vec<&'static [u8]> {
             include_bytes!("kernels/matmul_blocked.co"),
             include_bytes!("kernels/matmul_small.co"),
             include_bytes!("kernels/superlinear.co"),
+            include_bytes!("kernels/glu.co"),
+            include_bytes!("kernels/silu.co"),
+            include_bytes!("kernels/layer_norm.co"),
+            include_bytes!("kernels/trace_shift.co"),
+            include_bytes!("kernels/sync_update.co"),
+            include_bytes!("kernels/matvec_tiled.co"),
+            include_bytes!("kernels/ln_silu.co"),
+            include_bytes!("kernels/matvec_q4k.co"),
         ],
         _ => {
             eprintln!("    warning: no pre-compiled kernels for gfx{:x}", gfx_version);
@@ -546,6 +558,26 @@ impl HsaDevice {
             self.queue_event_mailbox_ptr, self.queue_event_id);
         self.queue.submit();
         Some(compute::GpuFuture::new(&self.signal, self.signal_value))
+    }
+
+    /// Queue a dispatch with raw kernargs VA.
+    /// Same as dispatch_enqueue but takes a u64 VA instead of &GpuBuffer.
+    /// Used by GpuQueue which manages its own kernarg slab.
+    pub fn dispatch_enqueue_va(&mut self, name: &str,
+                               kernargs_va: u64,
+                               grid: [u32; 3], block: [u32; 3]) -> bool {
+        let entry = match self.kernels.as_ref().and_then(|m| m.get(name)) {
+            Some(e) => e.clone(),
+            None => return false,
+        };
+        self.queue.dispatch_lds(
+            entry.code_addr,
+            entry.desc.pgm_rsrc1, entry.desc.pgm_rsrc2, entry.desc.pgm_rsrc3,
+            kernargs_va, self.scratch.va_addr,
+            grid, block,
+            entry.desc.group_segment_size,
+        );
+        true
     }
 
     /// Queue a dispatch without signaling or submitting.

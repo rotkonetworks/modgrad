@@ -34,6 +34,26 @@ path = "src/lib.rs"
 name = "isis"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench_gpu"
+path = "bench_gpu.rs"
+
+[[bin]]
+name = "test_q4k"
+path = "test_q4k.rs"
+
+[[bin]]
+name = "test_gguf"
+path = "test_gguf.rs"
+
+[[bin]]
+name = "serve"
+path = "serve.rs"
+
+[[bin]]
+name = "test_candle"
+path = "test_candle.rs"
+
 [features]
 default = []
 onnx = ["dep:ort", "modgrad-io/onnx"]

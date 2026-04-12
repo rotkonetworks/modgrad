@@ -23,6 +23,16 @@ pub trait TransformerOps: Send + Sync {
     /// ReLU² activation: y = max(0, x)²
     fn relu_squared_inplace(&self, x: &mut [f32]);
 
+    /// SiLU (swish) in-place: x[i] = x[i] * sigmoid(x[i])
+    fn silu_inplace(&self, x: &mut [f32]);
+
+    /// SiLU-gated multiply: out[i] = silu(gate[i]) * up[i]
+    /// Used by SwiGLU FFN. `gate` and `up` are same length.
+    fn silu_gated(&self, gate: &[f32], up: &[f32], out: &mut [f32]);
+
+    /// Scaled RMS norm: dst[i] = scale[i] * src[i] / sqrt(mean(src²) + eps)
+    fn scaled_rms_norm(&self, src: &[f32], scale: &[f32], dst: &mut [f32], eps: f32);
+
     /// Polar Express: approximate matrix sign function via Newton-Schulz iteration.
     ///
     /// Input: arbitrary matrix X (flattened row-major, [rows × cols]).
@@ -74,6 +84,28 @@ pub(crate) mod cpu {
     pub fn relu_squared_inplace(x: &mut [f32]) {
         for v in x.iter_mut() {
             *v = if *v > 0.0 { *v * *v } else { 0.0 };
+        }
+    }
+
+    pub fn silu_inplace(x: &mut [f32]) {
+        for v in x.iter_mut() {
+            *v *= 1.0 / (1.0 + (-*v).exp());
+        }
+    }
+
+    pub fn silu_gated(gate: &[f32], up: &[f32], out: &mut [f32]) {
+        for i in 0..out.len() {
+            let s = gate[i] / (1.0 + (-gate[i]).exp()); // silu(gate)
+            out[i] = s * up[i];
+        }
+    }
+
+    pub fn scaled_rms_norm(src: &[f32], scale: &[f32], dst: &mut [f32], eps: f32) {
+        let n = src.len() as f32;
+        let ss: f32 = src.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (ss / n + eps).sqrt();
+        for i in 0..src.len() {
+            dst[i] = scale[i] * src[i] * inv_rms;
         }
     }
 
@@ -156,6 +188,18 @@ impl TransformerOps for CpuBackend {
 
     fn relu_squared_inplace(&self, x: &mut [f32]) {
         cpu::relu_squared_inplace(x);
+    }
+
+    fn silu_inplace(&self, x: &mut [f32]) {
+        cpu::silu_inplace(x);
+    }
+
+    fn silu_gated(&self, gate: &[f32], up: &[f32], out: &mut [f32]) {
+        cpu::silu_gated(gate, up, out);
+    }
+
+    fn scaled_rms_norm(&self, src: &[f32], scale: &[f32], dst: &mut [f32], eps: f32) {
+        cpu::scaled_rms_norm(src, scale, dst, eps);
     }
 
     fn polar_express(&self, x: &mut [f32], rows: usize, cols: usize) {

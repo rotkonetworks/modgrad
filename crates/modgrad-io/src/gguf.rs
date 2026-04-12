@@ -107,7 +107,8 @@ impl Backend for GgufBackend {
             .map(|_| vec![0.0f32; self.hidden_dim])
             .collect();
 
-        Ok((hidden_placeholder, hidden_placeholder.clone()))
+        let hidden_clone = hidden_placeholder.clone();
+        Ok((hidden_placeholder, hidden_clone))
     }
 
     fn run_lm_head(&mut self, _full_hidden: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, BoxErr> {

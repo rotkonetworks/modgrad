@@ -26,6 +26,7 @@ pub mod optim;
 pub mod offload;
 pub mod train;
 pub mod loss;
+pub mod loop_lm;
 
 // Re-exports
 pub use config::GptConfig;

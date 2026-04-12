@@ -731,9 +731,173 @@ mod tests {
         assert!(approx_eq(beta[1], 1.0, 1e-5));
     }
 
+    // ─── GPU vs CPU comparison tests ───────────────────────────
+    // Run with: cargo test -p modgrad-compute -- --ignored
+    // Requires AMD GPU hardware (KFD).
+
+    fn gpu_available() -> bool {
+        modgrad_device::kfd::accel::available()
+    }
+
+    fn init_gpu_backend() -> HybridGpuBackend {
+        modgrad_device::kfd::accel::enable_vram_mode();
+        HybridGpuBackend::new()
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_glu() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let n = 128;
+        let input: Vec<f32> = (0..2*n).map(|i| (i as f32 - n as f32) * 0.01).collect();
+        let mut cpu_out = vec![0.0f32; n];
+        let mut gpu_out = vec![0.0f32; n];
+
+        cpu.glu(&input, &mut cpu_out);
+        gpu.glu(&input, &mut gpu_out);
+
+        for i in 0..n {
+            assert!((cpu_out[i] - gpu_out[i]).abs() < 0.01,
+                "GLU mismatch at {}: cpu={} gpu={}", i, cpu_out[i], gpu_out[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_silu() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let mut cpu_x: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.05).collect();
+        let mut gpu_x = cpu_x.clone();
+
+        cpu.silu_inplace(&mut cpu_x);
+        gpu.silu_inplace(&mut gpu_x);
+
+        for i in 0..256 {
+            assert!((cpu_x[i] - gpu_x[i]).abs() < 0.01,
+                "SiLU mismatch at {}: cpu={} gpu={}", i, cpu_x[i], gpu_x[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_layer_norm() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let mut cpu_x: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 + 1.0).collect();
+        let mut gpu_x = cpu_x.clone();
+
+        cpu.layer_norm_inplace(&mut cpu_x);
+        gpu.layer_norm_inplace(&mut gpu_x);
+
+        for i in 0..256 {
+            assert!((cpu_x[i] - gpu_x[i]).abs() < 0.05,
+                "LayerNorm mismatch at {}: cpu={} gpu={}", i, cpu_x[i], gpu_x[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_synapse_forward() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let out_dim = 128;
+        let in_dim = 64;
+        let matvec_dim = out_dim * 2; // pre-GLU
+
+        // Random-ish weights
+        let w: Vec<f32> = (0..matvec_dim * in_dim)
+            .map(|i| ((i * 7 + 3) % 100) as f32 * 0.001 - 0.05)
+            .collect();
+        let b: Vec<f32> = (0..matvec_dim)
+            .map(|i| ((i * 13 + 7) % 100) as f32 * 0.001)
+            .collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i * 11 + 5) % 100) as f32 * 0.01 - 0.5)
+            .collect();
+
+        let mut cpu_out = vec![0.0f32; out_dim];
+        let mut gpu_out = vec![0.0f32; out_dim];
+        let mut cpu_scratch = vec![0.0f32; matvec_dim];
+        let mut gpu_scratch = vec![0.0f32; matvec_dim];
+
+        cpu.synapse_forward(&w, &b, &x, &mut cpu_out, &mut cpu_scratch, out_dim, in_dim);
+        gpu.synapse_forward(&w, &b, &x, &mut gpu_out, &mut gpu_scratch, out_dim, in_dim);
+
+        for i in 0..out_dim {
+            assert!((cpu_out[i] - gpu_out[i]).abs() < 0.1,
+                "synapse_forward mismatch at {}: cpu={} gpu={}", i, cpu_out[i], gpu_out[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_trace_shift() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let n_neurons = 64;
+        let mem_len = 8;
+        let mut cpu_traces: Vec<f32> = (0..n_neurons * mem_len)
+            .map(|i| i as f32)
+            .collect();
+        let mut gpu_traces = cpu_traces.clone();
+        let new_act: Vec<f32> = (0..n_neurons).map(|i| (i * 100) as f32).collect();
+
+        cpu.trace_shift(&mut cpu_traces, &new_act, n_neurons, mem_len);
+        gpu.trace_shift(&mut gpu_traces, &new_act, n_neurons, mem_len);
+
+        for i in 0..n_neurons * mem_len {
+            assert!((cpu_traces[i] - gpu_traces[i]).abs() < 1e-5,
+                "trace_shift mismatch at {}: cpu={} gpu={}", i, cpu_traces[i], gpu_traces[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpu_sync_update() {
+        if !gpu_available() { return; }
+        let gpu = init_gpu_backend();
+        let cpu = CpuBackend::new();
+
+        let n = 32;
+        let mut cpu_alpha = vec![0.0f32; n];
+        let mut cpu_beta = vec![0.0f32; n];
+        let mut gpu_alpha = vec![0.0f32; n];
+        let mut gpu_beta = vec![0.0f32; n];
+        let mut cpu_sync = vec![0.0f32; n];
+        let mut gpu_sync = vec![0.0f32; n];
+
+        let act_l: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
+        let act_r: Vec<f32> = (0..n).map(|i| ((n - i) as f32) * 0.1).collect();
+        let decay: Vec<f32> = vec![0.5; n];
+        let decay_shift: Vec<f32> = vec![0.1; n];
+
+        cpu.sync_update(&mut cpu_alpha, &mut cpu_beta, &act_l, &act_r,
+            &[], &[], &decay, &decay_shift, 1.0, n, false, &mut cpu_sync);
+        gpu.sync_update(&mut gpu_alpha, &mut gpu_beta, &act_l, &act_r,
+            &[], &[], &decay, &decay_shift, 1.0, n, false, &mut gpu_sync);
+
+        for i in 0..n {
+            assert!((cpu_alpha[i] - gpu_alpha[i]).abs() < 0.01,
+                "sync alpha mismatch at {}: cpu={} gpu={}", i, cpu_alpha[i], gpu_alpha[i]);
+            assert!((cpu_sync[i] - gpu_sync[i]).abs() < 0.01,
+                "sync_out mismatch at {}: cpu={} gpu={}", i, cpu_sync[i], gpu_sync[i]);
+        }
+    }
+
     #[test]
     fn test_superlinear() {
-
         let backend = CpuBackend::new();
         // 2 neurons, in_per=2, out_per=1
         // neuron 0: w=[1,2], b=0.1, trace=[1,1] -> 1+2+0.1=3.1
@@ -901,19 +1065,33 @@ impl ComputeBackend for HybridGpuBackend {
         self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
     }
 
-    // Everything else: delegate to CPU (no GPU kernels for these ops yet)
-    fn glu(&self, input: &[f32], output: &mut [f32]) { self.cpu.glu(input, output); }
-    fn silu_inplace(&self, x: &mut [f32]) { self.cpu.silu_inplace(x); }
-    fn layer_norm_inplace(&self, x: &mut [f32]) { self.cpu.layer_norm_inplace(x); }
+    // ─── Element-wise ops: GPU only when data is VRAM-resident ───
+    // CPU is faster than GPU for small tensors that aren't already in VRAM.
+    // The zero-copy path in accel.rs detects VRAM pointers automatically.
+
+    fn glu(&self, input: &[f32], output: &mut [f32]) {
+        self.cpu.glu(input, output);
+    }
+
+    fn silu_inplace(&self, x: &mut [f32]) {
+        self.cpu.silu_inplace(x);
+    }
+
+    fn layer_norm_inplace(&self, x: &mut [f32]) {
+        self.cpu.layer_norm_inplace(x);
+    }
+
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
                        output: &mut [f32], scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
         self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
     }
+
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
         self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
     }
+
     fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
                    activations_left: &[f32], activations_right: &[f32],
                    phases_left: &[f32], phases_right: &[f32],

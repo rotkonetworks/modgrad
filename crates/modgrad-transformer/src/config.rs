@@ -84,6 +84,34 @@ impl Default for SmearConfig {
     }
 }
 
+/// MLP activation type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MlpActivation {
+    /// y = max(0, x)² — sparser than GELU.
+    ReluSquared,
+    /// SiLU-gated (SwiGLU): y = silu(gate(x)) * up(x)
+    /// Used by Llama, Mistral, Gemma, Qwen.
+    SwiGlu,
+}
+
+/// Per-layer attention configuration override.
+/// When None, uses the global config values.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LayerOverride {
+    /// Override head_dim for this layer (e.g. SWA vs full attention).
+    pub head_dim: Option<usize>,
+    /// Override num_heads for this layer.
+    pub num_heads: Option<usize>,
+    /// Override num_kv_heads for this layer.
+    pub num_kv_heads: Option<usize>,
+    /// Override RoPE base frequency for this layer.
+    pub rope_base: Option<f32>,
+    /// KV sharing: instead of computing K/V, reuse from this layer index.
+    pub share_kv_from: Option<usize>,
+    /// Whether this layer has a per-layer input gate (Gemma 4).
+    pub has_input_gate: bool,
+}
+
 /// Full transformer configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GptConfig {
@@ -102,6 +130,20 @@ pub struct GptConfig {
     pub qk_norm_scale: f32,
     /// Attention window pattern.
     pub window_pattern: WindowPattern,
+    /// MLP activation type.
+    pub mlp_activation: MlpActivation,
+    /// Per-layer overrides (indexed by layer). Empty = all layers use global config.
+    pub layer_overrides: Vec<LayerOverride>,
+    /// Whether to tie embedding and output weights.
+    pub tie_embeddings: bool,
+    /// Logit soft-capping value (0.0 = disabled). Gemma uses 30.0.
+    pub logit_cap: f32,
+    /// Recurrent depth: apply the block stack this many times per token.
+    /// 1 = standard transformer. >1 = LoopLM (weight-tied recurrence).
+    /// Ouro uses 4 steps for both 1.4B and 2.6B models.
+    pub recurrent_steps: usize,
+    /// Whether this model has a learned exit gate for adaptive halting.
+    pub has_exit_gate: bool,
 
     pub value_embed: ValueEmbedConfig,
     pub residual: ResidualConfig,
@@ -165,6 +207,55 @@ impl GptConfig {
     pub fn has_value_embed(&self, layer: LayerIdx) -> bool {
         layer.get() % 2 == (self.num_layers.get() - 1) % 2
     }
+
+    /// Get per-layer override (or default).
+    pub fn layer_override(&self, layer: usize) -> &LayerOverride {
+        static DEFAULT: LayerOverride = LayerOverride {
+            head_dim: None, num_heads: None, num_kv_heads: None,
+            rope_base: None, share_kv_from: None, has_input_gate: false,
+        };
+        self.layer_overrides.get(layer).unwrap_or(&DEFAULT)
+    }
+
+    /// Effective head_dim for a layer.
+    pub fn layer_head_dim(&self, layer: usize) -> usize {
+        self.layer_override(layer).head_dim.unwrap_or(self.head_dim.get())
+    }
+
+    /// Effective num_heads for a layer.
+    pub fn layer_num_heads(&self, layer: usize) -> usize {
+        self.layer_override(layer).num_heads.unwrap_or(self.num_heads.get())
+    }
+
+    /// Effective num_kv_heads for a layer.
+    pub fn layer_num_kv_heads(&self, layer: usize) -> usize {
+        self.layer_override(layer).num_kv_heads.unwrap_or(self.num_kv_heads.get())
+    }
+
+    /// Effective RoPE base for a layer.
+    pub fn layer_rope_base(&self, layer: usize) -> f32 {
+        self.layer_override(layer).rope_base.unwrap_or(self.rope_base)
+    }
+
+    /// KV dim for a layer (num_kv_heads * head_dim).
+    pub fn layer_kv_dim(&self, layer: usize) -> usize {
+        self.layer_num_kv_heads(layer) * self.layer_head_dim(layer)
+    }
+
+    /// Q dim for a layer (num_heads * head_dim).
+    pub fn layer_q_dim(&self, layer: usize) -> usize {
+        self.layer_num_heads(layer) * self.layer_head_dim(layer)
+    }
+
+    /// Which layer to source KV from (for KV sharing). Returns self if no sharing.
+    pub fn kv_source_layer(&self, layer: usize) -> usize {
+        self.layer_override(layer).share_kv_from.unwrap_or(layer)
+    }
+
+    /// Whether this layer uses SwiGLU activation.
+    pub fn is_swiglu(&self) -> bool {
+        matches!(self.mlp_activation, MlpActivation::SwiGlu)
+    }
 }
 
 impl Default for GptConfig {
@@ -181,6 +272,12 @@ impl Default for GptConfig {
             rope_base: 100_000.0,
             qk_norm_scale: 1.2,
             window_pattern: WindowPattern::Full,
+            mlp_activation: MlpActivation::ReluSquared,
+            layer_overrides: Vec::new(),
+            tie_embeddings: false,
+            logit_cap: 0.0,
+            recurrent_steps: 1,
+            has_exit_gate: false,
             value_embed: ValueEmbedConfig::default(),
             residual: ResidualConfig::default(),
             smear: SmearConfig::default(),

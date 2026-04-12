@@ -102,6 +102,28 @@ impl KvCache<Empty> {
         }
     }
 
+    /// Allocate cache with per-layer KV dimensions.
+    /// `kv_dims[i]` = kv_dim for layer i. Supports varying head sizes.
+    /// `kv_source[i]` = which layer to source KV from (for sharing).
+    pub fn new_per_layer(
+        kv_dims: &[usize],
+        model_dim: ModelDim,
+        max_seq_len: SeqLen,
+    ) -> Self {
+        let max_len = max_seq_len.get();
+        let layers = kv_dims.iter()
+            .map(|&kv_dim| LayerKv::new(max_len, kv_dim))
+            .collect();
+
+        Self {
+            layers,
+            prev_embedding: vec![0.0; model_dim.get()],
+            seq_len: 0,
+            max_seq_len: max_len,
+            _state: PhantomData,
+        }
+    }
+
     /// Transition to Prefilled after processing the prompt.
     pub fn prefill(mut self, prompt_len: usize) -> KvCache<Prefilled> {
         self.seq_len = prompt_len;
