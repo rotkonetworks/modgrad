@@ -22,10 +22,10 @@ half = "2"
 # ONNX backend
 ort = { version = "2.0.0-rc.12", optional = true }
 
-# GGUF backend (candle)
-candle-core = { version = "0.9", optional = true }
-candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
+# GGUF backend (candle from git — main branch has gemma4)
+candle-core = { git = "https://github.com/huggingface/candle", optional = true }
+candle-nn = { git = "https://github.com/huggingface/candle", optional = true }
+candle-transformers = { git = "https://github.com/huggingface/candle", optional = true }
 
 # QUIC transport for telemetry
 quinn = { version = "0.11", optional = true }
