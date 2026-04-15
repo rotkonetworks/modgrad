@@ -72,7 +72,7 @@ matvec:
 
     // --- load W[row][i] via flat ---
     // addr = W_ptr + row_byte_off + i*4
-    v_add_nc_u32 v4, v1, s14           // v4 = row_byte_off + i*4
+    v_add_nc_u32 v4, s14, v1           // v4 = row_byte_off + i*4
     v_add_co_u32 v14, vcc_lo, s2, v4   // lo
     v_add_co_ci_u32 v15, vcc_lo, s3, 0, vcc_lo  // hi
     flat_load_b32 v5, v[14:15]         // v5 = W[row][i]

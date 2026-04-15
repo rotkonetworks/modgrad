@@ -160,7 +160,7 @@ matvec_q4k:
 
     // ─── Load x[element] (current block) ───
     s_lshl_b32  s16, s13, 8             // blk * 256
-    v_add_nc_u32 v9, v0, s16            // tid + blk*256
+    v_add_nc_u32 v9, s16, v0            // tid + blk*256
     v_lshlrev_b32 v9, 2, v9
     global_load_b32 v11, v9, s[4:5]     // x[elem]
 

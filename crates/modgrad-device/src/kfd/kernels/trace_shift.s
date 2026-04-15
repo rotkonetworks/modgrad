@@ -52,7 +52,7 @@ trace_shift_fwd:
     // src offset = base + (j+1)*4
     s_add_u32 s11, s10, 1
     s_lshl_b32 s11, s11, 2              // (j+1)*4
-    v_add_nc_u32 v2, v1, s11            // base + (j+1)*4
+    v_add_nc_u32 v2, s11, v1            // base + (j+1)*4
 
     // load trace[neuron*M + j+1]
     global_load_b32 v4, v2, s[2:3]
