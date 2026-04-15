@@ -54,7 +54,7 @@ matmul_small:
     v_lshrrev_b32 v5, 5, v0
     v_and_b32 v6, 31, v0
     v_mul_lo_u32 v7, v5, s10
-    v_add_nc_u32 v7, v7, s16
+    v_add_nc_u32 v7, s16, v7
     v_add_nc_u32 v7, v7, v6
     v_lshlrev_b32 v7, 2, v7
     v_mul_lo_u32 v8, v5, TM
@@ -85,7 +85,7 @@ matmul_small:
     ds_store_b32 v10, v21
     s_waitcnt lgkmcnt(0)
     s_barrier
-    v_add_nc_u32 v7, v7, s22
+    v_add_nc_u32 v7, s22, v7
     v_add_nc_u32 v9, v9, TK * 4
     s_add_u32 s18, s18, TK
     s_cmp_ge_u32 s18, s11
@@ -180,7 +180,7 @@ matmul_small:
     ds_store_b32 v10, v21
     s_waitcnt lgkmcnt(0)
     s_barrier
-    v_add_nc_u32 v7, v7, s22
+    v_add_nc_u32 v7, s22, v7
     v_add_nc_u32 v9, v9, TK * 4
     s_add_u32 s18, s18, TK
     s_cmp_lt_u32 s18, s11
@@ -264,7 +264,7 @@ matmul_small:
     v_lshlrev_b32 v5, 2, v5
     global_store_b64 v5, v[16:17], s[8:9]
     s_lshl_b32 s19, s10, 2
-    v_add_nc_u32 v5, v5, s19
+    v_add_nc_u32 v5, s19, v5
     global_store_b64 v5, v[18:19], s[8:9]
     s_waitcnt vmcnt(0)
     s_endpgm

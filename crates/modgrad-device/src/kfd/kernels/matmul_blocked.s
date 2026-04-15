@@ -280,15 +280,15 @@ matmul_blocked:
 
     // Row j=1: offset += M*4
     s_lshl_b32 s19, s10, 2                // M * 4
-    v_add_nc_u32 v5, v5, s19
+    v_add_nc_u32 v5, s19, v5
     global_store_b128 v5, v[20:23], s[8:9]
 
     // Row j=2
-    v_add_nc_u32 v5, v5, s19
+    v_add_nc_u32 v5, s19, v5
     global_store_b128 v5, v[24:27], s[8:9]
 
     // Row j=3
-    v_add_nc_u32 v5, v5, s19
+    v_add_nc_u32 v5, s19, v5
     global_store_b128 v5, v[28:31], s[8:9]
 
     s_waitcnt vmcnt(0)

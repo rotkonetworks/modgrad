@@ -248,22 +248,14 @@ impl StreamEngine {
         Some(y)
     }
 
-    /// y = W @ x + b
+    /// y = W @ x + b (tiled: 1 WG per row, 256 threads cooperate via LDS)
     pub fn matvec(
         &mut self, dev: &mut HsaDevice,
         weight: &[f32], bias: &[f32], x: &[f32],
         out_dim: usize, in_dim: usize,
     ) -> Option<Vec<f32>> {
-        // Use tiled kernel for dims where it's verified correct,
-        // fall back to naive for others (tiled has a bug with some non-256-aligned in_dim)
-        if in_dim % 256 == 0 {
-            self.dispatch_kernel(dev, "matvec_tiled", weight, bias, x,
-                &[out_dim as u32, in_dim as u32], out_dim as u32, out_dim)
-        } else {
-            let nwg = ((out_dim as u32) + 255) / 256;
-            self.dispatch_kernel(dev, "matvec", weight, bias, x,
-                &[out_dim as u32, in_dim as u32], nwg, out_dim)
-        }
+        self.dispatch_kernel(dev, "matvec_tiled", weight, bias, x,
+            &[out_dim as u32, in_dim as u32], out_dim as u32, out_dim)
     }
 
     // ═══════════════════════════════════════════════════════════════

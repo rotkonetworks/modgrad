@@ -152,7 +152,7 @@ matvec_q4k:
     s_mul_i32    s14, s13, 144
     s_add_u32    s14, s14, s21           // current block base
     v_add_nc_u32 v6, v1, 16             // 16 + qs_idx
-    v_add_nc_u32 v6, v6, s14
+    v_add_nc_u32 v6, s14, v6            // SGPR in src0
     // Aligned dword load + byte extraction
     v_and_b32    v7, 3, v6              // byte_in_word
     v_and_b32    v6, 0xFFFFFFFC, v6     // align to 4

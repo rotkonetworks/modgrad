@@ -53,7 +53,7 @@ matvec_tiled:
 .Ltile:
     // i = tid + tile × 256
     s_lshl_b32  s14, s13, 8             // tile × 256
-    v_add_nc_u32 v4, v0, s14            // v4 = i
+    v_add_nc_u32 v4, s14, v0            // v4 = tile*256 + tid (SGPR in src0)
 
     // Bounds: if smallest i in next tile >= in_dim, this is last tile
     // But first process current tile (some threads may be out of bounds)
@@ -63,7 +63,7 @@ matvec_tiled:
 
     // Byte offset into W row: s21 (row base) + i×4
     v_lshlrev_b32 v5, 2, v4             // i × 4
-    v_add_nc_u32 v5, v5, s21            // row_base + i×4
+    v_add_nc_u32 v5, s21, v5            // row_base + i×4 (SGPR in src0)
     global_load_b32 v6, v5, s[2:3]      // W[row][i]
 
     // x[i]: byte offset = i×4

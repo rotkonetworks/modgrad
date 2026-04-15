@@ -60,7 +60,7 @@ trace_shift_fwd:
 
     // dst offset = base + j*4
     s_lshl_b32 s12, s10, 2
-    v_add_nc_u32 v3, v1, s12
+    v_add_nc_u32 v3, s12, v1            // SGPR in src0
 
     // store to trace[neuron*M + j]
     global_store_b32 v3, v4, s[2:3]
@@ -78,7 +78,7 @@ trace_shift_fwd:
     // dst offset = base + (M-1)*4
     s_sub_u32 s12, s7, 1
     s_lshl_b32 s12, s12, 2
-    v_add_nc_u32 v3, v1, s12
+    v_add_nc_u32 v3, s12, v1            // SGPR in src0
     global_store_b32 v3, v6, s[2:3]
 
 .Ldone:

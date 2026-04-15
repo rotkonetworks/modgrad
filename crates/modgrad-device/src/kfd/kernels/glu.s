@@ -42,7 +42,7 @@ glu_fwd:
 
     // load input[n + i] (gate half): byte offset = n*4 + i*4
     s_lshl_b32 s8, s6, 2                // s8 = n * 4
-    v_add_nc_u32 v5, v1, s8             // v5 = (n + i) * 4
+    v_add_nc_u32 v5, s8, v1             // v5 = (n + i) * 4
     global_load_b32 v6, v5, s[2:3]
 
     s_waitcnt vmcnt(0)
