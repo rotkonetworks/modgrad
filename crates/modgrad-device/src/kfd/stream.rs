@@ -263,17 +263,14 @@ impl StreamEngine {
         Some(y)
     }
 
-    /// y = W @ x + b
+    /// y = W @ x + b (tiled: 1 WG per row, LDS reduction)
     pub fn matvec(
         &mut self, dev: &mut HsaDevice,
         weight: &[f32], bias: &[f32], x: &[f32],
         out_dim: usize, in_dim: usize,
     ) -> Option<Vec<f32>> {
-        // Use naive kernel (1 thread/row) — tiled hangs during training
-        // TODO: debug tiled kernel hang
-        let nwg = ((out_dim as u32) + 255) / 256;
-        self.dispatch_kernel(dev, "matvec", weight, bias, x,
-            &[out_dim as u32, in_dim as u32], nwg, out_dim)
+        self.dispatch_kernel(dev, "matvec_tiled", weight, bias, x,
+            &[out_dim as u32, in_dim as u32], out_dim as u32, out_dim)
     }
 
     /// y = W @ x + b, writing directly to caller's output slice.
