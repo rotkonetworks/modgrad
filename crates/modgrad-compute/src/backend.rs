@@ -1041,7 +1041,9 @@ impl HybridGpuBackend {
 }
 
 /// Minimum FMA ops to justify GPU dispatch overhead.
-const GPU_MIN_FLOPS: usize = 1_000_000;
+/// Tiled matvec beats CPU at ~50K FLOPs (128×512 = 1.63x).
+/// CTM synapse ops are 50K-300K FLOPs at d_model=512.
+const GPU_MIN_FLOPS: usize = 50_000;
 
 impl ComputeBackend for HybridGpuBackend {
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
