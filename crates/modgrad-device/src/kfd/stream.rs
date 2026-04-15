@@ -39,6 +39,9 @@ pub struct StreamEngine {
     y_buf: Option<GpuBuffer>,
     y_cap: usize,
     args_buf: Option<GpuBuffer>,
+    /// Cached kernel entries for hot-path dispatch (no HashMap lookup).
+    cached_matvec_tiled: Option<super::dispatch::KernelEntry>,
+    cached_superlinear: Option<super::dispatch::KernelEntry>,
 
     // ─── Chained dispatch scratch buffers ───
     // These stay in VRAM between kernel dispatches so data never
@@ -69,6 +72,18 @@ impl StreamEngine {
             scratch_a: None, scratch_a_cap: 0,
             scratch_b: None, scratch_b_cap: 0,
             chain_args: [None, None, None, None, None, None, None, None],
+            cached_matvec_tiled: None,
+            cached_superlinear: None,
+        }
+    }
+
+    /// Resolve and cache kernel entries for hot-path dispatch.
+    pub fn cache_kernels(&mut self, dev: &HsaDevice) {
+        if self.cached_matvec_tiled.is_none() {
+            self.cached_matvec_tiled = dev.resolve_kernel("matvec_tiled");
+        }
+        if self.cached_superlinear.is_none() {
+            self.cached_superlinear = dev.resolve_kernel("superlinear_fwd");
         }
     }
 
@@ -259,7 +274,7 @@ impl StreamEngine {
     }
 
     /// y = W @ x + b, writing directly to caller's output slice.
-    /// Avoids the Vec allocation + double copy of dispatch_kernel → try_matvec.
+    /// Optimized path: cached kernel lookup, single copy readback.
     pub fn matvec_into(
         &mut self, dev: &mut HsaDevice,
         weight: &[f32], bias: &[f32], x: &[f32],
@@ -269,14 +284,14 @@ impl StreamEngine {
             Some(v) => v, None => return false,
         };
 
-        if !self.ensure_x(x.len() * 4, dev) { return false; }
+        if !self.ensure_x(in_dim * 4, dev) { return false; }
         if !self.ensure_y(out_dim * 4, dev) { return false; }
         if !self.ensure_args(dev) { return false; }
 
-        // Upload input
-        self.x_buf.as_ref().unwrap().write_f32(0, x);
+        // Upload input through BAR (~0.3us for 2KB at d_model=512)
+        self.x_buf.as_ref().unwrap().write_f32(0, &x[..in_dim]);
 
-        // Build kernargs
+        // Build kernargs (40 bytes — fast, no allocation)
         let xva = self.x_buf.as_ref().unwrap().va_addr;
         let yva = self.y_buf.as_ref().unwrap().va_addr;
         let args = self.args_buf.as_ref().unwrap();
@@ -289,18 +304,84 @@ impl StreamEngine {
         kargs[36..40].copy_from_slice(&(in_dim as u32).to_le_bytes());
         args.write(0, &kargs[..40]);
 
-        // Dispatch + wait
-        if !dev.dispatch_enqueue("matvec_tiled", args, [out_dim as u32, 1, 1], [256, 1, 1]) {
-            return false;
+        // Resolve kernel on first use (cached — no HashMap lookup after first call)
+        if self.cached_matvec_tiled.is_none() {
+            self.cached_matvec_tiled = dev.resolve_kernel("matvec_tiled");
         }
+
+        // Dispatch
+        match &self.cached_matvec_tiled {
+            Some(entry) => {
+                dev.dispatch_enqueue_resolved(entry, args, [out_dim as u32, 1, 1], [256, 1, 1]);
+            }
+            None => return false,
+        }
+
+        // Cache writeback + signal + wait
         dev.queue.cache_wb();
         if !dev.submit_wait(5000) { return false; }
 
-        // Read back directly into caller's slice (single copy)
+        // Read back through BAR directly into caller's slice (~0.3us for 2KB)
         let src = unsafe {
             std::slice::from_raw_parts(self.y_buf.as_ref().unwrap().cpu_ptr as *const f32, out_dim)
         };
         out[..out_dim].copy_from_slice(src);
+
+        if !self.vram_mode { self.active = 1 - self.active; }
+        true
+    }
+
+    /// SuperLinear into caller's output slice.
+    pub fn superlinear_into(
+        &mut self, dev: &mut HsaDevice,
+        weights: &[f32], biases: &[f32], trace: &[f32],
+        out: &mut [f32], n_neurons: usize, out_per: usize, in_per: usize,
+    ) -> bool {
+        let (w_va, bias_va) = match self.prepare_weights(dev, weights, biases) {
+            Some(v) => v, None => return false,
+        };
+
+        let total_in = n_neurons * in_per;
+        let total_out = n_neurons * out_per;
+        if !self.ensure_x(total_in * 4, dev) { return false; }
+        if !self.ensure_y(total_out * 4, dev) { return false; }
+        if !self.ensure_args(dev) { return false; }
+
+        self.x_buf.as_ref().unwrap().write_f32(0, &trace[..total_in]);
+
+        let xva = self.x_buf.as_ref().unwrap().va_addr;
+        let yva = self.y_buf.as_ref().unwrap().va_addr;
+        let args = self.args_buf.as_ref().unwrap();
+        let mut kargs = [0u8; 48];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&bias_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&xva.to_le_bytes());
+        kargs[24..32].copy_from_slice(&yva.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(n_neurons as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&(out_per as u32).to_le_bytes());
+        kargs[40..44].copy_from_slice(&(in_per as u32).to_le_bytes());
+        args.write(0, &kargs[..44]);
+
+        if self.cached_superlinear.is_none() {
+            self.cached_superlinear = dev.resolve_kernel("superlinear_fwd");
+        }
+
+        let total = (n_neurons * out_per) as u32;
+        let nwg = (total + 255) / 256;
+        match &self.cached_superlinear {
+            Some(entry) => {
+                dev.dispatch_enqueue_resolved(entry, args, [nwg, 1, 1], [256, 1, 1]);
+            }
+            None => return false,
+        }
+
+        dev.queue.cache_wb();
+        if !dev.submit_wait(5000) { return false; }
+
+        let src = unsafe {
+            std::slice::from_raw_parts(self.y_buf.as_ref().unwrap().cpu_ptr as *const f32, total_out)
+        };
+        out[..total_out].copy_from_slice(src);
 
         if !self.vram_mode { self.active = 1 - self.active; }
         true

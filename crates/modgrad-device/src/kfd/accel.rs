@@ -156,23 +156,16 @@ pub fn try_superlinear(
         );
     }
 
-    // Fallback: check threshold for non-VRAM path
-    let flops = n_neurons as usize * in_per as usize * out_per as usize;
-    if !g.engine.vram_mode && flops < 8_000_000 { return false; }
-
-    match g.engine.superlinear(
-        &mut g.dev, weights, biases, trace,
+    // Direct dispatch with single-copy readback
+    if g.engine.superlinear_into(
+        &mut g.dev, weights, biases, trace, out,
         n_neurons as usize, out_per as usize, in_per as usize,
     ) {
-        Some(y) => {
-            out[..(n_neurons * out_per) as usize].copy_from_slice(&y);
-            true
-        }
-        None => {
-            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            false
-        }
+        return true;
     }
+
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
 }
 
 /// Fused synapse forward: matvec → GLU → SiLU → LayerNorm.

@@ -561,6 +561,25 @@ impl HsaDevice {
         Some(compute::GpuFuture::new(&self.signal, self.signal_value))
     }
 
+    /// Resolve a kernel by name. Cache the result for fast dispatch.
+    pub fn resolve_kernel(&self, name: &str) -> Option<dispatch::KernelEntry> {
+        self.kernels.as_ref()?.get(name).cloned()
+    }
+
+    /// Queue a dispatch with pre-resolved kernel. No HashMap lookup.
+    pub fn dispatch_enqueue_resolved(&mut self,
+                                      entry: &dispatch::KernelEntry,
+                                      kernargs: &memory::GpuBuffer,
+                                      grid: [u32; 3], block: [u32; 3]) {
+        self.queue.dispatch_lds(
+            entry.code_addr,
+            entry.desc.pgm_rsrc1, entry.desc.pgm_rsrc2, entry.desc.pgm_rsrc3,
+            kernargs.va_addr, self.scratch.va_addr,
+            grid, block,
+            entry.desc.group_segment_size,
+        );
+    }
+
     /// Queue a dispatch with raw kernargs VA.
     /// Same as dispatch_enqueue but takes a u64 VA instead of &GpuBuffer.
     /// Used by GpuQueue which manages its own kernarg slab.
