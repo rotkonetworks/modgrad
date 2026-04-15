@@ -42,9 +42,9 @@ pub(crate) fn linear_backward(
             d_weight[row + j] += d * cache.input[j];
         }
     }
-    // d_input = W^T @ d_out — stateless GPU stream
+    // d_input = W^T @ d_out — GPU dispatch for backward pass
     if modgrad_compute::neuron::gpu_enabled()
-        && in_dim * out_dim >= 8_000_000
+        && in_dim * out_dim >= 50_000
     {
         let mut d_input = vec![0.0f32; in_dim];
         if modgrad_device::kfd::accel::try_matvec_t(
