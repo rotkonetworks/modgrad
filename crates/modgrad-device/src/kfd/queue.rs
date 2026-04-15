@@ -388,7 +388,16 @@ impl ComputeQueue {
     }
 
     /// Spin-wait until a 32-bit signal address contains the expected value.
+    /// Uses counter-based fast path for short waits (avoids clock_gettime syscall
+    /// overhead in the hot loop). Falls back to clock after 10000 spins (~100us).
     pub fn poll_signal(signal_ptr: *const u32, expected: u32, timeout_us: u64) -> bool {
+        // Fast path: spin with counter (no syscall)
+        for _ in 0..10000 {
+            let val = unsafe { signal_ptr.read_volatile() };
+            if val >= expected { return true; }
+            std::hint::spin_loop();
+        }
+        // Slow path: use clock for long waits
         let start = std::time::Instant::now();
         loop {
             let val = unsafe { signal_ptr.read_volatile() };

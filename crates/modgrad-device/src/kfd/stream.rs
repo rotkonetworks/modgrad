@@ -258,6 +258,54 @@ impl StreamEngine {
             &[out_dim as u32, in_dim as u32], out_dim as u32, out_dim)
     }
 
+    /// y = W @ x + b, writing directly to caller's output slice.
+    /// Avoids the Vec allocation + double copy of dispatch_kernel → try_matvec.
+    pub fn matvec_into(
+        &mut self, dev: &mut HsaDevice,
+        weight: &[f32], bias: &[f32], x: &[f32],
+        out: &mut [f32], out_dim: usize, in_dim: usize,
+    ) -> bool {
+        let (w_va, bias_va) = match self.prepare_weights(dev, weight, bias) {
+            Some(v) => v, None => return false,
+        };
+
+        if !self.ensure_x(x.len() * 4, dev) { return false; }
+        if !self.ensure_y(out_dim * 4, dev) { return false; }
+        if !self.ensure_args(dev) { return false; }
+
+        // Upload input
+        self.x_buf.as_ref().unwrap().write_f32(0, x);
+
+        // Build kernargs
+        let xva = self.x_buf.as_ref().unwrap().va_addr;
+        let yva = self.y_buf.as_ref().unwrap().va_addr;
+        let args = self.args_buf.as_ref().unwrap();
+        let mut kargs = [0u8; 48];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&bias_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&xva.to_le_bytes());
+        kargs[24..32].copy_from_slice(&yva.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(out_dim as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&(in_dim as u32).to_le_bytes());
+        args.write(0, &kargs[..40]);
+
+        // Dispatch + wait
+        if !dev.dispatch_enqueue("matvec_tiled", args, [out_dim as u32, 1, 1], [256, 1, 1]) {
+            return false;
+        }
+        dev.queue.cache_wb();
+        if !dev.submit_wait(5000) { return false; }
+
+        // Read back directly into caller's slice (single copy)
+        let src = unsafe {
+            std::slice::from_raw_parts(self.y_buf.as_ref().unwrap().cpu_ptr as *const f32, out_dim)
+        };
+        out[..out_dim].copy_from_slice(src);
+
+        if !self.vram_mode { self.active = 1 - self.active; }
+        true
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Zero-copy VRAM dispatch — no upload, no download, no PCIe
     // ═══════════════════════════════════════════════════════════════

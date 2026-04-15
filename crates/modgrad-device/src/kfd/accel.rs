@@ -113,14 +113,13 @@ pub fn try_matvec(
         );
     }
 
-    // Fallback: upload/dispatch/download
-    match g.engine.matvec(&mut g.dev, weight, bias, x, out_dim as usize, in_dim as usize) {
-        Some(y) => { out[..out_dim as usize].copy_from_slice(&y); true }
-        None => {
-            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            false
-        }
+    // Direct dispatch: upload x, dispatch tiled kernel, read back into out
+    if g.engine.matvec_into(&mut g.dev, weight, bias, x, out, out_dim as usize, in_dim as usize) {
+        return true;
     }
+
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
 }
 
 /// dx = W^T @ d_out.

@@ -351,6 +351,11 @@ pub trait ComputeBackend: Send + Sync {
         self.layer_norm_inplace(&mut output[..out_dim]);
     }
 
+    /// Flush any batched GPU dispatches. Call at tick/step boundaries.
+    /// No-op for CPU backends. GPU backends may buffer dispatches and
+    /// flush them in a single submit_wait for efficiency.
+    fn flush(&self) {}
+
     /// Trace shift: for each neuron, shift trace left by 1, append new activation.
     /// traces: [n_neurons x memory_length], new_activations: [n_neurons]
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
