@@ -263,14 +263,17 @@ impl StreamEngine {
         Some(y)
     }
 
-    /// y = W @ x + b (tiled: 1 WG per row, 256 threads cooperate via LDS)
+    /// y = W @ x + b
     pub fn matvec(
         &mut self, dev: &mut HsaDevice,
         weight: &[f32], bias: &[f32], x: &[f32],
         out_dim: usize, in_dim: usize,
     ) -> Option<Vec<f32>> {
-        self.dispatch_kernel(dev, "matvec_tiled", weight, bias, x,
-            &[out_dim as u32, in_dim as u32], out_dim as u32, out_dim)
+        // Use naive kernel (1 thread/row) — tiled hangs during training
+        // TODO: debug tiled kernel hang
+        let nwg = ((out_dim as u32) + 255) / 256;
+        self.dispatch_kernel(dev, "matvec", weight, bias, x,
+            &[out_dim as u32, in_dim as u32], nwg, out_dim)
     }
 
     /// y = W @ x + b, writing directly to caller's output slice.
@@ -304,17 +307,9 @@ impl StreamEngine {
         kargs[36..40].copy_from_slice(&(in_dim as u32).to_le_bytes());
         args.write(0, &kargs[..40]);
 
-        // Resolve kernel on first use (cached — no HashMap lookup after first call)
-        if self.cached_matvec_tiled.is_none() {
-            self.cached_matvec_tiled = dev.resolve_kernel("matvec_tiled");
-        }
-
-        // Dispatch
-        match &self.cached_matvec_tiled {
-            Some(entry) => {
-                dev.dispatch_enqueue_resolved(entry, args, [out_dim as u32, 1, 1], [256, 1, 1]);
-            }
-            None => return false,
+        // Dispatch (using standard path with name lookup)
+        if !dev.dispatch_enqueue("matvec_tiled", args, [out_dim as u32, 1, 1], [256, 1, 1]) {
+            return false;
         }
 
         // Cache writeback + signal + wait
