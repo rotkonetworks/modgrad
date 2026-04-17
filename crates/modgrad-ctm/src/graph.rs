@@ -3156,6 +3156,176 @@ pub struct RegionalCache {
 /// The 8-region brain as a Brain.
 pub struct RegionalBrain;
 
+impl RegionalBrain {
+    /// Forward with caching + frozen cerebellum override.
+    ///
+    /// Same as `forward_cached` from the Brain trait, but after each outer tick,
+    /// the cerebellum region's output is replaced with the frozen model's output.
+    /// This lets the frozen world model contribute to global sync each tick.
+    pub fn forward_cached_frozen(
+        weights: &RegionalWeights,
+        state: RegionalState,
+        input: &modgrad_traits::TokenInput,
+        frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
+    ) -> (modgrad_traits::BrainOutput, RegionalState, RegionalCache) {
+        // If no projection layers configured, fall back to normal forward
+        if weights.cereb_projection.is_none() {
+            return <Self as modgrad_traits::Brain>::forward_cached(weights, state, input);
+        }
+
+        let proj = weights.cereb_projection.as_ref().unwrap();
+        let cfg = &weights.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+        let cereb_idx = cfg.region_names.iter()
+            .position(|n| n.contains("cerebellum"))
+            .unwrap_or(4);
+
+        let obs_projected = weights.obs_proj.forward(&input.tokens);
+        let mut state = RegionalState::new(weights);
+        let mut region_explicit_states: Vec<_> = weights.regions.iter()
+            .map(|rw| Ctm::init_state(rw))
+            .collect();
+        let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
+
+        for outer_tick in 0..cfg.outer_ticks {
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+            let mut router_cache: Option<RouterCache> = None;
+
+            if let Some(ref router) = weights.router {
+                let gs: Vec<f32> = (0..n_sync)
+                    .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                    .collect();
+                let (routed, cache) = router.forward(
+                    outer_tick, &gs, &state.region_outputs, true,
+                );
+                router_cache = Some(cache);
+                for r in 0..n_regions {
+                    region_obs[r] = routed[r].clone();
+                }
+            } else {
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    let mut src = Vec::new();
+                    for &from_idx in &conn.from {
+                        src.extend_from_slice(&state.region_outputs[from_idx]);
+                    }
+                    if conn.receives_observation {
+                        src.extend_from_slice(&input.tokens);
+                    }
+                    connection_inputs.push(src.clone());
+                    let projected = weights.connection_synapses[ci].forward(&src);
+                    region_obs[conn.to] = projected;
+                }
+                for r in 0..n_regions {
+                    if region_obs[r].is_empty() {
+                        region_obs[r] = obs_projected.clone();
+                    }
+                }
+            }
+
+            // Run regions in parallel
+            let states_taken: Vec<_> = region_explicit_states.drain(..).collect();
+            let region_results: Vec<_> = states_taken.into_par_iter().enumerate().map(|(r, rstate)| {
+                let d_input = weights.regions[r].config.d_input;
+                let rinput = TokenInput {
+                    tokens: region_obs[r].clone(),
+                    n_tokens: 1,
+                    token_dim: d_input,
+                };
+                let (_output, new_state, cache) = Ctm::forward_cached(
+                    &weights.regions[r], rstate, &rinput,
+                );
+                (new_state.activated.clone(), new_state, cache)
+            }).collect();
+
+            state.region_outputs.clear();
+            let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
+            for (activated, new_state, cache) in region_results {
+                state.region_outputs.push(activated);
+                region_explicit_states.push(new_state);
+                region_caches.push(Some(cache));
+            }
+
+            // Override cerebellum with frozen model output
+            let cereb_input = &region_obs[cereb_idx];
+            let input_len = proj.cortex_dim.min(cereb_input.len());
+            let frozen_out = proj.forward(frozen, &cereb_input[..input_len]);
+            let d_model = weights.regions[cereb_idx].config.d_model;
+            let mut cereb_output = vec![0.0f32; d_model];
+            let copy_len = d_model.min(frozen_out.len());
+            cereb_output[..copy_len].copy_from_slice(&frozen_out[..copy_len]);
+            state.region_outputs[cereb_idx] = cereb_output;
+
+            // Global sync
+            let mut all_activations = Vec::new();
+            for r in 0..n_regions {
+                all_activations.extend_from_slice(&state.region_outputs[r]);
+            }
+
+            for i in 0..n_sync {
+                let l = weights.global_sync_left[i];
+                let ri = weights.global_sync_right[i];
+                if l < all_activations.len() && ri < all_activations.len() {
+                    let pw = all_activations[l] * all_activations[ri];
+                    let decay = (-weights.global_decay[i].clamp(0.0, 15.0)).exp();
+                    state.global_alpha[i] = decay * state.global_alpha[i] + pw;
+                    state.global_beta[i] = decay * state.global_beta[i] + 1.0;
+                }
+            }
+
+            let global_sync: Vec<f32> = (0..n_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+
+            let (exit_gate_cache, exit_lambda) = if let Some(ref gate) = weights.outer_exit_gate {
+                let (logit, cache) = crate::train::linear_forward_cached(gate, &global_sync);
+                let lambda = 1.0 / (1.0 + (-logit[0]).exp());
+                (Some(cache), lambda)
+            } else {
+                (None, 0.0)
+            };
+
+            tick_caches.push(OuterTickCache {
+                region_obs,
+                region_activated: state.region_outputs.clone(),
+                region_caches,
+                all_activations,
+                global_sync: global_sync.clone(),
+                global_beta: state.global_beta.clone(),
+                connection_inputs,
+                exit_gate_cache,
+                exit_lambda,
+                router_cache,
+            });
+        }
+
+        let predictions: Vec<Vec<f32>> = tick_caches.iter()
+            .map(|tc| weights.output_proj.forward(&tc.global_sync))
+            .collect();
+        let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
+            let c = compute_certainty(p);
+            [1.0 - c, c]
+        }).collect();
+
+        let brain_output = modgrad_traits::BrainOutput {
+            predictions,
+            certainties,
+            sync: tick_caches.last()
+                .map(|tc| tc.global_sync.clone())
+                .unwrap_or_default(),
+        };
+
+        let cache = RegionalCache {
+            tick_caches,
+            observation: input.tokens.clone(),
+            last_region_activations: state.region_outputs.clone(),
+        };
+
+        (brain_output, state, cache)
+    }
+}
+
 impl modgrad_traits::Brain for RegionalBrain {
     type Input = modgrad_traits::TokenInput;
     type Weights = RegionalWeights;

@@ -39,6 +39,7 @@ fn main() {
     let mut plural_mode = false;
     let mut csv_mode = false;
     let mut cereb_size = 0usize; // 0 = use preset default
+    let mut frozen_cereb = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -58,11 +59,12 @@ fn main() {
             "--plural" => { plural_mode = true; pain_mode = true; i += 1; }
             "--csv" => { csv_mode = true; i += 1; }
             "--cereb-size" => { cereb_size = args[i+1].parse().unwrap(); i += 2; }
+            "--frozen-cereb" => { frozen_cereb = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
                 eprintln!("             [--imagination] [--brain] [--pain] [--plural] [--csv]");
-                eprintln!("             [--cereb-size N]");
+                eprintln!("             [--cereb-size N] [--frozen-cereb]");
                 return;
             }
             _ => { i += 1; }
@@ -72,7 +74,7 @@ fn main() {
     let maze_size = maze_size | 1;
 
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb);
         return;
     }
 
@@ -287,7 +289,7 @@ fn eval(
 fn run_brain(
     maze_size: usize, ticks: usize, steps: usize, route_len: usize,
     lr: f32, seed: u64, batch_size: usize, imagination: bool, pain_mode: bool,
-    plural_mode: bool, csv_mode: bool, cereb_size: usize,
+    plural_mode: bool, csv_mode: bool, cereb_size: usize, frozen_cereb: bool,
 ) {
     use std::io::Write;
     use modgrad_ctm::bio::dream;
@@ -295,6 +297,7 @@ fn run_brain(
     use modgrad_ctm::graph::AuxLossConfig;
     use modgrad_ctm::organism::{Organism, OrganismConfig};
     use modgrad_ctm::bio::pain::PainConfig;
+    use modgrad_ctm::cerebellum::FrozenCerebellum;
 
     let encoder = VisualRetina::maze(maze_size, maze_size);
     let token_dim = encoder.token_dim();
@@ -328,6 +331,22 @@ fn run_brain(
         eprintln!("Cerebellum: {cereb_size} neurons (no aux losses)");
     }
     let mut w = RegionalWeights::new(cfg);
+
+    // Frozen cerebellum: RandomExpansion as biological cerebellar model
+    let mut frozen_model: Option<modgrad_ctm::cerebellum::RandomExpansion> = if frozen_cereb {
+        let cereb_idx = w.config.region_names.iter()
+            .position(|n| n.contains("cerebellum")).unwrap_or(4);
+        let cortex_dim = w.regions[cereb_idx].config.d_model;
+        let expansion = 4; // biological 4:1 granule:mossy ratio
+        let frozen = modgrad_ctm::cerebellum::RandomExpansion::new(cortex_dim, expansion, seed);
+        w = w.with_frozen_cerebellum(frozen.input_dim(), frozen.output_dim());
+        eprintln!("Frozen cerebellum: RandomExpansion {}→{} (4:1 expansion)",
+            frozen.input_dim(), frozen.output_dim());
+        Some(frozen)
+    } else {
+        None
+    };
+
     w.print_summary();
 
     let base_loss = RouteLoss::maze();
@@ -436,7 +455,11 @@ fn run_brain(
                 }
             }
 
-            let (output, _state, cache) = RegionalBrain::forward_cached(&w, state, &input);
+            let (output, _state, cache) = if let Some(ref mut frozen) = frozen_model {
+                RegionalBrain::forward_cached_frozen(&w, state, &input, frozen)
+            } else {
+                RegionalBrain::forward_cached(&w, state, &input)
+            };
             let (loss, d_preds) = loss_fn.compute(
                 &output.predictions, &output.certainties, &route);
             let sample_grads = RegionalBrain::backward(&w, cache, &d_preds);
