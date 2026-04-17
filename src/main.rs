@@ -996,9 +996,9 @@ fn learn(
             use modgrad_ctm::cerebellum::FrozenCerebellum;
             let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
                 .unwrap_or_else(|e| { eprintln!("Failed to load frozen cerebellum: {e}"); std::process::exit(1); });
-            w = w.with_frozen_cerebellum(cereb.input_dim(), cereb.output_dim());
-            eprintln!("Frozen cerebellum: {} ({}→{} hidden dims)",
-                path, cereb.input_dim(), cereb.output_dim());
+            let hd = cereb.hidden_dim();
+            w = w.with_frozen_cerebellum(hd, hd);
+            eprintln!("Frozen cerebellum: {} (hidden_dim={})", path, hd);
             Some(cereb)
         } else {
             None
@@ -1089,22 +1089,38 @@ fn learn(
         let mut chunk_correct = 0usize;
         let n = chunk.len() - 1;
 
+        // Encode full context through frozen cerebellum ONCE (amortized)
+        #[cfg(feature = "onnx")]
+        let cereb_cache = if let Some(ref mut fc) = frozen_cereb {
+            use modgrad_ctm::cerebellum::FrozenCerebellum;
+            let token_ids: Vec<i64> = chunk.iter().map(|&t| t as i64).collect();
+            Some(fc.encode_context(&token_ids))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "onnx"))]
+        let cereb_cache: Option<()> = { let _ = &frozen_cereb; None };
+
+        // Per-token training (zero ONNX calls in this loop)
+        let cereb_idx = w.config.region_names.iter()
+            .position(|n| n.contains("cerebellum")).unwrap_or(4);
+        let cereb_d_model = w.regions[cereb_idx].config.d_model;
+
         for pos in 0..n {
-            let (loss, pred) = {
-                #[cfg(feature = "onnx")]
-                {
-                    if let Some(ref mut fc) = frozen_cereb {
-                        regional_train_token_frozen(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1], fc)
-                    } else {
-                        regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
-                    }
-                }
-                #[cfg(not(feature = "onnx"))]
-                {
-                    let _ = &frozen_cereb;
-                    regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
-                }
-            };
+            let (loss, pred) = regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1]);
+
+            // Inject cerebellum hidden state at this position
+            // (the frozen model's prediction of what comes next at position `pos`)
+            #[cfg(feature = "onnx")]
+            if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
+                use modgrad_ctm::cerebellum::cerebellum_at_position;
+                let mut cereb_out = vec![0.0f32; cereb_d_model];
+                cerebellum_at_position(cache, proj, pos, &mut cereb_out);
+                // TODO: integrate cereb_out into the training step
+                // For now this validates the pipeline works
+                let _ = cereb_out;
+            }
+
             chunk_loss += loss;
             if pred == chunk[pos + 1] { chunk_correct += 1; }
         }

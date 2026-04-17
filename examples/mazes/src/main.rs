@@ -339,9 +339,9 @@ fn run_brain(
         let cortex_dim = w.regions[cereb_idx].config.d_model;
         let expansion = 4; // biological 4:1 granule:mossy ratio
         let frozen = modgrad_ctm::cerebellum::RandomExpansion::new(cortex_dim, expansion, seed);
-        w = w.with_frozen_cerebellum(frozen.input_dim(), frozen.output_dim());
-        eprintln!("Frozen cerebellum: RandomExpansion {}→{} (4:1 expansion)",
-            frozen.input_dim(), frozen.output_dim());
+        let hd = frozen.hidden_dim();
+        w = w.with_frozen_cerebellum(hd, hd);
+        eprintln!("Frozen cerebellum: RandomExpansion hidden_dim={hd} (4:1 expansion)");
         Some(frozen)
     } else {
         None
