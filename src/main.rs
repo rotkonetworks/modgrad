@@ -989,29 +989,44 @@ fn learn(
         };
         RegionalWeights::new(cfg)
     };
-    // Frozen cerebellum: load ONNX model and configure projection layers
-    #[cfg(feature = "onnx")]
-    let mut frozen_cereb: Option<modgrad_runtime::onnx_cerebellum::OnnxCerebellum> =
+    // Frozen cerebellum: load from safetensors (native) or ONNX
+    let mut frozen_cereb: Option<Box<dyn modgrad_ctm::cerebellum::FrozenCerebellum>> =
         if let Some(path) = frozen_cereb_path {
             use modgrad_ctm::cerebellum::FrozenCerebellum;
-            let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
-                .unwrap_or_else(|e| { eprintln!("Failed to load frozen cerebellum: {e}"); std::process::exit(1); });
-            let hd = cereb.hidden_dim();
-            let nl = cereb.n_layers();
-            w = w.with_frozen_cerebellum(hd, nl);
-            eprintln!("Frozen cerebellum: {} (hidden_dim={}, layers={})", path, hd, nl);
-            Some(cereb)
+
+            if path.ends_with(".safetensors") {
+                // Native safetensors loader — no external runtime needed
+                let cfg = modgrad_ctm::frozen_transformer::TransformerConfig::qwen2_0_5b();
+                let cereb = modgrad_ctm::frozen_transformer::FrozenTransformer::load(path, cfg)
+                    .unwrap_or_else(|e| { eprintln!("Failed to load safetensors: {e}"); std::process::exit(1); });
+                let hd = cereb.hidden_dim();
+                let nl = cereb.n_layers();
+                w = w.with_frozen_cerebellum(hd, nl);
+                eprintln!("Frozen cerebellum (native): {} (hidden_dim={}, layers={})", path, hd, nl);
+                Some(Box::new(cereb) as Box<dyn FrozenCerebellum>)
+            } else if path.ends_with(".onnx") {
+                #[cfg(feature = "onnx")]
+                {
+                    let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
+                        .unwrap_or_else(|e| { eprintln!("Failed to load ONNX: {e}"); std::process::exit(1); });
+                    let hd = cereb.hidden_dim();
+                    let nl = cereb.n_layers();
+                    w = w.with_frozen_cerebellum(hd, nl);
+                    eprintln!("Frozen cerebellum (ONNX): {} (hidden_dim={}, layers={})", path, hd, nl);
+                    Some(Box::new(cereb) as Box<dyn FrozenCerebellum>)
+                }
+                #[cfg(not(feature = "onnx"))]
+                {
+                    eprintln!("ERROR: .onnx files require --features onnx. Use .safetensors instead.");
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("ERROR: --frozen-cereb supports .safetensors or .onnx files");
+                std::process::exit(1);
+            }
         } else {
             None
         };
-    #[cfg(not(feature = "onnx"))]
-    let mut frozen_cereb: Option<()> = {
-        if frozen_cereb_path.is_some() {
-            eprintln!("ERROR: --frozen-cereb requires the 'onnx' feature. Build with: cargo build --features onnx");
-            std::process::exit(1);
-        }
-        None
-    };
 
     w.print_summary();
 
@@ -1091,40 +1106,26 @@ fn learn(
         let n = chunk.len() - 1;
 
         // Encode full context through frozen cerebellum ONCE (amortized)
-        #[cfg(feature = "onnx")]
         let cereb_cache = if let Some(ref mut fc) = frozen_cereb {
             use modgrad_ctm::cerebellum::FrozenCerebellum;
             let token_ids: Vec<i64> = chunk.iter().map(|&t| t as i64).collect();
-            Some(fc.encode_context(&token_ids))
+            Some(fc.encode_context_layers(&token_ids))
         } else {
             None
         };
-        #[cfg(not(feature = "onnx"))]
-        let cereb_cache: Option<()> = { let _ = &frozen_cereb; None };
 
-        // Per-token training — zero ONNX calls, reads from cache
+        // Per-token training — reads from cache, zero inference calls
         for pos in 0..n {
-            let (loss, pred) = {
-                #[cfg(feature = "onnx")]
-                {
-                    if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
-                        // Multi-layer blend: weighted combination of all transformer layers
-                        use modgrad_ctm::cerebellum::blended_hidden_at;
-                        let hidden = blended_hidden_at(cache, proj, pos);
-                        if hidden.is_empty() {
-                            regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
-                        } else {
-                            regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], &hidden)
-                        }
-                    } else {
-                        regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
-                    }
-                }
-                #[cfg(not(feature = "onnx"))]
-                {
-                    let _ = &cereb_cache;
+            let (loss, pred) = if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
+                use modgrad_ctm::cerebellum::blended_hidden_at;
+                let hidden = blended_hidden_at(cache, proj, pos);
+                if hidden.is_empty() {
                     regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                } else {
+                    regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], &hidden)
                 }
+            } else {
+                regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
             };
             chunk_loss += loss;
             if pred == chunk[pos + 1] { chunk_correct += 1; }
