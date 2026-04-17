@@ -941,12 +941,12 @@ fn ctm_loss(predictions: &[Vec<f32>], certainties: &[[f32; 2]], target: usize)
 
     // Find tick with minimum loss
     let min_tick = (0..k).min_by(|&a, &b|
-        losses_and_grads[a].0.partial_cmp(&losses_and_grads[b].0).unwrap()
+        losses_and_grads[a].0.partial_cmp(&losses_and_grads[b].0).unwrap_or(std::cmp::Ordering::Equal)
     ).unwrap_or(k - 1);
 
     // Find tick with highest certainty (1 - normalized_entropy)
     let cert_tick = (0..k).max_by(|&a, &b|
-        certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()
+        certainties[a][1].partial_cmp(&certainties[b][1]).unwrap_or(std::cmp::Ordering::Equal)
     ).unwrap_or(k - 1);
 
     let loss = (losses_and_grads[min_tick].0 + losses_and_grads[cert_tick].0) / 2.0;
@@ -1236,7 +1236,7 @@ pub fn train_step(
         .map(|p| super::forward::compute_certainty_pub(p)).collect();
 
     let pred_class = predictions.last().unwrap().iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
 
     // Choose loss based on exit strategy
@@ -1610,7 +1610,7 @@ pub fn train_step_composed<T, L: LossFn<Target = T>>(
     accumulate_gradients(grads, &step_grads);
 
     let pred_class = output.predictions.last()
-        .and_then(|p| p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()))
+        .and_then(|p| p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)))
         .map(|(i, _)| i).unwrap_or(0);
 
     TrainResult { loss, prediction: pred_class }

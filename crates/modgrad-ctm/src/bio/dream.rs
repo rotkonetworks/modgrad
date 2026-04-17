@@ -59,7 +59,7 @@ pub fn dream_replay(
         })
         .collect();
 
-    painful.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // most negative first
+    painful.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)); // most negative first
     painful.truncate(max_replays);
 
     for &(idx, old_valence) in &painful {
@@ -225,7 +225,7 @@ impl AdaptivePainFocus {
     /// Which position has the highest failure rate?
     pub fn weakest_position(&self) -> usize {
         self.failure_rates.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0)
     }

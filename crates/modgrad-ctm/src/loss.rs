@@ -28,9 +28,9 @@ impl LossFn for CtmLoss {
             .collect();
 
         let min_tick = (0..k).min_by(|&a, &b|
-            ce[a].0.partial_cmp(&ce[b].0).unwrap()).unwrap_or(0);
+            ce[a].0.partial_cmp(&ce[b].0).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
         let cert_tick = (0..k).max_by(|&a, &b|
-            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()).unwrap_or(k - 1);
+            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(k - 1);
 
         let loss = (ce[min_tick].0 + ce[cert_tick].0) / 2.0;
 
@@ -100,9 +100,9 @@ impl LossFn for ThinkingLoss {
             .collect();
 
         let min_tick = (0..k).min_by(|&a, &b|
-            ce[a].0.partial_cmp(&ce[b].0).unwrap()).unwrap_or(0);
+            ce[a].0.partial_cmp(&ce[b].0).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
         let cert_tick = (0..k).max_by(|&a, &b|
-            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()).unwrap_or(k - 1);
+            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(k - 1);
         let base_loss = (ce[min_tick].0 + ce[cert_tick].0) / 2.0;
 
         let mut thinking_loss = 0.0f32;
@@ -183,9 +183,9 @@ impl LossFn for ImaginationLoss {
         }
 
         let min_idx = (0..committed.len()).min_by(|&a, &b|
-            committed[a].0.partial_cmp(&committed[b].0).unwrap()).unwrap_or(0);
+            committed[a].0.partial_cmp(&committed[b].0).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
         let cert_idx = (commit_start..k).max_by(|&a, &b|
-            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap())
+            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap_or(std::cmp::Ordering::Equal))
             .map(|i| i - commit_start).unwrap_or(committed.len() - 1);
 
         let base_loss = (committed[min_idx].0 + committed[cert_idx].0) / 2.0;

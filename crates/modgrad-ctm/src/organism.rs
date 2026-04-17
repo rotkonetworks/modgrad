@@ -444,6 +444,8 @@ fn active_state_of<'a>(
     memory: &'a mut EpisodicMemory,
 ) -> (&'a mut Homeostasis, &'a mut Neuromodulators, &'a mut EpisodicMemory) {
     if let Some(sys) = plural {
+        debug_assert!(sys.active < sys.personalities.len(),
+            "active personality index {} out of bounds ({})", sys.active, sys.personalities.len());
         let active = &mut sys.personalities[sys.active];
         (&mut active.homeostasis, &mut active.neuromod, &mut active.memory)
     } else {

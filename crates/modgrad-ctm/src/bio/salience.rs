@@ -24,7 +24,7 @@ pub fn compute(dopamine: f32, reward_baseline: f32, motor_output: &[f32]) -> Sal
     let reward_rpe = (dopamine - reward_baseline).abs();
 
     let mut sorted: Vec<f32> = motor_output.iter().map(|x| x.abs()).collect();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let motor_conflict = if sorted.len() >= 2 {
         1.0 / (1.0 + (sorted[0] - sorted[1]) * 5.0)
     } else {

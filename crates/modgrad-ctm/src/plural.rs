@@ -342,7 +342,7 @@ pub fn retrieve_plural(
 
         if co_result.n_matches > 0 {
             // Weighted blend
-            let w = other_weight * (co_result.best_similarity / best_sim.max(0.01)).min(1.0);
+            let w = other_weight * (co_result.best_similarity / best_sim.max(0.01)).clamp(0.0, 1.0);
             for i in 0..traj_len.min(blended_traj.len()).min(co_result.blended_trajectory.len()) {
                 blended_traj[i] += w * co_result.blended_trajectory[i];
             }

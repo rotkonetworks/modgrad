@@ -291,7 +291,7 @@ impl Homeostasis {
             (self.surprise_ema / 5.0 * 0.10, "sustained surprise (stress)"),
         ];
         components.iter()
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, name)| *name)
             .unwrap_or("unknown")
     }

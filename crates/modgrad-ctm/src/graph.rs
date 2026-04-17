@@ -1617,12 +1617,12 @@ fn ctm_loss_regional(
 
     // Tick with minimum loss
     let min_tick = (0..k).min_by(|&a, &b|
-        losses_and_grads[a].0.partial_cmp(&losses_and_grads[b].0).unwrap()
+        losses_and_grads[a].0.partial_cmp(&losses_and_grads[b].0).unwrap_or(std::cmp::Ordering::Equal)
     ).unwrap_or(k - 1);
 
     // Tick with highest certainty
     let cert_tick = (0..k).max_by(|&a, &b|
-        certainties[a].partial_cmp(&certainties[b]).unwrap()
+        certainties[a].partial_cmp(&certainties[b]).unwrap_or(std::cmp::Ordering::Equal)
     ).unwrap_or(k - 1);
 
     let loss = (losses_and_grads[min_tick].0 + losses_and_grads[cert_tick].0) / 2.0;
@@ -3148,7 +3148,7 @@ pub fn video_to_tokens(
     }
 
     // Sort by time (stable: frames before audio at same timestamp)
-    events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+    events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
 
     let total: usize = events.iter().map(|e| e.tokens.len()).sum();
     let mut result = Vec::with_capacity(total + 2);

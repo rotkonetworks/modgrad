@@ -490,7 +490,7 @@ impl BrainPipeline {
             }
 
             let next = logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as i64).unwrap_or(0);
 
             ids.push(next);

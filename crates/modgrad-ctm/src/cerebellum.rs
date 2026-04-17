@@ -86,6 +86,8 @@ impl CerebProjection {
 
     /// Project cortex activations → frozen model input space.
     pub fn project_in(&self, cortex: &[f32]) -> Vec<f32> {
+        debug_assert!(cortex.len() <= self.cortex_dim,
+            "project_in: input {} > cortex_dim {}", cortex.len(), self.cortex_dim);
         // y = W @ x + b, W is [frozen_input_dim × cortex_dim]
         let mut out = self.proj_in_b.clone();
         for i in 0..self.frozen_input_dim {

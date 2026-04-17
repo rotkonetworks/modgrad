@@ -72,7 +72,7 @@ impl ReplayBuffer {
         } else {
             // Evict lowest-surprise entry instead of oldest (prioritized replay)
             let min_idx = self.entries.iter().enumerate()
-                .min_by(|(_, a), (_, b)| a.surprise.partial_cmp(&b.surprise).unwrap())
+                .min_by(|(_, a), (_, b)| a.surprise.partial_cmp(&b.surprise).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             if surprise > self.entries[min_idx].surprise {
@@ -85,7 +85,7 @@ impl ReplayBuffer {
     /// Get entries sorted by surprise (highest first) for prioritized replay.
     pub fn prioritized(&self) -> Vec<&ReplayEntry> {
         let mut sorted: Vec<&ReplayEntry> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| b.surprise.partial_cmp(&a.surprise).unwrap());
+        sorted.sort_by(|a, b| b.surprise.partial_cmp(&a.surprise).unwrap_or(std::cmp::Ordering::Equal));
         sorted
     }
 

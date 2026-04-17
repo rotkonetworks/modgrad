@@ -191,7 +191,7 @@ impl EpisodicMemory {
             .filter(|&i| self.meta[i].alive)
             .collect();
         indices.sort_by(|&a, &b| {
-            self.meta[b].strength.partial_cmp(&self.meta[a].strength).unwrap()
+            self.meta[b].strength.partial_cmp(&self.meta[a].strength).unwrap_or(std::cmp::Ordering::Equal)
         });
         indices
     }
