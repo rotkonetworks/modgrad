@@ -2306,10 +2306,10 @@ pub fn regional_train_step_loss(
     target: usize,
     loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
 ) -> (f32, usize, Vec<f32>) {
-    regional_train_step_inner(w, grads, observation, target, loss_fn, None)
+    regional_train_step_inner(w, grads, observation, target, loss_fn, None, None)
 }
 
-/// Train step with optional frozen cerebellum override.
+/// Train step with optional frozen cerebellum override (per-token, legacy).
 pub fn regional_train_step_frozen(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
@@ -2317,7 +2317,19 @@ pub fn regional_train_step_frozen(
     target: usize,
     frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
 ) -> (f32, usize, Vec<f32>) {
-    regional_train_step_inner(w, grads, observation, target, None, Some(frozen))
+    regional_train_step_inner(w, grads, observation, target, None, Some(frozen), None)
+}
+
+/// Train step with a pre-computed cerebellum hidden state injected
+/// into the cerebellum region output each tick.
+pub fn regional_train_step_with_cereb(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    observation: &[f32],
+    target: usize,
+    cereb_hidden: &[f32],
+) -> (f32, usize, Vec<f32>) {
+    regional_train_step_inner(w, grads, observation, target, None, None, Some(cereb_hidden))
 }
 
 fn regional_train_step_inner(
@@ -2327,6 +2339,7 @@ fn regional_train_step_inner(
     target: usize,
     loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
     mut frozen: Option<&mut dyn crate::cerebellum::FrozenCerebellum>,
+    cereb_hidden: Option<&[f32]>,
 ) -> (f32, usize, Vec<f32>) {
     let cfg = &w.config;
     let n_regions = cfg.regions.len();
@@ -2406,12 +2419,32 @@ fn regional_train_step_inner(
             region_caches.push(Some(cache));
         }
 
-        // Override cerebellum with frozen model if provided
-        if let Some(ref mut fm) = frozen {
+        // Override cerebellum region with frozen model output.
+        // Two paths: pre-computed hidden state (from cache) or per-token forward.
+        let cereb_idx = cfg.region_names.iter()
+            .position(|n| n.contains("cerebellum"))
+            .unwrap_or(4);
+
+        if let Some(hidden) = cereb_hidden {
+            // Cache path: project pre-computed LLM hidden state → cortex dim.
+            // ADDITIVE: blend with CTM cerebellum output, don't replace.
+            // The CTM cerebellum still runs and provides its own signal.
+            // The frozen model's contribution is added on top, scaled down
+            // initially so random projections don't overwhelm the CTM signal.
             if let Some(ref proj) = w.cereb_projection {
-                let cereb_idx = cfg.region_names.iter()
-                    .position(|n| n.contains("cerebellum"))
-                    .unwrap_or(4);
+                let d_model = w.regions[cereb_idx].config.d_model;
+                let projected = proj.project_out(hidden);
+                let copy_len = d_model.min(projected.len());
+                // Additive blend: CTM output + scaled frozen projection.
+                // Scale factor 0.1 prevents random projections from dominating.
+                // As projection learns, its contribution becomes meaningful.
+                for i in 0..copy_len {
+                    state.region_outputs[cereb_idx][i] += 0.1 * projected[i];
+                }
+            }
+        } else if let Some(ref mut fm) = frozen {
+            // Legacy per-token path
+            if let Some(ref proj) = w.cereb_projection {
                 let cereb_input = &region_obs[cereb_idx];
                 let input_len = proj.cortex_dim.min(cereb_input.len());
                 let frozen_out = proj.forward(*fm, &cereb_input[..input_len]);
@@ -2932,6 +2965,25 @@ pub fn regional_train_token_frozen(
         grads.embed_grad[offset + j] += d_obs[j];
     }
     let _ = ws; // TODO: pass workspace through to inner step
+    (loss, pred)
+}
+
+/// Train one token with pre-computed cerebellum hidden state from cache.
+/// The hidden state is injected into the cerebellum region output each tick.
+pub fn regional_train_token_with_cereb(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    token: usize,
+    target: usize,
+    cereb_hidden: &[f32],
+) -> (f32, usize) {
+    let obs = w.embed(token);
+    let (loss, pred, d_obs) = regional_train_step_with_cereb(w, grads, obs, target, cereb_hidden);
+    let d = w.config.raw_obs_dim;
+    let offset = token * d;
+    for j in 0..d {
+        grads.embed_grad[offset + j] += d_obs[j];
+    }
     (loss, pred)
 }
 

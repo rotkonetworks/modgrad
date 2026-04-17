@@ -1101,26 +1101,29 @@ fn learn(
         #[cfg(not(feature = "onnx"))]
         let cereb_cache: Option<()> = { let _ = &frozen_cereb; None };
 
-        // Per-token training (zero ONNX calls in this loop)
-        let cereb_idx = w.config.region_names.iter()
-            .position(|n| n.contains("cerebellum")).unwrap_or(4);
-        let cereb_d_model = w.regions[cereb_idx].config.d_model;
-
+        // Per-token training — zero ONNX calls, reads from cache
         for pos in 0..n {
-            let (loss, pred) = regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1]);
-
-            // Inject cerebellum hidden state at this position
-            // (the frozen model's prediction of what comes next at position `pos`)
-            #[cfg(feature = "onnx")]
-            if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
-                use modgrad_ctm::cerebellum::cerebellum_at_position;
-                let mut cereb_out = vec![0.0f32; cereb_d_model];
-                cerebellum_at_position(cache, proj, pos, &mut cereb_out);
-                // TODO: integrate cereb_out into the training step
-                // For now this validates the pipeline works
-                let _ = cereb_out;
-            }
-
+            let (loss, pred) = {
+                #[cfg(feature = "onnx")]
+                {
+                    if let Some(ref cache) = cereb_cache {
+                        // Read LLM hidden state at this position from cache
+                        let hidden = cache.at(pos);
+                        if hidden.is_empty() {
+                            regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                        } else {
+                            regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], hidden)
+                        }
+                    } else {
+                        regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                    }
+                }
+                #[cfg(not(feature = "onnx"))]
+                {
+                    let _ = &cereb_cache;
+                    regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                }
+            };
             chunk_loss += loss;
             if pred == chunk[pos + 1] { chunk_correct += 1; }
         }
