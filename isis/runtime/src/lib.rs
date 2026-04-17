@@ -24,3 +24,21 @@ pub mod nc_socket;
 // Actor model (generic)
 pub mod actors;
 
+// Plural system integration
+pub mod plural_nc;
+
+/// Generate tokens from a NeuralComputer using the SDK inference runtime.
+pub fn generate_nc(
+    nc: &mut modgrad_ctm::graph::NeuralComputer,
+    input_tokens: &[usize],
+    sampler: &mut dyn modgrad_traits::Sampler,
+    stop: &modgrad_training::inference::Stop,
+) -> modgrad_training::inference::GenerateResult {
+    let initial_logits = nc.observe(input_tokens);
+    modgrad_training::inference::generate(
+        &mut |token| nc.step(token),
+        initial_logits,
+        sampler,
+        stop,
+    )
+}
