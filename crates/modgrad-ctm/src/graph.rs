@@ -881,6 +881,13 @@ pub struct RegionalWeights {
     /// Present when cereb_mode != Ctm.
     #[serde(default)]
     pub cereb_projection: Option<crate::cerebellum::CerebProjection>,
+
+    /// Learnable blend scale for frozen cerebellum contribution.
+    /// Initialized small (sigmoid(-2) ≈ 0.12) so the cortex isn't overwhelmed
+    /// by random projections early in training. Learns to ramp up as the
+    /// projection layers become useful.
+    #[serde(default)]
+    pub cereb_blend_logit: Option<f32>,
 }
 
 impl RegionalWeights {
@@ -1010,6 +1017,7 @@ impl RegionalWeights {
             bg_value,
             router,
             cereb_projection: None,
+            cereb_blend_logit: None,
         }
     }
 
@@ -1023,6 +1031,8 @@ impl RegionalWeights {
         self.cereb_projection = Some(crate::cerebellum::CerebProjection::new(
             cortex_dim, frozen_input_dim, frozen_output_dim,
         ));
+        // sigmoid(-2.0) ≈ 0.12 — small initial contribution, learns to grow
+        self.cereb_blend_logit = Some(-2.0);
         self.config.cereb_mode = crate::cerebellum::CerebMode::External;
         self
     }
@@ -1403,6 +1413,11 @@ pub struct RegionalGradients {
     /// BG value head gradients (None when aux disabled).
     pub bg_value_dw: Option<Vec<f32>>,
     pub bg_value_db: Option<Vec<f32>>,
+    /// Cerebellum projection gradients (None when no frozen cerebellum).
+    pub cereb_proj_out_dw: Option<Vec<f32>>,
+    pub cereb_proj_out_db: Option<Vec<f32>>,
+    /// Cerebellum blend scale gradient.
+    pub cereb_blend_scale_grad: Option<f32>,
 }
 
 /// Compute L2 norm across multiple gradient slices.
@@ -1430,6 +1445,9 @@ impl RegionalGradients {
             cereb_predict_db: w.cereb_predict.as_ref().map(|h| vec![0.0; h.bias.len()]),
             bg_value_dw: w.bg_value.as_ref().map(|h| vec![0.0; h.weight.len()]),
             bg_value_db: w.bg_value.as_ref().map(|h| vec![0.0; h.bias.len()]),
+            cereb_proj_out_dw: w.cereb_projection.as_ref().map(|p| vec![0.0; p.proj_out_w.len()]),
+            cereb_proj_out_db: w.cereb_projection.as_ref().map(|p| vec![0.0; p.proj_out_b.len()]),
+            cereb_blend_scale_grad: w.cereb_projection.as_ref().map(|_| 0.0),
         }
     }
 
@@ -1451,6 +1469,9 @@ impl RegionalGradients {
         if let Some(b) = &mut self.cereb_predict_db { b.fill(0.0); }
         if let Some(w) = &mut self.bg_value_dw { w.fill(0.0); }
         if let Some(b) = &mut self.bg_value_db { b.fill(0.0); }
+        if let Some(w) = &mut self.cereb_proj_out_dw { w.fill(0.0); }
+        if let Some(b) = &mut self.cereb_proj_out_db { b.fill(0.0); }
+        if let Some(s) = &mut self.cereb_blend_scale_grad { *s = 0.0; }
     }
 
     /// Apply gradients with SGD + gradient clipping (for tests / simple usage).
@@ -2345,6 +2366,9 @@ fn regional_train_step_inner(
     let n_regions = cfg.regions.len();
     let n_sync = cfg.n_global_sync;
     let obs_dim = cfg.raw_obs_dim;
+    let cereb_idx = cfg.region_names.iter()
+        .position(|n| n.contains("cerebellum"))
+        .unwrap_or(4);
 
     // ── Forward with caching ──
     // Pre-allocated buffers for the hot loop. obs_projected is computed once,
@@ -2420,11 +2444,6 @@ fn regional_train_step_inner(
         }
 
         // Override cerebellum region with frozen model output.
-        // Two paths: pre-computed hidden state (from cache) or per-token forward.
-        let cereb_idx = cfg.region_names.iter()
-            .position(|n| n.contains("cerebellum"))
-            .unwrap_or(4);
-
         if let Some(hidden) = cereb_hidden {
             // Cache path: project pre-computed LLM hidden state → cortex dim.
             // ADDITIVE: blend with CTM cerebellum output, don't replace.
@@ -2435,11 +2454,13 @@ fn regional_train_step_inner(
                 let d_model = w.regions[cereb_idx].config.d_model;
                 let projected = proj.project_out(hidden);
                 let copy_len = d_model.min(projected.len());
-                // Additive blend: CTM output + scaled frozen projection.
-                // Scale factor 0.1 prevents random projections from dominating.
-                // As projection learns, its contribution becomes meaningful.
+                // Learnable blend: sigmoid(logit) scales the contribution.
+                // Starts small (~0.12), learns to ramp up as projections improve.
+                let blend = w.cereb_blend_logit
+                    .map(|logit| 1.0 / (1.0 + (-logit).exp()))
+                    .unwrap_or(0.1);
                 for i in 0..copy_len {
-                    state.region_outputs[cereb_idx][i] += 0.1 * projected[i];
+                    state.region_outputs[cereb_idx][i] += blend * projected[i];
                 }
             }
         } else if let Some(ref mut fm) = frozen {
@@ -2578,6 +2599,35 @@ fn regional_train_step_inner(
             let dim = w.regions[r].config.d_model;
             d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
             offset += dim;
+        }
+
+        // Accumulate cerebellum projection gradients from d_region_activated[cereb_idx].
+        // The forward was: region_outputs[cereb_idx] += blend * proj_out(hidden)
+        // So: d_proj_out_w += blend * d_cereb ⊗ hidden
+        //     d_blend_logit += sum(d_cereb * projected) * blend * (1 - blend)
+        if let (Some(hidden), Some(proj), Some(dw), Some(db)) = (
+            cereb_hidden,
+            &w.cereb_projection,
+            grads.cereb_proj_out_dw.as_mut(),
+            grads.cereb_proj_out_db.as_mut(),
+        ) {
+            let blend = w.cereb_blend_logit
+                .map(|logit| 1.0 / (1.0 + (-logit).exp()))
+                .unwrap_or(0.1);
+            let d_cereb = &d_region_activated[cereb_idx];
+            // Scale by blend since forward multiplied by blend
+            let mut d_cortex_scaled: Vec<f32> = d_cereb.iter().map(|&d| d * blend).collect();
+            proj.backward_out(hidden, &d_cortex_scaled, dw, db);
+
+            // Gradient for blend logit: d_loss/d_logit = d_loss/d_blend * d_blend/d_logit
+            // d_blend/d_logit = blend * (1 - blend) (sigmoid derivative)
+            if let Some(ref mut blend_grad) = grads.cereb_blend_scale_grad {
+                let projected = proj.project_out(hidden);
+                let dot: f32 = d_cereb.iter().zip(projected.iter())
+                    .map(|(d, p)| d * p)
+                    .sum();
+                *blend_grad += dot * blend * (1.0 - blend);
+            }
         }
 
         let mut d_region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
@@ -2807,6 +2857,9 @@ pub struct RegionalAdamW {
     cereb_predict_b: Option<AdamWBuf>,
     bg_value_w: Option<AdamWBuf>,
     bg_value_b: Option<AdamWBuf>,
+    cereb_proj_out_w: Option<AdamWBuf>,
+    cereb_proj_out_b: Option<AdamWBuf>,
+    cereb_blend_logit: Option<AdamWBuf>,
 }
 
 impl RegionalAdamW {
@@ -2831,6 +2884,9 @@ impl RegionalAdamW {
             cereb_predict_b: w.cereb_predict.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
             bg_value_w: w.bg_value.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
             bg_value_b: w.bg_value.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
+            cereb_proj_out_w: w.cereb_projection.as_ref().map(|p| AdamWBuf::zeros(p.proj_out_w.len())),
+            cereb_proj_out_b: w.cereb_projection.as_ref().map(|p| AdamWBuf::zeros(p.proj_out_b.len())),
+            cereb_blend_logit: w.cereb_blend_logit.map(|_| AdamWBuf::zeros(1)),
         }
     }
 
@@ -2902,6 +2958,27 @@ impl RegionalAdamW {
         ) {
             opt_w.step(&mut head.weight, dw, lr, wd, b1, b2, eps, bc1, bc2);
             opt_b.step(&mut head.bias, db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        }
+
+        // Cerebellum projection — AdamW on proj_out weights
+        if let (Some(proj), Some(opt_w), Some(opt_b),
+                Some(dw), Some(db)) = (
+            &mut w.cereb_projection, &mut self.cereb_proj_out_w, &mut self.cereb_proj_out_b,
+            &mut grads.cereb_proj_out_dw, &mut grads.cereb_proj_out_db,
+        ) {
+            opt_w.step(&mut proj.proj_out_w, dw, lr, wd, b1, b2, eps, bc1, bc2);
+            opt_b.step(&mut proj.proj_out_b, db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        }
+
+        // Cerebellum blend scale — AdamW on the logit
+        if let (Some(logit), Some(opt), Some(grad)) = (
+            &mut w.cereb_blend_logit, &mut self.cereb_blend_logit,
+            &mut grads.cereb_blend_scale_grad,
+        ) {
+            let mut logit_slice = [*logit];
+            let mut grad_slice = [*grad];
+            opt.step(&mut logit_slice, &mut grad_slice, lr, 0.0, b1, b2, eps, bc1, bc2);
+            *logit = logit_slice[0];
         }
     }
 
