@@ -76,6 +76,9 @@ enum Commands {
         max_tokens: usize,
         #[arg(short, long, default_value = "0.8")]
         temperature: f32,
+        /// Frozen cerebellum (.safetensors or .onnx)
+        #[arg(long)]
+        frozen_cereb: Option<String>,
     },
     /// Run as a headless daemon (NC service on TCP port)
     Daemon {
@@ -141,8 +144,8 @@ fn main() {
                 audio.as_deref(), camera.as_deref(), camera_fps,
                 audio_out.as_deref(), image_out.as_deref(), debug_port);
         }
-        Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
-            run_generate(&checkpoint, &prompt, max_tokens, temperature);
+        Commands::Generate { checkpoint, prompt, max_tokens, temperature, frozen_cereb } => {
+            run_generate(&checkpoint, &prompt, max_tokens, temperature, frozen_cereb.as_deref());
         }
         Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port, frozen_cereb } => {
             if gpu || vram {
@@ -176,14 +179,97 @@ fn main() {
 
 // ─── Generate ─────────────────────────────────────────────
 
-fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: f32) {
-    let w = RegionalWeights::load(checkpoint)
+fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: f32, frozen_cereb_path: Option<&str>) {
+    let mut w = RegionalWeights::load(checkpoint)
         .unwrap_or_else(|e| { eprintln!("Failed to load {checkpoint}: {e}"); std::process::exit(1); });
+
+    // Load frozen cerebellum if specified
+    let mut frozen: Option<Box<dyn modgrad_ctm::cerebellum::FrozenCerebellum>> =
+        if let Some(path) = frozen_cereb_path {
+            use modgrad_ctm::cerebellum::FrozenCerebellum;
+            if path.ends_with(".safetensors") {
+                let cfg = modgrad_ctm::frozen_transformer::TransformerConfig::qwen2_0_5b();
+                let cereb = modgrad_ctm::frozen_transformer::FrozenTransformer::load(path, cfg)
+                    .unwrap_or_else(|e| { eprintln!("Failed: {e}"); std::process::exit(1); });
+                let hd = cereb.hidden_dim();
+                let nl = cereb.n_layers();
+                // Only configure projection if not already present in checkpoint
+                if w.cereb_projection.is_none() {
+                    w = w.with_frozen_cerebellum(hd, nl);
+                }
+                eprintln!("Cerebellum: {} (hidden_dim={}, layers={})", path, hd, nl);
+                Some(Box::new(cereb))
+            } else {
+                #[cfg(feature = "onnx")]
+                {
+                    let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
+                        .unwrap_or_else(|e| { eprintln!("Failed: {e}"); std::process::exit(1); });
+                    let hd = cereb.hidden_dim();
+                    let nl = cereb.n_layers();
+                    if w.cereb_projection.is_none() {
+                        w = w.with_frozen_cerebellum(hd, nl);
+                    }
+                    eprintln!("Cerebellum: {} (hidden_dim={}, layers={})", path, hd, nl);
+                    Some(Box::new(cereb))
+                }
+                #[cfg(not(feature = "onnx"))]
+                { eprintln!("ONNX requires --features onnx"); std::process::exit(1); }
+            }
+        } else {
+            None
+        };
+
     w.print_summary();
 
+    // Generate with cerebellum
+    let prompt_bytes = prompt.as_bytes();
     let mut nc = NeuralComputer::new(w);
-    let response = nc.chat(prompt, max_tokens, temperature);
-    print!("{prompt}{response}");
+
+    // Feed prompt through NC + cerebellum
+    if let Some(ref mut fc) = frozen {
+        use modgrad_ctm::cerebellum::{FrozenCerebellum, blended_hidden_at};
+        let token_ids: Vec<i64> = prompt_bytes.iter().map(|&b| b as i64).collect();
+        let cache = fc.encode_context_layers(&token_ids);
+
+        for (i, &b) in prompt_bytes.iter().enumerate() {
+            let logits = nc.step(b as usize);
+            // Inject cerebellum hidden state into the NC's region outputs
+            if let Some(ref proj) = nc.weights.cereb_projection {
+                let cereb_idx = nc.weights.config.region_names.iter()
+                    .position(|n| n.contains("cerebellum")).unwrap_or(4);
+                let hidden = blended_hidden_at(&cache, proj, i);
+                if !hidden.is_empty() {
+                    let d_model = nc.weights.config.regions[cereb_idx].d_model;
+                    let projected = proj.project_out(&hidden);
+                    let blend = nc.weights.cereb_blend_logit
+                        .map(|l| 1.0 / (1.0 + (-l).exp()))
+                        .unwrap_or(0.1);
+                    for j in 0..d_model.min(projected.len()) {
+                        nc.state.region_outputs[cereb_idx][j] += blend * projected[j];
+                    }
+                }
+            }
+            let _ = logits;
+        }
+    } else {
+        for &b in prompt_bytes {
+            nc.step(b as usize);
+        }
+    }
+
+    // Generate
+    print!("{prompt}");
+    let mut prev_logits = nc.step(prompt_bytes.last().copied().unwrap_or(b' ') as usize);
+    for _ in 0..max_tokens {
+        let next = nc.sample(&prev_logits, temperature);
+        if next < 256 {
+            print!("{}", next as u8 as char);
+        }
+        // For generation, we run without cerebellum (autoregressive —
+        // we'd need to re-encode the growing sequence each step, which
+        // is expensive. The cortex has already been primed by the prompt.)
+        prev_logits = nc.step(next);
+    }
     println!();
 }
 
