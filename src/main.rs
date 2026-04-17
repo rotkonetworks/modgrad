@@ -120,6 +120,9 @@ enum Commands {
         billion: bool,
         #[arg(long)]
         debug_port: Option<u16>,
+        /// Path to frozen ONNX cerebellum model (e.g. backbone.onnx with hidden_states output).
+        #[arg(long)]
+        frozen_cereb: Option<String>,
     },
     /// Show available compute devices
     Devices,
@@ -141,7 +144,7 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature);
         }
-        Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port } => {
+        Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port, frozen_cereb } => {
             if gpu || vram {
                 modgrad_compute::neuron::enable_gpu();
             }
@@ -157,7 +160,7 @@ fn main() {
                     Box::new(modgrad_compute::backend::HybridGpuBackend::new())
                 );
             }
-            learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port);
+            learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port, frozen_cereb.as_deref());
         }
         Commands::Daemon { checkpoint, port } => {
             run_daemon(&checkpoint, port);
@@ -881,6 +884,7 @@ fn learn(
     large: bool,
     billion: bool,
     debug_port: Option<u16>,
+    frozen_cereb_path: Option<&str>,
 ) {
     // Gather all data as token sequences.
     // Two modes:
@@ -985,6 +989,29 @@ fn learn(
         };
         RegionalWeights::new(cfg)
     };
+    // Frozen cerebellum: load ONNX model and configure projection layers
+    #[cfg(feature = "onnx")]
+    let mut frozen_cereb: Option<modgrad_runtime::onnx_cerebellum::OnnxCerebellum> =
+        if let Some(path) = frozen_cereb_path {
+            use modgrad_ctm::cerebellum::FrozenCerebellum;
+            let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
+                .unwrap_or_else(|e| { eprintln!("Failed to load frozen cerebellum: {e}"); std::process::exit(1); });
+            w = w.with_frozen_cerebellum(cereb.input_dim(), cereb.output_dim());
+            eprintln!("Frozen cerebellum: {} ({}→{} hidden dims)",
+                path, cereb.input_dim(), cereb.output_dim());
+            Some(cereb)
+        } else {
+            None
+        };
+    #[cfg(not(feature = "onnx"))]
+    let mut frozen_cereb: Option<()> = {
+        if frozen_cereb_path.is_some() {
+            eprintln!("ERROR: --frozen-cereb requires the 'onnx' feature. Build with: cargo build --features onnx");
+            std::process::exit(1);
+        }
+        None
+    };
+
     w.print_summary();
 
     let opt_path = save_path.replace(".bin", ".opt.bin");
@@ -1063,7 +1090,21 @@ fn learn(
         let n = chunk.len() - 1;
 
         for pos in 0..n {
-            let (loss, pred) = regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1]);
+            let (loss, pred) = {
+                #[cfg(feature = "onnx")]
+                {
+                    if let Some(ref mut fc) = frozen_cereb {
+                        regional_train_token_frozen(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1], fc)
+                    } else {
+                        regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                    }
+                }
+                #[cfg(not(feature = "onnx"))]
+                {
+                    let _ = &frozen_cereb;
+                    regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                }
+            };
             chunk_loss += loss;
             if pred == chunk[pos + 1] { chunk_correct += 1; }
         }

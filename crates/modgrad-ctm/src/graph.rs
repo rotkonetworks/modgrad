@@ -2294,6 +2294,28 @@ pub fn regional_train_step_loss(
     target: usize,
     loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
 ) -> (f32, usize, Vec<f32>) {
+    regional_train_step_inner(w, grads, observation, target, loss_fn, None)
+}
+
+/// Train step with optional frozen cerebellum override.
+pub fn regional_train_step_frozen(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    observation: &[f32],
+    target: usize,
+    frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
+) -> (f32, usize, Vec<f32>) {
+    regional_train_step_inner(w, grads, observation, target, None, Some(frozen))
+}
+
+fn regional_train_step_inner(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    observation: &[f32],
+    target: usize,
+    loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
+    mut frozen: Option<&mut dyn crate::cerebellum::FrozenCerebellum>,
+) -> (f32, usize, Vec<f32>) {
     let cfg = &w.config;
     let n_regions = cfg.regions.len();
     let n_sync = cfg.n_global_sync;
@@ -2362,6 +2384,23 @@ pub fn regional_train_step_loss(
             state.region_outputs[r] = new_state.activated.clone();
             region_explicit_states[r] = new_state;
             region_caches.push(Some(cache));
+        }
+
+        // Override cerebellum with frozen model if provided
+        if let Some(ref mut fm) = frozen {
+            if let Some(ref proj) = w.cereb_projection {
+                let cereb_idx = cfg.region_names.iter()
+                    .position(|n| n.contains("cerebellum"))
+                    .unwrap_or(4);
+                let cereb_input = &region_obs[cereb_idx];
+                let input_len = proj.cortex_dim.min(cereb_input.len());
+                let frozen_out = proj.forward(*fm, &cereb_input[..input_len]);
+                let d_model = w.regions[cereb_idx].config.d_model;
+                let mut cereb_output = vec![0.0f32; d_model];
+                let copy_len = d_model.min(frozen_out.len());
+                cereb_output[..copy_len].copy_from_slice(&frozen_out[..copy_len]);
+                state.region_outputs[cereb_idx] = cereb_output;
+            }
         }
 
         let mut all_activations = Vec::new();
@@ -2847,6 +2886,25 @@ pub fn regional_train_token_fast(
     target: usize,
 ) -> (f32, usize) {
     regional_train_token_with_loss(w, grads, _ws, token, target, None)
+}
+
+/// Fast training with frozen cerebellum override.
+pub fn regional_train_token_frozen(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    _ws: &mut TrainWorkspace,
+    token: usize,
+    target: usize,
+    frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
+) -> (f32, usize) {
+    let obs = w.embed(token);
+    let (loss, pred, d_obs) = regional_train_step_frozen(w, grads, obs, target, frozen);
+    let d = w.config.raw_obs_dim;
+    let offset = token * d;
+    for j in 0..d {
+        grads.embed_grad[offset + j] += d_obs[j];
+    }
+    (loss, pred)
 }
 
 /// Fast training with pluggable loss function.

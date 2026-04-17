@@ -69,7 +69,7 @@ harness = false
 
 [features]
 default = []
-onnx = ["dep:ort", "modgrad-io/onnx"]
+onnx = ["dep:ort", "modgrad-io/onnx", "modgrad-runtime/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 cuda = ["dep:cudarc", "modgrad-compute/cuda"]
 sdp = ["dep:clarabel", "modgrad-runtime/sdp"]
