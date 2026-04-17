@@ -62,6 +62,17 @@ fn kernel_objects_for_target(gfx_version: u32) -> Vec<&'static [u8]> {
             include_bytes!("kernels/matvec_tiled.co"),
             include_bytes!("kernels/ln_silu.co"),
             include_bytes!("kernels/matvec_q4k.co"),
+            include_bytes!("kernels/outer_product.co"),
+            include_bytes!("kernels/sgd_update.co"),
+            include_bytes!("kernels/superlinear_bwd.co"),
+            include_bytes!("kernels/matvec_t.co"),
+            include_bytes!("kernels/silu_bwd.co"),
+            include_bytes!("kernels/glu_bwd.co"),
+            include_bytes!("kernels/ln_bwd.co"),
+            include_bytes!("kernels/per_neuron_glu_bwd.co"),
+            include_bytes!("kernels/reduce_l2.co"),
+            include_bytes!("kernels/adamw.co"),
+            include_bytes!("kernels/sync_backward.co"),
         ],
         _ => {
             eprintln!("    warning: no pre-compiled kernels for gfx{:x}", gfx_version);

@@ -7,5 +7,24 @@ pub mod neuron;
 pub mod ops;
 pub mod tensor;
 pub mod backend;
+pub mod kv_buffer;
+/// Compute L2 gradient norm over multiple slices, GPU-accelerated when available.
+pub fn grad_norm(slices: &[&[f32]]) -> f32 {
+    let total_len: usize = slices.iter().map(|s| s.len()).sum();
+    if total_len == 0 { return 0.0; }
+
+    if total_len >= 1024 && neuron::gpu_enabled() {
+        let mut buf = Vec::with_capacity(total_len);
+        for s in slices { buf.extend_from_slice(s); }
+        if let Some(norm) = modgrad_device::kfd::accel::try_l2_norm(&buf) {
+            return norm;
+        }
+    }
+
+    let mut total_sq = 0.0f32;
+    for s in slices { for x in *s { total_sq += x * x; } }
+    total_sq.sqrt()
+}
+
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;

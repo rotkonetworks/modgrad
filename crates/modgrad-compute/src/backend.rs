@@ -16,6 +16,91 @@
 
 use rayon::prelude::*;
 
+// ─── VRAM-aware allocation ─────────────────────────────────
+
+/// A buffer that may be backed by VRAM (GPU) or heap (CPU).
+/// When VRAM-backed, the underlying memory is BAR-mapped — reads/writes
+/// go through PCIe, but GPU dispatch detects the pointer and skips
+/// upload/download entirely (zero-copy).
+pub enum GpuVec {
+    Heap(Vec<f32>),
+    Vram { ptr: *mut f32, len: usize },
+}
+
+unsafe impl Send for GpuVec {}
+unsafe impl Sync for GpuVec {}
+
+impl Clone for GpuVec {
+    fn clone(&self) -> Self {
+        // Always clone to heap — VRAM arena can't do per-allocation clone
+        GpuVec::Heap(self.as_slice().to_vec())
+    }
+}
+
+impl GpuVec {
+    /// Allocate on the heap (CPU).
+    pub fn heap(n: usize) -> Self {
+        GpuVec::Heap(vec![0.0f32; n])
+    }
+
+    /// Try to allocate from the VRAM arena. Falls back to heap.
+    pub fn try_vram(n: usize) -> Self {
+        if let Some(ptr) = modgrad_device::kfd::accel::arena_alloc(n) {
+            // Zero the buffer through BAR
+            unsafe { std::ptr::write_bytes(ptr, 0, n); }
+            GpuVec::Vram { ptr, len: n }
+        } else {
+            GpuVec::heap(n)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            GpuVec::Heap(v) => v.len(),
+            GpuVec::Vram { len, .. } => *len,
+        }
+    }
+
+    /// Copy from a slice into this buffer.
+    pub fn copy_from(&mut self, src: &[f32]) {
+        let dst = self.as_mut_slice();
+        dst[..src.len()].copy_from_slice(src);
+    }
+
+    /// Get as slice.
+    pub fn as_slice(&self) -> &[f32] {
+        match self {
+            GpuVec::Heap(v) => v,
+            GpuVec::Vram { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
+
+    /// Get as mutable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        match self {
+            GpuVec::Heap(v) => v,
+            GpuVec::Vram { ptr, len } => unsafe { std::slice::from_raw_parts_mut(*ptr, *len) },
+        }
+    }
+}
+
+impl From<Vec<f32>> for GpuVec {
+    fn from(v: Vec<f32>) -> Self { GpuVec::Heap(v) }
+}
+
+impl From<GpuVec> for Vec<f32> {
+    fn from(g: GpuVec) -> Self { g.as_slice().to_vec() }
+}
+
+impl std::ops::Deref for GpuVec {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] { self.as_slice() }
+}
+
+impl std::ops::DerefMut for GpuVec {
+    fn deref_mut(&mut self) -> &mut [f32] { self.as_mut_slice() }
+}
+
 // ─── Explicit AVX-512 dot product ───────────────────────────
 
 /// AVX-512 dot product: 16 floats/cycle with FMA.
@@ -355,6 +440,17 @@ pub trait ComputeBackend: Send + Sync {
     /// No-op for CPU backends. GPU backends may buffer dispatches and
     /// flush them in a single submit_wait for efficiency.
     fn flush(&self) {}
+
+    /// Allocate an f32 buffer. GPU backends return VRAM-backed memory
+    /// so data stays in GPU memory between operations. CPU backends
+    /// return a regular heap allocation.
+    fn alloc_f32(&self, n: usize) -> GpuVec {
+        GpuVec::heap(n)
+    }
+
+    /// Reset activation arena. Call between training steps to reclaim
+    /// temporary VRAM buffers. No-op for CPU backends.
+    fn arena_reset(&self) {}
 
     /// Trace shift: for each neuron, shift trace left by 1, append new activation.
     /// traces: [n_neurons x memory_length], new_activations: [n_neurons]
@@ -1045,10 +1141,7 @@ impl HybridGpuBackend {
     }
 }
 
-/// Minimum FMA ops to justify GPU dispatch overhead.
-/// Tiled matvec beats CPU at ~50K FLOPs (128×512 = 1.63x).
-/// CTM synapse ops are 50K-300K FLOPs at d_model=512.
-const GPU_MIN_FLOPS: usize = 50_000;
+const GPU_MIN_FLOPS: usize = 32;
 
 impl ComputeBackend for HybridGpuBackend {
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
@@ -1072,30 +1165,39 @@ impl ComputeBackend for HybridGpuBackend {
         self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
     }
 
-    // ─── Element-wise ops: GPU only when data is VRAM-resident ───
-    // CPU is faster than GPU for small tensors that aren't already in VRAM.
-    // The zero-copy path in accel.rs detects VRAM pointers automatically.
+    // ─── Element-wise ops: try GPU, fall back to CPU ───
 
     fn glu(&self, input: &[f32], output: &mut [f32]) {
+        let n = input.len() / 2;
+        if modgrad_device::kfd::accel::try_glu(input, output, n as u32) { return; }
         self.cpu.glu(input, output);
     }
 
     fn silu_inplace(&self, x: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_silu_inplace(x) { return; }
         self.cpu.silu_inplace(x);
     }
 
     fn layer_norm_inplace(&self, x: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_layer_norm_inplace(x) { return; }
         self.cpu.layer_norm_inplace(x);
     }
 
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
                        output: &mut [f32], scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
+        // Fused GPU path: single PCIe round-trip for matvec→GLU→SiLU→LN
+        if modgrad_device::kfd::accel::try_synapse_forward(
+            x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
+        ) { return; }
         self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
     }
 
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
+        if modgrad_device::kfd::accel::try_trace_shift(
+            traces, new_activations, n_neurons as u32, memory_length as u32,
+        ) { return; }
         self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
     }
 
@@ -1105,8 +1207,110 @@ impl ComputeBackend for HybridGpuBackend {
                    decay: &[f32], decay_shift: &[f32],
                    dopamine: f32, n_pairs: usize, initialized: bool,
                    sync_out: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_sync_update(
+            alpha, beta, activations_left, activations_right,
+            phases_left, phases_right, decay, decay_shift,
+            dopamine, n_pairs as u32, initialized, sync_out,
+        ) { return; }
         self.cpu.sync_update(alpha, beta, activations_left, activations_right,
             phases_left, phases_right, decay, decay_shift, dopamine, n_pairs,
             initialized, sync_out);
+    }
+}
+
+// ─── Full VRAM backend ────────────────────────────────────
+//
+// All activation buffers live in VRAM arena. Every op dispatches
+// zero-copy — no PCIe transfers in the inner loop. Weights are
+// cached in VRAM on first use (re-uploaded after optimizer step
+// via invalidate_cache).
+//
+// Use with `--vram`. Requires model to fit in GPU memory.
+
+pub struct VramGpuBackend {
+    cpu: CpuBackend,
+}
+
+impl VramGpuBackend {
+    pub fn new(arena_mb: usize) -> Self {
+        modgrad_device::kfd::accel::enable_vram_mode();
+        modgrad_device::kfd::accel::init_arena(arena_mb);
+        Self { cpu: CpuBackend::new() }
+    }
+}
+
+impl ComputeBackend for VramGpuBackend {
+    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
+              y: &mut [f32], out_dim: usize, in_dim: usize) {
+        if modgrad_device::kfd::accel::try_matvec(
+            x, weight, bias, y, out_dim as u32, in_dim as u32,
+        ) { return; }
+        self.cpu.matvec(weight, bias, x, y, out_dim, in_dim);
+    }
+
+    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
+                   output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
+        if modgrad_device::kfd::accel::try_superlinear(
+            trace, weights, biases, output,
+            n_neurons as u32, in_per as u32, out_per as u32,
+        ) { return; }
+        self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
+    }
+
+    fn glu(&self, input: &[f32], output: &mut [f32]) {
+        let n = input.len() / 2;
+        if modgrad_device::kfd::accel::try_glu(input, output, n as u32) { return; }
+        self.cpu.glu(input, output);
+    }
+
+    fn silu_inplace(&self, x: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_silu_inplace(x) { return; }
+        self.cpu.silu_inplace(x);
+    }
+
+    fn layer_norm_inplace(&self, x: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_layer_norm_inplace(x) { return; }
+        self.cpu.layer_norm_inplace(x);
+    }
+
+    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
+                       output: &mut [f32], scratch: &mut [f32],
+                       out_dim: usize, in_dim: usize) {
+        if modgrad_device::kfd::accel::try_synapse_forward(
+            x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
+        ) { return; }
+        self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
+    }
+
+    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
+                   n_neurons: usize, memory_length: usize) {
+        if modgrad_device::kfd::accel::try_trace_shift(
+            traces, new_activations, n_neurons as u32, memory_length as u32,
+        ) { return; }
+        self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
+    }
+
+    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
+                   activations_left: &[f32], activations_right: &[f32],
+                   phases_left: &[f32], phases_right: &[f32],
+                   decay: &[f32], decay_shift: &[f32],
+                   dopamine: f32, n_pairs: usize, initialized: bool,
+                   sync_out: &mut [f32]) {
+        if modgrad_device::kfd::accel::try_sync_update(
+            alpha, beta, activations_left, activations_right,
+            phases_left, phases_right, decay, decay_shift,
+            dopamine, n_pairs as u32, initialized, sync_out,
+        ) { return; }
+        self.cpu.sync_update(alpha, beta, activations_left, activations_right,
+            phases_left, phases_right, decay, decay_shift, dopamine, n_pairs,
+            initialized, sync_out);
+    }
+
+    fn alloc_f32(&self, n: usize) -> GpuVec {
+        GpuVec::try_vram(n)
+    }
+
+    fn arena_reset(&self) {
+        modgrad_device::kfd::accel::arena_reset();
     }
 }

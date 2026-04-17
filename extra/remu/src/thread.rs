@@ -910,17 +910,17 @@ impl<'a> Thread<'a> {
                             self.vcc.set_lane((s1 as u64 + self.vcc.read() as u64) > s0 as u64);
                             temp
                         }
-                        11 => s0 * s1,
+                        11 => s0.wrapping_mul(s1),
                         19 => u32::min(s0, s1),
                         20 => u32::max(s0, s1),
-                        24 => s1 << s0,
-                        25 => s1 >> s0,
+                        24 => s1 << (s0 & 0x1f),
+                        25 => s1 >> (s0 & 0x1f),
                         27 => s0 & s1,
                         28 => s0 | s1,
                         29 => s0 ^ s1,
-                        37 => s0 + s1,
-                        38 => s0 - s1,
-                        39 => s1 - s0,
+                        37 => s0.wrapping_add(s1),
+                        38 => s0.wrapping_sub(s1),
+                        39 => s1.wrapping_sub(s0),
                         _ => todo_instr!(instruction)?,
                     };
                     if self.exec.read() {

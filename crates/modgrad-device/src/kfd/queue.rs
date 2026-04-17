@@ -192,16 +192,26 @@ impl ComputeQueue {
         })
     }
 
-    /// Check ring buffer space. Panics if GPU hasn't consumed enough packets.
+    /// Wait for ring buffer space. Spins until GPU has consumed enough
+    /// packets, or panics after timeout (GPU probably hung).
     fn check_ring_space(&self, dwords_needed: u64) {
         let ring_dwords = self.ring.size as u64 / 4;
-        let read_ptr = unsafe {
-            (self.rw_ptrs.cpu_ptr.add(0x80) as *const u64).read_volatile()
-        };
-        let used = self.put.wrapping_sub(read_ptr);
-        assert!(used + dwords_needed < ring_dwords,
-            "ring buffer overflow: put={} read={} need={} capacity={}",
-            self.put, read_ptr, dwords_needed, ring_dwords);
+        let start = std::time::Instant::now();
+        loop {
+            let read_ptr = unsafe {
+                (self.rw_ptrs.cpu_ptr.add(0x80) as *const u64).read_volatile()
+            };
+            let used = self.put.wrapping_sub(read_ptr);
+            if used + dwords_needed < ring_dwords {
+                return;
+            }
+            // Timeout after 5 seconds — GPU is probably hung
+            if start.elapsed().as_secs() > 5 {
+                panic!("ring buffer full (GPU hung?): put={} read={} need={} capacity={}",
+                    self.put, read_ptr, dwords_needed, ring_dwords);
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Write a DWORD to the ring and advance.

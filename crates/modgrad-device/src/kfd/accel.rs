@@ -113,11 +113,10 @@ pub fn try_matvec(
         );
     }
 
-    // Direct dispatch: single-copy readback, no Vec allocation
+    // Direct dispatch: upload → dispatch → wait → copy to caller's slice (no Vec alloc)
     if g.engine.matvec_into(&mut g.dev, weight, bias, x, out, out_dim as usize, in_dim as usize) {
         return true;
     }
-
     DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     false
 }
@@ -131,10 +130,20 @@ pub fn try_matvec_t(
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
-    match g.engine.matvec_t(&mut g.dev, weight, d_out, out_dim as usize, in_dim as usize) {
-        Some(dx) => { d_input[..in_dim as usize].copy_from_slice(&dx); true }
-        None => false,
+    // Zero-copy path: both d_out and d_input are in VRAM arena
+    if let (Some(dout_va), Some(dx_va)) = (resolve_va(g, d_out.as_ptr()), resolve_va(g, d_input.as_ptr())) {
+        return g.engine.matvec_t_zerocopy(
+            &mut g.dev, weight,
+            dout_va, dx_va, out_dim as usize, in_dim as usize,
+        );
     }
+
+    // Direct dispatch: upload → dispatch → wait → copy to caller's slice (no Vec alloc)
+    if g.engine.matvec_t_into(&mut g.dev, weight, d_out, d_input, out_dim as usize, in_dim as usize) {
+        return true;
+    }
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
 }
 
 /// SuperLinear: batched per-neuron matvec.
@@ -190,6 +199,48 @@ pub fn try_synapse_forward(
     ) {
         Some(y) => {
             output[..out_dim as usize].copy_from_slice(&y);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Fused synapse backward: SiLU_bwd → LN_bwd → matvec_t.
+/// All 3 kernels run on GPU with data staying in VRAM between ops.
+/// Single PCIe round-trip: upload cached activations + d_out,
+/// download d_input + d_ln + d_gamma + d_beta.
+///
+/// Returns true on success, writing d_input and d_ln.
+/// Accumulates into d_gamma, d_beta.
+/// Caller uses d_ln for d_weight (outer product) and d_bias.
+///
+/// Constraint: out_dim <= 256 (ln_bwd kernel is single-WG).
+pub fn try_synapse_backward(
+    weight: &[f32],
+    d_out: &[f32],
+    pre_silu: &[f32],
+    normalized: &[f32],
+    gamma: &[f32],
+    d_gamma: &mut [f32],
+    d_beta: &mut [f32],
+    d_input: &mut [f32],
+    d_ln: &mut [f32],
+    inv_std: f32,
+    out_dim: u32, in_dim: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if out_dim > 256 { return false; } // ln_bwd kernel limit
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    match g.engine.synapse_backward(
+        &mut g.dev, weight, d_out, pre_silu, normalized, gamma,
+        d_gamma, d_beta, inv_std,
+        out_dim as usize, in_dim as usize,
+    ) {
+        Some((di, dln)) => {
+            d_input[..in_dim as usize].copy_from_slice(&di);
+            d_ln[..out_dim as usize].copy_from_slice(&dln);
             true
         }
         None => false,
@@ -252,6 +303,130 @@ pub fn try_sync_update(
     g.engine.sync_update(&mut g.dev, alpha, beta,
         act_left, act_right, phases_left, phases_right,
         decay, decay_shift, dopamine, n_pairs as usize, initialized, sync_out)
+}
+
+/// GPU sync backward: scatter-add gradients from pairs back to neurons.
+/// `left` and `right` are u32 neuron indices. Returns d_act[d_model].
+pub fn try_sync_backward(
+    d_sync: &[f32], activated: &[f32], beta: &[f32],
+    left: &[u32], right: &[u32],
+    n_pairs: u32, d_model: u32,
+    d_act: &mut [f32],
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.sync_backward(&mut g.dev, d_sync, activated, beta,
+        left, right, n_pairs as usize, d_model as usize, d_act)
+}
+
+/// GPU outer product accumulate: dW[i*k+j] += d_out[i] * input[j]
+/// Used for gradient computation (d_weight = d_out ⊗ input).
+pub fn try_outer_product(
+    d_weight: &mut [f32], d_out: &[f32], input: &[f32],
+    out_dim: u32, in_dim: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.outer_product(&mut g.dev, d_weight, d_out, input,
+        out_dim as usize, in_dim as usize)
+}
+
+/// GPU SGD update: w[i] -= lr_scale * grad[i]; grad[i] = 0
+pub fn try_sgd_update(
+    weights: &mut [f32], grads: &mut [f32], lr_scale: f32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.sgd_update(&mut g.dev, weights, grads, lr_scale)
+}
+
+/// GPU AdamW optimizer: update weights, moments, zero grads.
+/// Bias correction terms are pre-computed by caller: bc1_inv = 1/(1-beta1^t), bc2_inv = 1/(1-beta2^t).
+pub fn try_adamw(
+    weights: &mut [f32], grads: &mut [f32],
+    m: &mut [f32], v: &mut [f32],
+    lr: f32, beta1: f32, beta2: f32, eps: f32,
+    weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.adamw(&mut g.dev, weights, grads, m, v,
+        lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv)
+}
+
+/// GPU SuperLinear backward: d_weight and d_input in two dispatches.
+/// Returns d_input. Accumulates into d_weights.
+pub fn try_superlinear_backward(
+    weights: &[f32], d_out: &[f32], input: &[f32],
+    d_weights: &mut [f32], d_input: &mut [f32],
+    n_neurons: u32, out_per: u32, in_per: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.superlinear_backward(
+        &mut g.dev, weights, d_out, input, d_weights, d_input,
+        n_neurons as usize, out_per as usize, in_per as usize,
+    )
+}
+
+/// GPU SiLU backward: d_input[i] = d_out[i] * (s + x*s*(1-s))
+pub fn try_silu_backward(
+    d_out: &[f32], pre_silu: &[f32], d_input: &mut [f32],
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.silu_backward(&mut g.dev, d_out, pre_silu, d_input)
+}
+
+/// GPU GLU backward: d_val and d_gate from d_out + cached input.
+pub fn try_glu_backward(
+    d_out: &[f32], cached_input: &[f32], d_input: &mut [f32], n: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.glu_backward(&mut g.dev, d_out, cached_input, d_input, n as usize)
+}
+
+/// GPU per-neuron GLU backward.
+pub fn try_per_neuron_glu_backward(
+    d_out: &[f32], cached_input: &[f32], d_input: &mut [f32],
+    n_neurons: u32, out_per: u32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.per_neuron_glu_backward(&mut g.dev, d_out, cached_input, d_input,
+        n_neurons as usize, out_per as usize)
+}
+
+/// GPU affine LayerNorm backward.
+pub fn try_ln_backward(
+    d_out: &[f32], normalized: &[f32], gamma: &[f32],
+    d_gamma: &mut [f32], d_beta: &mut [f32], d_input: &mut [f32],
+    inv_std: f32,
+) -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if d_out.len() > 256 { return false; } // single-WG kernel, max 256
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    g.engine.ln_backward(&mut g.dev, d_out, normalized, gamma,
+        d_gamma, d_beta, d_input, inv_std)
+}
+
+/// GPU L2 norm: returns sqrt(sum(x[i]^2)).
+/// Returns None if GPU unavailable or dispatch fails (caller should fall back to CPU).
+pub fn try_l2_norm(data: &[f32]) -> Option<f32> {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return None };
+    let g = match guard.as_mut() { Some(g) => g, None => return None };
+    g.engine.reduce_l2(&mut g.dev, data)
 }
 
 /// Check if KFD GPU is available.

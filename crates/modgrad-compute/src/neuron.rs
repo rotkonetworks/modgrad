@@ -100,6 +100,13 @@ impl Linear {
         self.forward_into(x, &mut y);
         y
     }
+
+    /// Forward with VRAM-aware allocation. Output may be GPU-resident.
+    pub fn forward_gpu(&self, x: &[f32]) -> super::backend::GpuVec {
+        let mut y = super::backend::backend().alloc_f32(self.out_dim);
+        self.forward_into(x, &mut y);
+        y
+    }
 }
 
 /// Minimal PRNG for weight init.
@@ -200,6 +207,13 @@ impl SuperLinear {
     /// Allocating forward (backward compat). Prefer forward_into.
     pub fn forward(&self, trace: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; self.n_neurons * self.out_per];
+        self.forward_into(trace, &mut out);
+        out
+    }
+
+    /// Forward with VRAM-aware allocation. Output may be GPU-resident.
+    pub fn forward_gpu(&self, trace: &[f32]) -> super::backend::GpuVec {
+        let mut out = super::backend::backend().alloc_f32(self.n_neurons * self.out_per);
         self.forward_into(trace, &mut out);
         out
     }
