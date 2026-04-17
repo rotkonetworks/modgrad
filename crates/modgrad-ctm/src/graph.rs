@@ -22,7 +22,7 @@ use crate::config::CtmConfig;
 use crate::weights::{CtmWeights, CtmState};
 use crate::forward::ctm_forward;
 use crate::train::{Ctm, CtmCache, CtmGradients, RegionBackwardResult, backward_from_activated};
-use modgrad_traits::{Brain, TokenInput};
+use modgrad_traits::{Brain, LossFn, TokenInput};
 
 // ─── Unified token space ──────────────────────────────────
 
@@ -500,6 +500,72 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
+        }
+    }
+
+    /// Small 8-region brain — all features, param-budgeted for benchmarking.
+    /// d_input per region is proportional to d_model, not raw observation dim.
+    /// Connection synapses handle the dimension reduction between regions.
+    pub fn eight_region_small(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        // d_input per region: half of d_model (connection synapses project to this)
+        let regions = vec![
+            CtmConfig::region("input", 32, 16, 8, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 32, 16, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 32, 16, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 32, 16, 8, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 8, 8, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(256);
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim: obs_dim,
+            aux_losses: AuxLossConfig::default(),
+            router: None, // no router at this scale
         }
     }
 
@@ -981,8 +1047,17 @@ pub struct RegionalState {
 
 impl RegionalState {
     pub fn new(w: &RegionalWeights) -> Self {
-        let region_states: Vec<CtmState> = w.regions.iter()
-            .map(|rw| CtmState::new(rw))
+        let region_states: Vec<CtmState> = w.regions.iter().enumerate()
+            .map(|(i, rw)| {
+                let is_hippocampus = w.config.region_names.get(i)
+                    .map_or(false, |n| n.contains("hippocampus"));
+                if is_hippocampus {
+                    // Hippocampus gets episodic memory: 4 short, 16 mid, 64 long
+                    CtmState::with_episodic(rw, 4, 16, 64)
+                } else {
+                    CtmState::new(rw)
+                }
+            })
             .collect();
 
         let region_outputs: Vec<Vec<f32>> = w.regions.iter()
@@ -1013,6 +1088,46 @@ pub struct RegionalOutput {
     pub exit_lambdas: Vec<f32>,
     /// How many outer ticks actually ran (may be < outer_ticks if early exit).
     pub ticks_used: usize,
+}
+
+/// GPU-accelerated sync backward scatter: compute d_activations from d_sync gradients.
+///
+/// For each pair i:
+///   d_act[left[i]] += d_sync[i] / sqrt(beta[i]) * activated[right[i]]
+///   d_act[right[i]] += d_sync[i] / sqrt(beta[i]) * activated[left[i]]
+///
+/// Tries GPU atomic scatter first, falls back to CPU.
+fn global_sync_backward(
+    d_sync: &[f32], activated: &[f32], beta: &[f32],
+    left: &[usize], right: &[usize], d_model: usize,
+) -> Vec<f32> {
+    let n_pairs = left.len();
+    // GPU path
+    if modgrad_compute::neuron::gpu_enabled() && n_pairs >= 16 {
+        let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
+        let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
+        let mut d_act = vec![0.0f32; d_model];
+        if modgrad_device::kfd::accel::try_sync_backward(
+            d_sync, activated, beta,
+            &left_u32, &right_u32,
+            n_pairs as u32, d_model as u32,
+            &mut d_act,
+        ) {
+            return d_act;
+        }
+    }
+    // CPU fallback
+    let mut d_act = vec![0.0f32; d_model];
+    for i in 0..n_pairs {
+        let l = left[i];
+        let r = right[i];
+        if l < d_model && r < d_model {
+            let inv_sqrt_beta = 1.0 / beta[i].sqrt().max(1e-8);
+            d_act[l] += d_sync[i] * activated[r] * inv_sqrt_beta;
+            d_act[r] += d_sync[i] * activated[l] * inv_sqrt_beta;
+        }
+    }
+    d_act
 }
 
 /// Run the regional CTM forward pass.
@@ -1086,7 +1201,12 @@ pub fn regional_forward(
         let mut states_vec: Vec<CtmState> = std::mem::take(&mut state.region_states);
         let results: Vec<Vec<f32>> = states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
             let d_input = w.regions[r].config.d_input;
-            let _output = ctm_forward(&w.regions[r], rs, &region_obs[r], 1, d_input);
+            if rs.episodic.is_some() {
+                let _output = crate::forward::ctm_forward_episodic(
+                    &w.regions[r], rs, &region_obs[r], 1, d_input);
+            } else {
+                let _output = ctm_forward(&w.regions[r], rs, &region_obs[r], 1, d_input);
+            }
             rs.activated.clone()
         }).collect();
         state.region_states = states_vec;
@@ -1156,7 +1276,7 @@ pub fn regional_forward(
 // ─── Training (BPTT) ───────────────────────────────────────
 
 /// Cache for one outer tick — stores everything needed for backward.
-struct OuterTickCache {
+pub struct OuterTickCache {
     /// Per-region: the observation fed to ctm_forward.
     region_obs: Vec<Vec<f32>>,
     /// Per-region: activated state AFTER forward (= region output).
@@ -1200,8 +1320,16 @@ pub struct RegionalGradients {
     pub outer_exit_gate_db: Option<Vec<f32>>,
     /// Router gradients (None when router is off).
     pub router_grads: Option<RouterGradients>,
+    /// Cerebellar prediction head gradients (None when aux disabled).
+    pub cereb_predict_dw: Option<Vec<f32>>,
+    pub cereb_predict_db: Option<Vec<f32>>,
+    /// BG value head gradients (None when aux disabled).
+    pub bg_value_dw: Option<Vec<f32>>,
+    pub bg_value_db: Option<Vec<f32>>,
 }
 
+/// Compute L2 norm across multiple gradient slices.
+/// Tries GPU dispatch first (concatenates into a scratch buffer), falls back to CPU.
 impl RegionalGradients {
     pub fn zeros(w: &RegionalWeights) -> Self {
         Self {
@@ -1221,6 +1349,10 @@ impl RegionalGradients {
             outer_exit_gate_dw: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.weight.len()]),
             outer_exit_gate_db: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.bias.len()]),
             router_grads: w.router.as_ref().map(RouterGradients::zeros),
+            cereb_predict_dw: w.cereb_predict.as_ref().map(|h| vec![0.0; h.weight.len()]),
+            cereb_predict_db: w.cereb_predict.as_ref().map(|h| vec![0.0; h.bias.len()]),
+            bg_value_dw: w.bg_value.as_ref().map(|h| vec![0.0; h.weight.len()]),
+            bg_value_db: w.bg_value.as_ref().map(|h| vec![0.0; h.bias.len()]),
         }
     }
 
@@ -1238,19 +1370,21 @@ impl RegionalGradients {
         if let Some(w) = &mut self.outer_exit_gate_dw { w.fill(0.0); }
         if let Some(b) = &mut self.outer_exit_gate_db { b.fill(0.0); }
         if let Some(rg) = &mut self.router_grads { rg.zero(); }
+        if let Some(w) = &mut self.cereb_predict_dw { w.fill(0.0); }
+        if let Some(b) = &mut self.cereb_predict_db { b.fill(0.0); }
+        if let Some(w) = &mut self.bg_value_dw { w.fill(0.0); }
+        if let Some(b) = &mut self.bg_value_db { b.fill(0.0); }
     }
 
     /// Apply gradients with SGD + gradient clipping (for tests / simple usage).
-    pub fn apply(&self, w: &mut RegionalWeights, lr: f32, clip_norm: f32) {
-        // Compute gradient norm for clipping
-        let mut total_sq = 0.0f32;
-        let add_sq = |v: &[f32], s: &mut f32| { for x in v { *s += x * x; } };
-        add_sq(&self.output_proj_dw, &mut total_sq);
-        add_sq(&self.output_proj_db, &mut total_sq);
-        add_sq(&self.obs_proj_dw, &mut total_sq);
-        add_sq(&self.embed_grad, &mut total_sq);
-        for dw in &self.connection_dw { add_sq(dw, &mut total_sq); }
-        let norm = total_sq.sqrt();
+    pub fn apply(&mut self, w: &mut RegionalWeights, lr: f32, clip_norm: f32) {
+        // Compute gradient norm for clipping (GPU-accelerated with CPU fallback)
+        let mut slices: Vec<&[f32]> = vec![
+            &self.output_proj_dw, &self.output_proj_db,
+            &self.obs_proj_dw, &self.embed_grad,
+        ];
+        for dw in &self.connection_dw { slices.push(dw); }
+        let norm = crate::grad_norm(&slices);
         let scale = if norm > clip_norm { clip_norm / norm } else { 1.0 };
         let lr = lr * scale;
 
@@ -1262,7 +1396,7 @@ impl RegionalGradients {
         sgd(&mut w.embeddings, &self.embed_grad, lr);
 
         // Per-region gradients via SDK
-        for (rw, rg) in w.regions.iter_mut().zip(&self.region_grads) {
+        for (rw, rg) in w.regions.iter_mut().zip(self.region_grads.iter_mut()) {
             rg.apply(rw, lr, clip_norm);
         }
 
@@ -1532,6 +1666,150 @@ pub fn compute_aux_losses(
     aux_loss
 }
 
+/// Accumulate aux loss gradients into RegionalGradients.
+///
+/// Call this after the main backward pass, using the region activations
+/// from the same forward pass. Gradients go through the same optimizer
+/// as everything else — no separate SGD step, no state inconsistency.
+pub fn accumulate_aux_gradients(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    region_outputs: &[Vec<f32>],
+    observation: &[f32],
+    prev_loss: f32,
+) {
+    let cfg = &w.config.aux_losses;
+    let weight = cfg.aux_weight;
+
+    // Cerebellar prediction: d_loss/d_W, d_loss/d_b for cereb_predict head
+    if cfg.cerebellar_prediction {
+        if let (Some(head), Some(dw), Some(db)) = (
+            &w.cereb_predict, &mut grads.cereb_predict_dw, &mut grads.cereb_predict_db,
+        ) {
+            let cereb_idx = w.config.region_names.iter()
+                .position(|n| n.contains("cerebellum"));
+            if let Some(ci) = cereb_idx {
+                if let Some(cereb_out) = region_outputs.get(ci) {
+                    let predicted = head.forward(cereb_out);
+                    let n = predicted.len().min(observation.len());
+                    let in_dim = cereb_out.len();
+                    let out_dim = predicted.len();
+
+                    for o in 0..n {
+                        let d_pred = 2.0 * (predicted[o] - observation[o]) / n as f32 * weight;
+                        for i in 0..in_dim {
+                            dw[o * in_dim + i] += d_pred * cereb_out[i];
+                        }
+                        db[o] += d_pred;
+                    }
+                }
+            }
+        }
+    }
+
+    // BG value: predict negative loss
+    if cfg.bg_temporal_difference {
+        if let (Some(head), Some(dw), Some(db)) = (
+            &w.bg_value, &mut grads.bg_value_dw, &mut grads.bg_value_db,
+        ) {
+            let bg_idx = w.config.region_names.iter()
+                .position(|n| n.contains("basal"));
+            if let Some(bi) = bg_idx {
+                if let Some(bg_out) = region_outputs.get(bi) {
+                    let value_pred = head.forward(bg_out);
+                    if !value_pred.is_empty() {
+                        let target = -prev_loss;
+                        let d_value = 2.0 * (value_pred[0] - target) * weight;
+                        let in_dim = bg_out.len();
+                        for i in 0..in_dim {
+                            dw[i] += d_value * bg_out[i];
+                        }
+                        db[0] += d_value;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compute aux loss gradients and apply them directly to the aux head weights.
+///
+/// This is a manual SGD step on the aux heads only — separate from the main
+/// optimizer step, because RegionalGradients doesn't track aux head gradients.
+///
+/// The aux heads are small Linear layers (cerebellum d_model → obs_dim,
+/// BG d_model → 1). Their gradients are cheap to compute and apply inline.
+///
+/// `region_outputs`: activated states from RegionalOutput.region_activations
+/// `observation`: raw input (target for cerebellar prediction)
+/// `prev_loss`: previous step's loss (target for BG value)
+/// `aux_lr`: learning rate for aux head updates
+pub fn apply_aux_gradients(
+    w: &mut RegionalWeights,
+    region_outputs: &[Vec<f32>],
+    observation: &[f32],
+    prev_loss: f32,
+    aux_lr: f32,
+) {
+    let cfg = &w.config.aux_losses;
+    let weight = cfg.aux_weight;
+
+    // ── Cerebellar prediction: teach cerebellum to predict observations ──
+    if cfg.cerebellar_prediction {
+        let cereb_idx = w.config.region_names.iter()
+            .position(|n| n.contains("cerebellum"));
+        if let (Some(ci), Some(ref mut head)) = (cereb_idx, w.cereb_predict.as_mut()) {
+            if let Some(cereb_out) = region_outputs.get(ci) {
+                let predicted = head.forward(cereb_out);
+                let n = predicted.len().min(observation.len());
+
+                // d_loss/d_predicted = 2/n * (predicted - observation) * weight
+                let mut d_pred = vec![0.0f32; predicted.len()];
+                for i in 0..n {
+                    d_pred[i] = 2.0 * (predicted[i] - observation[i]) / n as f32 * weight;
+                }
+
+                // Linear backward: dW = d_pred ⊗ input, db = d_pred
+                let in_dim = cereb_out.len();
+                let out_dim = predicted.len();
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        head.weight[o * in_dim + i] -= aux_lr * d_pred[o] * cereb_out[i];
+                    }
+                    head.bias[o] -= aux_lr * d_pred[o];
+                }
+            }
+        }
+    }
+
+    // ── BG value: teach BG to predict negative loss ──
+    if cfg.bg_temporal_difference {
+        let bg_idx = w.config.region_names.iter()
+            .position(|n| n.contains("basal"));
+        if let (Some(bi), Some(ref mut head)) = (bg_idx, w.bg_value.as_mut()) {
+            if let Some(bg_out) = region_outputs.get(bi) {
+                let value_pred = head.forward(bg_out);
+                if !value_pred.is_empty() {
+                    let target = -prev_loss;
+                    let d_value = 2.0 * (value_pred[0] - target) * weight;
+
+                    let in_dim = bg_out.len();
+                    for i in 0..in_dim {
+                        head.weight[i] -= aux_lr * d_value * bg_out[i];
+                    }
+                    head.bias[0] -= aux_lr * d_value;
+                }
+            }
+        }
+    }
+
+    // ── Hippocampal contrastive: no head weights to update ──
+    // The contrastive loss penalizes representation collapse in the hippocampus.
+    // Its gradients flow through the main backward pass (d_region_activations),
+    // not through a separate head. To wire this properly, we'd need to inject
+    // d_variance into the region's backward — left for future work.
+}
+
 /// One training step: forward all outer ticks, compute loss, backward.
 ///
 /// Uses outer-tick-level BPTT: gradients flow from output_proj through
@@ -1663,7 +1941,7 @@ pub fn regional_train_step(
         });
     }
 
-    // ── Loss: adaptive exit or legacy CTM ──
+    // ── Loss: imagination (default) ──
     let n_ticks = tick_caches.len();
     let predictions: Vec<Vec<f32>> = tick_caches.iter()
         .map(|tc| w.output_proj.forward(&tc.global_sync))
@@ -1672,25 +1950,32 @@ pub fn regional_train_step(
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
 
-    let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
-        let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
-        let beta = cfg.exit_strategy.beta();
-        let (loss, d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
-            &predictions, &lambdas, target, beta);
+    let default_imagination = crate::loss::ImaginationLoss::default();
+    let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
+        let c = compute_certainty(p);
+        [1.0 - c, c]
+    }).collect();
 
-        // Backward through outer exit gate (detached from main BPTT)
-        for (t, d_lambda) in d_lambdas.iter().enumerate() {
-            if let Some(ref cache) = tick_caches[t].exit_gate_cache {
-                let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
-                let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                let _d_sync = crate::train::linear_backward(
-                    gate, &[*d_lambda], cache, gw, gb);
+    let (loss, d_per_tick) = {
+        let (loss, d_preds) = default_imagination.compute(&predictions, &certainties, &target);
+
+        if let Some(ref gate) = w.outer_exit_gate {
+            let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+            let beta = cfg.exit_strategy.beta();
+            let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
+                &predictions, &lambdas, target, beta);
+
+            for (t, d_lambda) in d_lambdas.iter().enumerate() {
+                if let Some(ref cache) = tick_caches[t].exit_gate_cache {
+                    let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                    let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                    let _d_sync = crate::train::linear_backward(
+                        gate, &[*d_lambda], cache, gw, gb);
+                }
             }
         }
 
         (loss, d_preds)
-    } else {
-        ctm_loss_regional(&predictions, target)
     };
 
     // ── Backward through ALL outer ticks ──
@@ -1713,18 +1998,12 @@ pub fn regional_train_step(
             }
         }
 
-        // Global sync backward → d_all_activations
+        // Global sync backward → d_all_activations (GPU-accelerated)
         let total_act_dim = tc.all_activations.len();
-        let mut d_all_activations = vec![0.0f32; total_act_dim];
-        for i in 0..n_sync {
-            let l = w.global_sync_left[i];
-            let r = w.global_sync_right[i];
-            if l < total_act_dim && r < total_act_dim {
-                let inv_sqrt_beta = 1.0 / tc.global_beta[i].sqrt().max(1e-8);
-                d_all_activations[l] += d_global_sync[i] * tc.all_activations[r] * inv_sqrt_beta;
-                d_all_activations[r] += d_global_sync[i] * tc.all_activations[l] * inv_sqrt_beta;
-            }
-        }
+        let d_all_activations = global_sync_backward(
+            &d_global_sync, &tc.all_activations, &tc.global_beta,
+            &w.global_sync_left, &w.global_sync_right, total_act_dim,
+        );
 
         // Scatter to per-region
         let mut offset = 0;
@@ -1902,6 +2181,54 @@ pub fn regional_train_step_full(
     observation: &[f32],
     target: usize,
 ) -> (f32, usize, Vec<f32>) {
+    regional_train_step_loss(w, grads, observation, target, None)
+}
+
+/// Train one step with an arbitrary loss function.
+///
+/// The `compute_loss` closure receives (predictions, certainties) and returns (loss, d_preds).
+/// This is the generic version — works with RouteLoss, ClassTarget, anything.
+/// Returns (loss, d_observation).
+pub fn regional_train_step_generic(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    observation: &[f32],
+    compute_loss: impl FnOnce(&[Vec<f32>], &[[f32; 2]]) -> (f32, Vec<Vec<f32>>),
+) -> (f32, Vec<f32>) {
+    use std::cell::RefCell;
+
+    let compute_loss = RefCell::new(Some(compute_loss));
+
+    struct ShimLoss<'a, F> {
+        compute: &'a RefCell<Option<F>>,
+    }
+    impl<F: FnOnce(&[Vec<f32>], &[[f32; 2]]) -> (f32, Vec<Vec<f32>>)> modgrad_traits::LossFn for ShimLoss<'_, F> {
+        type Target = modgrad_traits::ClassTarget;
+        fn compute(
+            &self,
+            predictions: &[Vec<f32>],
+            certainties: &[[f32; 2]],
+            _target: &modgrad_traits::ClassTarget,
+        ) -> (f32, Vec<Vec<f32>>) {
+            let f = self.compute.borrow_mut().take().expect("loss called twice");
+            f(predictions, certainties)
+        }
+    }
+
+    let shim = ShimLoss { compute: &compute_loss };
+    let (loss, _pred, d_obs) = regional_train_step_loss(w, grads, observation, 0, Some(&shim));
+    (loss, d_obs)
+}
+
+/// Train one token with a configurable loss function.
+/// If `loss_fn` is None, uses the default CTM loss (min-tick + most-certain).
+pub fn regional_train_step_loss(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    observation: &[f32],
+    target: usize,
+    loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
+) -> (f32, usize, Vec<f32>) {
     let cfg = &w.config;
     let n_regions = cfg.regions.len();
     let n_sync = cfg.n_global_sync;
@@ -2023,22 +2350,35 @@ pub fn regional_train_step_full(
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
 
-    let (loss, d_per_tick) = if let Some(ref gate) = w.outer_exit_gate {
-        let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
-        let beta = cfg.exit_strategy.beta();
-        let (loss, d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
-            &predictions, &lambdas, target, beta);
-        for (t, d_lambda) in d_lambdas.iter().enumerate() {
-            if let Some(ref cache) = tick_caches[t].exit_gate_cache {
-                let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
-                let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                let _d_sync = crate::train::linear_backward(
-                    gate, &[*d_lambda], cache, gw, gb);
+    let default_imagination = crate::loss::ImaginationLoss::default();
+    let lf: &dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget> =
+        loss_fn.unwrap_or(&default_imagination);
+
+    let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
+        let c = compute_certainty(p);
+        [1.0 - c, c]
+    }).collect();
+
+    let (loss, d_per_tick) = {
+        let (loss, d_preds) = lf.compute(&predictions, &certainties, &target);
+
+        // Exit gate gradients still flow regardless of which loss is used
+        if let Some(ref gate) = w.outer_exit_gate {
+            let lambdas: Vec<f32> = tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+            let beta = cfg.exit_strategy.beta();
+            let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
+                &predictions, &lambdas, target, beta);
+            for (t, d_lambda) in d_lambdas.iter().enumerate() {
+                if let Some(ref cache) = tick_caches[t].exit_gate_cache {
+                    let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                    let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                    let _d_sync = crate::train::linear_backward(
+                        gate, &[*d_lambda], cache, gw, gb);
+                }
             }
         }
+
         (loss, d_preds)
-    } else {
-        ctm_loss_regional(&predictions, target)
     };
 
     // ── Backward ── (same as regional_train_step, but accumulates d_observation)
@@ -2063,16 +2403,10 @@ pub fn regional_train_step_full(
         }
 
         let total_act_dim = tc.all_activations.len();
-        let mut d_all_activations = vec![0.0f32; total_act_dim];
-        for i in 0..n_sync {
-            let l = w.global_sync_left[i];
-            let r = w.global_sync_right[i];
-            if l < total_act_dim && r < total_act_dim {
-                let inv_sqrt_beta = 1.0 / tc.global_beta[i].sqrt().max(1e-8);
-                d_all_activations[l] += d_global_sync[i] * tc.all_activations[r] * inv_sqrt_beta;
-                d_all_activations[r] += d_global_sync[i] * tc.all_activations[l] * inv_sqrt_beta;
-            }
-        }
+        let d_all_activations = global_sync_backward(
+            &d_global_sync, &tc.all_activations, &tc.global_beta,
+            &w.global_sync_left, &w.global_sync_right, total_act_dim,
+        );
 
         let mut offset = 0;
         let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
@@ -2261,13 +2595,25 @@ impl AdamWBuf {
         Self { m: vec![0.0; n], v: vec![0.0; n] }
     }
 
-    fn step(&mut self, weights: &mut [f32], grads: &[f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
+    fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
+        // Try GPU dispatch first — eliminates PCIe round-trip for optimizer
+        let bc1_inv = 1.0 / bc1;
+        let bc2_inv = 1.0 / bc2;
+        if weights.len() >= 256
+            && modgrad_device::kfd::accel::try_adamw(
+                weights, grads, &mut self.m, &mut self.v,
+                lr, b1, b2, eps, wd, bc1_inv, bc2_inv,
+            )
+        {
+            return;
+        }
+        // CPU fallback
         for i in 0..weights.len() {
             let g = grads[i];
             self.m[i] = b1 * self.m[i] + (1.0 - b1) * g;
             self.v[i] = b2 * self.v[i] + (1.0 - b2) * g * g;
-            let m_hat = self.m[i] / bc1;
-            let v_hat = self.v[i] / bc2;
+            let m_hat = self.m[i] * bc1_inv;
+            let v_hat = self.v[i] * bc2_inv;
             weights[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * weights[i]);
         }
     }
@@ -2293,6 +2639,10 @@ pub struct RegionalAdamW {
     global_decay: AdamWBuf,
     output_proj_w: AdamWBuf,
     output_proj_b: AdamWBuf,
+    cereb_predict_w: Option<AdamWBuf>,
+    cereb_predict_b: Option<AdamWBuf>,
+    bg_value_w: Option<AdamWBuf>,
+    bg_value_b: Option<AdamWBuf>,
 }
 
 impl RegionalAdamW {
@@ -2313,6 +2663,10 @@ impl RegionalAdamW {
             global_decay: AdamWBuf::zeros(w.global_decay.len()),
             output_proj_w: AdamWBuf::zeros(w.output_proj.weight.len()),
             output_proj_b: AdamWBuf::zeros(w.output_proj.bias.len()),
+            cereb_predict_w: w.cereb_predict.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
+            cereb_predict_b: w.cereb_predict.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
+            bg_value_w: w.bg_value.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
+            bg_value_b: w.bg_value.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
         }
     }
 
@@ -2321,7 +2675,7 @@ impl RegionalAdamW {
     pub fn with_clip(mut self, clip: f32) -> Self { self.grad_clip = clip; self }
 
     /// Apply accumulated gradients: AdamW for outer weights, SGD for inner CTM.
-    pub fn step(&mut self, w: &mut RegionalWeights, grads: &RegionalGradients) {
+    pub fn step(&mut self, w: &mut RegionalWeights, grads: &mut RegionalGradients) {
         self.step += 1;
         let b1 = self.beta1;
         let b2 = self.beta2;
@@ -2330,46 +2684,61 @@ impl RegionalAdamW {
         let bc1 = 1.0 - b1.powi(self.step as i32);
         let bc2 = 1.0 - b2.powi(self.step as i32);
 
-        // Gradient clipping (global norm)
-        let mut total_sq = 0.0f32;
-        let add_sq = |v: &[f32], s: &mut f32| { for x in v { *s += x * x; } };
-        add_sq(&grads.embed_grad, &mut total_sq);
-        add_sq(&grads.output_proj_dw, &mut total_sq);
-        add_sq(&grads.output_proj_db, &mut total_sq);
-        add_sq(&grads.obs_proj_dw, &mut total_sq);
-        add_sq(&grads.obs_proj_db, &mut total_sq);
-        for dw in &grads.connection_dw { add_sq(dw, &mut total_sq); }
-        for db in &grads.connection_db { add_sq(db, &mut total_sq); }
+        // Gradient clipping (global norm — GPU-accelerated with CPU fallback)
+        let mut slices: Vec<&[f32]> = vec![
+            &grads.embed_grad, &grads.output_proj_dw, &grads.output_proj_db,
+            &grads.obs_proj_dw, &grads.obs_proj_db,
+        ];
+        for dw in &grads.connection_dw { slices.push(dw); }
+        for db in &grads.connection_db { slices.push(db); }
         for rg in &grads.region_grads {
-            add_sq(&rg.nlm_s1_w, &mut total_sq);
-            add_sq(&rg.out_proj_w, &mut total_sq);
-            add_sq(&rg.q_proj_w, &mut total_sq);
-            add_sq(&rg.kv_proj_w, &mut total_sq);
+            slices.push(&rg.nlm_s1_w);
+            slices.push(&rg.out_proj_w);
+            slices.push(&rg.q_proj_w);
+            slices.push(&rg.kv_proj_w);
         }
-        let norm = total_sq.sqrt();
+        let norm = crate::grad_norm(&slices);
         let scale = if norm > self.grad_clip { self.grad_clip / norm } else { 1.0 };
         let lr = self.lr * scale;
 
         // Embeddings — AdamW (no weight decay)
-        self.embed.step(&mut w.embeddings, &grads.embed_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.embed.step(&mut w.embeddings, &mut grads.embed_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
 
         // Per-region CTM weights — SDK SGD (handles complex UNet + NLM structure)
-        for (rw, rg) in w.regions.iter_mut().zip(&grads.region_grads) {
+        for (rw, rg) in w.regions.iter_mut().zip(grads.region_grads.iter_mut()) {
             rg.apply(rw, lr, self.grad_clip);
         }
 
         // Connections — AdamW
         for (i, syn) in w.connection_synapses.iter_mut().enumerate() {
-            self.conn_w[i].step(&mut syn.weight, &grads.connection_dw[i], lr, wd, b1, b2, eps, bc1, bc2);
-            self.conn_b[i].step(&mut syn.bias, &grads.connection_db[i], lr, 0.0, b1, b2, eps, bc1, bc2);
+            self.conn_w[i].step(&mut syn.weight, &mut grads.connection_dw[i], lr, wd, b1, b2, eps, bc1, bc2);
+            self.conn_b[i].step(&mut syn.bias, &mut grads.connection_db[i], lr, 0.0, b1, b2, eps, bc1, bc2);
         }
 
         // Projections — AdamW
-        self.obs_proj_w.step(&mut w.obs_proj.weight, &grads.obs_proj_dw, lr, wd, b1, b2, eps, bc1, bc2);
-        self.obs_proj_b.step(&mut w.obs_proj.bias, &grads.obs_proj_db, lr, 0.0, b1, b2, eps, bc1, bc2);
-        self.global_decay.step(&mut w.global_decay, &grads.global_decay_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
-        self.output_proj_w.step(&mut w.output_proj.weight, &grads.output_proj_dw, lr, wd, b1, b2, eps, bc1, bc2);
-        self.output_proj_b.step(&mut w.output_proj.bias, &grads.output_proj_db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.obs_proj_w.step(&mut w.obs_proj.weight, &mut grads.obs_proj_dw, lr, wd, b1, b2, eps, bc1, bc2);
+        self.obs_proj_b.step(&mut w.obs_proj.bias, &mut grads.obs_proj_db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.global_decay.step(&mut w.global_decay, &mut grads.global_decay_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.output_proj_w.step(&mut w.output_proj.weight, &mut grads.output_proj_dw, lr, wd, b1, b2, eps, bc1, bc2);
+        self.output_proj_b.step(&mut w.output_proj.bias, &mut grads.output_proj_db, lr, 0.0, b1, b2, eps, bc1, bc2);
+
+        // Aux heads — AdamW (only when enabled)
+        if let (Some(head), Some(opt_w), Some(opt_b),
+                Some(dw), Some(db)) = (
+            &mut w.cereb_predict, &mut self.cereb_predict_w, &mut self.cereb_predict_b,
+            &mut grads.cereb_predict_dw, &mut grads.cereb_predict_db,
+        ) {
+            opt_w.step(&mut head.weight, dw, lr, wd, b1, b2, eps, bc1, bc2);
+            opt_b.step(&mut head.bias, db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        }
+        if let (Some(head), Some(opt_w), Some(opt_b),
+                Some(dw), Some(db)) = (
+            &mut w.bg_value, &mut self.bg_value_w, &mut self.bg_value_b,
+            &mut grads.bg_value_dw, &mut grads.bg_value_db,
+        ) {
+            opt_w.step(&mut head.weight, dw, lr, wd, b1, b2, eps, bc1, bc2);
+            opt_b.step(&mut head.bias, db, lr, 0.0, b1, b2, eps, bc1, bc2);
+        }
     }
 
     /// Save optimizer state.
@@ -2412,12 +2781,20 @@ pub fn regional_train_token_fast(
     token: usize,
     target: usize,
 ) -> (f32, usize) {
-    // For now, delegate to the allocating version.
-    // The workspace will be wired in incrementally as we convert
-    // each internal function to use pre-allocated buffers.
-    // Even this wrapper lets us measure the call overhead.
+    regional_train_token_with_loss(w, grads, _ws, token, target, None)
+}
+
+/// Fast training with pluggable loss function.
+pub fn regional_train_token_with_loss(
+    w: &RegionalWeights,
+    grads: &mut RegionalGradients,
+    _ws: &mut TrainWorkspace,
+    token: usize,
+    target: usize,
+    loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
+) -> (f32, usize) {
     let obs = w.embed(token);
-    let (loss, pred, d_obs) = regional_train_step_full(w, grads, obs, target);
+    let (loss, pred, d_obs) = regional_train_step_loss(w, grads, obs, target, loss_fn);
 
     let d = w.config.raw_obs_dim;
     let offset = token * d;
@@ -2699,6 +3076,348 @@ pub fn action_modified_key(modifier: usize, key_byte: u8) -> Vec<usize> {
 
 // ── Neural Computer: interactive loop ────────────────────
 
+// ═══════════════════════════════════════════════════════════════
+// BRAIN TRAIT IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════
+
+/// Cache for regional brain forward pass (consumed by backward).
+pub struct RegionalCache {
+    pub tick_caches: Vec<OuterTickCache>,
+    pub observation: Vec<f32>,
+    /// Region activations from the last outer tick (for aux gradient computation).
+    pub last_region_activations: Vec<Vec<f32>>,
+}
+
+/// The 8-region brain as a Brain.
+pub struct RegionalBrain;
+
+impl modgrad_traits::Brain for RegionalBrain {
+    type Input = modgrad_traits::TokenInput;
+    type Weights = RegionalWeights;
+    type State = RegionalState;
+    type Cache = RegionalCache;
+    type Gradients = RegionalGradients;
+
+    fn init_state(weights: &RegionalWeights) -> RegionalState {
+        RegionalState::new(weights)
+    }
+
+    fn forward(
+        weights: &RegionalWeights,
+        mut state: RegionalState,
+        input: &modgrad_traits::TokenInput,
+    ) -> (modgrad_traits::BrainOutput, RegionalState) {
+        let output = regional_forward(weights, &mut state, &input.tokens);
+        let brain_output = modgrad_traits::BrainOutput {
+            predictions: output.predictions,
+            certainties: output.exit_lambdas.iter()
+                .map(|&l| [1.0 - l, l])
+                .collect::<Vec<_>>(),
+            sync: output.global_sync,
+        };
+        // Pad certainties if exit_lambdas was empty (no gate)
+        let brain_output = if brain_output.certainties.is_empty() {
+            modgrad_traits::BrainOutput {
+                certainties: brain_output.predictions.iter()
+                    .map(|p| {
+                        let c = crate::forward::compute_certainty_pub(p);
+                        c
+                    }).collect(),
+                ..brain_output
+            }
+        } else {
+            brain_output
+        };
+        (brain_output, state)
+    }
+
+    fn forward_cached(
+        weights: &RegionalWeights,
+        _state: RegionalState,
+        input: &modgrad_traits::TokenInput,
+    ) -> (modgrad_traits::BrainOutput, RegionalState, RegionalCache) {
+        let cfg = &weights.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+
+        let obs_projected = weights.obs_proj.forward(&input.tokens);
+        let mut state = RegionalState::new(weights);
+        let mut region_explicit_states: Vec<_> = weights.regions.iter()
+            .map(|rw| Ctm::init_state(rw))
+            .collect();
+        let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
+
+        for outer_tick in 0..cfg.outer_ticks {
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+            let mut router_cache: Option<RouterCache> = None;
+
+            if let Some(ref router) = weights.router {
+                let gs: Vec<f32> = (0..n_sync)
+                    .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                    .collect();
+                let (routed, cache) = router.forward(
+                    outer_tick, &gs, &state.region_outputs, true,
+                );
+                router_cache = Some(cache);
+                for r in 0..n_regions {
+                    region_obs[r] = routed[r].clone();
+                }
+            } else {
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    let mut src = Vec::new();
+                    for &from_idx in &conn.from {
+                        src.extend_from_slice(&state.region_outputs[from_idx]);
+                    }
+                    if conn.receives_observation {
+                        src.extend_from_slice(&input.tokens);
+                    }
+                    connection_inputs.push(src.clone());
+                    let projected = weights.connection_synapses[ci].forward(&src);
+                    region_obs[conn.to] = projected;
+                }
+                for r in 0..n_regions {
+                    if region_obs[r].is_empty() {
+                        region_obs[r] = obs_projected.clone();
+                    }
+                }
+            }
+
+            // Run regions in parallel — take ownership for disjoint mut
+            let states_taken: Vec<_> = region_explicit_states.drain(..).collect();
+            let region_results: Vec<_> = states_taken.into_par_iter().enumerate().map(|(r, rstate)| {
+                let d_input = weights.regions[r].config.d_input;
+                let rinput = TokenInput {
+                    tokens: region_obs[r].clone(),
+                    n_tokens: 1,
+                    token_dim: d_input,
+                };
+                let (_output, new_state, cache) = Ctm::forward_cached(
+                    &weights.regions[r], rstate, &rinput,
+                );
+                (new_state.activated.clone(), new_state, cache)
+            }).collect();
+
+            state.region_outputs.clear();
+            let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
+            for (activated, new_state, cache) in region_results {
+                state.region_outputs.push(activated);
+                region_explicit_states.push(new_state);
+                region_caches.push(Some(cache));
+            }
+
+            let mut all_activations = Vec::new();
+            for r in 0..n_regions {
+                all_activations.extend_from_slice(&state.region_outputs[r]);
+            }
+
+            for i in 0..n_sync {
+                let l = weights.global_sync_left[i];
+                let ri = weights.global_sync_right[i];
+                if l < all_activations.len() && ri < all_activations.len() {
+                    let pw = all_activations[l] * all_activations[ri];
+                    let decay = (-weights.global_decay[i].clamp(0.0, 15.0)).exp();
+                    state.global_alpha[i] = decay * state.global_alpha[i] + pw;
+                    state.global_beta[i] = decay * state.global_beta[i] + 1.0;
+                }
+            }
+
+            let global_sync: Vec<f32> = (0..n_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+
+            let (exit_gate_cache, exit_lambda) = if let Some(ref gate) = weights.outer_exit_gate {
+                let (logit, cache) = crate::train::linear_forward_cached(gate, &global_sync);
+                let lambda = 1.0 / (1.0 + (-logit[0]).exp());
+                (Some(cache), lambda)
+            } else {
+                (None, 0.0)
+            };
+
+            tick_caches.push(OuterTickCache {
+                region_obs,
+                region_activated: state.region_outputs.clone(),
+                region_caches,
+                all_activations,
+                global_sync: global_sync.clone(),
+                global_beta: state.global_beta.clone(),
+                connection_inputs,
+                exit_gate_cache,
+                exit_lambda,
+                router_cache,
+            });
+        }
+
+        let predictions: Vec<Vec<f32>> = tick_caches.iter()
+            .map(|tc| weights.output_proj.forward(&tc.global_sync))
+            .collect();
+        let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
+            let c = compute_certainty(p);
+            [1.0 - c, c]
+        }).collect();
+
+        let brain_output = modgrad_traits::BrainOutput {
+            predictions,
+            certainties,
+            sync: tick_caches.last()
+                .map(|tc| tc.global_sync.clone())
+                .unwrap_or_default(),
+        };
+
+        let cache = RegionalCache {
+            tick_caches,
+            observation: input.tokens.clone(),
+            last_region_activations: state.region_outputs.clone(),
+        };
+
+        (brain_output, state, cache)
+    }
+
+    fn backward(
+        weights: &RegionalWeights,
+        cache: RegionalCache,
+        d_predictions: &[Vec<f32>],
+    ) -> RegionalGradients {
+        let cfg = &weights.config;
+        let n_regions = cfg.regions.len();
+        let obs_dim = cfg.raw_obs_dim;
+        let mut grads = RegionalGradients::zeros(weights);
+
+        let add = |d: &mut [f32], s: &[f32]| {
+            for (d, s) in d.iter_mut().zip(s) { *d += s; }
+        };
+
+        // Exit gate gradients
+        if let Some(ref gate) = weights.outer_exit_gate {
+            let predictions: Vec<Vec<f32>> = cache.tick_caches.iter()
+                .map(|tc| weights.output_proj.forward(&tc.global_sync))
+                .collect();
+            let lambdas: Vec<f32> = cache.tick_caches.iter().map(|tc| tc.exit_lambda).collect();
+            let beta = cfg.exit_strategy.beta();
+            let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
+                &predictions, &lambdas, 0, beta);
+            for (t, d_lambda) in d_lambdas.iter().enumerate() {
+                if let Some(ref ec) = cache.tick_caches[t].exit_gate_cache {
+                    let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                    let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                    let _d_sync = crate::train::linear_backward(
+                        gate, &[*d_lambda], ec, gw, gb);
+                }
+            }
+        }
+
+        // Save for aux gradients before cache is consumed
+        let aux_region_activations = cache.last_region_activations.clone();
+        let aux_observation = cache.observation.clone();
+
+        for (t, tc) in cache.tick_caches.into_iter().enumerate().rev() {
+            let d_logits = &d_predictions[t];
+
+            // output_proj backward
+            let out_dim = weights.output_proj.out_dim;
+            let in_dim = weights.output_proj.in_dim;
+            let mut d_global_sync = vec![0.0f32; in_dim];
+            for i in 0..out_dim {
+                grads.output_proj_db[i] += d_logits[i];
+                for j in 0..in_dim {
+                    grads.output_proj_dw[i * in_dim + j] += d_logits[i] * tc.global_sync[j];
+                    d_global_sync[j] += d_logits[i] * weights.output_proj.weight[i * in_dim + j];
+                }
+            }
+
+            // global sync backward
+            let total_act_dim = tc.all_activations.len();
+            let d_all_activations = global_sync_backward(
+                &d_global_sync, &tc.all_activations, &tc.global_beta,
+                &weights.global_sync_left, &weights.global_sync_right, total_act_dim,
+            );
+
+            // Split d_all_activations per region
+            let mut offset = 0;
+            let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let dim = weights.regions[r].config.d_model;
+                d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
+                offset += dim;
+            }
+
+            let mut d_region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            let mut region_caches = tc.region_caches;
+            for r in 0..n_regions {
+                if let Some(rcache) = region_caches[r].take() {
+                    let result = backward_from_activated(&weights.regions[r], &rcache, &d_region_activated[r]);
+                    let dst = &mut grads.region_grads[r];
+                    add(&mut dst.nlm_s1_w, &result.grads.nlm_s1_w);
+                    add(&mut dst.nlm_s1_b, &result.grads.nlm_s1_b);
+                    if let (Some(dw), Some(sw)) = (&mut dst.nlm_s2_w, &result.grads.nlm_s2_w) {
+                        add(dw, sw);
+                    }
+                    if let (Some(db), Some(sb)) = (&mut dst.nlm_s2_b, &result.grads.nlm_s2_b) {
+                        add(db, sb);
+                    }
+                    add(&mut dst.d_start_activated, &result.grads.d_start_activated);
+                    add(&mut dst.d_start_trace, &result.grads.d_start_trace);
+                    add(&mut dst.kv_proj_w, &result.grads.kv_proj_w);
+                    add(&mut dst.kv_proj_b, &result.grads.kv_proj_b);
+                    add(&mut dst.q_proj_w, &result.grads.q_proj_w);
+                    add(&mut dst.q_proj_b, &result.grads.q_proj_b);
+                    add(&mut dst.mha_in_w, &result.grads.mha_in_w);
+                    add(&mut dst.mha_in_b, &result.grads.mha_in_b);
+                    add(&mut dst.mha_out_w, &result.grads.mha_out_w);
+                    add(&mut dst.mha_out_b, &result.grads.mha_out_b);
+                    add(&mut dst.out_proj_w, &result.grads.out_proj_w);
+                    add(&mut dst.out_proj_b, &result.grads.out_proj_b);
+                    d_region_obs[r] = result.d_observation;
+                }
+            }
+
+            // Connection synapse backward
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let r = conn.to;
+                if d_region_obs[r].is_empty() { continue; }
+                let d_proj_out = &d_region_obs[r];
+                let syn = &weights.connection_synapses[ci];
+                let syn_input = &tc.connection_inputs.get(ci);
+                if let Some(input) = syn_input {
+                    for i in 0..syn.out_dim.min(d_proj_out.len()) {
+                        grads.connection_db[ci][i] += d_proj_out[i];
+                        for j in 0..syn.in_dim.min(input.len()) {
+                            grads.connection_dw[ci][i * syn.in_dim + j] += d_proj_out[i] * input[j];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Aux head gradients — computed from the last tick's region activations.
+        if cfg.aux_losses.cerebellar_prediction
+            || cfg.aux_losses.bg_temporal_difference
+        {
+            accumulate_aux_gradients(
+                weights, &mut grads,
+                &aux_region_activations,
+                &aux_observation,
+                0.0,
+            );
+        }
+
+        grads
+    }
+
+    fn zero_gradients(weights: &RegionalWeights) -> RegionalGradients {
+        RegionalGradients::zeros(weights)
+    }
+
+    fn apply_gradients(
+        weights: &mut RegionalWeights,
+        grads: &mut RegionalGradients,
+        lr: f32,
+        clip_norm: f32,
+    ) {
+        grads.apply(weights, lr, clip_norm);
+    }
+}
+
 /// NC runtime state: wraps the CTM state and provides the
 /// update-and-render loop from the NC paper (Eq 2.1).
 ///
@@ -2850,5 +3569,41 @@ impl NeuralComputer {
             logits = self.step(next);
         }
         output
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episodic_memory_accumulates() {
+        let cfg = RegionalConfig::eight_region(16, 256, 2);
+        let w = RegionalWeights::new(cfg);
+        let mut nc = NeuralComputer::new(w);
+
+        // Find hippocampus
+        let idx = nc.weights.config.region_names.iter()
+            .position(|n| n.contains("hippocampus"))
+            .expect("eight_region should have hippocampus");
+
+        let epi = nc.state.region_states[idx].episodic.as_ref()
+            .expect("hippocampus should have episodic memory");
+        assert_eq!(epi.n_tokens(), 0);
+
+        // Run 20 tokens
+        for i in 0..20 {
+            let _logits = nc.step(i % 256);
+        }
+
+        let epi = nc.state.region_states[idx].episodic.as_ref().unwrap();
+        assert!(epi.n_tokens() > 0,
+            "episodic memory should have entries after inference, got {}", epi.n_tokens());
+
+        // Memory should be bounded
+        let max = 4 + 16 + 64; // short + mid + long capacity
+        assert!(epi.n_tokens() <= max,
+            "episodic memory should be bounded: {} > {}", epi.n_tokens(), max);
     }
 }
