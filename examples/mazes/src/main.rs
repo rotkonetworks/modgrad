@@ -397,6 +397,8 @@ fn run_brain(
         plural: plural_mode,
         max_personalities: 4,
         red_threshold_for_split: 50,
+        pain_focus_decay: 0.95,
+        overcoming_threshold: -0.2,
     });
 
     let mut csv_writer = if csv_mode {

@@ -70,6 +70,8 @@ impl OrganismNC {
             plural,
             max_personalities: 4,
             red_threshold_for_split: 50,
+            pain_focus_decay: 0.95,
+            overcoming_threshold: -0.2,
         });
         Ok(Self::new(nc, organism))
     }

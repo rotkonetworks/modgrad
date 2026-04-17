@@ -50,6 +50,10 @@ pub struct OrganismConfig {
     pub max_personalities: usize,
     /// Steps in red zone before the organism splits.
     pub red_threshold_for_split: usize,
+    /// Adaptive pain focus decay rate (EMA alpha, default 0.95).
+    pub pain_focus_decay: f32,
+    /// Retrieval valence threshold for triggering on_overcoming (default -0.2).
+    pub overcoming_threshold: f32,
 }
 
 // ─── Response types ──────────────────────────────────────────
@@ -146,7 +150,7 @@ impl Organism {
             neuromod: Neuromodulators::default(),
             memory: EpisodicMemory::new(config.episodic.clone()),
             baseline: LossBaseline::new(config.pain.baseline_alpha),
-            pain_focus: AdaptivePainFocus::new(config.n_positions, 0.95),
+            pain_focus: AdaptivePainFocus::new(config.n_positions, config.pain_focus_decay),
             prev_loss: 0.0,
             plural,
             position_valences: Vec::new(),
@@ -244,7 +248,7 @@ impl Organism {
         let resp = pain::on_prediction(h, n, surprise, pos_loss, confidence, correct, &pain_cfg);
         self.position_valences.push(resp.valence_for_storage);
 
-        if correct && retrieval_valence < -0.2 {
+        if correct && retrieval_valence < self.config.overcoming_threshold {
             let (h, n, _) = active_state_of(
                 &mut self.plural, &mut self.homeostasis, &mut self.neuromod, &mut self.memory,
             );
@@ -473,6 +477,8 @@ mod tests {
             plural: false,
             max_personalities: 4,
             red_threshold_for_split: 5,
+            pain_focus_decay: 0.95,
+            overcoming_threshold: -0.2,
         }
     }
 

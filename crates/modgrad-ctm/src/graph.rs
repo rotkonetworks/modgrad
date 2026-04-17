@@ -1070,6 +1070,10 @@ pub struct RegionalState {
     /// Used as source for inter-region connections.
     pub region_outputs: Vec<Vec<f32>>,
 
+    /// Double-buffer for previous tick's outputs (avoids clone per tick).
+    /// Swapped with region_outputs at the start of each outer tick.
+    prev_outputs: Vec<Vec<f32>>,
+
     /// Global sync accumulators.
     pub global_alpha: Vec<f32>,
     pub global_beta: Vec<f32>,
@@ -1094,10 +1098,12 @@ impl RegionalState {
             .map(|rw| rw.start_activated.clone())
             .collect();
 
+        let prev_outputs = region_outputs.clone();
         let n = w.config.n_global_sync;
         Self {
             region_states,
             region_outputs,
+            prev_outputs,
             global_alpha: vec![0.0; n],
             global_beta: vec![1.0; n],
         }
@@ -1180,9 +1186,9 @@ pub fn regional_forward(
     let obs_projected = w.obs_proj.forward(observation);
 
     for outer_tick in 0..cfg.outer_ticks {
-        // Snapshot previous outputs (immutable read buffer for this tick).
-        // Regions read from prev_outputs, write to state.region_outputs.
-        let prev_outputs = state.region_outputs.clone();
+        // Swap double-buffer: prev_outputs gets current, region_outputs ready for writes.
+        std::mem::swap(&mut state.region_outputs, &mut state.prev_outputs);
+        let prev_outputs = &state.prev_outputs;
 
         // Phase A: Build observations — router or fixed connections.
         let region_obs: Vec<Vec<f32>> = if let Some(ref router) = w.router {
