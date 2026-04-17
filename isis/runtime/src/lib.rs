@@ -24,7 +24,7 @@ pub mod nc_socket;
 // Actor model (generic)
 pub mod actors;
 
-// Plural system integration
+// Organism-aware NeuralComputer (pain, memory, dream, plural, monarch)
 pub mod plural_nc;
 
 /// Generate tokens from a NeuralComputer using the SDK inference runtime.

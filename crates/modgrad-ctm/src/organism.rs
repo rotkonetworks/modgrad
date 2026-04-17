@@ -261,7 +261,7 @@ impl Organism {
         observation: &[f32],
     ) -> AfterSample {
         if !self.is_active() {
-            self.baseline.update(loss / n_total.max(1) as f32);
+            self.baseline.update(loss / self.config.n_positions.max(1) as f32);
             return AfterSample { valence: 0.0 };
         }
 
@@ -411,13 +411,28 @@ impl Organism {
     /// Get the plural system (if enabled).
     pub fn plural_system(&self) -> Option<&PluralSystem> { self.plural.as_ref() }
 
-    /// Self-report string.
+    /// Get mutable access to the plural system (for forced switching, monarch ops).
+    pub fn plural_system_mut(&mut self) -> Option<&mut PluralSystem> { self.plural.as_mut() }
+
+    /// Self-report string with key telemetry.
     pub fn report(&self) -> String {
-        if let Some(ref sys) = self.plural {
-            plural::self_report(sys)
+        let (h, n, mem_count) = if let Some(ref sys) = self.plural {
+            let a = &sys.personalities[sys.active];
+            (&a.homeostasis, &a.neuromod, a.memory.count)
         } else {
-            self.homeostasis.self_report()
+            (&self.homeostasis, &self.neuromod, self.memory.count)
+        };
+        let weakest = self.pain_focus.weakest_position();
+        let mut s = format!(
+            "p={:.2} DA={:.2} 5HT={:.2} NE={:.2} mem={} weak=pos{}",
+            h.pressure, n.dopamine, n.serotonin, n.norepinephrine, mem_count, weakest,
+        );
+        if let Some(ref sys) = self.plural {
+            s.push_str(&format!(" pers={}/{} \"{}\"",
+                sys.active, sys.personalities.len(),
+                sys.personalities[sys.active].name));
         }
+        s
     }
 }
 

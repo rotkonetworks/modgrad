@@ -20,7 +20,7 @@ use modgrad_ctm::graph::{
     RegionalAdamW, RegionalBrain, regional_forward,
 };
 use modgrad_codec::retina::VisualRetina;
-use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination, TokenInput};
+use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -290,13 +290,11 @@ fn run_brain(
     plural_mode: bool, csv_mode: bool, cereb_size: usize,
 ) {
     use std::io::Write;
-    use modgrad_ctm::bio::homeostasis::Homeostasis;
-    use modgrad_ctm::bio::neuromod::Neuromodulators;
-    use modgrad_ctm::bio::pain::{self, PainConfig};
     use modgrad_ctm::bio::dream;
-    use modgrad_ctm::memory::episodic::{self, EpisodicConfig, EpisodicMemory, ValenceReceipt};
+    use modgrad_ctm::memory::episodic::EpisodicConfig;
     use modgrad_ctm::graph::AuxLossConfig;
-    use modgrad_ctm::plural::{self, PluralSystem, SwitchPolicy, SwitchTrigger};
+    use modgrad_ctm::organism::{Organism, OrganismConfig};
+    use modgrad_ctm::bio::pain::PainConfig;
 
     let encoder = VisualRetina::maze(maze_size, maze_size);
     let token_dim = encoder.token_dim();
@@ -305,7 +303,6 @@ fn run_brain(
     let mut cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
 
     // Cerebellum: 64 neurons × 16 ticks is the sweet spot for this scale.
-    // Tight recurrent forward model that trains well via aux losses.
     if pain_mode {
         let cereb_idx = cfg.region_names.iter()
             .position(|n| n.contains("cerebellum")).unwrap_or(4);
@@ -357,44 +354,31 @@ fn run_brain(
 
     let d_model = w.config.regions[0].d_model;
     let n_regions = w.config.regions.len();
-    let pain_cfg = PainConfig::default();
     let pain_warmup = steps / 10;
-    let episodic_cfg = EpisodicConfig {
-        capacity: 512,
-        max_ticks: ticks,
+
+    // Organism composes all pain/memory/dream/plural state
+    let mut org = Organism::new(OrganismConfig {
+        n_regions,
         d_model,
-        min_ticks_for_storage: 1,
-        min_surprise: 0.0,
-        retrieval_threshold: 0.5,
-        consolidation_threshold: 0.85,
-        semantic_collapse_retrievals: 5,
-        strength_decay: 0.95,
-    };
-
-    // Plural system: wraps homeostasis/neuromod/memory per personality
-    let mut plural_sys = if plural_mode {
-        let mut sys = PluralSystem::new("primary", n_regions, episodic_cfg.clone());
-        sys.switch_policy = SwitchPolicy::Salience;
-        sys.permeability = 0.3;
-        Some(sys)
-    } else {
-        None
-    };
-
-    // Standalone pain state (used when plural_mode is off)
-    let mut homeostasis = Homeostasis::default();
-    let mut neuromod = Neuromodulators::default();
-    let mut memory = EpisodicMemory::new(episodic_cfg.clone());
-
-    // Shared across modes
-    let mut batch_baseline = pain::LossBaseline::new(0.95);
-    let mut pain_focus = dream::AdaptivePainFocus::new(route_len, 0.95);
-    let mut prev_loss = 0.0f32;
-
-    // Plural splitting state
-    let mut steps_in_red = 0usize;
-    let max_personalities = 4;
-    let red_threshold_for_split = 50; // steps in red before splitting
+        max_ticks: ticks,
+        pain: PainConfig::default(),
+        episodic: EpisodicConfig {
+            capacity: 512,
+            max_ticks: ticks,
+            d_model,
+            min_ticks_for_storage: 1,
+            min_surprise: 0.0,
+            retrieval_threshold: 0.5,
+            consolidation_threshold: 0.85,
+            semantic_collapse_retrievals: 5,
+            strength_decay: 0.95,
+        },
+        warmup_steps: pain_warmup,
+        n_positions: route_len,
+        plural: plural_mode,
+        max_personalities: 4,
+        red_threshold_for_split: 50,
+    });
 
     let mut csv_writer = if csv_mode {
         let mut f = std::fs::File::create("maze_telemetry.csv")
@@ -409,10 +393,6 @@ fn run_brain(
     let mut first_step_hits = 0usize;
     let mut first_step_total = 0usize;
 
-    // #4: Curriculum — organism self-paces (currently logs zone, doesn't change maze size
-    // because the encoder is fixed to maze_size. Future: use resizable encoder.)
-    let current_maze_size = maze_size;
-
     for step in 1..=steps {
         let mut grads = RegionalGradients::zeros(&w);
         let mut batch_loss = 0.0f32;
@@ -422,26 +402,11 @@ fn run_brain(
         let mut batch_first_correct = 0usize;
         let mut batch_first_total = 0usize;
 
-        let effective_maze_size = current_maze_size;
-
-        // Plural: check if we should switch personality before this batch
-        if plural_mode && step > pain_warmup {
-            if let Some(ref mut sys) = plural_sys {
-                // Use batch baseline surprise as proxy for global sync
-                let sync_proxy = vec![batch_baseline.expected(); 16];
-                let motor_proxy = vec![prev_loss; 4];
-                if let Some(target) = plural::should_switch(sys, &sync_proxy, &motor_proxy) {
-                    let claim = plural::evaluate_claims(sys, &sync_proxy, &motor_proxy)
-                        .into_iter().find(|(id, _)| *id == target)
-                        .map(|(_, c)| c).unwrap_or(0.0);
-                    let temp = std::mem::replace(sys, PluralSystem::new("_", n_regions, episodic_cfg.clone()));
-                    *sys = plural::switch(temp, target, SwitchTrigger::Salience { claim });
-                }
-            }
-        }
+        // Organism handles plural switching check
+        if pain_mode { org.begin_step(); }
 
         for _ in 0..batch_size {
-            let maze = generate_maze(effective_maze_size, &mut rng);
+            let maze = generate_maze(maze_size, &mut rng);
             if maze.path_length < 3 { continue; }
 
             let pixels = render_maze(&maze);
@@ -451,44 +416,29 @@ fn run_brain(
             route.truncate(route_len);
             while route.len() < route_len { route.push(DIR_WAIT); }
 
-            // Get active personality's state (or standalone state)
-            let (h, n, mem) = if let Some(ref mut sys) = plural_sys {
-                let active = &mut sys.personalities[sys.active];
-                (&mut active.homeostasis, &mut active.neuromod, &mut active.memory)
+            // Organism handles episodic retrieval + valence
+            let query_len = d_model.min(input.tokens.len());
+            let before = if pain_mode {
+                org.before_sample(&input.tokens[..query_len])
             } else {
-                (&mut homeostasis, &mut neuromod, &mut memory)
+                org.before_sample(&[])
             };
 
-            // #2: Episodic retrieval + state priming
-            let mut retrieval_valence = 0.0f32;
-            let mut retrieval_result = None;
-            if pain_mode && step > pain_warmup && mem.count > 0 {
-                let query_len = d_model.min(input.tokens.len());
-                let query = &input.tokens[..query_len];
-                let result = episodic::retrieve(mem, query);
-                if result.n_matches > 0 {
-                    retrieval_valence = result.blended_valence;
-                    pain::on_retrieval(h, n, retrieval_valence, &pain_cfg);
-                    retrieval_result = Some(result);
+            // Prime initial state from retrieval
+            let mut state = RegionalBrain::init_state(&w);
+            if let Some(ref retrieval) = before.retrieval {
+                if retrieval.n_matches > 0 {
+                    let hippo_idx = w.config.region_names.iter()
+                        .position(|n| n.contains("hippocampus"))
+                        .unwrap_or(7);
+                    let blend = retrieval.best_similarity * 0.3;
+                    dream::prime_state(&mut state.region_outputs, retrieval, blend, hippo_idx);
                 }
             }
 
-            // #2: Prime the initial state from retrieval
-            let mut state = RegionalBrain::init_state(&w);
-            if let Some(ref retrieval) = retrieval_result {
-                // Prime hippocampus region (index 7 in eight_region_small)
-                let hippo_idx = w.config.region_names.iter()
-                    .position(|n| n.contains("hippocampus"))
-                    .unwrap_or(7);
-                let blend = retrieval.best_similarity * 0.3; // scale blend by match quality
-                dream::prime_state(&mut state.region_outputs, retrieval, blend, hippo_idx);
-            }
-
             let (output, _state, cache) = RegionalBrain::forward_cached(&w, state, &input);
-
             let (loss, d_preds) = loss_fn.compute(
                 &output.predictions, &output.certainties, &route);
-
             let sample_grads = RegionalBrain::backward(&w, cache, &d_preds);
 
             // Accumulate gradients
@@ -519,10 +469,9 @@ fn run_brain(
             batch_loss += loss;
             batch_valid += 1;
 
-            // Per-position accuracy with adaptive pain focus
+            // Per-position accuracy — organism handles pain focus
             let mut sample_correct = 0usize;
             let mut sample_total = 0usize;
-            let mut position_valences = Vec::new();
 
             if let Some(pred) = output.predictions.last() {
                 for pos in 0..route_len.min(maze.path_length) {
@@ -540,12 +489,7 @@ fn run_brain(
                             if correct { batch_first_correct += 1; }
                         }
 
-                        // #5: Adaptive pain focus — weight from learned failure rates
-                        if pain_mode && step > pain_warmup {
-                            pain_focus.update(pos, correct);
-                            let pos_weight = pain_focus.weight(pos);
-                            let pos_loss = if correct { 0.0 } else { 1.0 } * pos_weight;
-
+                        if pain_mode {
                             let confidence = if correct {
                                 let logits = &pred[off..off + N_DIRECTIONS];
                                 let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -554,20 +498,7 @@ fn run_brain(
                             } else {
                                 0.5
                             };
-
-                            // #7: Use per-batch baseline for surprise, accumulate per position
-                            let surprise = batch_baseline.update(pos_loss);
-
-                            let resp = pain::on_prediction(
-                                h, n, surprise, pos_loss, confidence, correct, &pain_cfg,
-                            );
-                            position_valences.push(resp.valence_for_storage);
-
-                            if correct && retrieval_valence < -0.2 {
-                                pain::on_overcoming(
-                                    h, n, retrieval_valence, true, &pain_cfg,
-                                );
-                            }
+                            org.after_position(pos, correct, confidence, before.retrieval_valence);
                         }
                     }
                 }
@@ -575,31 +506,9 @@ fn run_brain(
             batch_correct += sample_correct;
             batch_total += sample_total;
 
-            // Store to episodic memory
-            if pain_mode && step > pain_warmup {
-                let avg_valence = if position_valences.is_empty() { 0.0 }
-                    else { position_valences.iter().sum::<f32>() / position_valences.len() as f32 };
-                let acc = if sample_total > 0 { sample_correct as f32 / sample_total as f32 } else { 0.0 };
-
-                let traj_len = d_model * ticks;
-                let mut traj = vec![0.0f32; traj_len];
-                let copy_len = traj_len.min(input.tokens.len());
-                traj[..copy_len].copy_from_slice(&input.tokens[..copy_len]);
-
-                let cert = vec![[1.0 - acc, acc]; ticks];
-                let receipt = ValenceReceipt {
-                    valence: avg_valence,
-                    loss: loss / route_len as f32,
-                    confidence: acc,
-                    correct: acc > 0.5,
-                };
-                let taken = std::mem::replace(mem, EpisodicMemory::new(episodic_cfg.clone()));
-                let (m, _) = episodic::store_with_valence(
-                    taken, &traj, &cert, &[], ticks, loss, Some(receipt),
-                );
-                *mem = m;
-            } else if pain_mode {
-                batch_baseline.update(loss / route_len as f32);
+            // Organism handles episodic storage with valence
+            if pain_mode {
+                org.after_sample(loss, sample_correct, sample_total, &input.tokens);
             }
         }
 
@@ -607,140 +516,71 @@ fn run_brain(
         first_step_total += batch_first_total;
 
         if batch_valid > 0 {
-            // Get active state for post-batch operations
-            let (h, n, mem) = if let Some(ref mut sys) = plural_sys {
-                let active = &mut sys.personalities[sys.active];
-                (&mut active.homeostasis, &mut active.neuromod, &mut active.memory)
-            } else {
-                (&mut homeostasis, &mut neuromod, &mut memory)
-            };
+            let avg_loss = batch_loss / batch_valid as f32;
+            let avg_acc = batch_correct as f32 / batch_total.max(1) as f32;
 
-            if pain_mode && step > pain_warmup {
-                opt.lr = lr * pain::lr_scale(n);
+            // Organism handles LR scaling, sleep, dream, splitting
+            if pain_mode {
+                let batch = org.after_batch(avg_loss, Some(&|_idx, key| {
+                    let mut dream_state = RegionalState::new(&w);
+                    let obs = if key.len() >= w.config.raw_obs_dim {
+                        key[..w.config.raw_obs_dim].to_vec()
+                    } else {
+                        let mut o = key.to_vec();
+                        o.resize(w.config.raw_obs_dim, 0.0);
+                        o
+                    };
+                    let output = regional_forward(&w, &mut dream_state, &obs);
+                    let loss = if let Some(pred) = output.predictions.last() {
+                        let max_l = pred.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        let sum_exp: f32 = pred.iter().map(|l| (l - max_l).exp()).sum();
+                        (sum_exp.ln() + max_l).abs()
+                    } else {
+                        avg_loss
+                    };
+                    let was_correct = loss < avg_loss;
+                    (loss, was_correct)
+                }));
+
+                opt.lr = lr * batch.lr_scale;
+
+                if batch.slept && step % 200 == 0 {
+                    eprintln!("    [sleep] overcame={} regressed={} merges={} mem={}",
+                        batch.dream.as_ref().map_or(0, |d| d.overcame),
+                        batch.dream.as_ref().map_or(0, |d| d.regressed),
+                        batch.merges, batch.memory_count);
+                }
+                if batch.did_split {
+                    eprintln!("    [SPLIT] personality forking → '{}' (n={})",
+                        batch.active_name, batch.n_personalities);
+                }
+
+                // CSV telemetry
+                if let Some(ref mut f) = csv_writer {
+                    let first_acc = if batch_first_total > 0 {
+                        batch_first_correct as f32 / batch_first_total as f32
+                    } else { 0.0 };
+                    writeln!(f, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
+                        step, avg_loss, avg_acc, batch.pressure, batch.dopamine,
+                        batch.serotonin, batch.norepinephrine, opt.lr, first_acc,
+                        batch.memory_count)
+                        .expect("failed to write CSV row");
+                }
+            } else {
+                // CSV telemetry (no pain)
+                if let Some(ref mut f) = csv_writer {
+                    let first_acc = if batch_first_total > 0 {
+                        batch_first_correct as f32 / batch_first_total as f32
+                    } else { 0.0 };
+                    writeln!(f, "{},{:.6},{:.6},0,0,0,0,{:.6},{:.6},0",
+                        step, avg_loss, avg_acc, lr, first_acc)
+                        .expect("failed to write CSV row");
+                }
             }
 
             opt.step(&mut w, &mut grads);
-
-            let avg_loss = batch_loss / batch_valid as f32;
-            let avg_acc = batch_correct as f32 / batch_total.max(1) as f32;
             loss_history.push(avg_loss);
             acc_history.push(avg_acc);
-            prev_loss = avg_loss;
-
-            if pain_mode {
-                h.tick_from_ctm(avg_loss, true, avg_loss);
-            }
-
-            // CSV telemetry
-            if let Some(ref mut f) = csv_writer {
-                let first_acc = if batch_first_total > 0 {
-                    batch_first_correct as f32 / batch_first_total as f32
-                } else { 0.0 };
-                let (pressure, dopamine, serotonin, norepinephrine, current_lr) = if pain_mode {
-                    (h.pressure, n.dopamine, n.serotonin, n.norepinephrine, opt.lr)
-                } else {
-                    (0.0, 0.0, 0.0, 0.0, lr)
-                };
-                let mem_count = if pain_mode { mem.count } else { 0 };
-                writeln!(f, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
-                    step, avg_loss, avg_acc, pressure, dopamine, serotonin,
-                    norepinephrine, current_lr, first_acc, mem_count)
-                    .expect("failed to write CSV row");
-            }
-
-            // Adaptive sleep
-            if pain_mode && step > pain_warmup && h.should_sleep() {
-                let quality = if h.must_sleep() { 1.0 } else { 0.6 };
-                h.on_sleep(quality);
-
-                // Consolidate
-                let taken = std::mem::replace(mem, EpisodicMemory::new(episodic_cfg.clone()));
-                let (m, cons) = episodic::consolidate(taken);
-
-                // Dream replay
-                let (m, dream_result) = dream::dream_replay(
-                    m, h, n,
-                    &|_idx, key| {
-                        let mut dream_state = RegionalState::new(&w);
-                        let obs = if key.len() >= w.config.raw_obs_dim {
-                            key[..w.config.raw_obs_dim].to_vec()
-                        } else {
-                            let mut o = key.to_vec();
-                            o.resize(w.config.raw_obs_dim, 0.0);
-                            o
-                        };
-                        let output = regional_forward(&w, &mut dream_state, &obs);
-                        let loss = if let Some(pred) = output.predictions.last() {
-                            let max_l = pred.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                            let sum_exp: f32 = pred.iter().map(|l| (l - max_l).exp()).sum();
-                            (sum_exp.ln() + max_l).abs()
-                        } else {
-                            prev_loss
-                        };
-                        let was_correct = loss < prev_loss;
-                        (loss, was_correct)
-                    },
-                    10, &pain_cfg,
-                );
-                *mem = m;
-
-                if step % 200 == 0 {
-                    eprintln!("    [sleep] quality={quality:.1} merges={} overcame={} regressed={} mem={}",
-                        cons.merges, dream_result.overcame, dream_result.regressed, mem.count);
-                }
-            }
-
-            // Plural: pressure-driven splitting
-            if plural_mode && step > pain_warmup {
-                if h.should_sleep() || matches!(h.zone(), modgrad_ctm::bio::homeostasis::SleepZone::Red) {
-                    steps_in_red += 1;
-                } else {
-                    steps_in_red = steps_in_red.saturating_sub(1);
-                }
-            }
-        }
-
-        // Plural: fork when sustained red — the unified self can't cope
-        if plural_mode && step > pain_warmup && steps_in_red >= red_threshold_for_split {
-            if let Some(ref mut sys) = plural_sys {
-                if sys.personalities.len() < max_personalities {
-                    let n_alters = sys.personalities.len();
-                    let name = format!("alter_{n_alters}");
-                    eprintln!("    [SPLIT] personality forking → '{}' (sustained red for {} steps)",
-                        name, steps_in_red);
-
-                    // Fork from active
-                    let temp = std::mem::replace(sys, PluralSystem::new("_", n_regions, episodic_cfg.clone()));
-                    let mut forked = plural::fork_active(temp, &name);
-
-                    // Differentiate: opposite temperament to handle what parent can't
-                    let new_id = forked.personalities.len() - 1;
-                    let parent = &forked.personalities[forked.active];
-                    let parent_ne = parent.neuromod.norepinephrine;
-                    let parent_da = parent.neuromod.dopamine;
-                    let new_p = &mut forked.personalities[new_id];
-
-                    // If parent is high-anxiety, new alter is calm explorer
-                    // If parent is low-arousal, new alter is vigilant
-                    if parent_ne > 1.0 {
-                        new_p.neuromod.norepinephrine = 0.3;
-                        new_p.neuromod.dopamine = 2.0;
-                        new_p.neuromod.curiosity = 1.5;
-                        new_p.neuromod.serotonin = 1.5;
-                    } else {
-                        new_p.neuromod.norepinephrine = 1.5;
-                        new_p.neuromod.dopamine = 0.8;
-                        new_p.neuromod.curiosity = 0.3;
-                        new_p.neuromod.serotonin = 0.8;
-                    }
-
-                    // New personality is co-conscious with all others
-                    forked.co_conscious = (0..forked.personalities.len()).collect();
-
-                    *sys = forked;
-                    steps_in_red = 0;
-                }
-            }
         }
 
         if step % 100 == 0 || step == steps {
@@ -752,22 +592,8 @@ fn run_brain(
                     first_step_hits as f32 / first_step_total as f32 * 100.0
                 } else { 0.0 };
                 if pain_mode {
-                    let weakest = pain_focus.weakest_position();
-                    let (p, da, sht, ne, mc) = if let Some(ref sys) = plural_sys {
-                        let a = &sys.personalities[sys.active];
-                        (a.homeostasis.pressure, a.neuromod.dopamine, a.neuromod.serotonin,
-                         a.neuromod.norepinephrine, a.memory.count)
-                    } else {
-                        (homeostasis.pressure, neuromod.dopamine, neuromod.serotonin,
-                         neuromod.norepinephrine, memory.count)
-                    };
-                    let plural_info = if let Some(ref sys) = plural_sys {
-                        format!(" pers={}/{} \"{}\"", sys.active, sys.personalities.len(),
-                            sys.personalities[sys.active].name)
-                    } else {
-                        String::new()
-                    };
-                    eprintln!("step {step:5}: loss={smooth_loss:.3} route={:.1}% first={first_pct:.1}% | p={p:.2} DA={da:.2} 5HT={sht:.2} NE={ne:.2} lr={:.5} mem={mc} weak=pos{weakest}{plural_info}",
+                    let report = org.report();
+                    eprintln!("step {step:5}: loss={smooth_loss:.3} route={:.1}% first={first_pct:.1}% | {report} lr={:.5}",
                         smooth_acc * 100.0, opt.lr);
                 } else {
                     eprintln!("step {step:5}: loss={smooth_loss:.3} route_acc={:.1}% first={first_pct:.1}%",
