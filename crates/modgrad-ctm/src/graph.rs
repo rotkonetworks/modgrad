@@ -1182,8 +1182,14 @@ pub fn regional_forward(
     let mut exit_cdf = 0.0f32;
     let mut survival = 1.0f32;
 
-    // Project raw observation
-    let obs_projected = w.obs_proj.forward(observation);
+    // Pre-allocated buffers for the hot loop
+    let mut obs_projected = vec![0.0f32; w.obs_proj.out_dim];
+    w.obs_proj.forward_into(observation, &mut obs_projected);
+    let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+    let mut all_act_buf = vec![0.0f32; total_neurons];
+    let n_sync = cfg.n_global_sync;
+    let mut gs_buf = vec![0.0f32; n_sync];
+    let mut pred_buf = vec![0.0f32; cfg.out_dims];
 
     for outer_tick in 0..cfg.outer_ticks {
         // Swap double-buffer: prev_outputs gets current, region_outputs ready for writes.
@@ -1252,37 +1258,41 @@ pub fn regional_forward(
             state.region_outputs[r] = results[r].clone();
         }
 
-        // Phase 3: Global sync over ALL regions' activations
-        let mut all_activations = Vec::new();
-        for r in 0..n_regions {
-            all_activations.extend_from_slice(&state.region_outputs[r]);
+        // Phase 3: Global sync — flatten into pre-allocated buffer
+        {
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = state.region_outputs[r].len();
+                all_act_buf[offset..offset + d].copy_from_slice(&state.region_outputs[r]);
+                offset += d;
+            }
         }
 
-        let n_sync = cfg.n_global_sync;
         for i in 0..n_sync {
             let l = w.global_sync_left[i];
             let r = w.global_sync_right[i];
-            if l < all_activations.len() && r < all_activations.len() {
-                let pw = all_activations[l] * all_activations[r];
+            if l < all_act_buf.len() && r < all_act_buf.len() {
+                let pw = all_act_buf[l] * all_act_buf[r];
                 let decay = (-w.global_decay[i].clamp(0.0, 15.0)).exp();
                 state.global_alpha[i] = decay * state.global_alpha[i] + pw;
                 state.global_beta[i] = decay * state.global_beta[i] + 1.0;
             }
         }
 
-        let global_sync: Vec<f32> = (0..n_sync)
-            .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
-            .collect();
+        for i in 0..n_sync {
+            gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
+        }
 
-        // Phase 4: Output prediction
-        let prediction = w.output_proj.forward(&global_sync);
+        // Phase 4: Output prediction — reuse buffer
+        w.output_proj.forward_into(&gs_buf, &mut pred_buf);
+        let prediction = pred_buf.clone(); // need owned copy for predictions vec
         predictions.push(prediction);
 
         // Phase 5: Exit decision
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let Some(ref gate) = w.outer_exit_gate {
-                    let gate_logit = gate.forward(&global_sync);
+                    let gate_logit = gate.forward(&gs_buf);
                     let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
                     exit_lambdas.push(lambda);
                     let p_exit = lambda * survival;
@@ -1295,14 +1305,10 @@ pub fn regional_forward(
         }
     }
 
-    let global_sync: Vec<f32> = (0..cfg.n_global_sync)
-        .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
-        .collect();
-
     let ticks_used = predictions.len();
     RegionalOutput {
         predictions,
-        global_sync,
+        global_sync: gs_buf,
         region_activations: state.region_outputs.clone(),
         exit_lambdas,
         ticks_used,
@@ -2327,8 +2333,15 @@ fn regional_train_step_inner(
     let n_sync = cfg.n_global_sync;
     let obs_dim = cfg.raw_obs_dim;
 
-    // ── Forward with caching (same as regional_train_step) ──
-    let obs_projected = w.obs_proj.forward(observation);
+    // ── Forward with caching ──
+    // Pre-allocated buffers for the hot loop. obs_projected is computed once,
+    // global_sync and all_activations are reused across ticks.
+    let mut obs_projected = vec![0.0f32; w.obs_proj.out_dim];
+    w.obs_proj.forward_into(observation, &mut obs_projected);
+
+    let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+    let mut gs_buf = vec![0.0f32; n_sync];
+    let mut all_act_buf = vec![0.0f32; total_neurons];
 
     let mut state = RegionalState::new(w);
     let mut region_explicit_states: Vec<_> = w.regions.iter()
@@ -2342,11 +2355,12 @@ fn regional_train_step_inner(
         let mut router_cache: Option<RouterCache> = None;
 
         if let Some(ref router) = w.router {
-            let gs: Vec<f32> = (0..n_sync)
-                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
-                .collect();
+            // Compute global sync into pre-allocated buffer
+            for i in 0..n_sync {
+                gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
+            }
             let (routed, cache) = router.forward(
-                outer_tick, &gs, &state.region_outputs, true,
+                outer_tick, &gs_buf, &state.region_outputs, true,
             );
             router_cache = Some(cache);
             for r in 0..n_regions {
@@ -2409,41 +2423,48 @@ fn regional_train_step_inner(
             }
         }
 
-        let mut all_activations = Vec::new();
-        for r in 0..n_regions {
-            all_activations.extend_from_slice(&state.region_outputs[r]);
+        // Flatten region outputs into pre-allocated buffer (zero alloc per tick)
+        {
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = state.region_outputs[r].len();
+                all_act_buf[offset..offset + d].copy_from_slice(&state.region_outputs[r]);
+                offset += d;
+            }
         }
 
         for i in 0..n_sync {
             let l = w.global_sync_left[i];
             let r = w.global_sync_right[i];
-            if l < all_activations.len() && r < all_activations.len() {
-                let pw = all_activations[l] * all_activations[r];
+            if l < all_act_buf.len() && r < all_act_buf.len() {
+                let pw = all_act_buf[l] * all_act_buf[r];
                 let decay = (-w.global_decay[i].clamp(0.0, 15.0)).exp();
                 state.global_alpha[i] = decay * state.global_alpha[i] + pw;
                 state.global_beta[i] = decay * state.global_beta[i] + 1.0;
             }
         }
 
-        let global_sync: Vec<f32> = (0..n_sync)
-            .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
-            .collect();
+        // Compute global sync in-place
+        for i in 0..n_sync {
+            gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
+        }
 
         // Outer exit gate
         let (exit_gate_cache, exit_lambda) = if let Some(ref gate) = w.outer_exit_gate {
-            let (logit, cache) = crate::train::linear_forward_cached(gate, &global_sync);
+            let (logit, cache) = crate::train::linear_forward_cached(gate, &gs_buf);
             let lambda = 1.0 / (1.0 + (-logit[0]).exp());
             (Some(cache), lambda)
         } else {
             (None, 0.0)
         };
 
+        // Cache needs owned copies for backward pass
         tick_caches.push(OuterTickCache {
             region_obs,
             region_activated: state.region_outputs.clone(),
             region_caches,
-            all_activations,
-            global_sync: global_sync.clone(),
+            all_activations: all_act_buf.clone(),
+            global_sync: gs_buf.clone(),
             global_beta: state.global_beta.clone(),
             connection_inputs,
             exit_gate_cache,
@@ -2887,16 +2908,18 @@ pub fn regional_train_token(
 pub fn regional_train_token_fast(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
+    ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
 ) -> (f32, usize) {
-    regional_train_token_with_loss(w, grads, token, target, None)
+    regional_train_token_with_loss(w, grads, ws, token, target, None)
 }
 
 /// Fast training with frozen cerebellum override.
 pub fn regional_train_token_frozen(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
+    ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
     frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
@@ -2908,6 +2931,7 @@ pub fn regional_train_token_frozen(
     for j in 0..d {
         grads.embed_grad[offset + j] += d_obs[j];
     }
+    let _ = ws; // TODO: pass workspace through to inner step
     (loss, pred)
 }
 
@@ -2915,10 +2939,12 @@ pub fn regional_train_token_frozen(
 pub fn regional_train_token_with_loss(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
+    ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
     loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,
 ) -> (f32, usize) {
+    let _ = ws; // TODO: pass workspace through to inner step
     let obs = w.embed(token);
     let (loss, pred, d_obs) = regional_train_step_loss(w, grads, obs, target, loss_fn);
 
