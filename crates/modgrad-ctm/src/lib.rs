@@ -20,6 +20,9 @@ pub mod curriculum;
 pub mod plural;
 pub mod organism;
 pub mod cerebellum;
+/// Minimal frozen transformer loader for external LLMs (safetensors).
+/// For trainable transformers, use modgrad-transformer crate instead.
+pub mod frozen_transformer;
 /// Red-team validation: attack primitives with corresponding defenses.
 /// Every attack function has a defense counterpart in bio/ or plural.
 /// This is penetration testing tooling, not weaponization.
