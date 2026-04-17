@@ -87,6 +87,72 @@ pub struct ExtraSchema {
     pub offset: usize,
 }
 
+/// Default signal schemas for the pain/neuromod/homeostasis system.
+/// These can be appended to a Manifest's signals vec.
+pub fn pain_signals() -> Vec<SignalSchema> {
+    vec![
+        SignalSchema { id: "homeostasis_pressure".into(), label: "Homeostasis Pressure".into(), range: [0.0, 1.5], color: "#ff0000".into() },
+        SignalSchema { id: "dopamine".into(), label: "Dopamine".into(), range: [0.1, 3.0], color: "#ffff00".into() },
+        SignalSchema { id: "serotonin".into(), label: "Serotonin".into(), range: [0.1, 2.0], color: "#0000ff".into() },
+        SignalSchema { id: "norepinephrine".into(), label: "Norepinephrine".into(), range: [0.1, 2.0], color: "#ff8800".into() },
+        SignalSchema { id: "curiosity".into(), label: "Curiosity".into(), range: [0.0, 2.0], color: "#00ffff".into() },
+        SignalSchema { id: "anxiety".into(), label: "Anxiety".into(), range: [0.0, 2.0], color: "#ff00ff".into() },
+        SignalSchema { id: "emotional_pressure".into(), label: "Emotional Pressure".into(), range: [0.0, 1.0], color: "#880000".into() },
+        SignalSchema { id: "valence".into(), label: "Valence".into(), range: [-1.0, 1.0], color: "#00ff00".into() },
+        SignalSchema { id: "pain_intensity".into(), label: "Pain Intensity".into(), range: [0.0, 2.0], color: "#ff0000".into() },
+        SignalSchema { id: "output_quality".into(), label: "Output Quality".into(), range: [0.0, 1.0], color: "#ffffff".into() },
+    ]
+}
+
+/// Pain system telemetry data for one tick.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PainTelemetry {
+    pub pressure: f32,
+    pub dopamine: f32,
+    pub serotonin: f32,
+    pub norepinephrine: f32,
+    pub curiosity: f32,
+    pub anxiety: f32,
+    pub emotional_pressure: f32,
+    pub valence: f32,
+    pub pain_intensity: f32,
+    pub output_quality: f32,
+}
+
+impl PainTelemetry {
+    /// Pack into a flat f32 slice for streaming.
+    pub fn to_floats(&self) -> [f32; 10] {
+        [
+            self.pressure,
+            self.dopamine,
+            self.serotonin,
+            self.norepinephrine,
+            self.curiosity,
+            self.anxiety,
+            self.emotional_pressure,
+            self.valence,
+            self.pain_intensity,
+            self.output_quality,
+        ]
+    }
+
+    /// Unpack from a flat f32 slice.
+    pub fn from_floats(data: &[f32]) -> Self {
+        Self {
+            pressure: *data.first().unwrap_or(&0.0),
+            dopamine: *data.get(1).unwrap_or(&0.0),
+            serotonin: *data.get(2).unwrap_or(&0.0),
+            norepinephrine: *data.get(3).unwrap_or(&0.0),
+            curiosity: *data.get(4).unwrap_or(&0.0),
+            anxiety: *data.get(5).unwrap_or(&0.0),
+            emotional_pressure: *data.get(6).unwrap_or(&0.0),
+            valence: *data.get(7).unwrap_or(&0.0),
+            pain_intensity: *data.get(8).unwrap_or(&0.0),
+            output_quality: *data.get(9).unwrap_or(&0.0),
+        }
+    }
+}
+
 impl Manifest {
     /// Build manifest for the 8-region CTM at given detail level.
     pub fn for_ctm(

@@ -5,5 +5,6 @@
 //! - `sleep`: Offline consolidation via least-squares (REM sleep analogue)
 
 pub mod hippocampus;
+pub mod episodic;
 pub mod replay;
 pub mod sleep;

@@ -19,3 +19,5 @@ pub mod three_factor;
 // pub mod autonomic; // needs modgrad-io types
 pub mod homeostasis;
 pub mod consolidation;
+pub mod pain;
+pub mod dream;
