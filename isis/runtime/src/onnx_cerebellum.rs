@@ -1,66 +1,90 @@
 //! ONNX-backed frozen cerebellum for isis runtime.
 //!
-//! Wraps an ONNX backbone model as a FrozenCerebellum. The model
-//! receives projected cortex activations and returns hidden states.
+//! Loads a Qwen/Llama-style ONNX model that outputs both logits and
+//! hidden_states. Uses only the hidden_states (896-dim for Qwen2.5-0.5B)
+//! as the cerebellum's world model output.
+//!
+//! The model receives token IDs (not float vectors). The cortex projection
+//! maps cortex activations → pseudo-token IDs via quantization, then the
+//! frozen LLM processes them and returns hidden states.
 //!
 //! Usage:
-//!   let cereb = OnnxCerebellum::load("backbone.onnx")?;
-//!   let weights = RegionalWeights::new(config).with_frozen_cerebellum(Box::new(cereb));
+//!   let cereb = OnnxCerebellum::load("/steam/llm/qwen2.5-0.5b-onnx/backbone.onnx")?;
+//!   let w = RegionalWeights::new(cfg)
+//!       .with_frozen_cerebellum(cereb.input_dim(), cereb.output_dim());
+//!   // In training loop:
+//!   RegionalBrain::forward_cached_frozen(&w, state, &input, &mut cereb);
 
 use modgrad_ctm::cerebellum::FrozenCerebellum;
-use modgrad_io::backend::Backend;
-use modgrad_io::inference::OnnxBackend;
 
-/// Frozen ONNX backbone model used as cerebellum.
+/// Frozen ONNX model used as cerebellum.
 ///
-/// The ONNX model is split into backbone + lm_head. We only use
-/// the backbone — hidden states are the cerebellum's output.
-/// The lm_head is loaded but unused (needed for Backend trait).
+/// Wraps an ONNX session that takes token IDs and returns hidden states.
+/// The model must have outputs named "hidden_states" (or second output).
 pub struct OnnxCerebellum {
-    backend: OnnxBackend,
-    /// Cached input dimension (from backbone input shape).
-    input_dim: usize,
+    session: ort::session::Session,
+    hidden_dim: usize,
+    /// Index of hidden_states in outputs.
+    hidden_output_idx: usize,
+    /// Token position counter (for position_ids).
+    position: i64,
 }
 
 impl OnnxCerebellum {
-    /// Load an ONNX backbone + lm_head pair as a frozen cerebellum.
-    pub fn load(backbone_path: &str, lm_head_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let backend = OnnxBackend::load(backbone_path, lm_head_path)?;
-        let input_dim = backend.hidden_dim(); // input dim = embedding dim
-        Ok(Self { backend, input_dim })
+    /// Load an ONNX model with hidden_states output.
+    ///
+    /// The model should have inputs: input_ids, attention_mask, position_ids
+    /// and outputs: logits, hidden_states (or just hidden_states).
+    pub fn load(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let session = ort::session::Session::builder()?
+            .commit_from_file(model_path)?;
+
+        // Probe hidden_dim by running a dummy forward pass
+        let outputs = session.outputs();
+        let n_outputs = outputs.len();
+        let n_inputs = session.inputs().len();
+
+        // Probe hidden_dim from output shape if available, else default
+        let hidden_dim = outputs.iter()
+            .find(|o| o.name() == "hidden_states")
+            .or_else(|| outputs.get(1))
+            .and_then(|o| {
+                o.dtype().tensor_shape()
+                    .and_then(|shape| shape.last().copied())
+                    .and_then(|d| if d > 0 { Some(d as usize) } else { None })
+            })
+            .unwrap_or(896);
+
+        let hidden_output_idx = outputs.iter()
+            .position(|o| o.name() == "hidden_states")
+            .unwrap_or(1.min(n_outputs - 1));
+
+        eprintln!("ONNX cerebellum loaded: {n_inputs} inputs, {n_outputs} outputs, hidden_dim={hidden_dim}, hidden_idx={hidden_output_idx}");
+
+        Ok(Self { session, hidden_dim, hidden_output_idx, position: 0 })
+    }
+
+    /// Reset position counter (call between sequences).
+    pub fn reset_position(&mut self) {
+        self.position = 0;
     }
 }
 
 impl FrozenCerebellum for OnnxCerebellum {
     fn input_dim(&self) -> usize {
-        self.input_dim
+        self.hidden_dim
     }
 
     fn output_dim(&self) -> usize {
-        self.backend.hidden_dim()
+        self.hidden_dim
     }
 
     fn forward(&mut self, input: &[f32]) -> Vec<f32> {
-        // The ONNX backbone expects token IDs, but we have float activations
-        // from the cortex projection. Two modes:
-        //
-        // 1. Direct embedding injection: requires ONNX model exported with
-        //    float input (post-embedding). This is the preferred mode.
-        //
-        // 2. Quantized proxy: convert float activations to pseudo-token IDs
-        //    via nearest-neighbor lookup in the embedding table. Lossy but
-        //    works with standard ONNX exports.
-        //
-        // For now, we implement mode 2 as a working fallback.
-        // Mode 1 requires a custom ONNX export script (future work).
+        // Convert float input → pseudo-token IDs.
+        // Each hidden_dim-sized chunk maps to one token via mean quantization.
+        let d = self.hidden_dim;
+        let n_tokens = ((input.len() + d - 1) / d).max(1);
 
-        // Convert float input to pseudo-token IDs by treating each
-        // chunk of hidden_dim floats as one "token" and hashing to an ID.
-        let d = self.input_dim;
-        let n_tokens = (input.len() + d - 1) / d;
-        let n_tokens = n_tokens.max(1);
-
-        // Simple quantization: map mean activation to token range [0, 255]
         let mut token_ids = Vec::with_capacity(n_tokens);
         for t in 0..n_tokens {
             let start = t * d;
@@ -71,20 +95,49 @@ impl FrozenCerebellum for OnnxCerebellum {
             }
             let chunk = &input[start..end];
             let mean: f32 = chunk.iter().sum::<f32>() / chunk.len() as f32;
-            // Map [-2, 2] → [0, 255]
+            // Map activation mean to token range [0, 255]
             let token = ((mean + 2.0) * 63.75).clamp(0.0, 255.0) as i64;
             token_ids.push(token);
         }
 
-        // Run backbone to get hidden states
-        match self.backend.run_backbone(&token_ids) {
-            Ok((hidden, _full)) => {
-                // Return last hidden state (most complete representation)
-                hidden.into_iter().last().unwrap_or_else(|| vec![0.0; self.output_dim()])
+        let seq_len = token_ids.len();
+        let attention_mask: Vec<i64> = vec![1; seq_len];
+        let position_ids: Vec<i64> = (self.position..self.position + seq_len as i64).collect();
+        self.position += seq_len as i64;
+
+        // Build ONNX inputs
+        let ids_shape = vec![1usize, seq_len];
+        let result = (|| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+            let ids_tensor = ort::value::Tensor::<i64>::from_array(
+                (ids_shape.as_slice(), token_ids))?;
+            let mask_tensor = ort::value::Tensor::<i64>::from_array(
+                (ids_shape.as_slice(), attention_mask))?;
+            let pos_tensor = ort::value::Tensor::<i64>::from_array(
+                (ids_shape.as_slice(), position_ids))?;
+
+            let outputs = self.session.run(ort::inputs![
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+                "position_ids" => pos_tensor,
+            ])?;
+
+            let hidden_idx = self.hidden_output_idx;
+            let (_, data) = outputs[hidden_idx].try_extract_tensor::<f32>()?;
+
+            // Return last token's hidden state
+            let last_offset = (seq_len - 1) * self.hidden_dim;
+            if last_offset + self.hidden_dim <= data.len() {
+                Ok(data[last_offset..last_offset + self.hidden_dim].to_vec())
+            } else {
+                Ok(data[..self.hidden_dim.min(data.len())].to_vec())
             }
+        })();
+
+        match result {
+            Ok(hidden) => hidden,
             Err(e) => {
                 eprintln!("ONNX cerebellum forward failed: {e}");
-                vec![0.0; self.output_dim()]
+                vec![0.0; self.hidden_dim]
             }
         }
     }

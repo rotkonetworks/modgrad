@@ -8,7 +8,7 @@ license = "MIT"
 [features]
 cuda = ["modgrad-device/cuda"]
 sdp = ["dep:clarabel"]
-onnx = ["modgrad-io/onnx"]
+onnx = ["modgrad-io/onnx", "dep:ort"]
 
 [dependencies]
 modgrad-traits = { path = "../../crates/modgrad-traits" }
@@ -27,6 +27,9 @@ rayon = "1"
 half = "2"
 fusion-blossom = { path = "../../../fusion-blossom" }
 ctrlc = "3"
+
+# ONNX runtime for frozen cerebellum
+ort = { version = "2.0.0-rc.12", optional = true }
 
 # Conic solver for SDP (Angeris bound, tight)
 clarabel = { version = "0.11", optional = true, default-features = false }
