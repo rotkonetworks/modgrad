@@ -1022,16 +1022,15 @@ impl RegionalWeights {
     }
 
     /// Configure projection layers for a frozen cerebellum model.
-    /// The model itself is held by the caller and passed to `frozen_cerebellum_forward`.
-    pub fn with_frozen_cerebellum(mut self, frozen_input_dim: usize, frozen_output_dim: usize) -> Self {
+    /// `n_layers` is how many transformer layers the model exposes.
+    pub fn with_frozen_cerebellum(mut self, hidden_dim: usize, n_layers: usize) -> Self {
         let cereb_idx = self.config.region_names.iter()
             .position(|n| n.contains("cerebellum"))
             .unwrap_or(4);
         let cortex_dim = self.regions[cereb_idx].config.d_model;
-        self.cereb_projection = Some(crate::cerebellum::CerebProjection::new(
-            cortex_dim, frozen_input_dim, frozen_output_dim,
+        self.cereb_projection = Some(crate::cerebellum::CerebProjection::with_layers(
+            cortex_dim, hidden_dim, hidden_dim, n_layers,
         ));
-        // sigmoid(-2.0) ≈ 0.12 — small initial contribution, learns to grow
         self.cereb_blend_logit = Some(-2.0);
         self.config.cereb_mode = crate::cerebellum::CerebMode::External;
         self

@@ -997,8 +997,9 @@ fn learn(
             let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
                 .unwrap_or_else(|e| { eprintln!("Failed to load frozen cerebellum: {e}"); std::process::exit(1); });
             let hd = cereb.hidden_dim();
-            w = w.with_frozen_cerebellum(hd, hd);
-            eprintln!("Frozen cerebellum: {} (hidden_dim={})", path, hd);
+            let nl = cereb.n_layers();
+            w = w.with_frozen_cerebellum(hd, nl);
+            eprintln!("Frozen cerebellum: {} (hidden_dim={}, layers={})", path, hd, nl);
             Some(cereb)
         } else {
             None
@@ -1106,13 +1107,14 @@ fn learn(
             let (loss, pred) = {
                 #[cfg(feature = "onnx")]
                 {
-                    if let Some(ref cache) = cereb_cache {
-                        // Read LLM hidden state at this position from cache
-                        let hidden = cache.at(pos);
+                    if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
+                        // Multi-layer blend: weighted combination of all transformer layers
+                        use modgrad_ctm::cerebellum::blended_hidden_at;
+                        let hidden = blended_hidden_at(cache, proj, pos);
                         if hidden.is_empty() {
                             regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
                         } else {
-                            regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], hidden)
+                            regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], &hidden)
                         }
                     } else {
                         regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])

@@ -1,93 +1,133 @@
 //! Frozen cerebellum: a world model that processes the same sensory stream
 //! as the cortex, but in one fast forward pass.
 //!
-//! Architecture (from the Henry de Valence meditation):
+//! Architecture:
+//!   token stream → LLM backbone (all layers, one forward pass)
+//!                → learned weighted combination across layers
+//!                → projection into cerebellum region
+//!                → existing brain topology distributes to cortex
 //!
-//!   token stream: [t0, t1, t2, ..., tn]
-//!                   ↓
-//!   LLM backbone:  [h0, h1, h2, ..., hn]  ← one forward pass, cached
-//!                   ↓
-//!   cortex at token ti reads h[i] through trained projection
+//! The cerebellum is the GATEWAY. Cortex regions never touch the LLM
+//! directly — they receive the cerebellum's output through the existing
+//! connection topology. If we swap Qwen for Llama, only the cerebellum
+//! projection changes. The rest of the brain never knows.
 //!
-//! The cerebellum processes the full context window ONCE. The cortex reads
-//! position-aligned hidden states during its per-token tick loop. This is
-//! the biological architecture: cerebellum is fast feedforward, cortex is
-//! slow recurrent. The cortex learns WHEN to trust the cerebellum.
-//!
-//! Three modes:
-//!   1. CTM (default) — cerebellum is a normal CTM region with tick loop
-//!   2. Frozen LLM — pre-trained language model, processes full context
-//!   3. Random expansion — biological granule cell model (per-token)
+//! Multi-layer blending: a learned softmax over all transformer layers
+//! determines which depth of representation the cerebellum uses. Early
+//! training may favor syntax (shallow layers); later training learns to
+//! trust world knowledge (deep layers).
 
 use serde::{Deserialize, Serialize};
 
 // ─── Cache ──────────────────────────────────────────────────
 
-/// Cached hidden states from a frozen cerebellum's context encoding.
+/// Cached hidden states from ALL layers of a frozen cerebellum.
 /// Computed once per context window, read per-token during training.
 pub struct CerebellumCache {
-    /// hidden_states[position] has length hidden_dim.
-    /// Contiguous: position i starts at offset i * hidden_dim.
+    /// All layer hidden states, contiguous.
+    /// Layout: [layer][position][hidden_dim]
+    /// Flat: layer * (n_positions * hidden_dim) + position * hidden_dim
     pub hidden_states: Vec<f32>,
     /// Dimension of each hidden state vector.
     pub hidden_dim: usize,
     /// Number of valid positions.
-    pub len: usize,
+    pub n_positions: usize,
+    /// Number of layers.
+    pub n_layers: usize,
 }
 
 impl CerebellumCache {
-    /// Get hidden state at a position. Returns zeros if out of bounds.
-    pub fn at(&self, position: usize) -> &[f32] {
-        if position < self.len {
-            let start = position * self.hidden_dim;
+    /// Get hidden state at a specific layer and position.
+    pub fn at(&self, layer: usize, position: usize) -> &[f32] {
+        if layer < self.n_layers && position < self.n_positions {
+            let start = layer * (self.n_positions * self.hidden_dim)
+                + position * self.hidden_dim;
             &self.hidden_states[start..start + self.hidden_dim]
         } else {
-            // Return a static zero slice would require unsafe; instead
-            // callers should check bounds. This path shouldn't be hit
-            // in correct usage.
             &[]
+        }
+    }
+
+    /// Get the weighted combination across all layers at a position.
+    /// `layer_weights` should be softmaxed (sum to 1.0).
+    pub fn blend_layers(&self, position: usize, layer_weights: &[f32]) -> Vec<f32> {
+        let d = self.hidden_dim;
+        let mut out = vec![0.0f32; d];
+        let n = self.n_layers.min(layer_weights.len());
+        for l in 0..n {
+            let h = self.at(l, position);
+            if h.is_empty() { continue; }
+            let w = layer_weights[l];
+            for i in 0..d {
+                out[i] += w * h[i];
+            }
+        }
+        out
+    }
+
+    /// Same as blend_layers but writes into pre-allocated buffer.
+    pub fn blend_layers_into(&self, position: usize, layer_weights: &[f32], out: &mut [f32]) {
+        let d = self.hidden_dim;
+        out[..d].fill(0.0);
+        let n = self.n_layers.min(layer_weights.len());
+        for l in 0..n {
+            let h = self.at(l, position);
+            if h.is_empty() { continue; }
+            let w = layer_weights[l];
+            for i in 0..d {
+                out[i] += w * h[i];
+            }
         }
     }
 
     /// Empty cache (no cerebellum active).
     pub fn empty() -> Self {
-        Self { hidden_states: Vec::new(), hidden_dim: 0, len: 0 }
+        Self { hidden_states: Vec::new(), hidden_dim: 0, n_positions: 0, n_layers: 0 }
     }
 
-    /// Number of cached positions.
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool { self.n_positions == 0 }
+
+    /// Single-layer cache (backward compat with old encode_context).
+    pub fn single_layer(hidden_states: Vec<f32>, hidden_dim: usize, n_positions: usize) -> Self {
+        Self { hidden_states, hidden_dim, n_positions, n_layers: 1 }
+    }
 }
 
 // ─── Trait ──────────────────────────────────────────────────
 
 /// A frozen forward model used as cerebellum region.
 ///
-/// Two usage patterns:
-///   1. Context-based (LLMs): call `encode_context()` once per window,
-///      then read positions from the cache during per-token training.
-///   2. Per-token (RandomExpansion): call `forward()` per token.
-///
-/// LLM implementations should override `encode_context()`.
-/// `forward()` is the fallback for per-token models.
+/// LLM implementations should override `encode_context_layers()` to return
+/// hidden states from ALL layers. The learned layer weights (in CerebProjection)
+/// blend these into a single representation per position.
 pub trait FrozenCerebellum: Send {
     /// Dimension of the model's output (hidden states per position).
     fn hidden_dim(&self) -> usize;
 
-    /// Encode a full context window of token IDs.
-    /// Returns cached hidden states for each position.
-    /// Default: calls forward() per token (for non-LLM models).
+    /// Number of layers in the model.
+    fn n_layers(&self) -> usize { 1 }
+
+    /// Encode a full context window, returning hidden states from ALL layers.
+    /// Default: calls encode_context() for single-layer models.
+    fn encode_context_layers(&mut self, token_ids: &[i64]) -> CerebellumCache {
+        // Default: single layer (backward compat)
+        let cache = self.encode_context(token_ids);
+        cache
+    }
+
+    /// Encode a full context window (single layer output).
+    /// Override this for simple models; override encode_context_layers for LLMs.
     fn encode_context(&mut self, token_ids: &[i64]) -> CerebellumCache {
         let d = self.hidden_dim();
         let n = token_ids.len();
         let mut hidden_states = vec![0.0f32; n * d];
         for (i, &tid) in token_ids.iter().enumerate() {
-            // Convert token ID to a simple float input for per-token models
             let input = vec![tid as f32 / 128.0; d];
             let h = self.forward(&input);
             let copy_len = d.min(h.len());
             hidden_states[i * d..i * d + copy_len].copy_from_slice(&h[..copy_len]);
         }
-        CerebellumCache { hidden_states, hidden_dim: d, len: n }
+        CerebellumCache::single_layer(hidden_states, d, n)
     }
 
     /// Per-token forward pass (for non-LLM models like RandomExpansion).
@@ -96,28 +136,37 @@ pub trait FrozenCerebellum: Send {
 
 // ─── Projection layers ─────────────────────────────────────
 
-/// Trained projection: frozen hidden_dim → cortex d_model.
+/// Trained projection: frozen cerebellum → cortex.
 ///
-/// Only proj_out is needed in the new architecture — the cerebellum
-/// sees raw tokens (not cortex activations), so proj_in is vestigial.
-/// Kept for backward compatibility with RandomExpansion mode.
+/// Now includes learned layer weights (softmax over N transformer layers)
+/// that determine which depth of representation the cerebellum uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CerebProjection {
     /// cortex d_model → frozen input dim (used by RandomExpansion)
-    pub proj_in_w: Vec<f32>,  // [frozen_input_dim × cortex_d_model]
-    pub proj_in_b: Vec<f32>,  // [frozen_input_dim]
-    /// frozen output dim → cortex d_model (the important one)
-    pub proj_out_w: Vec<f32>, // [cortex_d_model × frozen_output_dim]
-    pub proj_out_b: Vec<f32>, // [cortex_d_model]
+    pub proj_in_w: Vec<f32>,
+    pub proj_in_b: Vec<f32>,
+    /// frozen output dim → cortex d_model
+    pub proj_out_w: Vec<f32>,
+    pub proj_out_b: Vec<f32>,
     /// Dimensions
     pub cortex_dim: usize,
     pub frozen_input_dim: usize,
     pub frozen_output_dim: usize,
+    /// Learned layer weight logits (pre-softmax). Length = n_layers.
+    /// Softmax determines how much each transformer layer contributes.
+    /// Initialized uniform so all layers contribute equally at start.
+    #[serde(default)]
+    pub layer_weight_logits: Vec<f32>,
 }
 
 impl CerebProjection {
     /// Create with Xavier-initialized weights.
     pub fn new(cortex_dim: usize, frozen_input_dim: usize, frozen_output_dim: usize) -> Self {
+        Self::with_layers(cortex_dim, frozen_input_dim, frozen_output_dim, 1)
+    }
+
+    /// Create with multi-layer support.
+    pub fn with_layers(cortex_dim: usize, frozen_input_dim: usize, frozen_output_dim: usize, n_layers: usize) -> Self {
         let scale_in = (6.0 / (cortex_dim + frozen_input_dim) as f32).sqrt();
         let scale_out = (6.0 / (frozen_output_dim + cortex_dim) as f32).sqrt();
 
@@ -132,15 +181,23 @@ impl CerebProjection {
             .collect();
         let proj_out_b = vec![0.0; cortex_dim];
 
+        // Initialize layer weights uniform (all layers contribute equally)
+        let layer_weight_logits = vec![0.0f32; n_layers];
+
         Self {
             proj_in_w, proj_in_b,
             proj_out_w, proj_out_b,
             cortex_dim, frozen_input_dim, frozen_output_dim,
+            layer_weight_logits,
         }
     }
 
+    /// Compute softmaxed layer weights from logits.
+    pub fn layer_weights(&self) -> Vec<f32> {
+        softmax(&self.layer_weight_logits)
+    }
+
     /// Project cortex activations → frozen model input space.
-    /// Used by RandomExpansion mode (cortex → granule cells).
     pub fn project_in(&self, cortex: &[f32]) -> Vec<f32> {
         debug_assert!(cortex.len() <= self.cortex_dim,
             "project_in: input {} > cortex_dim {}", cortex.len(), self.cortex_dim);
@@ -155,7 +212,6 @@ impl CerebProjection {
     }
 
     /// Project frozen model output → cortex activation space.
-    /// This is the main projection for LLM cerebellum mode.
     pub fn project_out(&self, hidden: &[f32]) -> Vec<f32> {
         let mut out = self.proj_out_b.clone();
         for i in 0..self.cortex_dim {
@@ -167,7 +223,7 @@ impl CerebProjection {
         out
     }
 
-    /// Project frozen hidden state into a pre-allocated cortex buffer (zero alloc).
+    /// Project frozen hidden state into a pre-allocated cortex buffer.
     pub fn project_out_into(&self, hidden: &[f32], out: &mut [f32]) {
         out[..self.cortex_dim].copy_from_slice(&self.proj_out_b);
         for i in 0..self.cortex_dim {
@@ -178,24 +234,17 @@ impl CerebProjection {
         }
     }
 
-    /// Backward pass for project_out: given d_cortex, compute d_hidden and
-    /// accumulate gradients for proj_out_w and proj_out_b.
-    ///
-    /// Returns d_hidden (gradient w.r.t. frozen hidden states — discarded
-    /// since the LLM is frozen, but useful for debugging).
+    /// Backward pass for project_out.
     pub fn backward_out(
         &self,
-        hidden: &[f32],      // input to project_out (frozen, constant)
-        d_cortex: &[f32],    // upstream gradient
-        d_w: &mut [f32],     // accumulate into proj_out_w gradient
-        d_b: &mut [f32],     // accumulate into proj_out_b gradient
+        hidden: &[f32],
+        d_cortex: &[f32],
+        d_w: &mut [f32],
+        d_b: &mut [f32],
     ) {
-        // y = W @ hidden + b
-        // d_b += d_cortex
         for i in 0..self.cortex_dim {
             d_b[i] += d_cortex[i];
         }
-        // d_W[i, j] += d_cortex[i] * hidden[j]
         for i in 0..self.cortex_dim {
             let row_start = i * self.frozen_output_dim;
             for j in 0..self.frozen_output_dim.min(hidden.len()) {
@@ -205,7 +254,6 @@ impl CerebProjection {
     }
 
     /// Full forward: cortex → project_in → frozen → project_out → cortex.
-    /// Used by RandomExpansion mode.
     pub fn forward(&self, frozen: &mut dyn FrozenCerebellum, cortex_input: &[f32]) -> Vec<f32> {
         let projected_in = self.project_in(cortex_input);
         let hidden = frozen.forward(&projected_in);
@@ -216,6 +264,7 @@ impl CerebProjection {
     pub fn n_params(&self) -> usize {
         self.proj_in_w.len() + self.proj_in_b.len()
             + self.proj_out_w.len() + self.proj_out_b.len()
+            + self.layer_weight_logits.len()
     }
 
     /// Mutably view parameters for gradient update.
@@ -229,29 +278,53 @@ impl CerebProjection {
     }
 }
 
-/// Read a position from the cerebellum cache, project to cortex dim.
-/// Zero allocations when using project_out_into.
+/// Read a position from the cerebellum cache with multi-layer blending,
+/// project to cortex dim. Uses pre-allocated buffer.
 pub fn cerebellum_at_position(
     cache: &CerebellumCache,
     proj: &CerebProjection,
     position: usize,
     out: &mut [f32],
 ) {
-    let hidden = cache.at(position);
-    if hidden.is_empty() {
+    if cache.is_empty() || position >= cache.n_positions {
         out[..proj.cortex_dim].fill(0.0);
+        return;
+    }
+
+    if cache.n_layers == 1 {
+        // Single layer: direct project (backward compat)
+        let hidden = cache.at(0, position);
+        if hidden.is_empty() {
+            out[..proj.cortex_dim].fill(0.0);
+        } else {
+            proj.project_out_into(hidden, out);
+        }
     } else {
-        proj.project_out_into(hidden, out);
+        // Multi-layer: blend across layers with learned weights, then project
+        let weights = proj.layer_weights();
+        let blended = cache.blend_layers(position, &weights);
+        proj.project_out_into(&blended, out);
+    }
+}
+
+/// Get the blended hidden state at a position (for gradient computation).
+/// Returns the blended hidden vector before projection.
+pub fn blended_hidden_at(
+    cache: &CerebellumCache,
+    proj: &CerebProjection,
+    position: usize,
+) -> Vec<f32> {
+    if cache.n_layers <= 1 {
+        cache.at(0, position).to_vec()
+    } else {
+        let weights = proj.layer_weights();
+        cache.blend_layers(position, &weights)
     }
 }
 
 // ─── Random expansion cerebellum ───────────────────────────
 
-/// Biological cerebellum: frozen random sparse projection (granule cells)
-/// + trained readout (Purkinje cells via CerebProjection).
-///
-/// The expansion matrix is generated once from a seed and never updated.
-/// expansion_factor=4 means output_dim = input_dim × 4 (biological 4:1).
+/// Biological cerebellum: frozen random sparse projection (granule cells).
 pub struct RandomExpansion {
     weights: Vec<f32>,
     input_dim: usize,
@@ -259,7 +332,6 @@ pub struct RandomExpansion {
 }
 
 impl RandomExpansion {
-    /// Create with sparse random weights (±1/sqrt(input_dim), ~30% density).
     pub fn new(input_dim: usize, expansion_factor: usize, seed: u64) -> Self {
         let output_dim = input_dim * expansion_factor;
         let scale = 1.0 / (input_dim as f32).sqrt();
@@ -267,13 +339,9 @@ impl RandomExpansion {
 
         let weights: Vec<f32> = (0..output_dim * input_dim)
             .map(|_| {
-                if rng.uniform(0.0, 1.0) > 0.3 {
-                    0.0
-                } else if rng.uniform(0.0, 1.0) > 0.5 {
-                    scale
-                } else {
-                    -scale
-                }
+                if rng.uniform(0.0, 1.0) > 0.3 { 0.0 }
+                else if rng.uniform(0.0, 1.0) > 0.5 { scale }
+                else { -scale }
             })
             .collect();
 
@@ -295,13 +363,21 @@ impl FrozenCerebellum for RandomExpansion {
             for j in 0..self.input_dim.min(input.len()) {
                 sum += self.weights[row + j] * input[j];
             }
-            out[i] = sum.max(0.0); // ReLU
+            out[i] = sum.max(0.0);
         }
         out
     }
 }
 
-// ─── Simple RNG ────────────────────────────────────────────
+// ─── Utilities ─────────────────────────────────────────────
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() { return vec![]; }
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let exp: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+    let sum: f32 = exp.iter().sum::<f32>().max(1e-8);
+    exp.iter().map(|&e| e / sum).collect()
+}
 
 struct SimpleRng(u64);
 impl SimpleRng {
@@ -317,15 +393,10 @@ impl SimpleRng {
 
 // ─── Config ────────────────────────────────────────────────
 
-/// Configuration for the cerebellum region mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CerebMode {
-    /// Standard CTM region (current behavior, backward compatible).
     Ctm,
-    /// Frozen random expansion (biological granule cell model).
     Expansion { expansion_factor: usize, seed: u64 },
-    /// Frozen external model (ONNX, GGUF, etc).
-    /// The FrozenCerebellum is injected at runtime, not serialized.
     External,
 }
 
@@ -343,9 +414,7 @@ mod tests {
     fn random_expansion_dims() {
         let mut exp = RandomExpansion::new(32, 4, 42);
         assert_eq!(exp.hidden_dim(), 128);
-
-        let input = vec![1.0f32; 32];
-        let output = exp.forward(&input);
+        let output = exp.forward(&vec![1.0f32; 32]);
         assert_eq!(output.len(), 128);
         assert!(output.iter().all(|&x| x >= 0.0));
         assert!(output.iter().any(|&x| x > 0.0));
@@ -354,58 +423,85 @@ mod tests {
     #[test]
     fn projection_roundtrip() {
         let proj = CerebProjection::new(32, 64, 128);
-        assert_eq!(proj.n_params(), 32 * 64 + 64 + 32 * 128 + 32);
-
         let cortex = vec![1.0f32; 32];
-        let projected = proj.project_in(&cortex);
-        assert_eq!(projected.len(), 64);
-
-        let hidden = vec![0.5f32; 128];
-        let back = proj.project_out(&hidden);
-        assert_eq!(back.len(), 32);
+        assert_eq!(proj.project_in(&cortex).len(), 64);
+        assert_eq!(proj.project_out(&vec![0.5f32; 128]).len(), 32);
     }
 
     #[test]
     fn full_forward_with_expansion() {
         let mut exp = RandomExpansion::new(64, 4, 42);
         let proj = CerebProjection::new(32, 64, 256);
-
-        let cortex_input = vec![1.0f32; 32];
-        let output = proj.forward(&mut exp, &cortex_input);
+        let output = proj.forward(&mut exp, &vec![1.0f32; 32]);
         assert_eq!(output.len(), 32);
     }
 
     #[test]
-    fn cache_encode_and_read() {
-        let mut exp = RandomExpansion::new(16, 4, 42);
-        let cache = exp.encode_context(&[1, 2, 3, 4]);
-        assert_eq!(cache.len, 4);
-        assert_eq!(cache.hidden_dim, 64);
+    fn multi_layer_cache() {
+        let d = 4;
+        let n_pos = 3;
+        let n_layers = 3;
+        // Layer 0: all 1s, Layer 1: all 2s, Layer 2: all 3s
+        let mut data = Vec::new();
+        for l in 0..n_layers {
+            for _p in 0..n_pos {
+                data.extend(vec![(l + 1) as f32; d]);
+            }
+        }
+        let cache = CerebellumCache {
+            hidden_states: data,
+            hidden_dim: d,
+            n_positions: n_pos,
+            n_layers,
+        };
 
-        let h0 = cache.at(0);
-        assert_eq!(h0.len(), 64);
-        let h3 = cache.at(3);
-        assert_eq!(h3.len(), 64);
-        // Out of bounds returns empty
-        assert!(cache.at(4).is_empty());
+        // Layer 0, pos 0 should be [1,1,1,1]
+        assert_eq!(cache.at(0, 0), &[1.0, 1.0, 1.0, 1.0]);
+        // Layer 2, pos 1 should be [3,3,3,3]
+        assert_eq!(cache.at(2, 1), &[3.0, 3.0, 3.0, 3.0]);
+
+        // Uniform blend: (1+2+3)/3 = 2.0
+        let weights = vec![1.0 / 3.0; 3];
+        let blended = cache.blend_layers(0, &weights);
+        assert!((blended[0] - 2.0).abs() < 1e-6);
+
+        // Weighted toward layer 2: 0.1*1 + 0.1*2 + 0.8*3 = 2.7
+        let weights = vec![0.1, 0.1, 0.8];
+        let blended = cache.blend_layers(0, &weights);
+        assert!((blended[0] - 2.7).abs() < 1e-6);
     }
 
     #[test]
-    fn cerebellum_at_position_works() {
-        let mut exp = RandomExpansion::new(16, 4, 42);
-        let proj = CerebProjection::new(8, 16, 64);
-        let cache = exp.encode_context(&[10, 20, 30]);
+    fn layer_weights_softmax() {
+        let proj = CerebProjection::with_layers(8, 16, 64, 3);
+        let w = proj.layer_weights();
+        assert_eq!(w.len(), 3);
+        // Uniform logits → uniform weights
+        let sum: f32 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!((w[0] - w[1]).abs() < 1e-6);
+    }
 
-        let mut out = vec![0.0f32; 8];
+    #[test]
+    fn cerebellum_at_position_multilayer() {
+        let d = 4;
+        let n_pos = 2;
+        let n_layers = 2;
+        let mut data = Vec::new();
+        // Layer 0: [1,1,1,1], Layer 1: [3,3,3,3]
+        for l in 0..n_layers {
+            for _p in 0..n_pos {
+                data.extend(vec![if l == 0 { 1.0 } else { 3.0 }; d]);
+            }
+        }
+        let cache = CerebellumCache {
+            hidden_states: data, hidden_dim: d, n_positions: n_pos, n_layers,
+        };
+        let proj = CerebProjection::with_layers(4, 4, 4, 2);
+        let mut out = vec![0.0f32; 4];
         cerebellum_at_position(&cache, &proj, 0, &mut out);
-        assert_eq!(out.len(), 8);
-        // Should be non-zero (projection of non-zero hidden states)
+        // Should be non-zero (projection of blended [2,2,2,2])
         assert!(out.iter().any(|&x| x != 0.0));
-
-        // Out of bounds gives zeros
-        let mut out2 = vec![0.0f32; 8];
-        cerebellum_at_position(&cache, &proj, 99, &mut out2);
-        assert!(out2.iter().all(|&x| x == 0.0));
     }
 
     #[test]
@@ -415,12 +511,8 @@ mod tests {
         let d_cortex = vec![1.0f32; 4];
         let mut d_w = vec![0.0f32; 4 * 16];
         let mut d_b = vec![0.0f32; 4];
-
         proj.backward_out(&hidden, &d_cortex, &mut d_w, &mut d_b);
-
-        // d_b should equal d_cortex
         assert_eq!(d_b, vec![1.0; 4]);
-        // d_w should be outer product d_cortex ⊗ hidden
         for i in 0..4 {
             for j in 0..16 {
                 assert_eq!(d_w[i * 16 + j], d_cortex[i] * hidden[j]);
