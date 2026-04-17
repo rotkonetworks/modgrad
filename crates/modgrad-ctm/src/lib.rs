@@ -19,6 +19,7 @@ pub mod bio;
 pub mod curriculum;
 pub mod plural;
 pub mod organism;
+pub mod cerebellum;
 /// Red-team validation: attack primitives with corresponding defenses.
 /// Every attack function has a defense counterpart in bio/ or plural.
 /// This is penetration testing tooling, not weaponization.

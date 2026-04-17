@@ -432,6 +432,10 @@ pub struct RegionalConfig {
     /// When None, uses fixed connections (backward compatible).
     #[serde(default)]
     pub router: Option<RouterConfig>,
+    /// Cerebellum mode. When not Ctm, the cerebellum region uses a frozen
+    /// forward model instead of the CTM tick loop. Default: Ctm.
+    #[serde(default)]
+    pub cereb_mode: crate::cerebellum::CerebMode,
 }
 
 impl RegionalConfig {
@@ -500,6 +504,7 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
         }
     }
 
@@ -566,6 +571,7 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: None, // no router at this scale
+            cereb_mode: Default::default(),
         }
     }
 
@@ -602,6 +608,7 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: None,
+            cereb_mode: Default::default(),
         }
     }
 
@@ -667,6 +674,7 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
         }
     }
 
@@ -729,6 +737,7 @@ impl RegionalConfig {
             n_global_sync, out_dims, raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
         }
     }
 
@@ -796,6 +805,7 @@ impl RegionalConfig {
             raw_obs_dim: obs_dim,
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
         }
     }
 
@@ -866,6 +876,11 @@ pub struct RegionalWeights {
     /// Learned inter-region router (MoS-style). None = fixed connections.
     #[serde(default)]
     pub router: Option<RegionalRouter>,
+
+    /// Projection layers for frozen cerebellum (trained even when model is frozen).
+    /// Present when cereb_mode != Ctm.
+    #[serde(default)]
+    pub cereb_projection: Option<crate::cerebellum::CerebProjection>,
 }
 
 impl RegionalWeights {
@@ -994,7 +1009,22 @@ impl RegionalWeights {
             cereb_predict,
             bg_value,
             router,
+            cereb_projection: None,
         }
+    }
+
+    /// Configure projection layers for a frozen cerebellum model.
+    /// The model itself is held by the caller and passed to `frozen_cerebellum_forward`.
+    pub fn with_frozen_cerebellum(mut self, frozen_input_dim: usize, frozen_output_dim: usize) -> Self {
+        let cereb_idx = self.config.region_names.iter()
+            .position(|n| n.contains("cerebellum"))
+            .unwrap_or(4);
+        let cortex_dim = self.regions[cereb_idx].config.d_model;
+        self.cereb_projection = Some(crate::cerebellum::CerebProjection::new(
+            cortex_dim, frozen_input_dim, frozen_output_dim,
+        ));
+        self.config.cereb_mode = crate::cerebellum::CerebMode::External;
+        self
     }
 
     /// Look up embedding for a token index.
@@ -1271,6 +1301,41 @@ pub fn regional_forward(
         exit_lambdas,
         ticks_used,
     }
+}
+
+/// Run a frozen cerebellum forward pass, overriding the cerebellum region output.
+///
+/// Call this AFTER `regional_forward` to replace the cerebellum's CTM output
+/// with the frozen model's output. The projection layers (in CerebProjection)
+/// bridge cortex ↔ frozen model dimensions.
+///
+/// `observation` is the raw observation passed to `regional_forward`.
+pub fn frozen_cerebellum_forward(
+    w: &RegionalWeights,
+    state: &mut RegionalState,
+    observation: &[f32],
+    frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
+) {
+    let proj = match &w.cereb_projection {
+        Some(p) => p,
+        None => return,
+    };
+    let cereb_idx = w.config.region_names.iter()
+        .position(|n| n.contains("cerebellum"))
+        .unwrap_or(4);
+
+    // The cerebellum receives motor output + observation via its connection.
+    // For the frozen model, we project the observation into the model's space.
+    let input_len = proj.cortex_dim.min(observation.len());
+    let output = proj.forward(frozen, &observation[..input_len]);
+
+    // Resize to match the cerebellum region's d_model
+    let d_model = w.regions[cereb_idx].config.d_model;
+    let mut cereb_output = vec![0.0f32; d_model];
+    let copy_len = d_model.min(output.len());
+    cereb_output[..copy_len].copy_from_slice(&output[..copy_len]);
+
+    state.region_outputs[cereb_idx] = cereb_output;
 }
 
 // ─── Training (BPTT) ───────────────────────────────────────

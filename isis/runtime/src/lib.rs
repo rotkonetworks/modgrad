@@ -27,6 +27,10 @@ pub mod actors;
 // Organism-aware NeuralComputer (pain, memory, dream, plural, monarch)
 pub mod plural_nc;
 
+// ONNX-backed frozen cerebellum
+#[cfg(feature = "onnx")]
+pub mod onnx_cerebellum;
+
 /// Generate tokens from a NeuralComputer using the SDK inference runtime.
 pub fn generate_nc(
     nc: &mut modgrad_ctm::graph::NeuralComputer,

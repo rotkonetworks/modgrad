@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 cuda = ["modgrad-device/cuda"]
 sdp = ["dep:clarabel"]
+onnx = ["modgrad-io/onnx"]
 
 [dependencies]
 modgrad-traits = { path = "../../crates/modgrad-traits" }
