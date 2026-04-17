@@ -7,6 +7,8 @@
 //! Backward: (Weights, Cache, dOutput) → Gradients
 //! Loss:     (Output, Target) → (scalar, dOutput)
 //! Update:   (Weights, Gradients, lr) → Weights
+//! Sampler:  Logits → token index
+//! Generate: Brain + Sampler → tokens (see modgrad-training)
 
 /// Trait for weight types that can be viewed as a flat f32 slice.
 /// Enables Optimizer to operate on Brain weights directly.
@@ -150,9 +152,10 @@ pub trait Brain {
     fn zero_gradients(weights: &Self::Weights) -> Self::Gradients;
 
     /// Apply gradients to weights (SGD step).
+    /// `grads` is mutable to allow GPU kernels to zero grads in-place.
     fn apply_gradients(
         weights: &mut Self::Weights,
-        grads: &Self::Gradients,
+        grads: &mut Self::Gradients,
         lr: f32,
         clip_norm: f32,
     );
@@ -181,138 +184,52 @@ pub trait LossFn {
 /// Convenience type alias for classification targets.
 pub type ClassTarget = usize;
 
-/// CTM-style loss: (min_CE_tick + most_certain_tick) / 2.
-pub struct CtmLoss;
+/// Imagination wrapper: applies tick-skipping to any inner loss.
+///
+/// Delegates to `inner` but only passes the committed ticks (last fraction).
+/// Works with RouteLoss, ClassTarget losses, DistributionLoss — anything.
+pub struct Imagination<L> {
+    pub inner: L,
+    pub imagine_ratio: f32,
+}
 
-impl LossFn for CtmLoss {
-    type Target = ClassTarget;
+impl<L> Imagination<L> {
+    pub fn new(inner: L) -> Self {
+        Self { inner, imagine_ratio: 0.5 }
+    }
+
+    pub fn with_ratio(inner: L, ratio: f32) -> Self {
+        Self { inner, imagine_ratio: ratio }
+    }
+}
+
+impl<L: LossFn> LossFn for Imagination<L> {
+    type Target = L::Target;
 
     fn compute(
         &self,
         predictions: &[Vec<f32>],
         certainties: &[[f32; 2]],
-        target: &ClassTarget,
+        target: &Self::Target,
     ) -> (f32, Vec<Vec<f32>>) {
-        let target = *target;
         let k = predictions.len();
         if k == 0 { return (0.0, Vec::new()); }
+
+        let commit_start = ((k as f32 * self.imagine_ratio).ceil() as usize)
+            .min(k.saturating_sub(1));
+
+        let committed_preds = &predictions[commit_start..];
+        let committed_certs = &certainties[commit_start..];
+
+        let (loss, committed_grads) = self.inner.compute(
+            committed_preds, committed_certs, target);
+
+        // Pad gradients: zeros for imagination ticks, inner grads for committed
         let out_dim = predictions[0].len();
-
-        let ce: Vec<(f32, Vec<f32>)> = predictions.iter()
-            .map(|p| cross_entropy_grad(p, target))
-            .collect();
-
-        let min_tick = (0..k).min_by(|&a, &b|
-            ce[a].0.partial_cmp(&ce[b].0).unwrap()).unwrap_or(0);
-        let cert_tick = (0..k).max_by(|&a, &b|
-            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()).unwrap_or(k - 1);
-
-        let loss = (ce[min_tick].0 + ce[cert_tick].0) / 2.0;
-
-        let mut d_preds = vec![vec![0.0f32; out_dim]; k];
-        for (j, g) in ce[min_tick].1.iter().enumerate() {
-            d_preds[min_tick][j] += 0.5 * g;
-        }
-        for (j, g) in ce[cert_tick].1.iter().enumerate() {
-            d_preds[cert_tick][j] += 0.5 * g;
-        }
+        let mut d_preds = vec![vec![0.0f32; out_dim]; commit_start];
+        d_preds.extend(committed_grads);
 
         (loss, d_preds)
-    }
-}
-
-/// Simple cross-entropy on the last tick only.
-pub struct LastTickCE;
-
-impl LossFn for LastTickCE {
-    type Target = ClassTarget;
-
-    fn compute(
-        &self,
-        predictions: &[Vec<f32>],
-        _certainties: &[[f32; 2]],
-        target: &ClassTarget,
-    ) -> (f32, Vec<Vec<f32>>) {
-        let target = *target;
-        let k = predictions.len();
-        if k == 0 { return (0.0, Vec::new()); }
-        let out_dim = predictions[0].len();
-        let (loss, grad) = cross_entropy_grad(&predictions[k - 1], target);
-        let mut d_preds = vec![vec![0.0f32; out_dim]; k];
-        d_preds[k - 1] = grad;
-        (loss, d_preds)
-    }
-}
-
-/// Thinking-aware loss: CTM loss + reward for productive ticks.
-pub struct ThinkingLoss {
-    pub alpha: f32,
-    pub min_improvement: f32,
-}
-
-impl Default for ThinkingLoss {
-    fn default() -> Self {
-        Self { alpha: 0.1, min_improvement: 0.01 }
-    }
-}
-
-impl LossFn for ThinkingLoss {
-    type Target = ClassTarget;
-
-    fn compute(
-        &self,
-        predictions: &[Vec<f32>],
-        certainties: &[[f32; 2]],
-        target: &ClassTarget,
-    ) -> (f32, Vec<Vec<f32>>) {
-        let target = *target;
-        let k = predictions.len();
-        if k == 0 { return (0.0, Vec::new()); }
-        let out_dim = predictions[0].len();
-
-        let ce: Vec<(f32, Vec<f32>)> = predictions.iter()
-            .map(|p| cross_entropy_grad(p, target))
-            .collect();
-
-        let min_tick = (0..k).min_by(|&a, &b|
-            ce[a].0.partial_cmp(&ce[b].0).unwrap()).unwrap_or(0);
-        let cert_tick = (0..k).max_by(|&a, &b|
-            certainties[a][1].partial_cmp(&certainties[b][1]).unwrap()).unwrap_or(k - 1);
-        let base_loss = (ce[min_tick].0 + ce[cert_tick].0) / 2.0;
-
-        let mut thinking_loss = 0.0f32;
-        for t in 1..k {
-            let improvement = ce[t - 1].0 - ce[t].0;
-            if improvement < self.min_improvement {
-                thinking_loss += self.min_improvement - improvement;
-            }
-        }
-        thinking_loss /= (k - 1).max(1) as f32;
-
-        let total_loss = base_loss + self.alpha * thinking_loss;
-
-        let mut d_preds = vec![vec![0.0f32; out_dim]; k];
-        for (j, g) in ce[min_tick].1.iter().enumerate() {
-            d_preds[min_tick][j] += 0.5 * g;
-        }
-        for (j, g) in ce[cert_tick].1.iter().enumerate() {
-            d_preds[cert_tick][j] += 0.5 * g;
-        }
-
-        let alpha_per_tick = self.alpha / (k - 1).max(1) as f32;
-        for t in 1..k {
-            let improvement = ce[t - 1].0 - ce[t].0;
-            if improvement < self.min_improvement {
-                for (j, g) in ce[t].1.iter().enumerate() {
-                    d_preds[t][j] += alpha_per_tick * g;
-                }
-                for (j, g) in ce[t - 1].1.iter().enumerate() {
-                    d_preds[t - 1][j] -= 0.5 * alpha_per_tick * g;
-                }
-            }
-        }
-
-        (total_loss, d_preds)
     }
 }
 
@@ -536,7 +453,130 @@ impl LossFn for RouteLoss {
     }
 }
 
-fn cross_entropy_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+// ─── Sampler trait ─────────────────────────────────────────
+// Pure function: logits → token index.
+// Decoupled from Brain — any sampler works with any model.
+
+/// Token sampling strategy: logits in, token index out.
+pub trait Sampler {
+    fn sample(&mut self, logits: &[f32]) -> usize;
+}
+
+/// Greedy (argmax). Deterministic.
+pub struct Greedy;
+
+impl Sampler for Greedy {
+    fn sample(&mut self, logits: &[f32]) -> usize {
+        logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i).unwrap_or(0)
+    }
+}
+
+/// Top-k sampling with temperature.
+pub struct TopK {
+    pub k: usize,
+    pub temperature: f32,
+    rng: u64,
+}
+
+impl TopK {
+    pub fn new(k: usize, temperature: f32, seed: u64) -> Self {
+        Self { k, temperature, rng: seed | 1 } // xorshift requires nonzero seed
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+}
+
+impl Sampler for TopK {
+    fn sample(&mut self, logits: &[f32]) -> usize {
+        if logits.is_empty() { return 0; }
+        let t = self.temperature.max(1e-8);
+        let scaled: Vec<f32> = logits.iter().map(|&l| l / t).collect();
+
+        // Find top-k indices
+        let mut indices: Vec<usize> = (0..scaled.len()).collect();
+        indices.sort_unstable_by(|&a, &b| scaled[b].partial_cmp(&scaled[a]).unwrap());
+        indices.truncate(self.k);
+
+        // Softmax over top-k
+        let max_l = scaled[indices[0]];
+        let exps: Vec<f32> = indices.iter().map(|&i| (scaled[i] - max_l).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+        // Sample
+        let r = (self.next_u64() as f64 / u64::MAX as f64) as f32;
+        let mut cumulative = 0.0;
+        for (j, &p) in probs.iter().enumerate() {
+            cumulative += p;
+            if r < cumulative { return indices[j]; }
+        }
+        *indices.last().unwrap()
+    }
+}
+
+/// Nucleus (top-p) sampling with temperature.
+pub struct TopP {
+    pub p: f32,
+    pub temperature: f32,
+    rng: u64,
+}
+
+impl TopP {
+    pub fn new(p: f32, temperature: f32, seed: u64) -> Self {
+        Self { p, temperature, rng: seed | 1 } // xorshift requires nonzero seed
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+}
+
+impl Sampler for TopP {
+    fn sample(&mut self, logits: &[f32]) -> usize {
+        if logits.is_empty() { return 0; }
+        let t = self.temperature.max(1e-8);
+        let scaled: Vec<f32> = logits.iter().map(|&l| l / t).collect();
+
+        let max_l = scaled.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exps: Vec<f32> = scaled.iter().map(|&l| (l - max_l).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+
+        let mut indexed: Vec<(usize, f32)> = exps.iter().enumerate()
+            .map(|(i, &e)| (i, e / sum)).collect();
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Truncate to nucleus
+        let mut cumulative = 0.0;
+        let mut cutoff = indexed.len();
+        for (j, &(_, p)) in indexed.iter().enumerate() {
+            cumulative += p;
+            if cumulative >= self.p { cutoff = j + 1; break; }
+        }
+        let nucleus = &indexed[..cutoff];
+
+        // Renormalize and sample
+        let total: f32 = nucleus.iter().map(|&(_, p)| p).sum();
+        let r = (self.next_u64() as f64 / u64::MAX as f64) as f32;
+        let mut c = 0.0;
+        for &(idx, p) in nucleus {
+            c += p / total;
+            if r < c { return idx; }
+        }
+        nucleus.last().unwrap().0
+    }
+}
+
+pub fn cross_entropy_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
     let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let exp_s: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
     let sum: f32 = exp_s.iter().sum();

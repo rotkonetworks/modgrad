@@ -33,19 +33,25 @@ pub(crate) fn linear_backward(
     let out_dim = linear.out_dim;
     // d_bias
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
-    // d_weight (outer product, CPU)
-    for i in 0..out_dim {
-        let d = d_out[i];
-        if d.abs() < 1e-12 { continue; }
-        let row = i * in_dim;
-        for j in 0..in_dim {
-            d_weight[row + j] += d * cache.input[j];
+    // d_weight (outer product) — GPU when large enough
+    if modgrad_compute::neuron::gpu_enabled()
+        && modgrad_device::kfd::accel::try_outer_product(
+            d_weight, d_out, &cache.input, out_dim as u32, in_dim as u32,
+        )
+    {
+        // GPU path succeeded
+    } else {
+        for i in 0..out_dim {
+            let d = d_out[i];
+            if d.abs() < 1e-12 { continue; }
+            let row = i * in_dim;
+            for j in 0..in_dim {
+                d_weight[row + j] += d * cache.input[j];
+            }
         }
     }
     // d_input = W^T @ d_out — GPU dispatch for backward pass
-    if modgrad_compute::neuron::gpu_enabled()
-        && in_dim * out_dim >= 50_000
-    {
+    if modgrad_compute::neuron::gpu_enabled() {
         let mut d_input = vec![0.0f32; in_dim];
         if modgrad_device::kfd::accel::try_matvec_t(
             d_out, &linear.weight, &mut d_input,
@@ -91,15 +97,23 @@ fn affine_ln_backward(
     d_gamma: &mut [f32], d_beta: &mut [f32],
 ) -> Vec<f32> {
     let n = d_out.len();
+    // GPU path (single-WG kernel, n <= 256)
+    if modgrad_compute::neuron::gpu_enabled() && n <= 256 {
+        let mut d_input = vec![0.0f32; n];
+        if modgrad_device::kfd::accel::try_ln_backward(
+            d_out, &cache.normalized, gamma,
+            d_gamma, d_beta, &mut d_input, cache.inv_std,
+        ) {
+            return d_input;
+        }
+    }
+    // CPU fallback
     let nf = n as f32;
-    // d_gamma, d_beta
     for i in 0..n {
         d_gamma[i] += d_out[i] * cache.normalized[i];
         d_beta[i] += d_out[i];
     }
-    // d_normalized
     let d_norm: Vec<f32> = (0..n).map(|i| d_out[i] * gamma[i]).collect();
-    // Standard LN backward: d_x = inv_std * (d_norm - mean(d_norm) - normalized * mean(d_norm * normalized))
     let mean_dn: f32 = d_norm.iter().sum::<f32>() / nf;
     let mean_dn_xhat: f32 = d_norm.iter().zip(&cache.normalized)
         .map(|(&d, &x)| d * x).sum::<f32>() / nf;
@@ -120,10 +134,17 @@ fn silu_forward_cached(x: &mut [f32]) -> Vec<f32> {
 }
 
 fn silu_backward(d_out: &[f32], pre: &[f32]) -> Vec<f32> {
-    d_out.iter().zip(pre).map(|(&d, &x)| {
+    let mut d_input = vec![0.0f32; d_out.len()];
+    if modgrad_compute::neuron::gpu_enabled()
+        && modgrad_device::kfd::accel::try_silu_backward(d_out, pre, &mut d_input)
+    {
+        return d_input;
+    }
+    d_out.iter().zip(pre).enumerate().for_each(|(i, (&d, &x))| {
         let s = 1.0 / (1.0 + (-x).exp());
-        d * (s + x * s * (1.0 - s))
-    }).collect()
+        d_input[i] = d * (s + x * s * (1.0 - s));
+    });
+    d_input
 }
 
 // ─── Per-neuron GLU ────────────────────────────────────────
@@ -146,7 +167,21 @@ fn per_neuron_glu_cached(x: &[f32], n_neurons: usize, out_per: usize) -> (Vec<f3
 
 fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
     let half = cache.out_per / 2;
-    let mut d_input = vec![0.0f32; cache.n_neurons * cache.out_per];
+    let total_out = cache.n_neurons * half;
+    let total_in = cache.n_neurons * cache.out_per;
+
+    // GPU path
+    if modgrad_compute::neuron::gpu_enabled() {
+        let mut d_input = vec![0.0f32; total_in];
+        if modgrad_device::kfd::accel::try_per_neuron_glu_backward(
+            d_out, &cache.x, &mut d_input,
+            cache.n_neurons as u32, cache.out_per as u32,
+        ) {
+            return d_input;
+        }
+    }
+
+    let mut d_input = vec![0.0f32; total_in];
     for n in 0..cache.n_neurons {
         let base_in = n * cache.out_per;
         let base_out = n * half;
@@ -155,8 +190,8 @@ fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
             let gate_v = cache.x[base_in + half + j];
             let gate = 1.0 / (1.0 + (-gate_v).exp());
             let d = d_out[base_out + j];
-            d_input[base_in + j] = d * gate;                          // d_val
-            d_input[base_in + half + j] = d * val * gate * (1.0 - gate); // d_gate
+            d_input[base_in + j] = d * gate;
+            d_input[base_in + half + j] = d * val * gate * (1.0 - gate);
         }
     }
     d_input
@@ -187,8 +222,16 @@ impl BlockGrads {
         }
     }
 
-    fn apply(&self, block: &mut SynapseBlock, lr: f32) {
-        for (w, g) in block.linear.weight.iter_mut().zip(&self.d_weight) { *w -= lr * g; }
+    fn apply(&mut self, block: &mut SynapseBlock, lr: f32) {
+        if modgrad_compute::neuron::gpu_enabled()
+            && block.linear.weight.len() >= 1024
+            && modgrad_device::kfd::accel::try_sgd_update(
+                &mut block.linear.weight, &mut self.d_weight, lr)
+        {
+            // GPU handled weight update + zeroed d_weight
+        } else {
+            for (w, g) in block.linear.weight.iter_mut().zip(&self.d_weight) { *w -= lr * g; }
+        }
         for (b, g) in block.linear.bias.iter_mut().zip(&self.d_bias) { *b -= lr * g; }
         for (g, dg) in block.ln_gamma.iter_mut().zip(&self.d_gamma) { *g -= lr * dg; }
         for (b, db) in block.ln_beta.iter_mut().zip(&self.d_beta) { *b -= lr * db; }
@@ -206,6 +249,42 @@ fn block_forward_cached(block: &SynapseBlock, x: &[f32]) -> (Vec<f32>, BlockCach
 fn block_backward(
     block: &SynapseBlock, d_out: &[f32], cache: &BlockCache, grads: &mut BlockGrads,
 ) -> Vec<f32> {
+    let in_dim = block.linear.in_dim;
+    let out_dim = block.linear.out_dim;
+
+    // Fused GPU path: silu_bwd → ln_bwd → matvec_t in one submit_wait.
+    // Eliminates 2 GPU stalls between the 3 kernels.
+    if modgrad_compute::neuron::gpu_enabled() && out_dim <= 256 {
+        let mut d_input = vec![0.0f32; in_dim];
+        let mut d_ln = vec![0.0f32; out_dim];
+        if modgrad_device::kfd::accel::try_synapse_backward(
+            &block.linear.weight, d_out, &cache.pre_silu,
+            &cache.ln.normalized, &block.ln_gamma,
+            &mut grads.d_gamma, &mut grads.d_beta,
+            &mut d_input, &mut d_ln, cache.ln.inv_std,
+            out_dim as u32, in_dim as u32,
+        ) {
+            // d_bias from d_ln (the gradient at the linear output)
+            for i in 0..out_dim { grads.d_bias[i] += d_ln[i]; }
+            // d_weight (outer product) — GPU when large enough
+            if !modgrad_device::kfd::accel::try_outer_product(
+                &mut grads.d_weight, &d_ln, &cache.lin.input,
+                out_dim as u32, in_dim as u32,
+            ) {
+                for i in 0..out_dim {
+                    let d = d_ln[i];
+                    if d.abs() < 1e-12 { continue; }
+                    let row = i * in_dim;
+                    for j in 0..in_dim {
+                        grads.d_weight[row + j] += d * cache.lin.input[j];
+                    }
+                }
+            }
+            return d_input;
+        }
+    }
+
+    // CPU fallback: separate kernel dispatches
     let d_silu = silu_backward(d_out, &cache.pre_silu);
     let d_ln = affine_ln_backward(&d_silu, &cache.ln, &block.ln_gamma,
         &mut grads.d_gamma, &mut grads.d_beta);
@@ -250,10 +329,10 @@ impl UNetGrads {
         }
     }
 
-    fn apply(&self, unet: &mut SynapseUNet, lr: f32) {
+    fn apply(&mut self, unet: &mut SynapseUNet, lr: f32) {
         self.first.apply(&mut unet.first_projection, lr);
-        for (g, b) in self.downs.iter().zip(unet.down_blocks.iter_mut()) { g.apply(b, lr); }
-        for (g, b) in self.ups.iter().zip(unet.up_blocks.iter_mut()) { g.apply(b, lr); }
+        for (g, b) in self.downs.iter_mut().zip(unet.down_blocks.iter_mut()) { g.apply(b, lr); }
+        for (g, b) in self.ups.iter_mut().zip(unet.up_blocks.iter_mut()) { g.apply(b, lr); }
         for (i, (dg, db)) in self.skip_d_gamma.iter().zip(&self.skip_d_beta).enumerate() {
             for (g, d) in unet.skip_ln_gamma[i].iter_mut().zip(dg) { *g -= lr * d; }
             for (b, d) in unet.skip_ln_beta[i].iter_mut().zip(db) { *b -= lr * d; }
@@ -349,6 +428,7 @@ fn superlinear_forward_cached(sl: &SuperLinear, x: &[f32]) -> (Vec<f32>, SuperLi
 }
 
 /// Returns d_input. Accumulates into d_weights, d_biases.
+/// GPU-accelerated when available.
 fn superlinear_backward(
     sl: &SuperLinear, d_out: &[f32], cache: &SuperLinearCache,
     d_weights: &mut [f32], d_biases: &mut [f32],
@@ -356,8 +436,26 @@ fn superlinear_backward(
     let n = sl.n_neurons;
     let ip = sl.in_per;
     let op = sl.out_per;
-    let mut d_input = vec![0.0f32; n * ip];
 
+    // d_bias (always CPU — small, element-wise)
+    for i in 0..n * op {
+        d_biases[i] += d_out[i];
+    }
+
+    // GPU path for d_weight + d_input
+    if modgrad_compute::neuron::gpu_enabled() {
+        let mut d_input = vec![0.0f32; n * ip];
+        if modgrad_device::kfd::accel::try_superlinear_backward(
+            &sl.weights, d_out, &cache.input,
+            d_weights, &mut d_input,
+            n as u32, op as u32, ip as u32,
+        ) {
+            return d_input;
+        }
+    }
+
+    // CPU fallback
+    let mut d_input = vec![0.0f32; n * ip];
     for neuron in 0..n {
         let t = &cache.input[neuron * ip..(neuron + 1) * ip];
         let w_base = neuron * op * ip;
@@ -366,7 +464,6 @@ fn superlinear_backward(
         for o in 0..op {
             let d = d_out[o_base + o];
             if d.abs() < 1e-12 { continue; }
-            d_biases[o_base + o] += d;
             for i in 0..ip {
                 d_weights[w_base + o * ip + i] += d * t[i];
                 d_input[neuron * ip + i] += d * sl.weights[w_base + o * ip + i];
@@ -382,12 +479,30 @@ fn superlinear_backward(
 /// At the current tick, the contribution to alpha[i] is activated[left[i]] * activated[right[i]].
 /// d_activated[left[i]] += d_sync[i] / sqrt(beta[i]) * activated[right[i]]
 /// d_activated[right[i]] += d_sync[i] / sqrt(beta[i]) * activated[left[i]]
+///
+/// GPU-accelerated via atomic scatter kernel when available.
 fn sync_backward(
     d_sync: &[f32], activated: &[f32], beta: &[f32],
     left: &[usize], right: &[usize], d_model: usize,
 ) -> Vec<f32> {
+    let n_pairs = left.len();
+    // GPU path: convert usize indices to u32, dispatch scatter kernel
+    if modgrad_compute::neuron::gpu_enabled() && n_pairs >= 16 {
+        let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
+        let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
+        let mut d_act = vec![0.0f32; d_model];
+        if modgrad_device::kfd::accel::try_sync_backward(
+            d_sync, activated, beta,
+            &left_u32, &right_u32,
+            n_pairs as u32, d_model as u32,
+            &mut d_act,
+        ) {
+            return d_act;
+        }
+    }
+    // CPU fallback
     let mut d_act = vec![0.0f32; d_model];
-    for i in 0..left.len() {
+    for i in 0..n_pairs {
         let scale = 1.0 / beta[i].sqrt().max(1e-8);
         d_act[left[i]] += d_sync[i] * scale * activated[right[i]];
         d_act[right[i]] += d_sync[i] * scale * activated[left[i]];
@@ -533,21 +648,59 @@ fn linear_slice_vec(x: &[f32], linear: &Linear, row_start: usize, row_end: usize
 }
 
 /// Backward for a slice of rows. Returns d_input, accumulates into d_weight, d_bias.
+/// GPU-accelerated: outer_product for d_weight, matvec_t for d_input.
 fn linear_slice_backward(
     x: &[f32], linear: &Linear, d_out: &[f32],
     row_start: usize, row_end: usize,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
     let in_dim = linear.in_dim;
-    let mut d_input = vec![0.0f32; in_dim];
+    let slice_dim = row_end - row_start;
+
+    // d_bias — always on CPU (tiny)
     for (ri, r) in (row_start..row_end).enumerate() {
+        d_bias[r] += d_out[ri];
+    }
+
+    let use_gpu = modgrad_compute::neuron::gpu_enabled();
+
+    // d_weight (outer product): d_weight[r*in_dim+j] += d_out[ri] * x[j]
+    // GPU operates on the contiguous slice d_weight[row_start*in_dim..row_end*in_dim]
+    let w_offset = row_start * in_dim;
+    let w_slice = &mut d_weight[w_offset..w_offset + slice_dim * in_dim];
+    if !(use_gpu && modgrad_device::kfd::accel::try_outer_product(
+        w_slice, d_out, x, slice_dim as u32, in_dim as u32,
+    )) {
+        // CPU fallback
+        for (ri, r) in (row_start..row_end).enumerate() {
+            let d = d_out[ri];
+            if d.abs() < 1e-12 { continue; }
+            let local_row = ri * in_dim;
+            for j in 0..in_dim {
+                w_slice[local_row + j] += d * x[j];
+            }
+        }
+    }
+
+    // d_input = W_slice^T @ d_out
+    let wt_slice = &linear.weight[w_offset..w_offset + slice_dim * in_dim];
+    if use_gpu {
+        let mut d_input = vec![0.0f32; in_dim];
+        if modgrad_device::kfd::accel::try_matvec_t(
+            d_out, wt_slice, &mut d_input,
+            slice_dim as u32, in_dim as u32,
+        ) {
+            return d_input;
+        }
+    }
+    // CPU fallback
+    let mut d_input = vec![0.0f32; in_dim];
+    for (ri, _r) in (row_start..row_end).enumerate() {
         let d = d_out[ri];
         if d.abs() < 1e-12 { continue; }
-        d_bias[r] += d;
-        let row = r * in_dim;
+        let local_row = ri * in_dim;
         for j in 0..in_dim {
-            d_weight[row + j] += d * x[j];
-            d_input[j] += d * linear.weight[row + j];
+            d_input[j] += d * wt_slice[local_row + j];
         }
     }
     d_input
@@ -654,6 +807,8 @@ pub struct CtmGradients {
     pub exit_gate_b: Option<Vec<f32>>,
 }
 
+/// Compute L2 norm across multiple gradient slices.
+/// Tries GPU dispatch first (concatenates into a scratch buffer), falls back to CPU.
 impl CtmGradients {
     pub fn zeros(w: &CtmWeights) -> Self {
         Self {
@@ -711,46 +866,51 @@ impl CtmGradients {
     }
 
     /// SGD update: w -= lr * grad. Clips gradients by norm.
-    pub fn apply(&self, w: &mut CtmWeights, lr: f32, clip_norm: f32) {
+    /// GPU-accelerated for large parameter arrays.
+    pub fn apply(&mut self, w: &mut CtmWeights, lr: f32, clip_norm: f32) {
         let scale = {
-            let mut total_sq = 0.0f32;
-            let add = |v: &[f32], s: &mut f32| { for x in v { *s += x * x; } };
-            add(&self.nlm_s1_w, &mut total_sq);
-            add(&self.nlm_s1_b, &mut total_sq);
-            add(&self.out_proj_w, &mut total_sq);
-            add(&self.out_proj_b, &mut total_sq);
-            add(&self.q_proj_w, &mut total_sq);
-            let norm = total_sq.sqrt();
+            let grads: &[&[f32]] = &[
+                &self.nlm_s1_w, &self.nlm_s1_b,
+                &self.out_proj_w, &self.out_proj_b,
+                &self.q_proj_w,
+            ];
+            let norm = crate::grad_norm(grads);
             if norm > clip_norm { clip_norm / norm } else { 1.0 }
         };
         let lr = lr * scale;
 
         self.unet.apply(&mut w.synapse, lr);
-        let sgd = |w: &mut [f32], g: &[f32]| { for (w, g) in w.iter_mut().zip(g) { *w -= lr * g; } };
-        sgd(&mut w.nlm_stage1.weights, &self.nlm_s1_w);
-        sgd(&mut w.nlm_stage1.biases, &self.nlm_s1_b);
+        let gpu = modgrad_compute::neuron::gpu_enabled();
+        let sgd = |w: &mut [f32], g: &mut [f32]| {
+            if gpu && w.len() >= 1024
+                && modgrad_device::kfd::accel::try_sgd_update(w, g, lr)
+            { return; }
+            for (w, g) in w.iter_mut().zip(g.iter()) { *w -= lr * g; }
+        };
+        sgd(&mut w.nlm_stage1.weights, &mut self.nlm_s1_w);
+        sgd(&mut w.nlm_stage1.biases, &mut self.nlm_s1_b);
         if let Some(s2) = &mut w.nlm_stage2 {
-            if let (Some(gw), Some(gb)) = (&self.nlm_s2_w, &self.nlm_s2_b) {
+            if let (Some(gw), Some(gb)) = (&mut self.nlm_s2_w, &mut self.nlm_s2_b) {
                 sgd(&mut s2.weights, gw);
                 sgd(&mut s2.biases, gb);
             }
         }
-        sgd(&mut w.start_activated, &self.d_start_activated);
-        sgd(&mut w.start_trace, &self.d_start_trace);
-        sgd(&mut w.kv_proj.weight, &self.kv_proj_w);
-        sgd(&mut w.kv_proj.bias, &self.kv_proj_b);
-        sgd(&mut w.kv_ln_gamma, &self.kv_ln_d_gamma);
-        sgd(&mut w.kv_ln_beta, &self.kv_ln_d_beta);
-        sgd(&mut w.q_proj.weight, &self.q_proj_w);
-        sgd(&mut w.q_proj.bias, &self.q_proj_b);
-        sgd(&mut w.mha_in_proj.weight, &self.mha_in_w);
-        sgd(&mut w.mha_in_proj.bias, &self.mha_in_b);
-        sgd(&mut w.mha_out_proj.weight, &self.mha_out_w);
-        sgd(&mut w.mha_out_proj.bias, &self.mha_out_b);
-        sgd(&mut w.output_proj.weight, &self.out_proj_w);
-        sgd(&mut w.output_proj.bias, &self.out_proj_b);
+        sgd(&mut w.start_activated, &mut self.d_start_activated);
+        sgd(&mut w.start_trace, &mut self.d_start_trace);
+        sgd(&mut w.kv_proj.weight, &mut self.kv_proj_w);
+        sgd(&mut w.kv_proj.bias, &mut self.kv_proj_b);
+        sgd(&mut w.kv_ln_gamma, &mut self.kv_ln_d_gamma);
+        sgd(&mut w.kv_ln_beta, &mut self.kv_ln_d_beta);
+        sgd(&mut w.q_proj.weight, &mut self.q_proj_w);
+        sgd(&mut w.q_proj.bias, &mut self.q_proj_b);
+        sgd(&mut w.mha_in_proj.weight, &mut self.mha_in_w);
+        sgd(&mut w.mha_in_proj.bias, &mut self.mha_in_b);
+        sgd(&mut w.mha_out_proj.weight, &mut self.mha_out_w);
+        sgd(&mut w.mha_out_proj.bias, &mut self.mha_out_b);
+        sgd(&mut w.output_proj.weight, &mut self.out_proj_w);
+        sgd(&mut w.output_proj.bias, &mut self.out_proj_b);
         if let Some(gate) = &mut w.exit_gate {
-            if let (Some(gw), Some(gb)) = (&self.exit_gate_w, &self.exit_gate_b) {
+            if let (Some(gw), Some(gb)) = (&mut self.exit_gate_w, &mut self.exit_gate_b) {
                 sgd(&mut gate.weight, gw);
                 sgd(&mut gate.bias, gb);
             }
@@ -968,9 +1128,12 @@ pub fn train_step(
     let r_out: Vec<f32> = w.decay_params_out.iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
     let r_action: Vec<f32> = w.decay_params_action.iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
 
-    // State
-    let mut trace = w.start_trace.clone();
-    let mut activated = w.start_activated.clone();
+    // State — allocate from VRAM arena when available (zero-copy dispatch)
+    let be = modgrad_compute::backend::backend();
+    let mut trace = be.alloc_f32(w.start_trace.len());
+    trace.copy_from_slice(&w.start_trace);
+    let mut activated = be.alloc_f32(w.start_activated.len());
+    activated.copy_from_slice(&w.start_activated);
     let mut alpha_out: Vec<f32> = (0..cfg.n_synch_out).map(|i|
         activated[w.sync_out_left[i]] * activated[w.sync_out_right[i]]).collect();
     let mut beta_out = vec![1.0f32; cfg.n_synch_out];
@@ -981,17 +1144,19 @@ pub fn train_step(
     let mut tick_caches = Vec::with_capacity(cfg.iterations);
 
     for _tick in 0..cfg.iterations {
-        let activated_prev = activated.clone();
+        let activated_prev = activated.as_slice().to_vec();
 
-        // Sync action
+        // Sync action — VRAM-backed for zero-copy into q_proj matvec
         let (sync_action, ba) = if !action_init {
             let pw: Vec<f32> = (0..cfg.n_synch_action).map(|i|
                 activated[w.sync_action_left[i]] * activated[w.sync_action_right[i]]).collect();
             alpha_action = pw.clone();
             beta_action = vec![1.0f32; cfg.n_synch_action];
             action_init = true;
-            let sa: Vec<f32> = (0..cfg.n_synch_action).map(|i|
-                alpha_action[i] / beta_action[i].sqrt().max(1e-8)).collect();
+            let mut sa = be.alloc_f32(cfg.n_synch_action);
+            for i in 0..cfg.n_synch_action {
+                sa[i] = alpha_action[i] / beta_action[i].sqrt().max(1e-8);
+            }
             (sa, beta_action.clone())
         } else {
             for i in 0..cfg.n_synch_action {
@@ -999,8 +1164,10 @@ pub fn train_step(
                 alpha_action[i] = r_action[i] * alpha_action[i] + pw;
                 beta_action[i] = r_action[i] * beta_action[i] + 1.0;
             }
-            let sa: Vec<f32> = (0..cfg.n_synch_action).map(|i|
-                alpha_action[i] / beta_action[i].sqrt().max(1e-8)).collect();
+            let mut sa = be.alloc_f32(cfg.n_synch_action);
+            for i in 0..cfg.n_synch_action {
+                sa[i] = alpha_action[i] / beta_action[i].sqrt().max(1e-8);
+            }
             (sa, beta_action.clone())
         };
 
@@ -1011,10 +1178,10 @@ pub fn train_step(
         let (attn_out, mha_cache) = mha_forward_cached(
             &q, &kv, n_tokens, d_in, cfg.heads, &w.mha_in_proj, &w.mha_out_proj);
 
-        // Synapse
-        let mut pre_syn = Vec::with_capacity(d_in + d);
-        pre_syn.extend_from_slice(&attn_out);
-        pre_syn.extend_from_slice(&activated);
+        // Synapse — allocate concat buffer from VRAM for zero-copy dispatch
+        let mut pre_syn = be.alloc_f32(d_in + d);
+        pre_syn[..d_in].copy_from_slice(&attn_out);
+        pre_syn[d_in..d_in + d].copy_from_slice(&activated);
         let (pre_act, unet_cache) = unet_forward_cached(&w.synapse, &pre_syn);
 
         // Update trace
@@ -1027,7 +1194,7 @@ pub fn train_step(
         // NLM
         let (new_activated, nlm_cache) = nlm_forward_cached(
             &trace, &w.nlm_stage1, w.nlm_stage2.as_ref(), d);
-        activated = new_activated;
+        activated.copy_from_slice(&new_activated);
 
         // Sync out
         for i in 0..cfg.n_synch_out {
@@ -1035,8 +1202,10 @@ pub fn train_step(
             alpha_out[i] = r_out[i] * alpha_out[i] + pw;
             beta_out[i] = r_out[i] * beta_out[i] + 1.0;
         }
-        let sync_out: Vec<f32> = (0..cfg.n_synch_out).map(|i|
-            alpha_out[i] / beta_out[i].sqrt().max(1e-8)).collect();
+        let mut sync_out = be.alloc_f32(cfg.n_synch_out);
+        for i in 0..cfg.n_synch_out {
+            sync_out[i] = alpha_out[i] / beta_out[i].sqrt().max(1e-8);
+        }
 
         // Output proj
         let (_pred, out_lin) = linear_forward_cached(&w.output_proj, &sync_out);
@@ -1051,11 +1220,11 @@ pub fn train_step(
         };
 
         tick_caches.push(TickCache {
-            activated_prev, sync_action, beta_action: ba,
+            activated_prev, sync_action: sync_action.as_slice().to_vec(), beta_action: ba,
             q, q_lin, mha_cache, attn_out,
             unet_cache, pre_act: pre_act.clone(),
-            nlm_cache, activated_post: activated.clone(),
-            sync_out, beta_out: beta_out.clone(), out_lin,
+            nlm_cache, activated_post: activated.as_slice().to_vec(),
+            sync_out: sync_out.as_slice().to_vec(), beta_out: beta_out.clone(), out_lin,
             exit_gate_lin, exit_lambda,
         });
     }
@@ -1151,6 +1320,9 @@ pub fn train_step(
 
     // d_activated is now gradient w.r.t. initial activated state
     for i in 0..d { grads.d_start_activated[i] += d_activated[i]; }
+
+    // Reset VRAM arena — all temporary GPU buffers freed
+    be.arena_reset();
 
     TrainResult { loss, prediction: pred_class }
 }
@@ -1318,7 +1490,7 @@ impl Brain for Ctm {
             };
 
             tick_caches.push(TickCache {
-                activated_prev, sync_action, beta_action: ba,
+                activated_prev, sync_action: sync_action.as_slice().to_vec(), beta_action: ba,
                 q, q_lin, mha_cache, attn_out,
                 unet_cache, pre_act: pre_act.clone(),
                 nlm_cache, activated_post: state.activated.clone(),
@@ -1403,7 +1575,7 @@ impl Brain for Ctm {
         CtmGradients::zeros(w)
     }
 
-    fn apply_gradients(w: &mut CtmWeights, grads: &CtmGradients, lr: f32, clip_norm: f32) {
+    fn apply_gradients(w: &mut CtmWeights, grads: &mut CtmGradients, lr: f32, clip_norm: f32) {
         grads.apply(w, lr, clip_norm);
     }
 }

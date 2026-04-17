@@ -53,6 +53,21 @@ impl Default for TrainConfig {
     }
 }
 
+/// Hook called after each training step. The training loop doesn't
+/// know what the hook does — dream/sleep, logging, checkpointing,
+/// curriculum adjustment — all are implementations of this trait.
+///
+/// The hook receives the current weights (mutable) and step metadata.
+/// It can modify weights (e.g., dream phase applies its own gradient).
+pub trait StepHook<W> {
+    fn after_step(&mut self, weights: &mut W, step: usize, lr: f32);
+}
+
+/// No-op hook. Use when no post-step processing is needed.
+impl<W> StepHook<W> for () {
+    fn after_step(&mut self, _weights: &mut W, _step: usize, _lr: f32) {}
+}
+
 /// Callback for logging.
 pub trait Logger {
     fn log_step(&mut self, report: &StepReport);
@@ -125,13 +140,14 @@ impl<D: modgrad_data::data_stream::DataStream> SampleProvider<modgrad_traits::To
 ///
 /// The Brain's Input type flows through: SampleProvider produces B::Input,
 /// Brain::forward_cached consumes it. No type erasure.
-pub fn train<B, L, T, S, Log>(
+pub fn train<B, L, T, S, Log, H>(
     weights: &mut B::Weights,
     data: &mut dyn SampleProvider<B::Input, T>,
     loss_fn: &L,
     scheduler: &S,
     checkpointer: &mut Option<CheckpointManager>,
     logger: &mut Log,
+    hook: &mut H,
     config: &TrainConfig,
 ) -> TrainReport
 where
@@ -140,6 +156,7 @@ where
     T: Clone,
     S: Scheduler,
     Log: Logger,
+    H: StepHook<B::Weights>,
 {
     let t0 = std::time::Instant::now();
     let mut ema_loss = 5.0f32;
@@ -175,13 +192,16 @@ where
                 &output.predictions, &output.certainties, &sample.target);
 
             // Backward
-            let grads = B::backward(weights, cache, &d_preds);
+            let mut grads = B::backward(weights, cache, &d_preds);
 
             // Apply
-            B::apply_gradients(weights, &grads, lr, config.grad_clip);
+            B::apply_gradients(weights, &mut grads, lr, config.grad_clip);
 
             step_loss += loss;
         }
+
+        // Post-step hook (dream, consolidation, etc.)
+        hook.after_step(weights, step, lr);
 
         step_loss /= config.micro_batch as f32;
         ema_loss = 0.99 * ema_loss + 0.01 * step_loss;

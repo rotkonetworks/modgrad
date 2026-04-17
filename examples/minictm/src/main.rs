@@ -12,6 +12,7 @@
 //!   minictm -c model.bin --chat                       # just chat
 
 use modgrad_ctm::graph::*;
+use modgrad_training::trainer::StepHook;
 use modgrad_runtime::challenges::{self, byte_curriculum, run_curriculum};
 use std::io::Read;
 
@@ -152,6 +153,21 @@ fn main() {
         let mut grads = RegionalGradients::zeros(&w);
         let mut losses = Vec::new();
 
+        // Dream hook
+        let text_ref = &text;
+        let mut dream_ctr = 0u64;
+        let mut dream = modgrad_training::dream::DreamHook::new(20, 0.3,
+            |w: &mut RegionalWeights, lr: f32| {
+                dream_ctr += 1;
+                if text_ref.len() > 10 {
+                    let p = ((dream_ctr * 7919) as usize) % (text_ref.len() - 9);
+                    let tokens: Vec<usize> = text_ref[p..p+9].iter().map(|&b| b as usize).collect();
+                    let mut dg = RegionalGradients::zeros(w);
+                    dream_step(w, &mut dg, tokens[0], &tokens[1..], 8, 1.0);
+                    dg.apply(w, lr, 1.0);
+                }
+            });
+
         for step in 0..steps {
             let offset = (step * context) % (text.len().saturating_sub(context + 1)).max(1);
             let chunk = &text[offset..offset + context + 1];
@@ -168,7 +184,8 @@ fn main() {
                 if pred == target { correct += 1; }
             }
 
-            opt.step(&mut w, &grads);
+            opt.step(&mut w, &mut grads);
+            dream.after_step(&mut w, step, opt.lr);
             step_loss /= context as f32;
             losses.push(step_loss);
 

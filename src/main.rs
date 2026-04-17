@@ -5,6 +5,7 @@
 //!   isis nc model.bin [--audio mic.wav] [--camera frames/] [--debug-port 4747]
 
 use modgrad_ctm::graph::*;
+use modgrad_training::trainer::StepHook;
 use modgrad_runtime::nc_socket;
 use modgrad_runtime::nc_io;
 use modgrad_runtime::curriculum;
@@ -143,11 +144,19 @@ fn main() {
         Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port } => {
             if gpu || vram {
                 modgrad_compute::neuron::enable_gpu();
+            }
+            if vram {
+                // Full VRAM: all activations + weights cached in GPU memory.
+                // Zero PCIe in the inner loop.
+                let _ = modgrad_compute::backend::set_backend(
+                    Box::new(modgrad_compute::backend::VramGpuBackend::new(512))
+                );
+            } else if gpu {
+                // Hybrid/MegaTrain: weights stream through PCIe, GPU for compute.
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::HybridGpuBackend::new())
                 );
             }
-            if vram { modgrad_device::kfd::accel::enable_vram_mode(); }
             learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port);
         }
         Commands::Daemon { checkpoint, port } => {
@@ -745,6 +754,22 @@ fn develop_staged(
         let threshold = curriculum::MASTERY_THRESHOLDS[phase];
 
         let mut grads = RegionalGradients::zeros(&w); // allocate once, reuse
+
+        // Dream hook: replay random positions from current phase data
+        let seqs_ref = &sequences;
+        let mut dream_counter = 0u64;
+        let mut dream = modgrad_training::dream::DreamHook::new(20, 0.3,
+            |w: &mut RegionalWeights, lr: f32| {
+                dream_counter += 1;
+                let seq = &seqs_ref[(dream_counter as usize * 7919) % seqs_ref.len()];
+                if seq.len() > 9 {
+                    let pos = ((dream_counter * 7919) as usize) % (seq.len() - 9);
+                    let mut dg = RegionalGradients::zeros(w);
+                    dream_step(w, &mut dg, seq[pos], &seq[pos+1..pos+9], 8, 1.0);
+                    dg.apply(w, lr, 1.0);
+                }
+            });
+
         while step < max_steps_per_phase {
             if !running.load(std::sync::atomic::Ordering::SeqCst) { break; }
 
@@ -766,7 +791,10 @@ fn develop_staged(
             }
 
             // AdamW step (no gradient averaging — AdamW adapts to gradient scale)
-            opt.step(&mut w, &grads);
+            opt.step(&mut w, &mut grads);
+
+            // Dream phase
+            dream.after_step(&mut w, step, opt.lr);
 
             chunk_loss /= n_tokens as f32;
             phase_losses.push(chunk_loss);
@@ -1004,6 +1032,20 @@ fn learn(
     let n_data = all_tokens.len();
     let mut offset = 0usize;
 
+    // Dream hook: replay random data positions for memory consolidation
+    let tokens_ref = &all_tokens;
+    let mut dream_counter = 0u64;
+    let mut dream = modgrad_training::dream::DreamHook::new(20, 0.3,
+        |w: &mut RegionalWeights, lr: f32| {
+            dream_counter += 1;
+            if tokens_ref.len() > 10 {
+                let pos = ((dream_counter * 7919) as usize) % (tokens_ref.len() - 9);
+                let mut dg = RegionalGradients::zeros(w);
+                dream_step(w, &mut dg, tokens_ref[pos], &tokens_ref[pos+1..pos+9], 8, 1.0);
+                dg.apply(w, lr, 1.0);
+            }
+        });
+
     eprintln!("\nLearning... (Ctrl+C to save and stop)\n");
 
     while running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1026,23 +1068,12 @@ fn learn(
             if pred == chunk[pos + 1] { chunk_correct += 1; }
         }
 
-        opt.step(&mut w, &grads);
+        opt.step(&mut w, &mut grads);
         // VRAM mode: weights changed, invalidate GPU cache for re-upload
         modgrad_device::kfd::accel::invalidate_cache();
 
-        // ── Dream phase: free-running rollout with regret correction ──
-        // Like embryonic spontaneous neural activity — tests circuit coherence.
-        // TODO: re-enable once GPU path is stable
-        if false && step % 20 == 0 && n_data > context_len * 2 {
-            let seed_pos = ((step * 7919) as usize) % (n_data - 9);
-            let ground_truth = &all_tokens[seed_pos + 1..seed_pos + 9];
-            let mut dream_grads = RegionalGradients::zeros(&w);
-            let _dream_loss = dream_step(
-                &w, &mut dream_grads, all_tokens[seed_pos],
-                ground_truth, 8, 0.3,
-            );
-            dream_grads.apply(&mut w, opt.lr * 0.3, 1.0);
-        }
+        // Dream phase
+        dream.after_step(&mut w, step as usize, opt.lr);
 
         loss_sum += chunk_loss / n as f32;
         correct_sum += chunk_correct;

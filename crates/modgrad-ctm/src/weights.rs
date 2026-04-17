@@ -169,6 +169,12 @@ pub struct CtmState {
     pub beta_action: Option<Vec<f32>>,
     pub alpha_out: Vec<f32>,
     pub beta_out: Vec<f32>,
+
+    /// Episodic memory: persistent KV buffer for long-range context.
+    /// When present, MHA attends over episodic entries in addition to
+    /// the current observation. Entries accumulate across forward calls
+    /// with bounded memory via hierarchical compression.
+    pub episodic: Option<modgrad_compute::kv_buffer::EpisodicMemory>,
 }
 
 impl CtmState {
@@ -180,7 +186,18 @@ impl CtmState {
             beta_action: None,
             alpha_out: vec![0.0; w.config.n_synch_out],
             beta_out: vec![0.0; w.config.n_synch_out],
+            episodic: None,
         }
+    }
+
+    /// Create state with episodic memory enabled.
+    /// `short`, `mid`, `long`: capacity in entries per tier.
+    pub fn with_episodic(w: &CtmWeights, short: usize, mid: usize, long: usize) -> Self {
+        let mut s = Self::new(w);
+        s.episodic = Some(modgrad_compute::kv_buffer::EpisodicMemory::new(
+            w.config.d_input, short, mid, long,
+        ));
+        s
     }
 }
 

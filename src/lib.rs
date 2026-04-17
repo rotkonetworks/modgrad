@@ -15,8 +15,11 @@ pub use modgrad_compute::neuron;
 pub use modgrad_ctm as ctm;
 pub use modgrad_ctm::graph;
 
-// Training
+// Training + Inference
 pub use modgrad_training::optim;
+pub use modgrad_training::inference;
+pub use modgrad_training::dream;
+pub use modgrad_training::trainer;
 
 // Data
 pub use modgrad_data::tokenize;

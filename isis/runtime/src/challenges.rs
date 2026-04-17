@@ -5,6 +5,7 @@
 
 use modgrad_ctm::graph::*;
 use modgrad_ctm::curriculum::{self, ChallengeResult, TestCase};
+use modgrad_training::trainer::StepHook;
 
 /// One stage of isis curriculum.
 pub struct Stage {
@@ -328,6 +329,21 @@ pub fn run_curriculum(
         let mut stage_step = 0;
         let mut graduated = false;
 
+        // Dream hook for this stage
+        let data_ref = &data;
+        let mut dctr = 0u64;
+        let mut dream = modgrad_training::dream::DreamHook::new(20, 0.3,
+            |w: &mut RegionalWeights, lr: f32| {
+                dctr += 1;
+                if data_ref.len() > 10 {
+                    let p = ((dctr * 7919) as usize) % (data_ref.len() - 9);
+                    let tokens: Vec<usize> = data_ref[p..p+9].iter().map(|&b| b as usize).collect();
+                    let mut dg = RegionalGradients::zeros(w);
+                    dream_step(w, &mut dg, tokens[0], &tokens[1..], 8, 1.0);
+                    dg.apply(w, lr, 1.0);
+                }
+            });
+
         while stage_step < stage.max_steps {
             let offset = (global_step * context_len) % data.len().saturating_sub(context_len + 1).max(1);
             let end = (offset + context_len + 1).min(data.len());
@@ -342,7 +358,8 @@ pub fn run_curriculum(
                 loss += l;
                 if pred == chunk[pos+1] as usize { correct += 1; }
             }
-            opt.step(w, &grads);
+            opt.step(w, &mut grads);
+            dream.after_step(w, stage_step, opt.lr);
             loss /= context_len as f32;
             global_step += 1;
             stage_step += 1;

@@ -189,7 +189,7 @@ fn adamw_with_builtin_embeddings() {
             if pred == target { step_correct += 1; }
         }
 
-        opt.step(&mut w, &grads);
+        opt.step(&mut w, &mut grads);
 
         step_loss /= context_len as f32;
         losses.push(step_loss);

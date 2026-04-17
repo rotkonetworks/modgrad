@@ -34,13 +34,9 @@ pub fn ctm_forward(
     n_tokens: usize,
     raw_dim: usize,
 ) -> CtmOutput {
-    let cfg = &w.config;
-    let d = cfg.d_model;
-    let d_in = cfg.d_input;
-    let k = cfg.iterations;
-    let m = cfg.memory_length;
+    let d_in = w.config.d_input;
 
-    // ── 1. Featurize: project observation → KV features ──
+    // Project observation → KV features
     let mut kv = Vec::with_capacity(n_tokens * d_in);
     for t in 0..n_tokens {
         let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
@@ -49,17 +45,102 @@ pub fn ctm_forward(
         kv.extend_from_slice(&projected);
     }
 
-    // ── 2. Decay rates ──
+    // Delegate to the KV-based forward (single implementation of the tick loop)
+    ctm_forward_with_kv(w, state, &kv, n_tokens)
+}
+
+/// Forward pass with episodic memory.
+///
+/// Wraps `ctm_forward`: prepends episodic KV entries to the observation,
+/// runs the faithful forward, then stores the current observation in memory.
+/// When `state.episodic` is None, this is identical to `ctm_forward`.
+pub fn ctm_forward_episodic(
+    w: &CtmWeights,
+    state: &mut CtmState,
+    observation: &[f32],
+    n_tokens: usize,
+    raw_dim: usize,
+) -> CtmOutput {
+    let d_in = w.config.d_input;
+
+    // If episodic memory has entries, build extended observation
+    let has_entries = state.episodic.as_ref().map_or(false, |e| !e.is_empty());
+
+    if has_entries {
+        let ep = state.episodic.as_ref().unwrap();
+        let ep_kv = ep.as_kv();
+        let ep_n = ep.n_tokens();
+
+        // Episodic entries are already in d_input space.
+        // Build a synthetic observation: [episodic_raw || observation]
+        // where episodic_raw is padded/projected to match raw_dim.
+        // Since ctm_forward projects through kv_proj, and episodic entries
+        // are already projected, we need to bypass kv_proj for episodic entries.
+        // The clean way: call the inner MHA directly with a combined KV buffer.
+        //
+        // For now, we project observation normally, build the combined KV,
+        // and call a variant that takes pre-built KV.
+        let mut kv = Vec::with_capacity((ep_n + n_tokens) * d_in);
+        kv.extend_from_slice(&ep_kv);
+        for t in 0..n_tokens {
+            let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
+            let mut projected = w.kv_proj.forward(tok);
+            affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
+            kv.extend_from_slice(&projected);
+        }
+
+        let output = ctm_forward_with_kv(w, state, &kv, ep_n + n_tokens);
+
+        // Store current observation's projected KV into episodic memory
+        let current_kv_start = ep_n * d_in;
+        if let Some(ref mut mem) = state.episodic {
+            for t in 0..n_tokens {
+                let offset = current_kv_start + t * d_in;
+                mem.push(&kv[offset..offset + d_in]);
+            }
+        }
+
+        output
+    } else {
+        // No episodic entries — run faithful forward, then store
+        let output = ctm_forward(w, state, observation, n_tokens, raw_dim);
+
+        if let Some(ref mut mem) = state.episodic {
+            // Project and store current observation
+            for t in 0..n_tokens {
+                let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
+                let mut projected = w.kv_proj.forward(tok);
+                affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
+                mem.push(&projected);
+            }
+        }
+
+        output
+    }
+}
+
+/// Forward pass with pre-built KV buffer (skips kv_proj).
+/// Used by ctm_forward_episodic when episodic entries are already projected.
+fn ctm_forward_with_kv(
+    w: &CtmWeights,
+    state: &mut CtmState,
+    kv: &[f32],
+    n_tokens: usize,
+) -> CtmOutput {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+
     let r_out: Vec<f32> = w.decay_params_out.iter()
         .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
     let r_action: Vec<f32> = w.decay_params_action.iter()
         .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
 
-    // ── 3. Initialize out sync (matches Python line 555) ──
     sync_init(&state.activated, &w.sync_out_left, &w.sync_out_right,
         &mut state.alpha_out, &mut state.beta_out);
 
-    // Action sync starts uninitialized (None in Python)
     let mut alpha_action: Vec<f32> = Vec::new();
     let mut beta_action: Vec<f32> = Vec::new();
     let mut action_initialized = false;
@@ -70,11 +151,8 @@ pub fn ctm_forward(
     let mut exit_cdf = 0.0f32;
     let mut survival = 1.0f32;
 
-    // ── 4. Tick loop ──
     for _tick in 0..k {
-        // (a) Sync for attention (action)
         let sync_action = if !action_initialized {
-            // First tick: initialize (matches Python: decay_alpha_action=None → init)
             sync_init(&state.activated, &w.sync_action_left, &w.sync_action_right,
                 &mut alpha_action, &mut beta_action);
             action_initialized = true;
@@ -84,40 +162,33 @@ pub fn ctm_forward(
                 &mut alpha_action, &mut beta_action, &r_action)
         };
 
-        // (b) Attention: q_proj(sync_action) → attend over KV
         let q = w.q_proj.forward(&sync_action);
         let attn_out = multihead_attention(
-            &q, &kv, n_tokens, d_in, cfg.heads,
+            &q, kv, n_tokens, d_in, cfg.heads,
             &w.mha_in_proj, &w.mha_out_proj,
         );
 
-        // (c) Synapse: concat(attn_out, activated_state) → pre-activations
         let mut pre_syn = Vec::with_capacity(d_in + d);
         pre_syn.extend_from_slice(&attn_out);
         pre_syn.extend_from_slice(&state.activated);
         let pre_act = w.synapse.forward(&pre_syn);
 
-        // (d) Update trace: shift left, append new pre-activations
         for n in 0..d {
             let base = n * m;
             state.trace.copy_within(base + 1..base + m, base);
             state.trace[base + m - 1] = pre_act[n];
         }
 
-        // (e) NLM: trace → activated_state via GLU chain
         state.activated = nlm_forward(&state.trace, &w.nlm_stage1, w.nlm_stage2.as_ref(), d);
 
-        // (f) Sync for output
         let sync_out = sync_update(&state.activated, &w.sync_out_left, &w.sync_out_right,
             &mut state.alpha_out, &mut state.beta_out, &r_out);
 
-        // (g) Prediction + certainty
         let pred = w.output_proj.forward(&sync_out);
         let cert = compute_certainty(&pred);
         predictions.push(pred);
         certainties.push(cert);
 
-        // (h) Exit decision
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let Some(ref gate) = w.exit_gate {
