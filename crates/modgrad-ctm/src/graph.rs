@@ -2887,18 +2887,16 @@ pub fn regional_train_token(
 pub fn regional_train_token_fast(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
-    _ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
 ) -> (f32, usize) {
-    regional_train_token_with_loss(w, grads, _ws, token, target, None)
+    regional_train_token_with_loss(w, grads, token, target, None)
 }
 
 /// Fast training with frozen cerebellum override.
 pub fn regional_train_token_frozen(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
-    _ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
     frozen: &mut dyn crate::cerebellum::FrozenCerebellum,
@@ -2917,7 +2915,6 @@ pub fn regional_train_token_frozen(
 pub fn regional_train_token_with_loss(
     w: &RegionalWeights,
     grads: &mut RegionalGradients,
-    _ws: &mut TrainWorkspace,
     token: usize,
     target: usize,
     loss_fn: Option<&dyn modgrad_traits::LossFn<Target = modgrad_traits::ClassTarget>>,

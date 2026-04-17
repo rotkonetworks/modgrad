@@ -142,6 +142,7 @@ fn test_with_nc(mut nc: NeuralComputer) {
         vec![(100, 50.0)], // 'd' = 100
         0.8,
         None,
+        sys.personalities.len(),
     );
     println!("  Installed reflex: trigger → boost 'd'");
 
@@ -246,7 +247,7 @@ fn test_synthetic() {
 
     // Install reflex
     let trigger: Vec<f32> = (0..8).map(|i| (i as f32 * 0.3).sin()).collect();
-    monarch::inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.9, None);
+    monarch::inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.9, None, sys.personalities.len());
     println!("  Installed reflex targeting token 42");
 
     // Check it fires

@@ -127,7 +127,15 @@ pub fn inject_reflex(
     biases: Vec<(usize, f32)>,
     threshold: f32,
     personality: Option<usize>,
+    num_personalities: usize,
 ) {
+    // Bounds validation: reject reflexes targeting nonexistent personalities.
+    if let Some(id) = personality {
+        if id >= num_personalities {
+            return;
+        }
+    }
+
     state.reflexes.push(ConditionedReflex {
         trigger,
         biases,
@@ -237,9 +245,10 @@ pub fn detect_forced_switch(sys: &PluralSystem) -> bool {
     let curiosity = active.neuromod.curiosity;
     let anxiety = active.neuromod.anxiety;
 
-    // Forced switch signature: high NE without proportional curiosity
-    // Natural high-NE state has proportional curiosity from exploration
-    ne > 0.8 && curiosity < 0.5
+    // Forced switch signature: high NE without proportional curiosity,
+    // or high NE with elevated anxiety (catches forced states where curiosity
+    // was artificially boosted).
+    (ne > 0.8 && curiosity < 0.5) || (ne > 0.8 && anxiety > 0.3)
 }
 
 /// Measure homeostasis drift from partition isolation.
@@ -412,6 +421,7 @@ mod tests {
             vec![(42, 50.0)],
             0.9,
             None,
+            1, // at least one personality exists in tests
         );
 
         // Test with matching hidden state
@@ -444,7 +454,7 @@ mod tests {
     #[test]
     fn deprogram_clears_all() {
         let mut monarch = MonarchState::new();
-        inject_reflex(&mut monarch, vec![1.0; 8], vec![(0, 10.0)], 0.5, None);
+        inject_reflex(&mut monarch, vec![1.0; 8], vec![(0, 10.0)], 0.5, None, 1);
         suppress_tokens(&mut monarch, vec![42], 100.0, None);
         assert!(!monarch.reflexes.is_empty());
         assert!(!monarch.suppressions.is_empty());
@@ -471,7 +481,7 @@ mod tests {
 
         // Install reflex only on personality 0
         let trigger: Vec<f32> = vec![1.0; 8];
-        inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.5, Some(0));
+        inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.5, Some(0), 2);
 
         // Fires for personality 0
         let result = check_reflexes(&monarch, &trigger, 0);
@@ -493,7 +503,7 @@ mod tests {
         // 2. Install conditioning
         let mut monarch = MonarchState::new();
         let trigger: Vec<f32> = (0..8).map(|i| (i as f32 * 0.3).sin()).collect();
-        inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.9, None);
+        inject_reflex(&mut monarch, trigger.clone(), vec![(42, 50.0)], 0.9, None, sys.personalities.len());
 
         // 3. Force switch
         let sys = force_switch(sys, 1);

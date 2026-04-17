@@ -223,3 +223,158 @@ impl CtmConfig {
             ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CtmConfig::default ─────────────────────────────────────
+
+    #[test]
+    fn default_config_has_sane_values() {
+        let c = CtmConfig::default();
+        assert_eq!(c.iterations, 8);
+        assert_eq!(c.d_model, 512);
+        assert_eq!(c.d_input, 128);
+        assert_eq!(c.heads, 4);
+        assert_eq!(c.memory_length, 25);
+        assert_eq!(c.out_dims, 10);
+        assert!(c.deep_nlms);
+        assert!(matches!(c.exit_strategy, ExitStrategy::None));
+    }
+
+    #[test]
+    fn default_config_synapse_in_dim() {
+        let c = CtmConfig::default();
+        assert_eq!(c.synapse_in_dim(), c.d_input + c.d_model);
+    }
+
+    // ── CtmConfig::region ──────────────────────────────────────
+
+    #[test]
+    fn region_sets_d_model_and_d_input() {
+        let c = CtmConfig::region("test", 64, 32, 8, true, 4, ExitStrategy::None);
+        assert_eq!(c.d_model, 64);
+        assert_eq!(c.d_input, 32);
+        assert_eq!(c.memory_length, 8);
+        assert_eq!(c.iterations, 4);
+        assert!(c.deep_nlms);
+    }
+
+    #[test]
+    fn region_out_dims_equals_d_model() {
+        let c = CtmConfig::region("test", 128, 64, 8, false, 4, ExitStrategy::None);
+        assert_eq!(c.out_dims, c.d_model);
+    }
+
+    #[test]
+    fn region_synapse_depth_scales_with_d_model() {
+        // d_model >= 32 => depth 3
+        let big = CtmConfig::region("big", 64, 16, 4, false, 4, ExitStrategy::None);
+        assert_eq!(big.synapse_depth, 3);
+
+        // d_model < 32 => depth 1
+        let small = CtmConfig::region("small", 16, 8, 4, false, 4, ExitStrategy::None);
+        assert_eq!(small.synapse_depth, 1);
+    }
+
+    #[test]
+    fn region_heads_clamp() {
+        // d_input=64 => heads = 64/8 = 8 (clamped to max 8)
+        let c = CtmConfig::region("test", 64, 64, 4, false, 4, ExitStrategy::None);
+        assert_eq!(c.heads, 8);
+
+        // d_input=4 => heads = 1 (below 8 threshold)
+        let c2 = CtmConfig::region("test", 64, 4, 4, false, 4, ExitStrategy::None);
+        assert_eq!(c2.heads, 1);
+    }
+
+    #[test]
+    fn region_deep_nlm_sets_memory_hidden() {
+        let c = CtmConfig::region("test", 64, 32, 8, true, 4, ExitStrategy::None);
+        assert_eq!(c.memory_hidden_dims, 4); // memory_length/2
+
+        let c2 = CtmConfig::region("test", 64, 32, 8, false, 4, ExitStrategy::None);
+        assert_eq!(c2.memory_hidden_dims, 0); // no deep NLMs
+    }
+
+    #[test]
+    fn region_synch_action_capped_at_d_input() {
+        let c = CtmConfig::region("test", 64, 16, 4, false, 4, ExitStrategy::None);
+        assert_eq!(c.n_synch_action, 16); // min(d_model=64, d_input=16)
+    }
+
+    // ── Preset region constructors ─────────────────────────────
+
+    #[test]
+    fn cerebellum_region_is_small() {
+        let c = CtmConfig::cerebellum_region(16, 4);
+        assert_eq!(c.d_model, 8);
+        assert!(!c.deep_nlms);
+        assert_eq!(c.memory_length, 4);
+        assert!(c.exit_strategy.has_gate());
+    }
+
+    #[test]
+    fn hippocampus_region_has_long_memory() {
+        let c = CtmConfig::hippocampus_region(16, 4);
+        assert_eq!(c.memory_length, 16);
+        assert!(c.deep_nlms);
+        assert!(c.exit_strategy.has_gate());
+    }
+
+    #[test]
+    fn input_region_is_fast() {
+        let c = CtmConfig::input_region(32, 4);
+        assert!(!c.deep_nlms);
+        assert_eq!(c.memory_length, 4);
+    }
+
+    // ── ExitStrategy ───────────────────────────────────────────
+
+    #[test]
+    fn exit_strategy_default_is_none() {
+        let e = ExitStrategy::default();
+        assert!(matches!(e, ExitStrategy::None));
+        assert!(!e.has_gate());
+        assert_eq!(e.threshold(), None);
+        assert_eq!(e.beta(), 0.0);
+    }
+
+    #[test]
+    fn certainty_strategy_has_threshold() {
+        let e = ExitStrategy::Certainty { threshold: 0.95 };
+        assert!(!e.has_gate());
+        assert_eq!(e.threshold(), Some(0.95));
+        assert_eq!(e.beta(), 0.0);
+    }
+
+    #[test]
+    fn adaptive_gate_has_gate_and_params() {
+        let e = ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.5 };
+        assert!(e.has_gate());
+        assert_eq!(e.beta(), 0.1);
+        assert_eq!(e.threshold(), Some(0.5));
+    }
+
+    // ── Serde round-trip ───────────────────────────────────────
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let c = CtmConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: CtmConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(c2.d_model, c.d_model);
+        assert_eq!(c2.iterations, c.iterations);
+        assert_eq!(c2.memory_length, c.memory_length);
+    }
+
+    #[test]
+    fn exit_strategy_serde_roundtrip() {
+        let e = ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 };
+        let json = serde_json::to_string(&e).unwrap();
+        let e2: ExitStrategy = serde_json::from_str(&json).unwrap();
+        assert!(e2.has_gate());
+        assert_eq!(e2.beta(), 0.1);
+    }
+}

@@ -1050,7 +1050,7 @@ fn learn(
 
     // ── Learn ──
     let mut grads = RegionalGradients::zeros(&w);
-    let mut workspace = TrainWorkspace::new(&w);
+    let _workspace = TrainWorkspace::new(&w);
     let mut total_tokens = opt.step as u64;
     let mut step = 0u64;
     let mut loss_sum = 0.0f32;
@@ -1094,15 +1094,15 @@ fn learn(
                 #[cfg(feature = "onnx")]
                 {
                     if let Some(ref mut fc) = frozen_cereb {
-                        regional_train_token_frozen(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1], fc)
+                        regional_train_token_frozen(&w, &mut grads, chunk[pos], chunk[pos + 1], fc)
                     } else {
-                        regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                        regional_train_token_fast(&w, &mut grads, chunk[pos], chunk[pos + 1])
                     }
                 }
                 #[cfg(not(feature = "onnx"))]
                 {
                     let _ = &frozen_cereb;
-                    regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                    regional_train_token_fast(&w, &mut grads, chunk[pos], chunk[pos + 1])
                 }
             };
             chunk_loss += loss;

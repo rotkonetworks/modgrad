@@ -213,3 +213,228 @@ impl LossFn for ImaginationLoss {
         (total_loss, d_preds)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: simple logits and certainties for tick sequences.
+    fn make_predictions(logits: &[&[f32]]) -> Vec<Vec<f32>> {
+        logits.iter().map(|l| l.to_vec()).collect()
+    }
+
+    fn uniform_certainties(k: usize) -> Vec<[f32; 2]> {
+        vec![[0.5, 0.5]; k]
+    }
+
+    // ── LastTickCE ──────────────────────────────────────────────
+
+    #[test]
+    fn last_tick_ce_uses_final_tick() {
+        let loss_fn = LastTickCE;
+        // Two ticks, 3 classes, target = 1
+        let preds = make_predictions(&[&[1.0, 0.0, 0.0], &[0.0, 5.0, 0.0]]);
+        let certs = uniform_certainties(2);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+
+        // Loss should be low (correct class has high logit in last tick)
+        assert!(loss < 0.1, "expected low loss, got {loss}");
+        // Gradient on first tick should be zero
+        assert!(grads[0].iter().all(|&g| g == 0.0), "first tick grad should be zero");
+        // Gradient on last tick should be nonzero
+        assert!(grads[1].iter().any(|&g| g != 0.0), "last tick grad should be nonzero");
+    }
+
+    #[test]
+    fn last_tick_ce_single_tick() {
+        let loss_fn = LastTickCE;
+        let preds = make_predictions(&[&[0.0, 0.0, 10.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &2);
+        assert!(loss < 0.01, "correct class should give near-zero loss, got {loss}");
+        assert_eq!(grads.len(), 1);
+    }
+
+    #[test]
+    fn last_tick_ce_empty_predictions() {
+        let loss_fn = LastTickCE;
+        let (loss, grads) = loss_fn.compute(&[], &[], &0);
+        assert_eq!(loss, 0.0);
+        assert!(grads.is_empty());
+    }
+
+    #[test]
+    fn last_tick_ce_wrong_class_high_loss() {
+        let loss_fn = LastTickCE;
+        // Target is class 0 but logits favor class 2
+        let preds = make_predictions(&[&[-5.0, 0.0, 5.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, _) = loss_fn.compute(&preds, &certs, &0);
+        assert!(loss > 5.0, "wrong class should give high loss, got {loss}");
+    }
+
+    // ── CtmLoss ────────────────────────────────────────────────
+
+    #[test]
+    fn ctm_loss_averages_min_and_cert_ticks() {
+        let loss_fn = CtmLoss;
+        // Tick 0: bad, Tick 1: good. Certainty higher on tick 0.
+        let preds = make_predictions(&[&[0.0, 0.0, 0.0], &[0.0, 10.0, 0.0]]);
+        let certs = vec![[0.5, 0.9], [0.5, 0.1]]; // tick 0 more certain
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+
+        // min_tick = 1 (low CE), cert_tick = 0 (high certainty[1])
+        // Loss = avg of CE at tick 1 and CE at tick 0
+        assert!(loss > 0.0);
+        assert_eq!(grads.len(), 2);
+        // Both ticks should have nonzero gradients (one from min, one from cert)
+        assert!(grads[0].iter().any(|&g| g != 0.0));
+        assert!(grads[1].iter().any(|&g| g != 0.0));
+    }
+
+    #[test]
+    fn ctm_loss_empty() {
+        let loss_fn = CtmLoss;
+        let (loss, grads) = loss_fn.compute(&[], &[], &0);
+        assert_eq!(loss, 0.0);
+        assert!(grads.is_empty());
+    }
+
+    // ── ThinkingLoss ───────────────────────────────────────────
+
+    #[test]
+    fn thinking_loss_penalizes_no_improvement() {
+        let loss_fn = ThinkingLoss::default();
+        // All ticks have same logits => no improvement between ticks
+        let preds = make_predictions(&[&[1.0, 0.0], &[1.0, 0.0], &[1.0, 0.0]]);
+        let certs = uniform_certainties(3);
+        let (loss_no_improve, _) = loss_fn.compute(&preds, &certs, &0);
+
+        // Compare: ticks that DO improve
+        let preds_improve = make_predictions(&[&[1.0, 0.0], &[3.0, 0.0], &[5.0, 0.0]]);
+        let (loss_improve, _) = loss_fn.compute(&preds_improve, &certs, &0);
+
+        // No-improvement should have higher total loss due to thinking penalty
+        assert!(
+            loss_no_improve > loss_improve,
+            "no-improvement loss ({loss_no_improve}) should exceed improving loss ({loss_improve})"
+        );
+    }
+
+    #[test]
+    fn thinking_loss_single_tick_no_penalty() {
+        let loss_fn = ThinkingLoss::default();
+        let preds = make_predictions(&[&[0.0, 5.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+        // With single tick, thinking_loss loop (1..k) doesn't run
+        assert!(loss < 0.1);
+        assert_eq!(grads.len(), 1);
+    }
+
+    #[test]
+    fn thinking_loss_empty() {
+        let loss_fn = ThinkingLoss::default();
+        let (loss, grads) = loss_fn.compute(&[], &[], &0);
+        assert_eq!(loss, 0.0);
+        assert!(grads.is_empty());
+    }
+
+    #[test]
+    fn thinking_loss_alpha_scales_penalty() {
+        let preds = make_predictions(&[&[1.0, 0.0], &[1.0, 0.0]]); // no improvement
+        let certs = uniform_certainties(2);
+
+        let low_alpha = ThinkingLoss { alpha: 0.01, min_improvement: 0.01 };
+        let high_alpha = ThinkingLoss { alpha: 1.0, min_improvement: 0.01 };
+
+        let (loss_low, _) = low_alpha.compute(&preds, &certs, &0);
+        let (loss_high, _) = high_alpha.compute(&preds, &certs, &0);
+
+        assert!(loss_high > loss_low, "higher alpha should produce higher loss");
+    }
+
+    // ── ImaginationLoss ────────────────────────────────────────
+
+    #[test]
+    fn imagination_loss_splits_ticks() {
+        // Use zero bonus so imagination doesn't subtract from base loss
+        let loss_fn = ImaginationLoss { imagine_ratio: 0.5, imagination_bonus: 0.0 };
+        // 4 ticks: first 2 = imagination, last 2 = commit
+        let preds = make_predictions(&[
+            &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0],
+            &[0.0, 1.0, 0.0], &[0.0, 2.0, 0.0],
+        ]);
+        let certs = uniform_certainties(4);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+
+        assert!(loss > 0.0, "loss should be positive, got {loss}");
+        assert_eq!(grads.len(), 4);
+        // Imagination ticks (0, 1) should have zero gradient
+        assert!(grads[0].iter().all(|&g| g == 0.0), "imagination tick 0 should have zero grad");
+        assert!(grads[1].iter().all(|&g| g == 0.0), "imagination tick 1 should have zero grad");
+    }
+
+    #[test]
+    fn imagination_loss_bonus_reduces_loss() {
+        // When imagination phase improves predictions, bonus should reduce total loss
+        let with_bonus = ImaginationLoss { imagine_ratio: 0.5, imagination_bonus: 1.0 };
+        let no_bonus = ImaginationLoss { imagine_ratio: 0.5, imagination_bonus: 0.0 };
+
+        // Tick 0 (imagine): bad. Tick 1 (commit): good. => positive improvement
+        let preds = make_predictions(&[&[0.0, 0.0], &[0.0, 5.0]]);
+        let certs = uniform_certainties(2);
+
+        let (loss_bonus, _) = with_bonus.compute(&preds, &certs, &1);
+        let (loss_no_bonus, _) = no_bonus.compute(&preds, &certs, &1);
+
+        assert!(
+            loss_bonus < loss_no_bonus,
+            "imagination bonus should reduce loss: {loss_bonus} < {loss_no_bonus}"
+        );
+    }
+
+    #[test]
+    fn imagination_loss_empty() {
+        let loss_fn = ImaginationLoss::default();
+        let (loss, grads) = loss_fn.compute(&[], &[], &0);
+        assert_eq!(loss, 0.0);
+        assert!(grads.is_empty());
+    }
+
+    #[test]
+    fn imagination_loss_single_tick() {
+        let loss_fn = ImaginationLoss::default();
+        // Single tick: commit_start should be 0 (can't imagine without committing)
+        let preds = make_predictions(&[&[0.0, 5.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+        assert!(loss < 0.1);
+        assert_eq!(grads.len(), 1);
+    }
+
+    // ── NaN / edge case handling ───────────────────────────────
+
+    #[test]
+    fn loss_handles_identical_logits() {
+        // All logits equal => uniform softmax => well-defined CE
+        let loss_fn = LastTickCE;
+        let preds = make_predictions(&[&[0.0, 0.0, 0.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &1);
+        let expected = (3.0f32).ln(); // -ln(1/3)
+        assert!((loss - expected).abs() < 0.01, "expected ~{expected}, got {loss}");
+        assert!(grads[0].iter().all(|g| g.is_finite()));
+    }
+
+    #[test]
+    fn loss_with_extreme_logits() {
+        // Very large logits should not produce NaN/Inf due to softmax stability
+        let loss_fn = LastTickCE;
+        let preds = make_predictions(&[&[1000.0, -1000.0, 0.0]]);
+        let certs = uniform_certainties(1);
+        let (loss, grads) = loss_fn.compute(&preds, &certs, &0);
+        assert!(loss.is_finite(), "loss should be finite, got {loss}");
+        assert!(grads[0].iter().all(|g| g.is_finite()));
+    }
+}

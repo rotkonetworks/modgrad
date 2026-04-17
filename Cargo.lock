@@ -2544,6 +2544,7 @@ dependencies = [
  "modgrad-traits",
  "rayon",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2624,6 +2625,7 @@ dependencies = [
  "modgrad-training",
  "modgrad-traits",
  "modgrad-transformer",
+ "ort",
  "rayon",
  "serde",
  "serde_json",
