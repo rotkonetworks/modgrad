@@ -1116,7 +1116,13 @@ fn learn(
 
     w.print_summary();
 
-    let opt_path = save_path.replace(".bin", ".opt.bin");
+    let opt_path = if save_path.ends_with(".bin") {
+        save_path.replace(".bin", ".opt.bin")
+    } else if save_path.ends_with(".json") {
+        save_path.replace(".json", ".opt.json")
+    } else {
+        format!("{save_path}.opt")
+    };
     let mut opt = if std::path::Path::new(&opt_path).exists() {
         RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
     } else {

@@ -11,7 +11,7 @@
 set -e
 
 CHECKPOINT="train_cereb.bin"
-DATA="isis/runtime/src/small_text.bin"
+DATA="isis/curriculum/parent_curriculum.txt"
 CEREB="/steam/llm/hf_cache/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987/model.safetensors"
 CONTEXT=16
 

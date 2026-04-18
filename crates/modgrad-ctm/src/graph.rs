@@ -880,13 +880,11 @@ pub struct RegionalWeights {
     /// Projection layers for frozen cerebellum (trained even when model is frozen).
     /// Present when cereb_mode != Ctm.
     #[serde(default)]
+    #[serde(skip)]
     pub cereb_projection: Option<crate::cerebellum::CerebProjection>,
 
     /// Learnable blend scale for frozen cerebellum contribution.
-    /// Initialized small (sigmoid(-2) ≈ 0.12) so the cortex isn't overwhelmed
-    /// by random projections early in training. Learns to ramp up as the
-    /// projection layers become useful.
-    #[serde(default)]
+    #[serde(skip)]
     pub cereb_blend_logit: Option<f32>,
 }
 
