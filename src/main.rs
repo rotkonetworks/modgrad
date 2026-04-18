@@ -7,11 +7,9 @@
 use modgrad_ctm::graph::*;
 use modgrad_training::trainer::StepHook;
 use modgrad_runtime::nc_socket;
-use modgrad_runtime::nc_io;
-use modgrad_runtime::curriculum;
 
 use clap::{Parser, Subcommand};
-use std::io::{self, Write, BufRead};
+use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "isis", version, about = "8-region hierarchical CTM — a neural computer")]
@@ -129,6 +127,37 @@ enum Commands {
     },
     /// Show available compute devices
     Devices,
+    /// Train FFN cerebellum (standalone feedforward language model).
+    /// This is phase 1 of the architecture: train language storage first,
+    /// then freeze and layer CTM on top.
+    LearnFfn {
+        #[arg(default_value = "cerebellum.bin")]
+        checkpoint: String,
+        #[arg(required = true)]
+        data: Vec<String>,
+        #[arg(long, default_value = "64")]
+        context: usize,
+        #[arg(long, default_value = "256")]
+        vocab: usize,
+        /// Use GPU for training.
+        #[arg(long)]
+        gpu: bool,
+        /// Small model: ~5M params (sanity check).
+        #[arg(long)]
+        small: bool,
+        /// Medium model: ~50M params.
+        #[arg(long)]
+        medium: bool,
+        /// Large model: ~200M params (default, real language learning).
+        #[arg(long)]
+        large: bool,
+        /// XL model: ~500M params (tight on 8GB VRAM).
+        #[arg(long)]
+        xl: bool,
+        /// Learning rate (defaults by size).
+        #[arg(long)]
+        lr: Option<f32>,
+    },
 }
 
 fn main() {
@@ -174,7 +203,138 @@ fn main() {
         Commands::Devices => {
             show_devices();
         }
+        Commands::LearnFfn { checkpoint, data, context, vocab, gpu, small, medium, large, xl, lr } => {
+            if gpu {
+                modgrad_compute::neuron::enable_gpu();
+                let _ = modgrad_compute::backend::set_backend(
+                    Box::new(modgrad_compute::backend::VramGpuBackend::new(1024))
+                );
+            }
+            learn_ffn(&checkpoint, &data, context, vocab, small, medium, large, xl, lr);
+        }
     }
+}
+
+// ─── FFN Cerebellum Training ──────────────────────────────
+
+fn learn_ffn(
+    save_path: &str,
+    data_paths: &[String],
+    context_len: usize,
+    vocab: usize,
+    small: bool,
+    medium: bool,
+    large: bool,
+    xl: bool,
+    lr_override: Option<f32>,
+) {
+    use modgrad_ctm::ffn::{FfnConfig, FfnWeights, FfnAdamW, FfnGradients, ffn_train_step};
+
+    // Load data
+    let mut all_tokens: Vec<usize> = Vec::new();
+    for path in data_paths {
+        if let Ok(data) = std::fs::read(path) {
+            eprintln!("  + {path} ({} bytes)", data.len());
+            for &b in &data { all_tokens.push(b as usize); }
+        }
+    }
+    if all_tokens.is_empty() {
+        eprintln!("No data found.");
+        return;
+    }
+    eprintln!("Data: {} tokens, vocab: {}", all_tokens.len(), vocab);
+
+    // Model size
+    let cfg = if xl {
+        FfnConfig::xl(vocab)
+    } else if small {
+        FfnConfig::small(vocab)
+    } else if medium {
+        FfnConfig::medium(vocab)
+    } else {
+        // Default: large (200M params — real language learning)
+        let _ = large;
+        FfnConfig::large(vocab)
+    };
+
+    let mut w = if std::path::Path::new(save_path).exists() {
+        eprintln!("Loading {save_path}...");
+        FfnWeights::load(save_path).expect("failed to load")
+    } else {
+        eprintln!("Creating FFN cerebellum...");
+        FfnWeights::new(cfg)
+    };
+    w.print_summary();
+
+    let opt_path = save_path.replace(".bin", ".opt.bin").replace(".json", ".opt.json");
+    let lr = lr_override.unwrap_or_else(|| {
+        if w.n_params() > 100_000_000 { 1e-4 }
+        else if w.n_params() > 20_000_000 { 3e-4 }
+        else { 1e-3 }
+    });
+
+    let mut opt = if std::path::Path::new(&opt_path).exists() {
+        FfnAdamW::load(&opt_path).unwrap_or_else(|_| FfnAdamW::new(&w).with_lr(lr))
+    } else {
+        FfnAdamW::new(&w).with_lr(lr)
+    };
+
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nSaving...");
+        r.store(false, std::sync::atomic::Ordering::SeqCst);
+    }).ok();
+
+    let mut grads = FfnGradients::zeros(&w);
+    let mut step = 0u64;
+    let mut loss_sum = 0.0f32;
+    let mut acc_sum = 0.0f32;
+    let n_data = all_tokens.len();
+    let mut offset = 0usize;
+
+    eprintln!("\nTraining FFN... (lr={:.1e}, Ctrl+C to save and stop)\n", lr);
+
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        let end = (offset + context_len + 1).min(n_data);
+        if end - offset < 2 {
+            offset = 0;
+            continue;
+        }
+        let chunk = &all_tokens[offset..end];
+
+        let (loss, acc) = ffn_train_step(&mut w, &mut opt, &mut grads, chunk);
+
+        loss_sum += loss;
+        acc_sum += acc;
+        step += 1;
+        offset += context_len;
+
+        if step % 100 == 0 {
+            let avg_loss = loss_sum / 100.0;
+            let avg_acc = acc_sum / 100.0;
+            let progress = (offset as f64 / n_data as f64 * 100.0).min(100.0);
+            eprintln!("step {step:6} | loss {avg_loss:.3} | acc {:.1}% | data {progress:.0}%",
+                avg_acc * 100.0);
+            loss_sum = 0.0;
+            acc_sum = 0.0;
+        }
+
+        if step % 5000 == 0 {
+            w.save(save_path).expect("save failed");
+            opt.save(&opt_path).expect("opt save failed");
+            eprintln!("  [saved at step {step}]");
+        }
+
+        if offset >= n_data {
+            offset = 0;
+            eprintln!("  --- epoch complete ---");
+        }
+    }
+
+    w.save(save_path).expect("save failed");
+    opt.save(&opt_path).expect("opt save failed");
+    eprintln!("\nSaved to {save_path}");
 }
 
 // ─── Generate ─────────────────────────────────────────────
@@ -227,7 +387,7 @@ fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: 
 
     // Feed prompt through NC + cerebellum
     if let Some(ref mut fc) = frozen {
-        use modgrad_ctm::cerebellum::{FrozenCerebellum, blended_hidden_at};
+        use modgrad_ctm::cerebellum::blended_hidden_at;
         let token_ids: Vec<i64> = prompt_bytes.iter().map(|&b| b as i64).collect();
         let cache = fc.encode_context_layers(&token_ids);
 
@@ -416,11 +576,9 @@ fn generate_multimodal_pairs() -> Vec<Vec<usize>> {
     // graph types imported at crate level
     use modgrad_codec::vqvae::VqVae;
     use modgrad_codec::audio_codec::AudioCodec;
-    use modgrad_compute::neuron::SimpleRng;
 
     let vae = VqVae::new(4096, 64);
     let audio_codec = AudioCodec::new(4096, 64, 24000);
-    let mut rng = SimpleRng::new(1337);
     let mut pairs = Vec::new();
 
     // ── Text → Image pairs (synthetic "images" with CIFAR-10 class names) ──
@@ -657,7 +815,7 @@ fn develop_staged(
     };
 
     // Helper: update debug view during training
-    let update_train_debug = |w: &RegionalWeights, step: usize, loss: f32,
+    let update_train_debug = |w: &RegionalWeights, step: usize, _loss: f32,
                                debug: &Option<(std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>,)>| {
         if let Some((view,)) = debug {
             if step % 10 == 0 { // update every 10 steps to avoid overhead
@@ -1199,7 +1357,6 @@ fn learn(
 
         // Encode full context through frozen cerebellum ONCE (amortized)
         let cereb_cache = if let Some(ref mut fc) = frozen_cereb {
-            use modgrad_ctm::cerebellum::FrozenCerebellum;
             let token_ids: Vec<i64> = chunk.iter().map(|&t| t as i64).collect();
             Some(fc.encode_context_layers(&token_ids))
         } else {
@@ -1612,7 +1769,7 @@ fn flush_text(buf: &mut Vec<u8>) {
 /// Load videos from a directory of subdirectories.
 /// Each subdirectory = one video, containing frame files + optional audio.wav.
 fn load_video_tokens(path: &str, _fps: f32) -> Vec<Vec<usize>> {
-    let mut result = Vec::new();
+    let result: Vec<Vec<usize>> = Vec::new();
 
     // Each subdirectory = one video with frame files + optional audio.wav
     // TODO: implement with modgrad_codec when needed

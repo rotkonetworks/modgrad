@@ -13,6 +13,7 @@ pub mod weights;
 pub mod forward;
 pub mod train;
 pub mod loss;
+pub mod ffn;
 pub mod graph;
 pub mod memory;
 pub mod bio;

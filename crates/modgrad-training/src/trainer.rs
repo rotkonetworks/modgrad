@@ -5,7 +5,7 @@
 //! or any specific architecture — it operates through the Brain trait.
 
 use modgrad_traits::{Brain, LossFn};
-use super::optim::{Optimizer, Scheduler};
+use super::optim::Scheduler;
 use super::checkpoint::CheckpointManager;
 
 /// Result of one training step.

@@ -204,7 +204,7 @@ pub fn start_debug_server(
 
             let nc = nc.clone();
             let control_tx = control_tx.clone();
-            let event_rx_proxy = event_rx; // single consumer — last client wins
+            let _event_rx_proxy = event_rx; // single consumer — last client wins
             // For simplicity: handle one client at a time in this thread.
             // A production server would spawn per-client threads.
             handle_client(&mut stream, &nc, &control_tx, &event_tx_clone);

@@ -21,7 +21,7 @@ use modgrad_compute::neuron::{Linear, SimpleRng};
 use crate::config::CtmConfig;
 use crate::weights::{CtmWeights, CtmState};
 use crate::forward::ctm_forward;
-use crate::train::{Ctm, CtmCache, CtmGradients, RegionBackwardResult, backward_from_activated};
+use crate::train::{Ctm, CtmCache, backward_from_activated};
 use modgrad_traits::{Brain, LossFn, TokenInput};
 
 // ─── Unified token space ──────────────────────────────────
@@ -1215,11 +1215,11 @@ pub fn regional_forward(
             );
             // Routed inputs replace connection-based observations.
             // Regions that need raw observation get it added.
-            let mut obs = routed;
+            let obs = routed;
             for conn in &cfg.connections {
                 if conn.receives_observation {
                     // Add observation signal to regions that need it
-                    for v in obs_projected.iter() {
+                    for _v in obs_projected.iter() {
                         // obs[conn.to] already has routed context; observation
                         // was part of global sync — no separate concat needed
                     }
@@ -1362,8 +1362,10 @@ pub fn frozen_cerebellum_forward(
 /// Cache for one outer tick — stores everything needed for backward.
 pub struct OuterTickCache {
     /// Per-region: the observation fed to ctm_forward.
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     region_obs: Vec<Vec<f32>>,
     /// Per-region: activated state AFTER forward (= region output).
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     region_activated: Vec<Vec<f32>>,
     /// Per-region: SDK CTM cache for inner-tick BPTT.
     region_caches: Vec<Option<CtmCache>>,
@@ -1557,7 +1559,6 @@ pub struct TrainWorkspace {
 impl TrainWorkspace {
     pub fn new(w: &RegionalWeights) -> Self {
         let cfg = &w.config;
-        let n_regions = cfg.regions.len();
         let n_sync = cfg.n_global_sync;
         let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
 
@@ -1604,19 +1605,6 @@ impl TrainWorkspace {
     }
 }
 
-/// Cross-entropy loss + gradient w.r.t. logits.
-fn cross_entropy_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
-    let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let exp_s: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
-    let sum: f32 = exp_s.iter().sum();
-    let mut softmax: Vec<f32> = exp_s.iter().map(|&e| e / sum).collect();
-    let loss = -(softmax.get(target).copied().unwrap_or(1e-8).max(1e-8)).ln();
-    if target < softmax.len() {
-        softmax[target] -= 1.0;
-    }
-    (loss, softmax)
-}
-
 /// Compute certainty (1 - normalized_entropy) from logits.
 fn compute_certainty(logits: &[f32]) -> f32 {
     let n = logits.len();
@@ -1629,45 +1617,6 @@ fn compute_certainty(logits: &[f32]) -> f32 {
         .map(|&e| { let p = e / sum; if p > 1e-10 { -p * p.ln() } else { 0.0 } })
         .sum();
     if max_ent > 0.0 { 1.0 - (ent / max_ent).clamp(0.0, 1.0) } else { 1.0 }
-}
-
-/// CTM loss: (min_tick_CE + most_certain_tick_CE) / 2.
-/// Returns (loss, d_logits_per_tick).
-fn ctm_loss_regional(
-    predictions: &[Vec<f32>],
-    target: usize,
-) -> (f32, Vec<Vec<f32>>) {
-    let k = predictions.len();
-    if k == 0 { return (0.0, Vec::new()); }
-
-    let losses_and_grads: Vec<(f32, Vec<f32>)> = predictions.iter()
-        .map(|p| cross_entropy_grad(p, target)).collect();
-    let certainties: Vec<f32> = predictions.iter()
-        .map(|p| compute_certainty(p)).collect();
-
-    // Tick with minimum loss
-    let min_tick = (0..k).min_by(|&a, &b|
-        losses_and_grads[a].0.partial_cmp(&losses_and_grads[b].0).unwrap_or(std::cmp::Ordering::Equal)
-    ).unwrap_or(k - 1);
-
-    // Tick with highest certainty
-    let cert_tick = (0..k).max_by(|&a, &b|
-        certainties[a].partial_cmp(&certainties[b]).unwrap_or(std::cmp::Ordering::Equal)
-    ).unwrap_or(k - 1);
-
-    let loss = (losses_and_grads[min_tick].0 + losses_and_grads[cert_tick].0) / 2.0;
-
-    // Gradients: half from min_tick, half from cert_tick
-    let out_dims = predictions[0].len();
-    let mut d_preds: Vec<Vec<f32>> = vec![vec![0.0; out_dims]; k];
-    for (j, g) in losses_and_grads[min_tick].1.iter().enumerate() {
-        d_preds[min_tick][j] += 0.5 * g;
-    }
-    for (j, g) in losses_and_grads[cert_tick].1.iter().enumerate() {
-        d_preds[cert_tick][j] += 0.5 * g;
-    }
-
-    (loss, d_preds)
 }
 
 // ── Auxiliary bio-inspired losses ──────────────────────────
@@ -1788,7 +1737,6 @@ pub fn accumulate_aux_gradients(
                     let predicted = head.forward(cereb_out);
                     let n = predicted.len().min(observation.len());
                     let in_dim = cereb_out.len();
-                    let out_dim = predicted.len();
 
                     for o in 0..n {
                         let d_pred = 2.0 * (predicted[o] - observation[o]) / n as f32 * weight;
@@ -2037,7 +1985,6 @@ pub fn regional_train_step(
     }
 
     // ── Loss: imagination (default) ──
-    let n_ticks = tick_caches.len();
     let predictions: Vec<Vec<f32>> = tick_caches.iter()
         .map(|tc| w.output_proj.forward(&tc.global_sync))
         .collect();
@@ -2613,7 +2560,7 @@ fn regional_train_step_inner(
                 .unwrap_or(0.1);
             let d_cereb = &d_region_activated[cereb_idx];
             // Scale by blend since forward multiplied by blend
-            let mut d_cortex_scaled: Vec<f32> = d_cereb.iter().map(|&d| d * blend).collect();
+            let d_cortex_scaled: Vec<f32> = d_cereb.iter().map(|&d| d * blend).collect();
             proj.backward_out(hidden, &d_cortex_scaled, dw, db);
 
             // Gradient for blend logit: d_loss/d_logit = d_loss/d_blend * d_blend/d_logit
@@ -3728,7 +3675,6 @@ impl modgrad_traits::Brain for RegionalBrain {
     ) -> RegionalGradients {
         let cfg = &weights.config;
         let n_regions = cfg.regions.len();
-        let obs_dim = cfg.raw_obs_dim;
         let mut grads = RegionalGradients::zeros(weights);
 
         let add = |d: &mut [f32], s: &[f32]| {

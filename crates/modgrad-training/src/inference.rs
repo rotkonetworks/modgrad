@@ -279,7 +279,7 @@ mod tests {
     fn speculative_matches_normal() {
         // Verifier: deterministic sequence 3,1,4,1,5
         let target = [3usize, 1, 4, 1, 5];
-        let mut v_pos = 0;
+        let mut v_pos;
 
         let make_logits = |token: usize| -> Vec<f32> {
             let mut l = vec![0.0; 6];

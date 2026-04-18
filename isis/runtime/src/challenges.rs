@@ -4,7 +4,7 @@
 //! This module provides isis-specific challenges, stages, and the training loop.
 
 use modgrad_ctm::graph::*;
-use modgrad_ctm::curriculum::{self, ChallengeResult, TestCase};
+use modgrad_ctm::curriculum::ChallengeResult;
 use modgrad_training::trainer::StepHook;
 
 /// One stage of isis curriculum.

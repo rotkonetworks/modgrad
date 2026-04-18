@@ -19,7 +19,7 @@ use modgrad_compute::neuron::Linear;
 use modgrad_ctm::weights::{CtmWeights, CtmState};
 use modgrad_ctm::forward::ctm_forward;
 
-use super::regional::{RegionalConfig, RegionalWeights, Connection};
+use super::regional::{RegionalConfig, RegionalWeights};
 
 // ─── Published state ───────────────────────────────────────
 
@@ -75,6 +75,7 @@ pub struct ActorBrain {
     /// Collator thread.
     collator: Option<JoinHandle<()>>,
     /// Config for reading.
+    #[allow(dead_code)] // retained so ActorBrain can serve config queries later
     config: RegionalConfig,
 }
 
@@ -264,7 +265,7 @@ fn region_loop(
     running: Arc<AtomicBool>,
     ticks_per_step: usize,
     receives_observation: bool,
-    raw_obs_dim: usize,
+    _raw_obs_dim: usize,
 ) {
     let mut state = CtmState::new(weights);
     let d_input = weights.config.d_input;
