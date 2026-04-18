@@ -63,7 +63,9 @@ pub struct StreamEngine {
     scratch_b_cap: usize,
     /// Per-kernel args buffers for chained dispatch (avoids overwriting
     /// args while previous kernel is still reading them).
-    chain_args: [Option<GpuBuffer>; 8],
+    /// Per-dispatch kernarg slots. Enough to enqueue one full-FFN AdamW step
+    /// (embed + 12 layers × 8 tensors + 3 final = up to 100) plus headroom.
+    chain_args: [Option<GpuBuffer>; 128],
 }
 
 impl StreamEngine {
@@ -79,7 +81,7 @@ impl StreamEngine {
             args_buf: None,
             scratch_a: None, scratch_a_cap: 0,
             scratch_b: None, scratch_b_cap: 0,
-            chain_args: [None, None, None, None, None, None, None, None],
+            chain_args: [const { None }; 128],
             cached_matvec_tiled: None,
             cached_matvec_t_tiled: None,
             cached_superlinear: None,
@@ -1766,13 +1768,71 @@ impl StreamEngine {
     /// # Returns
     /// `true` on success. `false` on kernel not loaded, args buffer alloc
     /// failure, or submit_wait timeout.
+    /// Enqueue adamw_zerocopy without submitting. Uses `args_slot` of chain_args
+    /// so callers can batch multiple enqueues and do one submit_wait at the end.
+    /// Returns false on kernel resolve / args alloc failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_enqueue(
+        &mut self, dev: &mut HsaDevice, args_slot: usize,
+        w_va: u64, g_va: u64, m_va: u64, v_va: u64, n: usize,
+        lr: f32, beta1: f32, beta2: f32, eps: f32,
+        weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
+    ) -> bool {
+        if args_slot >= self.chain_args.len() {
+            eprintln!("adamw_enqueue: args_slot {} >= {}", args_slot, self.chain_args.len());
+            return false;
+        }
+        if !self.ensure_chain_args(args_slot, dev) {
+            eprintln!("adamw_enqueue: ensure_chain_args({}) failed", args_slot);
+            return false;
+        }
+        let mut kargs = [0u8; 64];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&g_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&m_va.to_le_bytes());
+        kargs[24..32].copy_from_slice(&v_va.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(n as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&lr.to_le_bytes());
+        kargs[40..44].copy_from_slice(&beta1.to_le_bytes());
+        kargs[44..48].copy_from_slice(&beta2.to_le_bytes());
+        kargs[48..52].copy_from_slice(&eps.to_le_bytes());
+        kargs[52..56].copy_from_slice(&weight_decay.to_le_bytes());
+        kargs[56..60].copy_from_slice(&bc1_inv.to_le_bytes());
+        kargs[60..64].copy_from_slice(&bc2_inv.to_le_bytes());
+        let args = self.chain_args[args_slot].as_ref().unwrap();
+        args.write(0, &kargs[..64]);
+
+        if self.cached_adamw.is_none() {
+            self.cached_adamw = dev.resolve_kernel("adamw");
+        }
+        let nwg = (n as u32 + 255) / 256;
+        match &self.cached_adamw {
+            Some(entry) => dev.dispatch_enqueue_resolved(entry, args, [nwg, 1, 1], [256, 1, 1]),
+            None => {
+                eprintln!("adamw_enqueue: kernel 'adamw' not loaded");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Flush any pending enqueued dispatches — cache writeback + submit + wait.
+    /// One full round-trip regardless of how many dispatches have been queued.
+    pub fn flush_queue(&mut self, dev: &mut HsaDevice, timeout_ms: u32) -> bool {
+        dev.queue.cache_wb();
+        dev.submit_wait(timeout_ms)
+    }
+
     pub fn adamw_zerocopy(
         &mut self, dev: &mut HsaDevice,
         w_va: u64, g_va: u64, m_va: u64, v_va: u64, n: usize,
         lr: f32, beta1: f32, beta2: f32, eps: f32,
         weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
     ) -> bool {
-        if !self.ensure_chain_args(0, dev) { return false; }
+        if !self.ensure_chain_args(0, dev) {
+            eprintln!("adamw_zerocopy: ensure_chain_args failed");
+            return false;
+        }
 
         let mut kargs = [0u8; 64];
         kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
@@ -1796,10 +1856,17 @@ impl StreamEngine {
         let nwg = (n as u32 + 255) / 256;
         match &self.cached_adamw {
             Some(entry) => dev.dispatch_enqueue_resolved(entry, args, [nwg, 1, 1], [256, 1, 1]),
-            None => return false,
+            None => {
+                eprintln!("adamw_zerocopy: cached_adamw kernel entry is None");
+                return false;
+            }
         }
         dev.queue.cache_wb();
-        dev.submit_wait(10_000)
+        if !dev.submit_wait(10_000) {
+            eprintln!("adamw_zerocopy: submit_wait timed out (n={}, nwg={})", n, nwg);
+            return false;
+        }
+        true
     }
 
     /// AdamW optimizer: update weights, moments, and zero grads on GPU.

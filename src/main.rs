@@ -210,7 +210,7 @@ fn main() {
                     Box::new(modgrad_compute::backend::VramGpuBackend::new(1024))
                 );
             }
-            learn_ffn(&checkpoint, &data, context, vocab, small, medium, large, xl, lr);
+            learn_ffn(&checkpoint, &data, context, vocab, gpu, small, medium, large, xl, lr);
         }
     }
 }
@@ -222,6 +222,7 @@ fn learn_ffn(
     data_paths: &[String],
     context_len: usize,
     vocab: usize,
+    gpu: bool,
     small: bool,
     medium: bool,
     large: bool,
@@ -278,6 +279,14 @@ fn learn_ffn(
     } else {
         FfnAdamW::new(&w).with_lr(lr)
     };
+
+    // NOTE: VRAM-resident AdamW path is available via opt.enable_vram(&w)
+    // but turns out to be net-slower than the cache-based path because
+    // forward/backward still use prepare_weights' own VRAM cache — every
+    // step we then pay 2× weight-sized BAR transfers to keep the mirror
+    // and the cache in sync. Leaving it off until try_matmul can dispatch
+    // on external VA pointers (bypassing the cache).
+    let _ = gpu;  // silences unused-warning on non-GPU builds
 
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = running.clone();

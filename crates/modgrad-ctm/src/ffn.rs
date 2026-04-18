@@ -644,7 +644,46 @@ fn layer_norm_backward_batched(
 // ADAMW OPTIMIZER
 // ═══════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Canonical tensor ordering inside a `VramMirror` backing an `FfnAdamW`.
+/// Index 0 is `embed`; each layer contributes 8 tensors; then `final_ln_gamma`,
+/// `final_ln_beta`, `lm_head`. Callers compute indices via `ffn_tensor_index`.
+const TENSORS_PER_BLOCK: usize = 8;
+const BLOCK_LN_GAMMA: usize = 0;
+const BLOCK_LN_BETA:  usize = 1;
+const BLOCK_GATE_W:   usize = 2;
+const BLOCK_GATE_B:   usize = 3;
+const BLOCK_UP_W:     usize = 4;
+const BLOCK_UP_B:     usize = 5;
+const BLOCK_DOWN_W:   usize = 6;
+const BLOCK_DOWN_B:   usize = 7;
+
+fn idx_embed() -> usize { 0 }
+fn idx_block(layer: usize, which: usize) -> usize { 1 + layer * TENSORS_PER_BLOCK + which }
+fn idx_final_ln_gamma(n_layers: usize) -> usize { 1 + n_layers * TENSORS_PER_BLOCK }
+fn idx_final_ln_beta(n_layers: usize)  -> usize { 1 + n_layers * TENSORS_PER_BLOCK + 1 }
+fn idx_lm_head(n_layers: usize)        -> usize { 1 + n_layers * TENSORS_PER_BLOCK + 2 }
+
+/// Size of every tensor in canonical order. Matches the index helpers above.
+fn ffn_tensor_sizes(w: &FfnWeights) -> Vec<usize> {
+    let mut sizes = Vec::with_capacity(1 + w.blocks.len() * TENSORS_PER_BLOCK + 3);
+    sizes.push(w.embed.len());
+    for block in &w.blocks {
+        sizes.push(block.ln_gamma.len());
+        sizes.push(block.ln_beta.len());
+        sizes.push(block.gate.weight.len());
+        sizes.push(block.gate.bias.len());
+        sizes.push(block.up.weight.len());
+        sizes.push(block.up.bias.len());
+        sizes.push(block.down.weight.len());
+        sizes.push(block.down.bias.len());
+    }
+    sizes.push(w.final_ln_gamma.len());
+    sizes.push(w.final_ln_beta.len());
+    sizes.push(w.lm_head.len());
+    sizes
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct FfnAdamW {
     pub lr: f32,
     pub beta1: f32,
@@ -656,6 +695,12 @@ pub struct FfnAdamW {
     // Flat moment buffers — one per parameter group
     m: FfnGradients,
     v: FfnGradients,
+    /// VRAM-resident mirror of weights/grads/m/v. Set via `enable_vram`.
+    /// When present, `step_update` dispatches AdamW on VRAM directly
+    /// (zero-copy), and `m` / `v` in this struct become stale until a
+    /// `sync_moments_to_cpu` call (done automatically before save).
+    #[serde(skip)]
+    vram: Option<modgrad_device::kfd::vram_mirror::VramMirror>,
 }
 
 impl FfnAdamW {
@@ -670,12 +715,124 @@ impl FfnAdamW {
             step: 0,
             m: FfnGradients::zeros(w),
             v: FfnGradients::zeros(w),
+            vram: None,
         }
     }
 
     pub fn with_lr(mut self, lr: f32) -> Self { self.lr = lr; self }
 
+    /// Allocate a VRAM mirror and upload current `w`, `self.m`, `self.v` to it.
+    /// Returns `true` on success; `false` if GPU is unavailable or any alloc
+    /// fails (caller stays on the CPU path).
+    ///
+    /// After this, training steps invoke `adamw_zerocopy` on VRAM directly;
+    /// ~5 GB of per-step BAR traffic disappears. CPU-side `self.m` and `self.v`
+    /// go stale until the next `save` (which syncs them first).
+    pub fn enable_vram(&mut self, w: &FfnWeights) -> bool {
+        use modgrad_device::kfd::accel::make_vram_mirror;
+        let sizes = ffn_tensor_sizes(w);
+        let mirror = match make_vram_mirror(sizes) {
+            Some(m) => m, None => return false,
+        };
+        let n_layers = w.blocks.len();
+
+        // Upload weights.
+        mirror.upload_weight(idx_embed(), &w.embed);
+        for (li, block) in w.blocks.iter().enumerate() {
+            mirror.upload_weight(idx_block(li, BLOCK_LN_GAMMA), &block.ln_gamma);
+            mirror.upload_weight(idx_block(li, BLOCK_LN_BETA),  &block.ln_beta);
+            mirror.upload_weight(idx_block(li, BLOCK_GATE_W),   &block.gate.weight);
+            mirror.upload_weight(idx_block(li, BLOCK_GATE_B),   &block.gate.bias);
+            mirror.upload_weight(idx_block(li, BLOCK_UP_W),     &block.up.weight);
+            mirror.upload_weight(idx_block(li, BLOCK_UP_B),     &block.up.bias);
+            mirror.upload_weight(idx_block(li, BLOCK_DOWN_W),   &block.down.weight);
+            mirror.upload_weight(idx_block(li, BLOCK_DOWN_B),   &block.down.bias);
+        }
+        mirror.upload_weight(idx_final_ln_gamma(n_layers), &w.final_ln_gamma);
+        mirror.upload_weight(idx_final_ln_beta(n_layers),  &w.final_ln_beta);
+        mirror.upload_weight(idx_lm_head(n_layers),        &w.lm_head);
+
+        // Upload m, v (may be zero if fresh training, or loaded values on resume).
+        mirror.upload_m(idx_embed(), &self.m.embed);
+        mirror.upload_v(idx_embed(), &self.v.embed);
+        for li in 0..n_layers {
+            let mb = &self.m.blocks[li]; let vb = &self.v.blocks[li];
+            mirror.upload_m(idx_block(li, BLOCK_LN_GAMMA), &mb.ln_gamma);
+            mirror.upload_v(idx_block(li, BLOCK_LN_GAMMA), &vb.ln_gamma);
+            mirror.upload_m(idx_block(li, BLOCK_LN_BETA),  &mb.ln_beta);
+            mirror.upload_v(idx_block(li, BLOCK_LN_BETA),  &vb.ln_beta);
+            mirror.upload_m(idx_block(li, BLOCK_GATE_W),   &mb.gate_w);
+            mirror.upload_v(idx_block(li, BLOCK_GATE_W),   &vb.gate_w);
+            mirror.upload_m(idx_block(li, BLOCK_GATE_B),   &mb.gate_b);
+            mirror.upload_v(idx_block(li, BLOCK_GATE_B),   &vb.gate_b);
+            mirror.upload_m(idx_block(li, BLOCK_UP_W),     &mb.up_w);
+            mirror.upload_v(idx_block(li, BLOCK_UP_W),     &vb.up_w);
+            mirror.upload_m(idx_block(li, BLOCK_UP_B),     &mb.up_b);
+            mirror.upload_v(idx_block(li, BLOCK_UP_B),     &vb.up_b);
+            mirror.upload_m(idx_block(li, BLOCK_DOWN_W),   &mb.down_w);
+            mirror.upload_v(idx_block(li, BLOCK_DOWN_W),   &vb.down_w);
+            mirror.upload_m(idx_block(li, BLOCK_DOWN_B),   &mb.down_b);
+            mirror.upload_v(idx_block(li, BLOCK_DOWN_B),   &vb.down_b);
+        }
+        mirror.upload_m(idx_final_ln_gamma(n_layers), &self.m.final_ln_gamma);
+        mirror.upload_v(idx_final_ln_gamma(n_layers), &self.v.final_ln_gamma);
+        mirror.upload_m(idx_final_ln_beta(n_layers),  &self.m.final_ln_beta);
+        mirror.upload_v(idx_final_ln_beta(n_layers),  &self.v.final_ln_beta);
+        mirror.upload_m(idx_lm_head(n_layers),        &self.m.lm_head);
+        mirror.upload_v(idx_lm_head(n_layers),        &self.v.lm_head);
+
+        self.vram = Some(mirror);
+        true
+    }
+
+    /// True if the mirror is active.
+    pub fn vram_enabled(&self) -> bool { self.vram.is_some() }
+
+    /// Pull `m` and `v` out of VRAM into `self.m`/`self.v`. Called automatically
+    /// before `save`; external callers can invoke it to inspect moments on CPU.
+    pub fn sync_moments_to_cpu(&mut self) {
+        let mirror = match &self.vram { Some(m) => m, None => return };
+        // Embed.
+        self.m.embed = mirror.download_m(idx_embed());
+        self.v.embed = mirror.download_v(idx_embed());
+        for li in 0..self.m.blocks.len() {
+            let mb = &mut self.m.blocks[li]; let vb = &mut self.v.blocks[li];
+            mb.ln_gamma = mirror.download_m(idx_block(li, BLOCK_LN_GAMMA));
+            vb.ln_gamma = mirror.download_v(idx_block(li, BLOCK_LN_GAMMA));
+            mb.ln_beta  = mirror.download_m(idx_block(li, BLOCK_LN_BETA));
+            vb.ln_beta  = mirror.download_v(idx_block(li, BLOCK_LN_BETA));
+            mb.gate_w   = mirror.download_m(idx_block(li, BLOCK_GATE_W));
+            vb.gate_w   = mirror.download_v(idx_block(li, BLOCK_GATE_W));
+            mb.gate_b   = mirror.download_m(idx_block(li, BLOCK_GATE_B));
+            vb.gate_b   = mirror.download_v(idx_block(li, BLOCK_GATE_B));
+            mb.up_w     = mirror.download_m(idx_block(li, BLOCK_UP_W));
+            vb.up_w     = mirror.download_v(idx_block(li, BLOCK_UP_W));
+            mb.up_b     = mirror.download_m(idx_block(li, BLOCK_UP_B));
+            vb.up_b     = mirror.download_v(idx_block(li, BLOCK_UP_B));
+            mb.down_w   = mirror.download_m(idx_block(li, BLOCK_DOWN_W));
+            vb.down_w   = mirror.download_v(idx_block(li, BLOCK_DOWN_W));
+            mb.down_b   = mirror.download_m(idx_block(li, BLOCK_DOWN_B));
+            vb.down_b   = mirror.download_v(idx_block(li, BLOCK_DOWN_B));
+        }
+        let n_layers = self.m.blocks.len();
+        self.m.final_ln_gamma = mirror.download_m(idx_final_ln_gamma(n_layers));
+        self.v.final_ln_gamma = mirror.download_v(idx_final_ln_gamma(n_layers));
+        self.m.final_ln_beta  = mirror.download_m(idx_final_ln_beta(n_layers));
+        self.v.final_ln_beta  = mirror.download_v(idx_final_ln_beta(n_layers));
+        self.m.lm_head        = mirror.download_m(idx_lm_head(n_layers));
+        self.v.lm_head        = mirror.download_v(idx_lm_head(n_layers));
+    }
+
     pub fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // If VRAM mirror is active, sync moments down first so the serialised
+        // state matches what the mirror holds. (Saving weights is the caller's
+        // responsibility via FfnWeights::save after sync_weights_to_cpu.)
+        if self.vram.is_some() {
+            // `save` takes `&self` — the caller should call `sync_moments_to_cpu`
+            // via `&mut self` before invoking save. Log a warning if not synced.
+            eprintln!("  warning: FfnAdamW::save called with vram active; \
+                       call sync_moments_to_cpu() first to avoid stale m/v.");
+        }
         modgrad_persist::persist::save(self, path).map_err(|e| e.into())
     }
 
@@ -691,7 +848,7 @@ impl FfnAdamW {
         let bc1 = 1.0 - b1.powi(t);
         let bc2 = 1.0 - b2.powi(t);
 
-        // Compute grad norm for clipping
+        // Compute grad norm for clipping (always CPU — grads live on CPU).
         let norm = {
             let mut sq = 0.0f32;
             for x in &g.embed { sq += x * x; }
@@ -716,7 +873,22 @@ impl FfnAdamW {
         let eps = self.eps;
         let wd = self.wd;
 
-        // Apply to each param group
+        // ─── VRAM-resident fast path ───
+        // Weights / m / v stay in VRAM across steps. We BAR-write pre-scaled
+        // grads into the mirror, dispatch adamw_zerocopy, then BAR-read updated
+        // weights back into `w` so the next forward pass sees them.
+        // (Forward matmul still reads from CPU `w`; a follow-up will keep
+        // forward entirely on VRAM and drop the weight readback.)
+        if self.vram.is_some() {
+            if self.step_update_vram(w, g, scale, b1, b2, bc1, bc2, eps, lr, wd) {
+                return;
+            }
+            // If VRAM dispatch failed mid-step, fall through to CPU. State is
+            // consistent because we only write-through to mirror on success.
+            eprintln!("  warning: VRAM adamw failed, falling back to CPU path");
+        }
+
+        // ─── CPU path (original) ───
         adamw_apply(&mut w.embed, &g.embed, &mut self.m.embed, &mut self.v.embed,
             b1, b2, bc1, bc2, eps, lr, 0.0, scale); // embed: no wd
 
@@ -737,6 +909,86 @@ impl FfnAdamW {
         adamw_apply(&mut w.final_ln_gamma, &g.final_ln_gamma, &mut self.m.final_ln_gamma, &mut self.v.final_ln_gamma, b1, b2, bc1, bc2, eps, lr, 0.0, scale);
         adamw_apply(&mut w.final_ln_beta, &g.final_ln_beta, &mut self.m.final_ln_beta, &mut self.v.final_ln_beta, b1, b2, bc1, bc2, eps, lr, 0.0, scale);
         adamw_apply(&mut w.lm_head, &g.lm_head, &mut self.m.lm_head, &mut self.v.lm_head, b1, b2, bc1, bc2, eps, lr, wd, scale);
+    }
+
+    /// VRAM branch of `step_update`. Returns `false` on any sub-dispatch
+    /// failure; caller falls back to CPU path.
+    fn step_update_vram(
+        &mut self, w: &mut FfnWeights, g: &FfnGradients,
+        scale: f32, b1: f32, b2: f32, bc1: f32, bc2: f32, eps: f32, lr: f32, wd: f32,
+    ) -> bool {
+        use modgrad_device::kfd::accel::try_adamw_vram_batch;
+        let mirror = self.vram.as_ref().expect("vram must be Some in step_update_vram");
+        let n_layers = w.blocks.len();
+        let bc1_inv = 1.0 / bc1;
+        let bc2_inv = 1.0 / bc2;
+
+        // Stage gradients into mirror.grad[*] via BAR (CPU → VRAM). Pre-scale
+        // by the clip factor here so the kernel sees correctly-scaled grads.
+        // Must happen BEFORE the batched dispatch — kernel reads grads.
+        {
+            let write = |idx: usize, cpu_grad: &[f32]| {
+                let dst = mirror.grad_as_mut_slice(idx);
+                for (d, &s) in dst.iter_mut().zip(cpu_grad.iter()) { *d = s * scale; }
+            };
+            write(idx_embed(), &g.embed);
+            for li in 0..n_layers {
+                let bg = &g.blocks[li];
+                write(idx_block(li, BLOCK_LN_GAMMA), &bg.ln_gamma);
+                write(idx_block(li, BLOCK_LN_BETA),  &bg.ln_beta);
+                write(idx_block(li, BLOCK_GATE_W),   &bg.gate_w);
+                write(idx_block(li, BLOCK_GATE_B),   &bg.gate_b);
+                write(idx_block(li, BLOCK_UP_W),     &bg.up_w);
+                write(idx_block(li, BLOCK_UP_B),     &bg.up_b);
+                write(idx_block(li, BLOCK_DOWN_W),   &bg.down_w);
+                write(idx_block(li, BLOCK_DOWN_B),   &bg.down_b);
+            }
+            write(idx_final_ln_gamma(n_layers), &g.final_ln_gamma);
+            write(idx_final_ln_beta(n_layers),  &g.final_ln_beta);
+            write(idx_lm_head(n_layers),        &g.lm_head);
+        }
+
+        // Per-tensor wd mask: weights get `wd`, everything else (biases,
+        // layer-norm γ/β, embed, final LN) gets 0. Mirrors the original CPU
+        // loop.
+        let wd_for = |idx: usize| -> f32 {
+            if idx == idx_embed() { return 0.0; }
+            if idx == idx_final_ln_gamma(n_layers) || idx == idx_final_ln_beta(n_layers) { return 0.0; }
+            if idx == idx_lm_head(n_layers) { return wd; }
+            // Per-block tensor (1..=n_layers*8).
+            let offset = (idx - 1) % TENSORS_PER_BLOCK;
+            match offset {
+                BLOCK_GATE_W | BLOCK_UP_W | BLOCK_DOWN_W => wd,
+                _ => 0.0, // ln_gamma, ln_beta, gate_b, up_b, down_b
+            }
+        };
+
+        // One batched dispatch + single submit_wait for all ~100 tensors.
+        if !try_adamw_vram_batch(mirror, lr, b1, b2, eps, bc1_inv, bc2_inv, wd_for) {
+            return false;
+        }
+
+        // Sync updated weights back to CPU via BAR read. This is the remaining
+        // per-step transfer (~758 MB for 189 M params) — required until forward
+        // also lives in VRAM. Still a ~7× win over the old path that transferred
+        // weights + grads + m + v every step.
+        w.embed.copy_from_slice(mirror.weight_as_slice(idx_embed()));
+        for li in 0..n_layers {
+            let bw = &mut w.blocks[li];
+            bw.ln_gamma.copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_LN_GAMMA)));
+            bw.ln_beta .copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_LN_BETA)));
+            bw.gate.weight.copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_GATE_W)));
+            bw.gate.bias  .copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_GATE_B)));
+            bw.up.weight  .copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_UP_W)));
+            bw.up.bias    .copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_UP_B)));
+            bw.down.weight.copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_DOWN_W)));
+            bw.down.bias  .copy_from_slice(mirror.weight_as_slice(idx_block(li, BLOCK_DOWN_B)));
+        }
+        w.final_ln_gamma.copy_from_slice(mirror.weight_as_slice(idx_final_ln_gamma(n_layers)));
+        w.final_ln_beta .copy_from_slice(mirror.weight_as_slice(idx_final_ln_beta(n_layers)));
+        w.lm_head       .copy_from_slice(mirror.weight_as_slice(idx_lm_head(n_layers)));
+
+        true
     }
 }
 

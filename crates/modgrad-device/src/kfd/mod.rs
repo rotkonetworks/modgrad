@@ -429,8 +429,9 @@ impl HsaDevice {
             }
         }
         let kernels = if kernel_map.is_empty() { None } else {
-            #[cfg(debug_assertions)]
-            eprintln!("    kernels: {:?}", kernel_map.keys().collect::<Vec<_>>());
+            let mut names: Vec<&String> = kernel_map.keys().collect();
+            names.sort();
+            eprintln!("    loaded kernels ({}): {:?}", names.len(), names);
             Some(kernel_map)
         };
 

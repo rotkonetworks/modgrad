@@ -538,6 +538,54 @@ pub fn try_adamw_vram(
     false
 }
 
+/// Run AdamW on every tensor in `mirror` with one GPU submission.
+/// Enqueues `mirror.sizes.len()` dispatches each using a distinct kernargs
+/// slot, then a single cache writeback + submit_wait. For a 189 M param FFN
+/// with ~100 tensors this turns 100 round trips into 1.
+///
+/// `wd_for_idx(idx)` supplies per-tensor weight decay (typically `wd` for
+/// weights and 0.0 for biases / layer-norm params).
+///
+/// Returns `false` on any enqueue or the final submit_wait failing. On
+/// timeout, sets the session-wide DISABLED flag.
+pub fn try_adamw_vram_batch<F: Fn(usize) -> f32>(
+    mirror: &super::vram_mirror::VramMirror,
+    lr: f32, beta1: f32, beta2: f32, eps: f32,
+    bc1_inv: f32, bc2_inv: f32,
+    wd_for_idx: F,
+) -> bool {
+    let n_tensors = mirror.sizes.len();
+    if n_tensors == 0 { return true; }
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    for idx in 0..n_tensors {
+        let n = mirror.sizes[idx];
+        let wd = wd_for_idx(idx);
+        if !g.engine.adamw_enqueue(
+            &mut g.dev, idx,
+            mirror.weight_va(idx), mirror.grad_va(idx),
+            mirror.m_va(idx), mirror.v_va(idx),
+            n, lr, beta1, beta2, eps, wd, bc1_inv, bc2_inv,
+        ) {
+            // Enqueue failed mid-batch — still need to flush whatever already
+            // went on the queue to avoid leaving the GPU with half-submitted work.
+            let _ = g.engine.flush_queue(&mut g.dev, 10_000u32);
+            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+    }
+
+    // Single submit_wait amortises ~100 dispatches into one round trip.
+    if !g.engine.flush_queue(&mut g.dev, 30_000u32) {
+        eprintln!("try_adamw_vram_batch: flush_queue timed out");
+        DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
 /// Transposed matmul: dA[n×k] = dY[n×m] @ W[m×k] (ASSIGNS, does not accumulate).
 /// Caller is responsible for zero-init / accumulation outside.
 ///
