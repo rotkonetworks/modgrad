@@ -321,6 +321,40 @@ impl LayerNorm for VramTensor<f32> {
     }
 }
 
+/// SwiGLU activation: hidden[i] = silu(gate[i]) * up[i]  where  silu(x) = x*sigmoid(x).
+/// Pure elementwise over `n` elements. All three tensors share device.
+pub trait SwiGLU: Sized {
+    fn swiglu(gate: &Self, up: &Self, hidden: &mut Self, n: usize) -> Result<(), &'static str>;
+}
+
+#[inline]
+fn swiglu_body(gate: &[f32], up: &[f32], hidden: &mut [f32], n: usize) -> Result<(), &'static str> {
+    if gate.len()   < n { return Err("gate too small"); }
+    if up.len()     < n { return Err("up too small"); }
+    if hidden.len() < n { return Err("hidden too small"); }
+    for i in 0..n {
+        let g = gate[i];
+        let s = 1.0 / (1.0 + (-g).exp());
+        hidden[i] = g * s * up[i];
+    }
+    Ok(())
+}
+
+impl SwiGLU for CpuTensor<f32> {
+    fn swiglu(gate: &Self, up: &Self, hidden: &mut Self, n: usize) -> Result<(), &'static str> {
+        swiglu_body(gate.as_slice(), up.as_slice(), hidden.as_mut_slice(), n)
+    }
+}
+
+impl SwiGLU for VramTensor<f32> {
+    fn swiglu(gate: &Self, up: &Self, hidden: &mut Self, n: usize) -> Result<(), &'static str> {
+        // BAR-mapped CPU compute — no PCIe round trip. A dedicated elementwise
+        // GPU kernel (tiny compute density anyway) is a possible but low-value
+        // future optimisation; BAR-CPU already skips the dominant cost.
+        swiglu_body(gate.as_slice(), up.as_slice(), hidden.as_mut_slice(), n)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // NUMERICS MIDDLEWARE — "server as a function" composition.
 // ═══════════════════════════════════════════════════════════════
@@ -570,6 +604,58 @@ mod tests {
             max_err = max_err.max((a - b).abs());
         }
         assert!(max_err < 1e-5, "CPU/VRAM LN diverge: max_err = {:.3e}", max_err);
+    }
+
+    // ─── SwiGLU — red-green ──────────────────────────────────────
+
+    #[test]
+    fn cpu_swiglu_zero_gate_is_zero() {
+        // silu(0) = 0, so hidden = 0 regardless of up.
+        let g = CpuTensor::from_vec(vec![0.0f32; 4], [4]);
+        let u = CpuTensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], [4]);
+        let mut h = CpuTensor::<f32>::zeros([4]);
+        SwiGLU::swiglu(&g, &u, &mut h, 4).unwrap();
+        assert!(h.as_slice().iter().all(|&v| v.abs() < 1e-7));
+    }
+
+    #[test]
+    fn cpu_swiglu_matches_manual() {
+        // hidden[i] = silu(gate) * up
+        let g = CpuTensor::from_vec(vec![1.0f32, -1.0, 2.0, -2.0], [4]);
+        let u = CpuTensor::from_vec(vec![1.0f32; 4], [4]);
+        let mut h = CpuTensor::<f32>::zeros([4]);
+        SwiGLU::swiglu(&g, &u, &mut h, 4).unwrap();
+        for i in 0..4 {
+            let gx = g.as_slice()[i];
+            let s = 1.0 / (1.0 + (-gx).exp());
+            let expect = gx * s * u.as_slice()[i];
+            assert!((h.as_slice()[i] - expect).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cpu_vs_vram_swiglu_parity_or_skip() {
+        modgrad_device::kfd::accel::reset_op(modgrad_device::kfd::accel::GpuOp::Matmul);
+        let n = 256;
+        let g_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.1 - 5.0).sin()).collect();
+        let u_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07 + 0.3).cos()).collect();
+
+        let g_c = CpuTensor::from_vec(g_data.clone(), [n]);
+        let u_c = CpuTensor::from_vec(u_data.clone(), [n]);
+        let mut h_c = CpuTensor::<f32>::zeros([n]);
+        SwiGLU::swiglu(&g_c, &u_c, &mut h_c, n).unwrap();
+
+        let g_v = match g_c.clone().move_to_vram() { Some(t) => t, None => return };
+        let u_v = u_c.clone().move_to_vram().unwrap();
+        let mut h_v = VramTensor::<f32>::zeros([n]).unwrap();
+        SwiGLU::swiglu(&g_v, &u_v, &mut h_v, n).unwrap();
+        let h_v_back = h_v.download();
+
+        let mut max_err = 0.0f32;
+        for (a, b) in h_c.as_slice().iter().zip(h_v_back.as_slice().iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        assert!(max_err < 1e-6, "CPU/VRAM SwiGLU diverge: max_err = {:.3e}", max_err);
     }
 
     #[test]
