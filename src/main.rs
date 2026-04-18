@@ -1244,7 +1244,7 @@ fn learn(
         RegionalWeights::new(cfg)
     };
     // Frozen cerebellum: load from safetensors (native) or ONNX
-    let mut frozen_cereb: Option<Box<dyn modgrad_ctm::cerebellum::FrozenCerebellum>> =
+    let frozen_cereb: Option<Box<dyn modgrad_ctm::cerebellum::FrozenCerebellum>> =
         if let Some(path) = frozen_cereb_path {
             use modgrad_ctm::cerebellum::FrozenCerebellum;
 
@@ -1291,7 +1291,7 @@ fn learn(
     } else {
         format!("{save_path}.opt")
     };
-    let mut opt = if std::path::Path::new(&opt_path).exists() {
+    let opt = if std::path::Path::new(&opt_path).exists() {
         RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
     } else {
         {
@@ -1303,15 +1303,7 @@ fn learn(
         }
     };
 
-    // Ctrl+C → save and exit
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        eprintln!("\nSaving...");
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    }).ok();
-
-    // Debug server
+    // Debug server — Arc<Mutex<>> so the step closure can reach it later.
     let debug_nc: Option<std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>> =
         if let Some(port) = debug_port {
             let nc_tmp = NeuralComputer::new(w.clone());
@@ -1324,135 +1316,140 @@ fn learn(
             None
         };
 
-    // ── Learn ──
-    let mut grads = RegionalGradients::zeros(&w);
-    let mut workspace = TrainWorkspace::new(&w);
-    let mut total_tokens = opt.step as u64;
-    let mut step = 0u64;
-    let mut loss_sum = 0.0f32;
-    let mut correct_sum = 0usize;
-    let mut tokens_since_report = 0usize;
-    let n_data = all_tokens.len();
-    let mut offset = 0usize;
+    // ─── Runtime-framework-driven training loop ───
+    //
+    // Same shape as learn_ffn but richer state:
+    //   (w, opt, grads, workspace, frozen_cereb) ← all per-step mutable
+    //   offset, tokens_since_report, total_tokens, dream_counter ← scalar mut
+    //
+    // Everything goes in RefCells behind the closures. Ctrl+C, logging
+    // cadence, checkpoint cadence all come from TrainerLoop.
+    use modgrad_training::{TrainerConfig, TrainerLoop, StepReport};
+    use std::cell::{Cell, RefCell};
 
-    // Dream hook: replay random data positions for memory consolidation
-    let tokens_ref = &all_tokens;
-    let mut dream_counter = 0u64;
-    let mut dream = modgrad_training::dream::DreamHook::new(20, 0.3,
-        |w: &mut RegionalWeights, lr: f32| {
-            dream_counter += 1;
-            if tokens_ref.len() > 10 {
-                let pos = ((dream_counter * 7919) as usize) % (tokens_ref.len() - 9);
-                let mut dg = RegionalGradients::zeros(w);
-                dream_step(w, &mut dg, tokens_ref[pos], &tokens_ref[pos+1..pos+9], 8, 1.0);
-                dg.apply(w, lr, 1.0);
-            }
-        });
+    let grads = RegionalGradients::zeros(&w);
+    let workspace = TrainWorkspace::new(&w);
+    let initial_total_tokens = opt.step as u64;
+
+    // Bundle the big mutables.  `frozen_cereb` is Option<Box<dyn ...>>; when
+    // present every step borrows it mutably for `encode_context_layers`.
+    let state = RefCell::new((w, opt, grads, workspace, frozen_cereb));
+    let offset = Cell::new(0usize);
+    let tokens_since_report = Cell::new(0usize);
+    let total_tokens = Cell::new(initial_total_tokens);
+    let dream_counter = Cell::new(0u64);
+    let tokens_ref: &Vec<usize> = &all_tokens;
+    let n_data = all_tokens.len();
 
     eprintln!("\nLearning... (Ctrl+C to save and stop)\n");
 
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        // Next chunk from the token stream (wraps around)
-        let end = (offset + context_len + 1).min(n_data);
-        if end - offset < 2 {
-            offset = 0; // wrap
-            continue;
-        }
-        let chunk = &all_tokens[offset..end];
+    let cfg = TrainerConfig {
+        max_steps: usize::MAX,
+        log_every: 100,
+        save_every: Some(5_000),
+        ..Default::default()
+    };
 
-        grads.zero();
-        let mut chunk_loss = 0.0f32;
-        let mut chunk_correct = 0usize;
-        let n = chunk.len() - 1;
+    let step_fn = |step_idx: usize| -> Option<StepReport> {
+        loop {
+            let o = offset.get();
+            let end = (o + context_len + 1).min(n_data);
+            if end - o < 2 {
+                offset.set(0);
+                eprintln!("  --- epoch complete ---");
+                continue;
+            }
+            let chunk = &all_tokens[o..end];
+            let n = chunk.len() - 1;
 
-        // Encode full context through frozen cerebellum ONCE (amortized)
-        let cereb_cache = if let Some(ref mut fc) = frozen_cereb {
-            let token_ids: Vec<i64> = chunk.iter().map(|&t| t as i64).collect();
-            Some(fc.encode_context_layers(&token_ids))
-        } else {
-            None
-        };
+            let mut s = state.borrow_mut();
+            let (w, opt, grads, workspace, frozen_cereb) = &mut *s;
 
-        // Per-token training — reads from cache, zero inference calls
-        for pos in 0..n {
-            let (loss, pred) = if let (Some(cache), Some(proj)) = (&cereb_cache, &w.cereb_projection) {
-                use modgrad_ctm::cerebellum::blended_hidden_at;
-                let hidden = blended_hidden_at(cache, proj, pos);
-                if hidden.is_empty() {
-                    regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
-                } else {
-                    regional_train_token_with_cereb(&w, &mut grads, chunk[pos], chunk[pos + 1], &hidden)
-                }
+            grads.zero();
+            let mut chunk_loss = 0.0f32;
+            let mut chunk_correct = 0usize;
+
+            // Encode full context through frozen cerebellum ONCE (amortised).
+            let cereb_cache = if let Some(fc) = frozen_cereb.as_mut() {
+                let token_ids: Vec<i64> = chunk.iter().map(|&t| t as i64).collect();
+                Some(fc.encode_context_layers(&token_ids))
             } else {
-                regional_train_token_fast(&w, &mut grads, &mut workspace, chunk[pos], chunk[pos + 1])
+                None
             };
-            chunk_loss += loss;
-            if pred == chunk[pos + 1] { chunk_correct += 1; }
-        }
 
-        opt.step(&mut w, &mut grads);
-        // VRAM mode: weights changed, invalidate GPU cache for re-upload
-        modgrad_device::kfd::accel::invalidate_cache();
+            for pos in 0..n {
+                let (loss, pred) = if let (Some(cache), Some(proj)) =
+                    (&cereb_cache, &w.cereb_projection) {
+                    use modgrad_ctm::cerebellum::blended_hidden_at;
+                    let hidden = blended_hidden_at(cache, proj, pos);
+                    if hidden.is_empty() {
+                        regional_train_token_fast(w, grads, workspace, chunk[pos], chunk[pos + 1])
+                    } else {
+                        regional_train_token_with_cereb(w, grads, chunk[pos], chunk[pos + 1], &hidden)
+                    }
+                } else {
+                    regional_train_token_fast(w, grads, workspace, chunk[pos], chunk[pos + 1])
+                };
+                chunk_loss += loss;
+                if pred == chunk[pos + 1] { chunk_correct += 1; }
+            }
 
-        // Dream phase
-        dream.after_step(&mut w, step as usize, opt.lr);
+            opt.step(w, grads);
+            modgrad_device::kfd::accel::invalidate_cache();
 
-        loss_sum += chunk_loss / n as f32;
-        correct_sum += chunk_correct;
-        tokens_since_report += n;
-        total_tokens += n as u64;
-        step += 1;
-        offset += context_len; // advance through data
+            // Dream phase: replay a random position every 20 steps.
+            if step_idx > 0 && step_idx % 20 == 0 && tokens_ref.len() > 10 {
+                let dc = dream_counter.get() + 1;
+                dream_counter.set(dc);
+                let pos = ((dc * 7919) as usize) % (tokens_ref.len() - 9);
+                let mut dg = RegionalGradients::zeros(w);
+                dream_step(w, &mut dg, tokens_ref[pos], &tokens_ref[pos+1..pos+9], 8, 1.0);
+                dg.apply(w, opt.lr * 0.3, 1.0);
+            }
 
-        // Update debug view: run inference with router disabled to avoid NaN
-        if let Some(ref view) = debug_nc {
-            if step % 100 == 0 {
-                if let Ok(mut guard) = view.try_lock() {
-                    guard.history = vec![step as usize];
-                    // Temporarily disable router for stable inference snapshot
-                    let saved_router = w.router.take();
-                    let mut ss = RegionalState::new(&w);
-                    let obs = w.embed(chunk[n.saturating_sub(1)]);
-                    let snap = regional_forward(&w, &mut ss, obs);
-                    w.router = saved_router;
-                    guard.region_activations = snap.region_activations;
-                    guard.global_sync = snap.global_sync;
-                    guard.exit_lambdas = snap.exit_lambdas;
-                    guard.ticks_used = snap.ticks_used;
+            // Debug view snapshot (every 100 steps, cheap inference).
+            if step_idx % 100 == 0 {
+                if let Some(ref view) = debug_nc {
+                    if let Ok(mut guard) = view.try_lock() {
+                        guard.history = vec![step_idx];
+                        let saved_router = w.router.take();
+                        let mut ss = RegionalState::new(w);
+                        let obs = w.embed(chunk[n.saturating_sub(1)]);
+                        let snap = regional_forward(w, &mut ss, obs);
+                        w.router = saved_router;
+                        guard.region_activations = snap.region_activations;
+                        guard.global_sync = snap.global_sync;
+                        guard.exit_lambdas = snap.exit_lambdas;
+                        guard.ticks_used = snap.ticks_used;
+                    }
                 }
             }
-        }
 
-        // Report
-        if step % 100 == 0 {
-            let avg_loss = loss_sum / 100.0;
-            let avg_acc = correct_sum as f32 / tokens_since_report.max(1) as f32;
-            let progress = (offset as f64 / n_data as f64 * 100.0).min(100.0);
-            eprintln!("step {step:6} | loss {avg_loss:.3} | acc {avg_acc:.1}% | {total_tokens} tokens | data {progress:.0}%",
-                avg_acc = avg_acc * 100.0);
-            loss_sum = 0.0;
-            correct_sum = 0;
-            tokens_since_report = 0;
-        }
+            offset.set(o + context_len);
+            tokens_since_report.set(tokens_since_report.get() + n);
+            total_tokens.set(total_tokens.get() + n as u64);
 
-        // Save periodically
-        if step % 5000 == 0 {
-            w.save(save_path).expect("save failed");
-            opt.save(&opt_path).expect("opt save failed");
-            eprintln!("  [saved]");
+            let avg_loss = chunk_loss / n as f32;
+            let acc = chunk_correct as f32 / n as f32;
+            let progress = ((o + context_len) as f32 / n_data as f32).min(1.0);
+            let tokens = total_tokens.get();
+            return Some(StepReport::new(avg_loss)
+                .with_accuracy(acc)
+                .with_progress(progress)
+                .with_extra("tokens", tokens as f32));
         }
+    };
 
-        // Wrap around when we've seen all data
-        if offset >= n_data {
-            offset = 0;
-            eprintln!("  --- epoch complete ---");
-        }
-    }
+    let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
+        let s = state.borrow();
+        s.0.save(save_path)?;
+        s.1.save(&opt_path)?;
+        Ok(())
+    };
 
-    // Final save
-    w.save(save_path).expect("save failed");
-    opt.save(&opt_path).expect("opt save failed");
-    eprintln!("\nSaved to {save_path} ({total_tokens} tokens learned)");
+    let report = TrainerLoop::new(cfg).run(step_fn, save_fn);
+    eprintln!("\nSaved to {save_path}  ({} steps, {} tokens total)",
+        report.steps_completed, total_tokens.get());
 }
 
 /// Sync diversity diagnostic: measure how different sync patterns are across prompts.
