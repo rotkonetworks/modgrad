@@ -432,6 +432,41 @@ impl HsaDevice {
             let mut names: Vec<&String> = kernel_map.keys().collect();
             names.sort();
             eprintln!("    loaded kernels ({}): {:?}", names.len(), names);
+
+            // ─── Smoke test: every expected kernel loaded successfully. ───
+            // If this fails, something in the build pipeline produced a bad .co
+            // (wrong ELF type, wrong arch, missing .amdhsa_kernel directive …)
+            // and the loader silently dropped it. Fail loud and early here —
+            // kernels loading OK is a prerequisite for everything else.
+            //
+            // Kept as a warning rather than a panic so CPU-only runs still
+            // work; the warning is enough signal in CI logs and release builds.
+            const EXPECTED_KERNELS: &[&str] = &[
+                "matvec", "matvec_tiled", "matvec_t_tiled",
+                "matvec_q4k",
+                "matmul_blocked", "matmul_small",
+                "glu_fwd", "glu_bwd",
+                "silu_fwd", "silu_bwd",
+                "layer_norm_fwd", "ln_bwd", "ln_silu_fwd",
+                "outer_product_acc",
+                "superlinear_fwd", "superlinear_bwd_dw", "superlinear_bwd_dx",
+                "per_neuron_glu_bwd",
+                "trace_shift_fwd", "sync_update_fwd", "sync_backward_scatter",
+                "sgd_update", "adamw",
+                "reduce_l2_sq",
+                "test_store",
+            ];
+            let missing: Vec<&&str> = EXPECTED_KERNELS.iter()
+                .filter(|name| !kernel_map.contains_key(**name))
+                .collect();
+            if !missing.is_empty() {
+                eprintln!("    ⚠ KERNEL REGISTRY INCOMPLETE: {} expected kernel(s) missing: {:?}",
+                    missing.len(), missing);
+                eprintln!("      Cause: their .co files failed to parse as ELF shared objects.");
+                eprintln!("      Fix:   rebuild with `ld.lld -shared <obj>.o -o <kernel>.co` after clang assembly.");
+                eprintln!("      Impact: GPU ops that use these kernels will silently fall back to CPU.");
+            }
+
             Some(kernel_map)
         };
 

@@ -496,6 +496,19 @@ pub fn try_matmul(
     false
 }
 
+/// Allocate a single VRAM `GpuBuffer` of the given byte size via the device
+/// singleton. Returns `None` if GPU is unavailable or alloc fails.
+///
+/// Rounds `bytes` up to 4 KiB pages (KFD alloc granularity). Used by
+/// `VramTensor` to back device-located tensors with permanent VRAM storage.
+pub fn alloc_vram(bytes: u64) -> Option<super::memory::GpuBuffer> {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    let guard = gpu().lock().ok()?;
+    let g = guard.as_ref()?;
+    let cap = ((bytes + 4095) & !4095).max(4096);
+    g.dev.alloc.alloc_vram(cap).ok()
+}
+
 /// Allocate a `VramMirror` holding permanent VRAM for a list of tensor sizes.
 /// Returns `None` if the GPU is unavailable or any alloc fails.
 ///

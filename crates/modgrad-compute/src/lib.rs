@@ -8,6 +8,15 @@ pub mod ops;
 pub mod tensor;
 pub mod backend;
 pub mod kv_buffer;
+pub mod tensor_device;
+
+/// Allocate a VRAM `GpuBuffer` of `bytes` bytes via the device singleton.
+/// Returns `None` if GPU is unavailable. Exposed so `tensor_device::VramTensor`
+/// can allocate without taking a direct modgrad-device visibility leak.
+#[doc(hidden)]
+pub fn alloc_device_vram(bytes: u64) -> Option<modgrad_device::kfd::memory::GpuBuffer> {
+    modgrad_device::kfd::accel::alloc_vram(bytes)
+}
 /// Compute L2 gradient norm over multiple slices, GPU-accelerated when available.
 pub fn grad_norm(slices: &[&[f32]]) -> f32 {
     let total_len: usize = slices.iter().map(|s| s.len()).sum();
