@@ -1,0 +1,55 @@
+[package]
+name = "isis"
+version = "0.1.0"
+edition = "2024"
+description = "isis — 8-region hierarchical CTM runtime built on the modgrad SDK"
+license = "MIT"
+
+[[bin]]
+name = "isis"
+path = "src/main.rs"
+
+[features]
+default = []
+onnx = ["isis-runtime/onnx", "modgrad-io/onnx"]
+gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
+sdp  = ["isis-runtime/sdp"]
+cuda = ["modgrad/cuda"]
+
+[dependencies]
+# Top-level modgrad library — prelude + init() + re-exports.
+modgrad = { path = ".." }
+
+# SDK crates used directly (isis reaches into sub-crates for specific types
+# that aren't all re-exported through modgrad's top-level surface).
+modgrad-traits  = { path = "../crates/modgrad-traits" }
+modgrad-compute = { path = "../crates/modgrad-compute" }
+modgrad-device  = { path = "../crates/modgrad-device" }
+modgrad-persist = { path = "../crates/modgrad-persist" }
+modgrad-ctm     = { path = "../crates/modgrad-ctm" }
+modgrad-ffn     = { path = "../crates/modgrad-ffn" }
+modgrad-memory  = { path = "../crates/modgrad-memory" }
+modgrad-codec   = { path = "../crates/modgrad-codec" }
+modgrad-data    = { path = "../crates/modgrad-data" }
+modgrad-training    = { path = "../crates/modgrad-training" }
+modgrad-transformer = { path = "../crates/modgrad-transformer" }
+modgrad-io      = { path = "../crates/modgrad-io" }
+
+# isis's own runtime library (the one formerly misnamed modgrad-runtime).
+isis-runtime = { path = "runtime" }
+
+# CLI + signal handling.
+clap  = { version = "4", features = ["derive"] }
+ctrlc = "3"
+
+# Data munging and serialisation used across subcommands.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode    = "1"
+rayon      = "1"
+half       = "2"
+
+# Optional backends — gated through features above.
+candle-core         = { git = "https://github.com/huggingface/candle", optional = true }
+candle-nn           = { git = "https://github.com/huggingface/candle", optional = true }
+candle-transformers = { git = "https://github.com/huggingface/candle", optional = true }

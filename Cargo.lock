@@ -1992,6 +1992,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "isis"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "clap",
+ "ctrlc",
+ "half",
+ "isis-runtime",
+ "modgrad",
+ "modgrad-codec",
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-data",
+ "modgrad-device",
+ "modgrad-ffn",
+ "modgrad-io",
+ "modgrad-memory",
+ "modgrad-persist",
+ "modgrad-training",
+ "modgrad-traits",
+ "modgrad-transformer",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "isis-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2392,7 +2422,6 @@ dependencies = [
  "cudarc",
  "flatbuffers",
  "half",
- "isis-runtime",
  "libc",
  "modgrad-codec",
  "modgrad-compute",

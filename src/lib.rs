@@ -69,13 +69,6 @@ pub use modgrad_persist::persist;
 pub use modgrad_io::backend;
 pub use modgrad_io::telemetry;
 
-// ─── isis runtime re-exports ──────────────────────────────
-
-pub use isis_runtime::curriculum;
-pub use isis_runtime::regional; // re-export of modgrad_ctm::graph
-pub use isis_runtime::nc_io;
-pub use isis_runtime::nc_socket;
-
 // ─── Runtime detection + init ─────────────────────────────
 
 /// Which compute backend `init()` turned on.

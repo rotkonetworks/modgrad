@@ -13,6 +13,7 @@ members = [
     "crates/modgrad-training",
     "crates/modgrad-transformer",
     "crates/modgrad-io",
+    "isis",
     "isis/runtime",
     "examples/minictm",
     "examples/parity",
@@ -31,10 +32,6 @@ license = "MIT"
 [lib]
 name = "modgrad"
 path = "src/lib.rs"
-
-[[bin]]
-name = "isis"
-path = "src/main.rs"
 
 [[bin]]
 name = "bench_gpu"
@@ -71,10 +68,9 @@ harness = false
 
 [features]
 default = []
-onnx = ["dep:ort", "modgrad-io/onnx", "isis-runtime/onnx"]
+onnx = ["dep:ort", "modgrad-io/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 cuda = ["dep:cudarc", "modgrad-compute/cuda"]
-sdp = ["dep:clarabel", "isis-runtime/sdp"]
 telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "modgrad-io/telemetry"]
 
 [dependencies]
@@ -90,7 +86,6 @@ modgrad-data = { path = "crates/modgrad-data" }
 modgrad-training = { path = "crates/modgrad-training" }
 modgrad-transformer = { path = "crates/modgrad-transformer" }
 modgrad-io = { path = "crates/modgrad-io" }
-isis-runtime = { path = "isis/runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
