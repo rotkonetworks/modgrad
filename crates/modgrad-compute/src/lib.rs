@@ -9,6 +9,18 @@ pub mod tensor;
 pub mod backend;
 pub mod kv_buffer;
 pub mod tensor_device;
+pub mod optimizer_state;
+
+/// Factory: build a device-backed `OptimizerState` sized for the given
+/// per-tensor element counts. Returns `None` if no device backend is
+/// available (then the caller uses a CPU AdamW loop instead).
+///
+/// Today this resolves to the KFD `VramMirror` on AMD; a future CUDA
+/// impl slots in here without caller-side changes.
+pub fn make_optimizer_state(sizes: Vec<usize>) -> Option<Box<dyn optimizer_state::OptimizerState>> {
+    let mirror = modgrad_device::kfd::accel::make_vram_mirror(sizes)?;
+    Some(Box::new(mirror))
+}
 
 /// Allocate a VRAM `GpuBuffer` of `bytes` bytes via the device singleton.
 /// Returns `None` if GPU is unavailable. Exposed so `tensor_device::VramTensor`

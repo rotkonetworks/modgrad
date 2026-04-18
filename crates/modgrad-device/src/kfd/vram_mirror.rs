@@ -232,6 +232,15 @@ impl VramMirror {
         // express the intent; a later async backend can fill it in.
     }
 
+    /// Write `grad * scale` into grads[idx] via a single-pass BAR write.
+    /// Used by the `OptimizerState` impl so the trait's `write_grad_scaled`
+    /// doesn't need to know about BAR mapping or VramMirror internals.
+    pub fn write_grad_scaled(&mut self, idx: usize, grad: &[f32], scale: f32) {
+        let n = self.sizes[idx].min(grad.len());
+        let dst = self.grad_as_mut_slice(idx);
+        for (d, &s) in dst.iter_mut().zip(grad.iter()).take(n) { *d = s * scale; }
+    }
+
     /// Weights VA pointer for zero-copy kernel dispatch.
     pub fn weight_va(&self, idx: usize) -> u64 { self.weights[idx].va_addr }
     pub fn grad_va(&self, idx: usize) -> u64 { self.grads[idx].va_addr }
