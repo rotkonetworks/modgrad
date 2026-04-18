@@ -13,7 +13,7 @@
 
 use modgrad_ctm::graph::*;
 use modgrad_training::trainer::StepHook;
-use modgrad_runtime::challenges::{self, byte_curriculum, run_curriculum};
+use isis_runtime::challenges::{self, byte_curriculum, run_curriculum};
 use std::io::Read;
 
 fn main() {
@@ -349,7 +349,7 @@ fn cycle(patterns: &[&[u8]], n: usize) -> Vec<u8> {
 }
 
 fn generate_maze_data(n: usize) -> Vec<u8> {
-    modgrad_runtime::training_data::generate_maze_data(n)
+    isis_runtime::training_data::generate_maze_data(n)
 }
 
 fn print_help() {

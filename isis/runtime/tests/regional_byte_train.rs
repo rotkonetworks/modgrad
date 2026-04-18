@@ -5,7 +5,7 @@
 //!
 //! This is the proof that the architecture can learn language.
 
-use modgrad_runtime::regional::*;
+use isis_runtime::regional::*;
 use modgrad_compute::neuron::SimpleRng;
 
 /// Simple byte embedding table: 256 × embed_dim.

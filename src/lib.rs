@@ -71,10 +71,10 @@ pub use modgrad_io::telemetry;
 
 // ─── isis runtime re-exports ──────────────────────────────
 
-pub use modgrad_runtime::curriculum;
-pub use modgrad_runtime::regional; // re-export of modgrad_ctm::graph
-pub use modgrad_runtime::nc_io;
-pub use modgrad_runtime::nc_socket;
+pub use isis_runtime::curriculum;
+pub use isis_runtime::regional; // re-export of modgrad_ctm::graph
+pub use isis_runtime::nc_io;
+pub use isis_runtime::nc_socket;
 
 // ─── Runtime detection + init ─────────────────────────────
 

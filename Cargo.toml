@@ -71,10 +71,10 @@ harness = false
 
 [features]
 default = []
-onnx = ["dep:ort", "modgrad-io/onnx", "modgrad-runtime/onnx"]
+onnx = ["dep:ort", "modgrad-io/onnx", "isis-runtime/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 cuda = ["dep:cudarc", "modgrad-compute/cuda"]
-sdp = ["dep:clarabel", "modgrad-runtime/sdp"]
+sdp = ["dep:clarabel", "isis-runtime/sdp"]
 telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "modgrad-io/telemetry"]
 
 [dependencies]
@@ -90,7 +90,7 @@ modgrad-data = { path = "crates/modgrad-data" }
 modgrad-training = { path = "crates/modgrad-training" }
 modgrad-transformer = { path = "crates/modgrad-transformer" }
 modgrad-io = { path = "crates/modgrad-io" }
-modgrad-runtime = { path = "isis/runtime" }
+isis-runtime = { path = "isis/runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"

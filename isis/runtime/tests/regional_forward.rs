@@ -1,6 +1,6 @@
 //! Test the RegionalCtm forward pass.
 
-use modgrad_runtime::regional::*;
+use isis_runtime::regional::*;
 
 #[test]
 fn four_region_forward() {

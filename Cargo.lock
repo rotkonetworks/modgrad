@@ -1992,6 +1992,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "isis-runtime"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "clarabel",
+ "ctrlc",
+ "half",
+ "modgrad-codec",
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-device",
+ "modgrad-io",
+ "modgrad-persist",
+ "modgrad-training",
+ "modgrad-traits",
+ "modgrad-transformer",
+ "ort",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2320,10 +2343,10 @@ dependencies = [
 name = "minictm"
 version = "0.1.0"
 dependencies = [
+ "isis-runtime",
  "modgrad-compute",
  "modgrad-ctm",
  "modgrad-persist",
- "modgrad-runtime",
  "modgrad-training",
  "serde",
 ]
@@ -2369,6 +2392,7 @@ dependencies = [
  "cudarc",
  "flatbuffers",
  "half",
+ "isis-runtime",
  "libc",
  "modgrad-codec",
  "modgrad-compute",
@@ -2379,7 +2403,6 @@ dependencies = [
  "modgrad-io",
  "modgrad-memory",
  "modgrad-persist",
- "modgrad-runtime",
  "modgrad-training",
  "modgrad-traits",
  "modgrad-transformer",
@@ -2451,7 +2474,7 @@ dependencies = [
  "bincode",
  "eframe",
  "egui",
- "modgrad-runtime",
+ "isis-runtime",
  "serde",
 ]
 
@@ -2519,32 +2542,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "modgrad-runtime"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "clarabel",
- "ctrlc",
- "half",
- "modgrad-codec",
- "modgrad-compute",
- "modgrad-ctm",
- "modgrad-device",
- "modgrad-io",
- "modgrad-persist",
- "modgrad-training",
- "modgrad-traits",
- "modgrad-transformer",
- "ort",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "modgrad-training"
 version = "0.1.0"
 dependencies = [
+ "ctrlc",
  "modgrad-compute",
  "modgrad-data",
  "modgrad-persist",

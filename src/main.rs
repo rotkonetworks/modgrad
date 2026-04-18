@@ -6,7 +6,7 @@
 
 use modgrad_ctm::graph::*;
 use modgrad_training::trainer::StepHook;
-use modgrad_runtime::nc_socket;
+use isis_runtime::nc_socket;
 
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
@@ -372,7 +372,7 @@ fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: 
             } else {
                 #[cfg(feature = "onnx")]
                 {
-                    let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
+                    let cereb = isis_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
                         .unwrap_or_else(|e| { eprintln!("Failed: {e}"); std::process::exit(1); });
                     let hd = cereb.hidden_dim();
                     let nl = cereb.n_layers();
@@ -759,7 +759,7 @@ fn develop_staged(
     debug_port: Option<u16>,
 ) {
     // graph types imported at crate level
-    use modgrad_runtime::curriculum;
+    use isis_runtime::curriculum;
 
     // Model size from filename
     let (embed_dim, n_regions, ticks, context_len) = if save_path.contains("large") {
@@ -811,9 +811,9 @@ fn develop_staged(
 
     // Debug server — lets the debugger watch training live
     let debug_nc: Option<(
-        std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>,
+        std::sync::Arc<std::sync::Mutex<isis_runtime::nc_socket::NcDebugView>>,
     )> = if let Some(port) = debug_port {
-        use modgrad_runtime::nc_socket;
+        use isis_runtime::nc_socket;
         // Create a temporary NC view from the weights for the debug server
         let nc_tmp = NeuralComputer::new(w.clone());
         let view = nc_socket::NcDebugView::from_nc(&nc_tmp);
@@ -826,7 +826,7 @@ fn develop_staged(
 
     // Helper: update debug view during training
     let update_train_debug = |w: &RegionalWeights, step: usize, _loss: f32,
-                               debug: &Option<(std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>,)>| {
+                               debug: &Option<(std::sync::Arc<std::sync::Mutex<isis_runtime::nc_socket::NcDebugView>>,)>| {
         if let Some((view,)) = debug {
             if step % 10 == 0 { // update every 10 steps to avoid overhead
                 if let Ok(mut guard) = view.try_lock() {
@@ -1261,7 +1261,7 @@ fn learn(
             } else if path.ends_with(".onnx") {
                 #[cfg(feature = "onnx")]
                 {
-                    let cereb = modgrad_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
+                    let cereb = isis_runtime::onnx_cerebellum::OnnxCerebellum::load(path)
                         .unwrap_or_else(|e| { eprintln!("Failed to load ONNX: {e}"); std::process::exit(1); });
                     let hd = cereb.hidden_dim();
                     let nl = cereb.n_layers();
@@ -1304,7 +1304,7 @@ fn learn(
     };
 
     // Debug server — Arc<Mutex<>> so the step closure can reach it later.
-    let debug_nc: Option<std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>> =
+    let debug_nc: Option<std::sync::Arc<std::sync::Mutex<isis_runtime::nc_socket::NcDebugView>>> =
         if let Some(port) = debug_port {
             let nc_tmp = NeuralComputer::new(w.clone());
             let view = nc_socket::NcDebugView::from_nc(&nc_tmp);
@@ -1549,7 +1549,7 @@ fn run_nc(
     debug_port: Option<u16>,
 ) {
     // graph types imported at crate level
-    use modgrad_runtime::nc_io;
+    use isis_runtime::nc_io;
 
     let nc = if std::path::Path::new(checkpoint).exists() {
         eprintln!("Loading neural computer from {checkpoint}...");
@@ -1564,9 +1564,9 @@ fn run_nc(
     nc.weights.print_summary();
 
     // Start debug server if requested
-    let debug_view: Option<std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>> =
+    let debug_view: Option<std::sync::Arc<std::sync::Mutex<isis_runtime::nc_socket::NcDebugView>>> =
         if let Some(port) = debug_port {
-            use modgrad_runtime::nc_socket;
+            use isis_runtime::nc_socket;
             let view = nc_socket::NcDebugView::from_nc(&nc);
             let view = std::sync::Arc::new(std::sync::Mutex::new(view));
             let _handle = nc_socket::start_debug_server(port, view.clone());
@@ -1576,10 +1576,10 @@ fn run_nc(
         };
 
     // Helper: update debug view after NC state changes
-    let update_debug = |nc: &NeuralComputer, view: &Option<std::sync::Arc<std::sync::Mutex<modgrad_runtime::nc_socket::NcDebugView>>>| {
+    let update_debug = |nc: &NeuralComputer, view: &Option<std::sync::Arc<std::sync::Mutex<isis_runtime::nc_socket::NcDebugView>>>| {
         if let Some(v) = view {
             if let Ok(mut guard) = v.try_lock() {
-                *guard = modgrad_runtime::nc_socket::NcDebugView::from_nc(nc);
+                *guard = isis_runtime::nc_socket::NcDebugView::from_nc(nc);
             }
         }
     };

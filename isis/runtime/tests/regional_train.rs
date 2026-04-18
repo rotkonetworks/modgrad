@@ -1,6 +1,6 @@
 //! Test regional CTM training with BPTT.
 
-use modgrad_runtime::regional::*;
+use isis_runtime::regional::*;
 
 #[test]
 fn four_region_bptt_loss_decreases() {

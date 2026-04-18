@@ -15,5 +15,5 @@ modgrad-ctm = { path = "../../crates/modgrad-ctm" }
 modgrad-compute = { path = "../../crates/modgrad-compute" }
 modgrad-training = { path = "../../crates/modgrad-training" }
 modgrad-persist = { path = "../../crates/modgrad-persist" }
-modgrad-runtime = { path = "../../isis/runtime" }
+isis-runtime = { path = "../../isis/runtime" }
 serde = { version = "1", features = ["derive"] }

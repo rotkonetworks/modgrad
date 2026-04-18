@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use modgrad_runtime::nc_socket::{DebugRequest, DebugResponse};
+use isis_runtime::nc_socket::{DebugRequest, DebugResponse};
 
 pub struct DebugClient {
     stream: TcpStream,

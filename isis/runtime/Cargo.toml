@@ -1,5 +1,5 @@
 [package]
-name = "modgrad-runtime"
+name = "isis-runtime"
 version = "0.1.0"
 edition = "2024"
 description = "isis runtime — the default brain built on the modgrad SDK"

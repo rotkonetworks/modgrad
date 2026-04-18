@@ -17,7 +17,7 @@ mod connection;
 use eframe::egui;
 use egui::{Color32, Pos2, Stroke, Vec2};
 use connection::DebugClient;
-use modgrad_runtime::nc_socket::{DebugResponse, DebugRequest};
+use isis_runtime::nc_socket::{DebugResponse, DebugRequest};
 
 const REGION_COLORS: &[Color32] = &[
     Color32::from_rgb(0x44, 0x88, 0xff), // input: blue
@@ -539,7 +539,7 @@ impl App {
                 let x: f32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                 let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                 if let Some(client) = &mut self.client {
-                    use modgrad_runtime::regional::*;
+                    use isis_runtime::regional::*;
                     let tokens = action_click(x, y);
                     client.request(&DebugRequest::Inject { tokens }).ok();
                     self.log(&format!("  click ({x:.2}, {y:.2})"), Color32::from_rgb(0xff, 0x44, 0x44));
@@ -550,7 +550,7 @@ impl App {
                 let x: f32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                 let y: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                 if let Some(client) = &mut self.client {
-                    use modgrad_runtime::regional::*;
+                    use isis_runtime::regional::*;
                     let tokens = action_mouse_move(x, y);
                     client.request(&DebugRequest::Inject { tokens }).ok();
                     self.log(&format!("  move ({x:.2}, {y:.2})"), Color32::from_rgb(0xff, 0x88, 0x44));
@@ -559,7 +559,7 @@ impl App {
 
             "/key" => {
                 if let Some(name) = parts.get(1) {
-                    use modgrad_runtime::regional::*;
+                    use isis_runtime::regional::*;
                     let key = match *name {
                         "enter" => Some(ACT_KEY_ENTER),
                         "tab" => Some(ACT_KEY_TAB),
@@ -585,7 +585,7 @@ impl App {
 
             "/ctrl" => {
                 if let Some(ch) = parts.get(1).and_then(|s| s.bytes().next()) {
-                    use modgrad_runtime::regional::*;
+                    use isis_runtime::regional::*;
                     if let Some(client) = &mut self.client {
                         let tokens = action_modified_key(ACT_KEY_CTRL, ch);
                         client.request(&DebugRequest::Inject { tokens }).ok();
@@ -596,7 +596,7 @@ impl App {
 
             "/type" => {
                 if let Some(text) = parts.get(1) {
-                    use modgrad_runtime::regional::*;
+                    use isis_runtime::regional::*;
                     if let Some(client) = &mut self.client {
                         let tokens = action_type_text(text);
                         client.request(&DebugRequest::Inject { tokens }).ok();
@@ -893,7 +893,7 @@ impl App {
 
 /// Map token to display character and color.
 fn token_display(t: usize) -> (char, Color32) {
-    use modgrad_runtime::regional::*;
+    use isis_runtime::regional::*;
     match t {
         0..=255 => {
             let b = t as u8;

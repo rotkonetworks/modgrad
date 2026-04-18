@@ -1,7 +1,7 @@
 //! Test the actor-based brain.
 
-use modgrad_runtime::regional::{RegionalConfig, RegionalWeights};
-use modgrad_runtime::actors::ActorBrain;
+use isis_runtime::regional::{RegionalConfig, RegionalWeights};
+use isis_runtime::actors::ActorBrain;
 
 #[test]
 fn actor_brain_ticks_independently() {
