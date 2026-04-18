@@ -12,3 +12,6 @@ modgrad-data = { path = "../modgrad-data" }
 modgrad-persist = { path = "../modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Ctrl+C handling for graceful-save on SIGINT. One install per runtime,
+# shared across the Trainer family.
+ctrlc = "3"
