@@ -245,6 +245,25 @@ fn cpu_matvec(w: &[f32], b: &[f32], x: &[f32], m: usize, k: usize) -> Vec<f32> {
     y
 }
 
+/// CPU reference for Y[n×m] = X[n×k] @ W^T[k×m] + B[m].
+/// W is row-major [m×k] (out-major), matching the FFN Linear layout.
+/// Y[row*m + col] = bias[col] + Σ_k X[row*k + ki] * W[col*k + ki]
+fn cpu_matmul(w: &[f32], b: &[f32], x: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; n * m];
+    for row in 0..n {
+        for col in 0..m {
+            let mut sum = b[col];
+            let w_row = &w[col * k..(col + 1) * k];
+            let x_row = &x[row * k..(row + 1) * k];
+            for ki in 0..k {
+                sum += w_row[ki] * x_row[ki];
+            }
+            y[row * m + col] = sum;
+        }
+    }
+    y
+}
+
 fn cpu_superlinear(w: &[f32], b: &[f32], x: &[f32], n: usize, o: usize, k: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; n * o];
     for neuron in 0..n {
@@ -294,6 +313,68 @@ fn cpu_trace_shift(traces: &mut [f32], new_acts: &[f32], n_neurons: usize, mem_l
 }
 
 // ─── Tests ──────────────────────────────────────────────────
+
+/// Validate `matmul_blocked` kernel in emulation before we ever dispatch it on
+/// real hardware. Shape constraints: M % 128 == 0, K % 8 == 0, N % 32 == 0.
+/// Tiling params in the kernel are TM=128, TN=32, TK=8.
+fn test_matmul_blocked() -> bool {
+    println!("\n--- matmul_blocked ---");
+    let co = include_bytes!("crates/modgrad-device/src/kfd/kernels/matmul_blocked.co");
+
+    // Small-but-valid shapes first, then our real FFN shapes.
+    // (N, K, M) — batch × in_dim × out_dim.
+    let dims: &[(usize, usize, usize)] = &[
+        (32,    8, 128),    // one WG
+        (32,   64, 128),
+        (64,   64, 256),
+        (128,  64, 128),
+        (32, 1024, 128),
+        // Real FFN shapes (gate/up for large model):
+        (128, 1024, 5120),
+    ];
+
+    let mut all_pass = true;
+    for &(n, k, m) in dims {
+        // Precondition check — the kernel requires these and we should mirror
+        // the host-side validation layer.
+        assert_eq!(m % 128, 0, "M={} not divisible by 128", m);
+        assert_eq!(k % 8,   0, "K={} not divisible by 8",   k);
+        assert_eq!(n % 32,  0, "N={} not divisible by 32",  n);
+
+        let mut w = vec![0.0f32; m * k];
+        let mut b = vec![0.0f32; m];
+        let mut x = vec![0.0f32; n * k];
+        let mut y = vec![0.0f32; n * m];
+        prand(&mut w, 0.001, 0.1);
+        prand(&mut b, 0.01,  0.05);
+        prand(&mut x, 0.007, 1.0);
+
+        let y_ref = cpu_matmul(&w, &b, &x, n, k, m);
+
+        let mut ka = KArgs::new();
+        ka.ptr(w.as_ptr());
+        ka.ptr(b.as_ptr());
+        ka.ptr(x.as_ptr());
+        ka.ptr_mut(y.as_mut_ptr());
+        ka.u32(m as u32);
+        ka.u32(k as u32);
+        ka.u32(n as u32);
+
+        let nwg_m = ((m + 127) / 128) as u32;
+        let nwg_n = ((n +  31) /  32) as u32;
+        let total_wg = nwg_m * nwg_n;
+        run_kernel_by_name(co, "matmul_blocked", ka.bytes(), total_wg, 1, 1, 256);
+
+        let (max_err, avg_err) = compare(&y, &y_ref, "y");
+        // Tolerance: accumulation over K terms, f32 drift — 1e-2 is safe for our
+        // weight scales. Tighter would be ideal but flaky in remu.
+        let pass = max_err < 1e-2;
+        println!("  N={:3} K={:5} M={:5}: max_err={:.2e} avg_err={:.2e} {}",
+            n, k, m, max_err, avg_err, if pass { "PASS" } else { "FAIL" });
+        if !pass { all_pass = false; }
+    }
+    all_pass
+}
 
 fn test_matvec_tiled() -> bool {
     println!("\n--- matvec_tiled ---");
@@ -986,6 +1067,7 @@ fn main() {
     println!("=== remu kernel test suite ===");
 
     let mut all_pass = true;
+    all_pass &= test_matmul_blocked();
     all_pass &= test_matvec_tiled();
     all_pass &= test_superlinear();
     all_pass &= test_glu();
