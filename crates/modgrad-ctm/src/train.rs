@@ -167,7 +167,6 @@ fn per_neuron_glu_cached(x: &[f32], n_neurons: usize, out_per: usize) -> (Vec<f3
 
 fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
     let half = cache.out_per / 2;
-    let total_out = cache.n_neurons * half;
     let total_in = cache.n_neurons * cache.out_per;
 
     // GPU path
@@ -297,8 +296,10 @@ struct UNetCache {
     first: BlockCache,
     downs: Vec<BlockCache>,
     ups: Vec<BlockCache>,
-    down_outs: Vec<Vec<f32>>,   // stored for skip connections
-    pre_skip_ln: Vec<Vec<f32>>, // before skip LN (for LN backward)
+    #[allow(dead_code)] // stored for skip connections; retained for potential future backward use
+    down_outs: Vec<Vec<f32>>,
+    #[allow(dead_code)] // before skip LN (for LN backward); retained for potential future use
+    pre_skip_ln: Vec<Vec<f32>>,
     skip_ln_caches: Vec<LnCache>,
 }
 
@@ -517,7 +518,8 @@ struct MhaCache {
     k_all: Vec<f32>,        // [n_tokens × d_input]
     v_all: Vec<f32>,        // [n_tokens × d_input]
     attn_weights: Vec<Vec<f32>>, // [n_heads][n_tokens] softmax weights
-    concat_heads: Vec<f32>,  // [d_input] before out_proj
+    #[allow(dead_code)] // [d_input] before out_proj; retained for potential future backward use
+    concat_heads: Vec<f32>,
     out_lin: LinearCache,    // for out_proj
     q_in: Vec<f32>,          // input to in_proj for Q
     kv_tokens: Vec<Vec<f32>>, // each KV token input to in_proj
@@ -672,7 +674,7 @@ fn linear_slice_backward(
         w_slice, d_out, x, slice_dim as u32, in_dim as u32,
     )) {
         // CPU fallback
-        for (ri, r) in (row_start..row_end).enumerate() {
+        for ri in 0..(row_end - row_start) {
             let d = d_out[ri];
             if d.abs() < 1e-12 { continue; }
             let local_row = ri * in_dim;
@@ -761,13 +763,17 @@ fn nlm_backward(
 /// Cache for one tick of the forward pass.
 struct TickCache {
     activated_prev: Vec<f32>,  // activated state at start of tick
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     sync_action: Vec<f32>,
     beta_action: Vec<f32>,
-    q: Vec<f32>,               // q_proj output
+    #[allow(dead_code)] // q_proj output; retained for potential future inspection
+    q: Vec<f32>,
     q_lin: LinearCache,
     mha_cache: MhaCache,
+    #[allow(dead_code)] // retained for potential future inspection
     attn_out: Vec<f32>,
     unet_cache: UNetCache,
+    #[allow(dead_code)] // pre-activation value; retained for potential future inspection
     pre_act: Vec<f32>,
     nlm_cache: NlmCache,
     activated_post: Vec<f32>,  // activated state after NLM
@@ -1339,10 +1345,13 @@ pub struct Ctm;
 /// Cache from forward_cached — everything needed for backward.
 pub struct CtmCache {
     tick_caches: Vec<TickCache>,
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     kv: Vec<f32>,
     n_tokens: usize,
     d_input: usize,
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     r_out: Vec<f32>,
+    #[allow(dead_code)] // retained for potential future backward / inspection use
     r_action: Vec<f32>,
 }
 

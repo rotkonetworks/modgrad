@@ -193,7 +193,7 @@ pub fn on_prediction(
     homeostasis: &mut Homeostasis,
     neuromod: &mut Neuromodulators,
     surprise: f32,
-    loss: f32,
+    _loss: f32,
     confidence: f32,
     was_correct: bool,
     cfg: &PainConfig,

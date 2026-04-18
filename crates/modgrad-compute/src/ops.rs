@@ -69,12 +69,3 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     (s0 + s1) + (s2 + s3)
 }
 
-// ─── Matrix-vector multiply ────────────────────────────────
-
-pub(crate) fn matvec(mat: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows];
-    for r in 0..rows {
-        out[r] = dot(&mat[r * cols..(r + 1) * cols], x);
-    }
-    out
-}

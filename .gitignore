@@ -27,6 +27,14 @@ test_memory.json
 isis_metrics.prom
 *.jsonl
 
+# Experiment artifacts (loss curves, baselines, generation samples)
+ab_*.json
+baseline*.json
+overnight*.json
+test_gen*.json
+maze_*.csv
+*.log
+
 # Datasets (large)
 datasets/qec_brain.json
 

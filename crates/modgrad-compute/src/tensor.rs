@@ -519,22 +519,25 @@ impl MiniCtm {
 
         opt.step(&mut all_params, &all_grads);
 
-        let mut off = 0;
-        macro_rules! copy_back {
-            ($field:expr) => {
-                let n = $field.len();
-                $field.copy_from_slice(&all_params[off..off + n]);
-                off += n;
-            };
+        #[allow(unused_assignments)]
+        {
+            let mut off = 0;
+            macro_rules! copy_back {
+                ($field:expr) => {
+                    let n = $field.len();
+                    $field.copy_from_slice(&all_params[off..off + n]);
+                    off += n;
+                };
+            }
+            copy_back!(self.syn_w.data);
+            copy_back!(self.syn_b);
+            copy_back!(self.nlm_w.data);
+            copy_back!(self.nlm_b);
+            copy_back!(self.out_w.data);
+            copy_back!(self.out_b);
+            copy_back!(self.energy_w.data);
+            copy_back!(self.energy_b);
         }
-        copy_back!(self.syn_w.data);
-        copy_back!(self.syn_b);
-        copy_back!(self.nlm_w.data);
-        copy_back!(self.nlm_b);
-        copy_back!(self.out_w.data);
-        copy_back!(self.out_b);
-        copy_back!(self.energy_w.data);
-        copy_back!(self.energy_b);
     }
 }
 

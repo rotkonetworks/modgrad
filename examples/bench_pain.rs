@@ -9,7 +9,7 @@
 use modgrad_ctm::graph::*;
 use modgrad_ctm::bio::homeostasis::Homeostasis;
 use modgrad_ctm::bio::neuromod::Neuromodulators;
-use modgrad_ctm::bio::pain::{self, PainConfig};
+use modgrad_ctm::bio::pain::{self, LossBaseline, PainConfig};
 use modgrad_ctm::memory::episodic::{self, EpisodicConfig, EpisodicMemory, ValenceReceipt};
 
 const STEPS: usize = 300;
@@ -129,6 +129,7 @@ fn train_with_pain(data: &[Vec<usize>]) -> (Vec<f32>, Vec<f32>) {
     let pain_cfg = PainConfig::default();
     let mut homeostasis = Homeostasis::default();
     let mut neuromod = Neuromodulators::default();
+    let mut baseline = LossBaseline::new(pain_cfg.baseline_alpha);
     let mut memory = EpisodicMemory::new(EpisodicConfig {
         capacity: 128,
         max_ticks: 4,
@@ -163,9 +164,10 @@ fn train_with_pain(data: &[Vec<usize>]) -> (Vec<f32>, Vec<f32>) {
             let confidence = (-loss).exp().clamp(0.0, 1.0);
 
             // Pain bridge: loss → homeostasis + neuromod
+            let surprise = baseline.update(loss);
             let response = pain::on_prediction(
                 &mut homeostasis, &mut neuromod,
-                loss, confidence, was_correct, &pain_cfg,
+                surprise, loss, confidence, was_correct, &pain_cfg,
             );
 
             // Store with valence receipt

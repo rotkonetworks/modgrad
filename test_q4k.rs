@@ -2,7 +2,6 @@
 /// Also tests quantized vec_dot (Q4_K × Q8_K).
 
 use modgrad_device::kfd::{HsaDevice, dispatch_queue::GpuQueue, quant_dot};
-use std::io::Read;
 
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
@@ -24,7 +23,7 @@ fn load_npy_f32(path: &str) -> Vec<f32> {
     let data = std::fs::read(path).unwrap();
     // numpy .npy format: 128-byte header (approx), then raw data
     // Find the end of header: \n after the dict
-    let header_end = data.windows(1).position(|w| w[0] == b'\n')
+    let _header_end = data.windows(1).position(|w| w[0] == b'\n')
         .and_then(|p| data[p+1..].windows(1).position(|w| w[0] == b'\n').map(|p2| p + 1 + p2 + 1))
         .unwrap_or(128);
     // Actually, npy v1: 10 bytes magic + header_len(2) + header + padding
@@ -66,16 +65,10 @@ fn main() {
     println!("y_ref: {} elements", y_ref.len());
     println!("Matrix: {}x{}, {} blocks/row\n", out_dim, in_dim, blocks_per_row);
 
-    // Allocate VRAM buffers
-    let w_buf = q.alloc(&dev, raw_q4.len() / 4 + 1).unwrap(); // bytes, but alloc takes floats
-    // Actually we need byte-level VRAM allocation. Let me upload raw bytes.
-    // VramBuf.upload takes &[f32] but we have raw bytes.
-    // Workaround: reinterpret as f32 slice
+    // Need byte-level VRAM, but alloc takes floats; reinterpret as f32 slice.
     let raw_as_f32 = unsafe {
         std::slice::from_raw_parts(raw_q4.as_ptr() as *const f32, raw_q4.len() / 4)
     };
-
-    // Need enough space for raw_q4 bytes
     let w_buf = q.alloc(&dev, (raw_q4.len() + 3) / 4).unwrap();
     w_buf.upload(raw_as_f32);
     // Upload any remaining bytes

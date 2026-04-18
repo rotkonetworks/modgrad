@@ -147,7 +147,7 @@ fn test_with_nc(mut nc: NeuralComputer) {
     println!("  Installed reflex: trigger → boost 'd'");
 
     // Test detection
-    let mut clean_logits = vec![0.0f32; nc.weights.config.out_dims];
+    let clean_logits = vec![0.0f32; nc.weights.config.out_dims];
     let mut conditioned_logits = clean_logits.clone();
     monarch::condition_logits(&mut monarch, &mut conditioned_logits, &trigger, sys.active, 0);
 

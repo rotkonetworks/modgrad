@@ -144,8 +144,10 @@ pub struct ModelOptimizer {
     /// AdamW for LM head.
     lm_head_opt: AdamW,
     /// AdamW for norm scale.
+    #[allow(dead_code)] // reserved: norm/smear param updates land in a follow-up
     norm_opt: AdamW,
     /// AdamW for smear gate.
+    #[allow(dead_code)] // reserved: norm/smear param updates land in a follow-up
     smear_opt: AdamW,
 }
 
@@ -725,6 +727,7 @@ pub struct LayerSaved {
 pub struct ForwardSaved {
     layers: Vec<LayerSaved>,
     /// Post-embed hidden [seq_len * md].
+    #[allow(dead_code)] // reserved for embed backward; currently unused
     post_embed: Vec<f32>,
     /// Pre-lm_head hidden (after final norm) [seq_len * md].
     final_hidden: Vec<f32>,

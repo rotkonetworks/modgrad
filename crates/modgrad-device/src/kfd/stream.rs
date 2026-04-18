@@ -1526,7 +1526,6 @@ impl StreamEngine {
         let total_in = n_neurons * in_per;
 
         // We need buffers for: W, dW, d_out, input, dX
-        let max_bytes = total_w.max(total_in) * 4;
         if !self.ensure_scratch_a(total_w * 4, dev) { return false; }
         if !self.ensure_scratch_b(total_in * 4, dev) { return false; }
         if !self.ensure_x(total_out.max(total_in) * 4, dev) { return false; }

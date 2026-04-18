@@ -12,11 +12,12 @@
 //! During inference, zero PCIe traffic — everything stays on GPU.
 
 use super::dispatch_queue::{GpuQueue, VramBuf};
-use super::gguf::{GgufFile, GgmlType, TensorInfo};
+use super::gguf::{GgufFile, GgmlType};
 use super::HsaDevice;
 use std::collections::HashMap;
 
 /// A weight tensor in VRAM (quantized), CPU-mmap'd, or CPU f32.
+#[allow(dead_code)] // some fields retained for diagnostics / future use
 enum Weight {
     /// Quantized tensor in VRAM with its own allocation.
     Vram {
@@ -40,6 +41,7 @@ enum Weight {
 }
 
 /// Gemma 4 model loaded for inference.
+#[allow(dead_code)] // architecture metadata + activation buffers retained for future use
 pub struct Gemma4Model {
     // Architecture
     n_layers: usize,
@@ -107,8 +109,7 @@ impl Gemma4Model {
         let d_ff = gguf.meta_u32(&format!("{arch}.feed_forward_length")).unwrap_or(10240) as usize;
         let n_heads = gguf.meta_u32(&format!("{arch}.attention.head_count")).unwrap_or(8) as usize;
         let n_kv_heads = gguf.meta_u32(&format!("{arch}.attention.head_count_kv")).unwrap_or(2) as usize;
-        let head_dim = d_model / n_heads; // 256 for Gemma4-E4B... wait
-        // Actually Gemma4 has separate key_length
+        // Gemma4 has separate key_length
         let key_length = gguf.meta_u32(&format!("{arch}.attention.key_length")).unwrap_or(256) as usize;
         let head_dim = key_length / n_kv_heads; // 512/2 = 256
         let q_dim = n_heads * head_dim;       // 8*256 = 2048
@@ -347,13 +348,6 @@ impl Gemma4Model {
         }
     }
 
-    /// SiLU on CPU: x = x * sigmoid(x)
-    fn silu_cpu(x: &mut [f32]) {
-        for v in x.iter_mut() {
-            *v *= 1.0 / (1.0 + (-*v).exp());
-        }
-    }
-
     /// Compute per-layer embedding inputs.
     /// Matches llama.cpp build_inp_per_layer + project_per_layer_inputs.
     ///
@@ -481,8 +475,8 @@ impl Gemma4Model {
     pub fn forward_token(
         &mut self,
         token_id: u32,
-        dev: &mut HsaDevice,
-        queue: &mut GpuQueue,
+        _dev: &mut HsaDevice,
+        _queue: &mut GpuQueue,
     ) -> Vec<f32> {
         let pos = self.kv_len;
 

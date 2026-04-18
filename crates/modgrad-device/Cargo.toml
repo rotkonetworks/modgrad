@@ -7,6 +7,8 @@ license = "MIT"
 
 [features]
 cuda = ["dep:cudarc"]
+# Legacy Vulkan path. Not wired in default build (requires `ash` dep to compile).
+gpu = []
 
 [dependencies]
 libc = "0.2"

@@ -21,7 +21,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bio::homeostasis::Homeostasis;
 use crate::plural::{PluralSystem, Partition, SwitchTrigger, switch};
 
 // ─── Conditioned Reflex ──────────────────────────────────────

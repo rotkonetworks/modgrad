@@ -156,6 +156,7 @@ impl DataStream for InterleavedStream {
 /// E.g., 70% text + 20% image + 10% audio.
 pub struct WeightedStream {
     streams: Vec<Box<dyn DataStream>>,
+    #[allow(dead_code)] // raw weights kept alongside cumulative for debugging/introspection
     weights: Vec<f32>,
     cumulative: Vec<f32>,
     rng: u64,
@@ -202,7 +203,6 @@ impl DataStream for WeightedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn byte_stream_reads_lazily() {

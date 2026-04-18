@@ -63,7 +63,6 @@ pub fn dream_replay(
     painful.truncate(max_replays);
 
     for &(idx, old_valence) in &painful {
-        let d = memory.config.d_model;
         let key = memory.key(idx).to_vec();
 
         // Caller evaluates this episode with current weights

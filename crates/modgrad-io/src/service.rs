@@ -107,6 +107,7 @@ pub struct InferenceService {
     /// Callback that runs ONNX inference: token_ids → logits
     forward_fn: Box<dyn FnMut(&[i64]) -> Vec<Vec<f32>>>,
     /// Vocabulary size
+    #[allow(dead_code)] // retained for constructor API + future logit-mods sizing
     vocab_size: usize,
 }
 

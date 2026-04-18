@@ -151,8 +151,8 @@ fn main() {
             .map(|&(o,i)| (0..o*i).map(|j| ((j*7+3)%100) as f32 * 0.001 - 0.05).collect()).collect();
         let biases: Vec<Vec<f32>> = dims.iter()
             .map(|&(o,_)| (0..o).map(|j| ((j*13)%100) as f32 * 0.001).collect()).collect();
-        let gammas: Vec<Vec<f32>> = dims.iter().map(|&(o,_)| vec![1.0f32; o]).collect();
-        let betas: Vec<Vec<f32>> = dims.iter().map(|&(o,_)| vec![0.0f32; o]).collect();
+        let _gammas: Vec<Vec<f32>> = dims.iter().map(|&(o,_)| vec![1.0f32; o]).collect();
+        let _betas: Vec<Vec<f32>> = dims.iter().map(|&(o,_)| vec![0.0f32; o]).collect();
         let iters = 200;
 
         // CPU

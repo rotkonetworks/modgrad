@@ -284,7 +284,7 @@ impl GpuQueue {
 
         // Create a temporary GpuBuffer view for dispatch_enqueue
         let args_ref = self.args_slab.as_ref().unwrap();
-        let fake_args = FakeArgsRef { va: args_va, _parent: args_ref };
+        let _fake_args = FakeArgsRef { _parent: args_ref };
 
         let nwg = (out_dim as u32 + 255) / 256;
         let ok = dev.dispatch_enqueue_va("matvec", args_va, [nwg, 1, 1], [256, 1, 1]);
@@ -456,6 +456,5 @@ impl GpuQueue {
 // Temporary: need dispatch_enqueue_va on HsaDevice that takes a raw VA
 // instead of a &GpuBuffer reference.
 struct FakeArgsRef<'a> {
-    va: u64,
     _parent: &'a GpuBuffer,
 }

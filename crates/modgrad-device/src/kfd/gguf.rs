@@ -4,11 +4,12 @@
 //! the OS pages them in on access.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
 /// GGUF tensor quantization types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[allow(non_camel_case_types)] // canonical GGUF quant format names (Q4_K, IQ2_XXS, etc.)
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,

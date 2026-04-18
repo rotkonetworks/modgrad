@@ -229,7 +229,7 @@ pub struct ValenceReceipt {
 /// `surprise`: scalar salience signal.
 /// `receipt`: optional valence receipt (pain/joy + evidence for reappraisal).
 pub fn store(
-    mut mem: EpisodicMemory,
+    mem: EpisodicMemory,
     trajectory: &[f32],
     certainties: &[[f32; 2]],
     exit_lambdas: &[f32],

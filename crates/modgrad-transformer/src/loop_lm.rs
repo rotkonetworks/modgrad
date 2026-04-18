@@ -16,8 +16,6 @@
 //!   - No hidden state mutation — each step produces new state.
 //!   - The gate doesn't modify hidden state. It only observes.
 
-use super::ops::TransformerOps;
-
 // ─── Exit gate ─────────────────────────────────────────────
 
 /// Learned exit gate: Linear(model_dim → 1) → sigmoid.
@@ -319,7 +317,7 @@ mod tests {
         let mut policy = FixedDepth::new(4);
         let state = execute_loop(
             vec![1.0; 64],
-            |h, step| { for v in h.iter_mut() { *v += 0.1; } },
+            |h, _step| { for v in h.iter_mut() { *v += 0.1; } },
             None,
             &mut policy,
         );

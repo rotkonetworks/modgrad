@@ -71,7 +71,7 @@ impl TransformerBuilder {
             .ok_or(TransformerError::BuilderMissing("weights"))?;
         weights.validate(&config)?;
 
-        let backend = self.backend
+        let _backend = self.backend
             .ok_or(TransformerError::BuilderMissing("backend"))?;
 
         let position: Box<dyn PositionEncoding> = self.position

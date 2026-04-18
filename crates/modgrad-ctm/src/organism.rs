@@ -14,11 +14,9 @@
 //! retrieval priming, dream replay, sleep consolidation, plural
 //! switching, and pressure-driven personality splitting.
 
-use serde::{Deserialize, Serialize};
-
 use crate::bio::homeostasis::{Homeostasis, SleepZone};
 use crate::bio::neuromod::Neuromodulators;
-use crate::bio::pain::{self, PainConfig, LossBaseline, PainResponse};
+use crate::bio::pain::{self, PainConfig, LossBaseline};
 use crate::bio::dream::{self, AdaptivePainFocus, DreamResult};
 use crate::memory::episodic::{
     self, EpisodicConfig, EpisodicMemory, EpisodicRetrievalResult, ValenceReceipt,

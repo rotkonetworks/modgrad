@@ -27,6 +27,7 @@ pub struct Bpe {
     /// Ordered merge rules: (left_id, right_id) applied in sequence during encoding.
     merges: Vec<(u32, u32)>,
     /// Fast merge lookup: (left_id, right_id) → rank (lower = higher priority).
+    #[allow(dead_code)] // reserved for fast-path encoder; currently unused
     merge_rank: HashMap<(u32, u32), usize>,
     /// Special token offsets (set after vocab is built).
     pub bos_id: u32,

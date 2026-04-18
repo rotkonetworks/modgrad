@@ -12,6 +12,7 @@ use super::super::ops::TransformerOps;
 
 /// Newton-Schulz iteration coefficients (Bernstein & Newhouse 2024).
 /// Each tuple is (a, b, c) for: X_{k+1} = a*X_k + X_k @ (b * X_k^T X_k + c * (X_k^T X_k)²)
+#[allow(dead_code)] // canonical Polar Express coefficients; referenced from tests only today
 const NS_COEFFS: [(f32, f32, f32); 5] = [
     (3.4445, -2.8025, 0.8025),
     (3.5042, -2.8893, 0.8493),

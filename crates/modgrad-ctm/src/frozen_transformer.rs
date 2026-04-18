@@ -78,8 +78,6 @@ pub struct FrozenTransformer {
 impl FrozenTransformer {
     /// Load from safetensors file.
     pub fn load(path: &str, config: TransformerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        use std::collections::HashMap;
-
         let data = std::fs::read(path)?;
         let tensors = parse_safetensors(&data)?;
 
@@ -142,7 +140,6 @@ impl FrozenTransformer {
         let cfg = &self.config;
         let hd = cfg.hidden_dim;
         let head_dim = hd / cfg.n_heads;
-        let half_head = head_dim / 2;
         let kv_dim = cfg.n_kv_heads * head_dim;
         let seq_len = token_ids.len();
 
@@ -363,6 +360,7 @@ use std::collections::HashMap;
 #[derive(Debug)]
 struct TensorInfo {
     dtype: String,
+    #[allow(dead_code)] // populated from safetensors header; retained for debug output and potential validation
     shape: Vec<usize>,
     data_offsets: (usize, usize),
 }
@@ -415,7 +413,7 @@ fn get_tensor_f32(
     tensors: &HashMap<String, TensorInfo>,
     data: &[u8],
     name: &str,
-    expected_len: usize,
+    _expected_len: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let info = tensors.get(name)
         .ok_or_else(|| format!("tensor '{}' not found", name))?;

@@ -7,6 +7,7 @@ use std::os::unix::io::RawFd;
 
 // ─── ioctl direction bits ───────────────────────────────────
 
+#[allow(dead_code)] // canonical KFD direction bit; retained for completeness
 const IOC_NONE: u32 = 0;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
@@ -218,6 +219,7 @@ const IOC_GET_VERSION: u64 = ior::<GetVersionArgs>(0x01);
 const IOC_CREATE_QUEUE: u64 = iowr::<CreateQueueArgs>(0x02);
 const IOC_DESTROY_QUEUE: u64 = iowr::<DestroyQueueArgs>(0x03);
 const IOC_CREATE_EVENT: u64 = iowr::<CreateEventArgs>(0x08);
+#[allow(dead_code)] // canonical KFD ioctl number; retained for completeness
 const IOC_DESTROY_EVENT: u64 = iow::<DestroyEventArgs>(0x09);
 const IOC_SET_EVENT: u64 = iow::<SetEventArgs>(0x0A);
 const IOC_WAIT_EVENTS: u64 = iowr::<WaitEventsArgs>(0x0C);
