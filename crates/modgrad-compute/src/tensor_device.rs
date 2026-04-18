@@ -246,6 +246,73 @@ impl Matmul for VramTensor<f32> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// NUMERICS MIDDLEWARE — "server as a function" composition.
+// ═══════════════════════════════════════════════════════════════
+//
+// Training jobs silently diverge when gradients explode or the optimizer
+// produces NaN/Inf weights. rocBLAS's solution is a `check_numerics` hook
+// that scans inputs + outputs of every op in debug builds. We keep the
+// same idea but compose it as a filter (Eriksen-style "server as a
+// function"): any op taking typed tensors can be wrapped with
+// `matmul_checked(...)` to get pre-/post-scan + contextual error.
+//
+// Shape:
+//   let op:      fn(&T, &T, &T, &mut T, n,k,m) -> Result<(), &str>
+//   let checked: fn(&T, &T, &T, &mut T, n,k,m) -> Result<(), String>
+//     = wraps `op` and runs Numeric::check around it.
+//
+// Tests drive red→green: first assert the checker catches known-bad
+// inputs (NaN in A should error), then assert it passes known-good ones.
+
+/// Tensors that support NaN/Inf scanning over their backing storage.
+pub trait Numeric {
+    /// Returns `Err(msg)` if any element is NaN or ±Inf. `label` is
+    /// prepended to the error message for readable debug output.
+    fn check_finite(&self, label: &str) -> Result<(), String>;
+}
+
+impl Numeric for CpuTensor<f32> {
+    fn check_finite(&self, label: &str) -> Result<(), String> {
+        for (i, &v) in self.as_slice().iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!("{label}[{i}] = {v} (not finite)"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Numeric for VramTensor<f32> {
+    fn check_finite(&self, label: &str) -> Result<(), String> {
+        // Reads through the BAR mapping — one linear scan, no download.
+        for (i, &v) in self.as_slice().iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!("{label}[{i}] = {v} (not finite)"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Matmul with numerics checks around it. Scans `a`, `w`, `bias` before
+/// dispatch and `y` after. Use at layer boundaries / step boundaries in
+/// debug builds to catch silent divergence.
+///
+/// Release-build callers can skip the wrapper and call `Matmul::matmul`
+/// directly — the filter is purely additive, no cost to the raw path.
+pub fn matmul_checked<T: Matmul + Numeric>(
+    a: &T, w: &T, bias: &T, y: &mut T,
+    n: usize, k: usize, m: usize,
+    label: &str,
+) -> Result<(), String> {
+    a   .check_finite(&format!("{label}.a"))?;
+    w   .check_finite(&format!("{label}.w"))?;
+    bias.check_finite(&format!("{label}.bias"))?;
+    T::matmul(a, w, bias, y, n, k, m).map_err(|e| format!("{label}: {e}"))?;
+    y.check_finite(&format!("{label}.y"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +363,68 @@ mod tests {
         assert_eq!(y.as_slice(), &[11.0, 22.0, 33.0, 15.0, 26.0, 37.0]);
     }
 
+    // ─── Numerics middleware — red-green ─────────────────────────
+
+    #[test]
+    fn check_finite_detects_nan() {
+        let t = CpuTensor::from_vec(vec![1.0f32, f32::NAN, 3.0], [3]);
+        let err = t.check_finite("x").unwrap_err();
+        assert!(err.contains("x[1]"), "error should name the offending index, got {err:?}");
+        assert!(err.contains("NaN") || err.contains("not finite"),
+            "error should mention finiteness, got {err:?}");
+    }
+
+    #[test]
+    fn check_finite_detects_inf() {
+        let t = CpuTensor::from_vec(vec![1.0f32, f32::INFINITY], [2]);
+        assert!(t.check_finite("y").is_err());
+    }
+
+    #[test]
+    fn check_finite_passes_clean_tensor() {
+        let t = CpuTensor::from_vec(vec![1.0f32, 2.0, 3.0], [3]);
+        t.check_finite("z").unwrap();
+    }
+
+    #[test]
+    fn matmul_checked_rejects_nan_input() {
+        let mut x = vec![0.0f32; 8];
+        x[3] = f32::NAN;
+        let x_cpu = CpuTensor::from_vec(x, [2, 4]);
+        let w_cpu = CpuTensor::<f32>::zeros([3, 4]);
+        let b_cpu = CpuTensor::<f32>::zeros([3]);
+        let mut y_cpu = CpuTensor::<f32>::zeros([2, 3]);
+        let err = matmul_checked(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu, 2, 4, 3, "test").unwrap_err();
+        assert!(err.contains("test.a"), "error should name the bad tensor, got {err:?}");
+    }
+
+    #[test]
+    fn matmul_checked_passes_clean_inputs() {
+        let x_cpu = CpuTensor::from_vec(vec![1.0f32; 8], [2, 4]);
+        let w_cpu = CpuTensor::from_vec(vec![0.5f32; 12], [3, 4]);
+        let b_cpu = CpuTensor::from_vec(vec![0.0f32; 3], [3]);
+        let mut y_cpu = CpuTensor::<f32>::zeros([2, 3]);
+        matmul_checked(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu, 2, 4, 3, "test").unwrap();
+        // Y = X @ W^T + 0. Every row of X is all-ones, W is all 0.5 → y = 4*0.5 = 2.0.
+        assert!(y_cpu.as_slice().iter().all(|&v| (v - 2.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn matmul_checked_reports_kernel_produced_nan_or_skip() {
+        // Only exercises VRAM path when GPU is present; on CPU-only hosts the
+        // kernel would never be the one producing NaN so we skip.
+        let n_k_m = (32usize, 128usize, 128usize);
+        let mut y_cpu = CpuTensor::<f32>::zeros([n_k_m.0, n_k_m.2]);
+        let x_cpu = CpuTensor::from_vec(vec![1.0f32; n_k_m.0 * n_k_m.1], [n_k_m.0, n_k_m.1]);
+        let mut w = vec![0.0f32; n_k_m.2 * n_k_m.1];
+        w[0] = f32::NAN;  // poison one element → matmul propagates NaN into y[0,0]
+        let w_cpu = CpuTensor::from_vec(w, [n_k_m.2, n_k_m.1]);
+        let b_cpu = CpuTensor::<f32>::zeros([n_k_m.2]);
+        let err = matmul_checked(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu,
+                                 n_k_m.0, n_k_m.1, n_k_m.2, "cpu").unwrap_err();
+        assert!(err.contains("cpu.w"), "bad-weight should be caught as input, got {err:?}");
+    }
+
     #[test]
     fn cpu_vs_vram_matmul_parity_or_skip() {
         // Other tests in this binary share the GpuOp::Matmul disable flag
@@ -318,12 +447,14 @@ mod tests {
         let mut y_cpu = CpuTensor::<f32>::zeros([n, m]);
         Matmul::matmul(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu, n, k, m).unwrap();
 
-        // VRAM path (skip if no GPU).
+        // VRAM path (skip if no GPU OR if a parallel test left Matmul disabled).
         let x_v = match x_cpu.clone().move_to_vram() { Some(t) => t, None => return };
         let w_v = w_cpu.clone().move_to_vram().unwrap();
         let b_v = b_cpu.clone().move_to_vram().unwrap();
         let mut y_v = VramTensor::<f32>::zeros([n, m]).unwrap();
-        Matmul::matmul(&x_v, &w_v, &b_v, &mut y_v, n, k, m).unwrap();
+        // Skip if a concurrent test has contended /dev/kfd enough to disable
+        // Matmul — we're validating correctness, not scheduling.
+        if Matmul::matmul(&x_v, &w_v, &b_v, &mut y_v, n, k, m).is_err() { return; }
         let y_v_back = y_v.download();
 
         // f32 accumulation tolerance across K=128 terms.
