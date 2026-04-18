@@ -25,7 +25,9 @@ pub mod plural;
 pub mod organism;
 pub mod cerebellum;
 /// Minimal frozen transformer loader for external LLMs (safetensors).
-/// For trainable transformers, use modgrad-transformer crate instead.
+/// Stays here because it impls the `cerebellum::FrozenCerebellum` trait;
+/// splitting requires a bridge module across crates — deferred until needed.
+/// For trainable transformers, use the rest of `modgrad-transformer`.
 pub mod frozen_transformer;
 /// Red-team validation: attack primitives with corresponding defenses.
 /// Every attack function has a defense counterpart in bio/ or plural.
