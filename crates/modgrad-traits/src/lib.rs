@@ -13,6 +13,9 @@
 pub mod param_iter;
 pub use param_iter::ParamIter;
 
+pub mod vjp;
+pub use vjp::Vjp;
+
 /// Trait for weight types that can be viewed as a flat f32 slice.
 /// Enables Optimizer to operate on Brain weights directly.
 pub trait Flattenable {
