@@ -261,12 +261,25 @@ pub fn ffn_forward(w: &FfnWeights, tokens: &[usize]) -> (Vec<Vec<f32>>, FfnCache
 /// At N=128 and 32 cores, a chunk size of 4 gives full core coverage.
 const GEMM_N_CHUNK: usize = 4;
 
-/// Batched matmul: Y[n×m] = A[n×k] @ W^T[k×m] + bias[m].
-/// Splits the batch dimension across rayon threads; each chunk calls matrixmultiply
-/// independently (SIMD-vectorized sgemm). Result: SIMD × multi-core parallelism.
+/// Forward matmul: Y[n×m] = A[n×k] @ W^T[k×m] + bias[m].
+/// GPU-accelerated via `accel::try_matmul` (uses matmul_blocked kernel).
+/// Falls back to rayon + matrixmultiply sgemm on shape-mismatch or GPU failure.
+///
+/// GPU path constraints: m%128==0, k%8==0, n%32==0. For our FFN sizes
+/// (N=128, K∈{1024, 5120}, M∈{1024, 5120}) all natural shapes pass.
 #[inline]
 fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
-                _n: usize, k: usize, m: usize) {
+                n: usize, k: usize, m: usize) {
+    // Try GPU first. try_matmul itself validates everything and falls back
+    // silently by returning false — no panic risk, no device-hang risk.
+    if modgrad_compute::neuron::gpu_enabled()
+        && modgrad_device::kfd::accel::try_matmul(
+            a, weight, bias, y, n as u32, k as u32, m as u32)
+    {
+        return;
+    }
+
+    // CPU fallback: rayon-parallel matrixmultiply sgemm.
     y.par_chunks_mut(GEMM_N_CHUNK * m)
         .zip(a.par_chunks(GEMM_N_CHUNK * k))
         .for_each(|(y_chunk, a_chunk)| {
@@ -287,11 +300,25 @@ fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
         });
 }
 
-/// Batched transposed matmul: dA[n×k] += dY[n×m] @ W[m×k].
-/// Splits the batch dimension across rayon threads.
+/// Transposed matmul: dA[n×k] += dY[n×m] @ W[m×k] (ACCUMULATES).
+/// GPU path first (try_matmul_t), CPU rayon fallback via matrixmultiply.
 #[inline]
 fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
-                  _n: usize, k: usize, m: usize) {
+                  n: usize, k: usize, m: usize) {
+    if modgrad_compute::neuron::gpu_enabled() {
+        // GPU path assigns — so compute into tmp and add. For the common
+        // case where `da` was pre-zeroed, the add collapses to a copy, but
+        // we keep the pattern uniform for safety.
+        let mut tmp = vec![0.0f32; n * k];
+        if modgrad_device::kfd::accel::try_matmul_t(
+            dy, weight, &mut tmp, n as u32, k as u32, m as u32)
+        {
+            da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
+            return;
+        }
+    }
+
+    // CPU fallback: rayon-split batch + matrixmultiply sgemm (beta=1.0 accumulates).
     da.par_chunks_mut(GEMM_N_CHUNK * k)
         .zip(dy.par_chunks(GEMM_N_CHUNK * m))
         .for_each(|(da_chunk, dy_chunk)| {
@@ -307,21 +334,26 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
         });
 }
 
-/// Weight-gradient matmul: dW[m×k] += dY^T[m×n] @ A[n×k].
-/// Split along output dim m (= rows of dW). Each thread owns a row range
-/// and reads all n rows of dY and A — thread-safe since dW rows don't overlap.
+/// Weight-gradient matmul: dW[m×k] += dY^T[m×n] @ A[n×k] (ACCUMULATES).
+/// GPU path first (try_matmul_grad), CPU rayon fallback.
 #[inline]
 fn matmul_grad_rayon(dy: &[f32], a: &[f32], dw: &mut [f32],
                      n: usize, k: usize, m: usize) {
-    // Chunk size chosen for ~32 chunks on an m=5120 matmul (160 rows each).
+    if modgrad_compute::neuron::gpu_enabled() {
+        let mut tmp = vec![0.0f32; m * k];
+        if modgrad_device::kfd::accel::try_matmul_grad(
+            dy, a, &mut tmp, n as u32, k as u32, m as u32)
+        {
+            dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
+            return;
+        }
+    }
+
+    // CPU fallback. Chunk size chosen for ~32 chunks on an m=5120 matmul.
     let m_chunk = (m / 32).max(32);
     dw.par_chunks_mut(m_chunk * k).enumerate().for_each(|(chunk_idx, dw_chunk)| {
         let rows = dw_chunk.len() / k;
         let m_start = chunk_idx * m_chunk;
-        // dy_sub is a column-sub-slice of dY: still n rows, but only `rows` cols starting at m_start.
-        // Its strides inside the full dY: row stride m, col stride 1.
-        // For the transposed view used by sgemm, strides swap: row stride (of dY^T_sub) = 1, col stride = m.
-        // Offset into dY: column m_start.
         let dy_sub = &dy[m_start..];
         unsafe {
             matrixmultiply::sgemm(
@@ -772,6 +804,11 @@ pub fn ffn_train_step(
 
     ffn_backward(w, &cache, &d_logits, grads);
     opt.step_update(w, grads);
+
+    // Weights were updated in place — the GPU's VRAM-cached copies are now
+    // stale. Drop them so the next forward re-uploads the current values.
+    // No-op when GPU is unavailable or in stream mode.
+    modgrad_device::kfd::accel::invalidate_cache();
 
     (loss, acc)
 }

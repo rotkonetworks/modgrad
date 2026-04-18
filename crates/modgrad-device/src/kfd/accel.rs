@@ -420,6 +420,204 @@ pub fn try_ln_backward(
         d_gamma, d_beta, d_input, inv_std)
 }
 
+/// Y[n×m] = X[n×k] @ W^T[k×m] + B[m] using the GPU `matmul_blocked` kernel.
+/// Defensive layer — validates every precondition before touching hardware.
+///
+/// # Preconditions (checked; returns `false` if violated)
+/// * `m % 128 == 0`, `k % 8 == 0`, `n % 32 == 0` — required by matmul_blocked tiling
+/// * `weight.len() >= m*k`, `bias.len() >= m`, `x.len() >= n*k`, `out.len() >= n*m`
+///
+/// # Quick-return behaviour
+/// * If `n == 0` or `m == 0`: zero-sized output, returns `true` without dispatch.
+/// * If `k == 0`: output is just broadcast bias; returns `true` after writing bias on CPU.
+///
+/// # Failure modes (returns `false`, `out` may be partially written)
+/// * GPU globally disabled (prior hang / unavailable hardware)
+/// * GPU lock contention
+/// * VRAM alloc / upload / dispatch / timeout failure — sets session-wide DISABLED flag
+///   on timeout so subsequent calls skip the hardware and fall to CPU.
+///
+/// # Safety (not unsafe, but documented)
+/// This function never violates memory safety, but a mis-sized weight against the
+/// declared `m, k` could cause the GPU kernel to read out-of-bounds of the uploaded
+/// buffer → device hang + Xorg crash. The length checks above are the ONLY barrier
+/// between caller bugs and a device reset. Do not weaken them.
+pub fn try_matmul(
+    x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
+    n: u32, k: u32, m: u32,
+) -> bool {
+    // ─── Quick-return edge cases (success without dispatch) ───
+    if n == 0 || m == 0 {
+        return true;  // nothing to write
+    }
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let m_us = m as usize;
+
+    if k == 0 {
+        // Y = bias broadcast; no matmul to do. Fill `out` row-wise on CPU — this
+        // is small (n rows × m cols) and only hit for degenerate shapes.
+        if bias.len() < m_us || out.len() < n_us * m_us { return false; }
+        for row in 0..n_us {
+            out[row * m_us..(row + 1) * m_us].copy_from_slice(&bias[..m_us]);
+        }
+        return true;
+    }
+
+    // ─── Kernel tiling preconditions (violation → GPU OOB → hang) ───
+    if m % 128 != 0 || k % 8 != 0 || n % 32 != 0 {
+        return false;
+    }
+
+    // ─── Buffer length validation — caller bug protection ───
+    if weight.len() < m_us * k_us
+        || bias.len() < m_us
+        || x.len() < n_us * k_us
+        || out.len() < n_us * m_us
+    {
+        return false;
+    }
+
+    // ─── GPU availability & locking ───
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    // ─── Dispatch. engine.matmul_into returns false on upload, alloc, or
+    //     submit_wait failure. A submit_wait timeout is the most dangerous
+    //     signal — we set DISABLED so a second bad call doesn't re-trigger.
+    if g.engine.matmul_into(&mut g.dev, weight, bias, x, out, n_us, k_us, m_us) {
+        return true;
+    }
+
+    // Couldn't complete — assume the queue is wedged. Disable for the session
+    // and fall to CPU. Ops/ps this is safer than retrying into a hung GPU.
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// Transposed matmul: dA[n×k] = dY[n×m] @ W[m×k] (ASSIGNS, does not accumulate).
+/// Caller is responsible for zero-init / accumulation outside.
+///
+/// Implemented by physically transposing `weight` into a scratch `W^T` laid out
+/// as [k×m] row-major, then calling `matmul_blocked` with `X=dY` and `W=W^T`.
+///
+/// # Preconditions (returns `false` on violation)
+/// * `k % 128 == 0` (output M for kernel), `m % 8 == 0`, `n % 32 == 0`
+/// * slice length checks as per `try_matmul`
+pub fn try_matmul_t(
+    dy: &[f32], weight: &[f32], da: &mut [f32],
+    n: u32, k: u32, m: u32,
+) -> bool {
+    if n == 0 || k == 0 { return true; }
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let m_us = m as usize;
+
+    // matmul_blocked requires M_kernel % 128 == 0. Here M_kernel = k.
+    if k % 128 != 0 || m % 8 != 0 || n % 32 != 0 { return false; }
+
+    if dy.len() < n_us * m_us
+        || weight.len() < m_us * k_us
+        || da.len() < n_us * k_us
+    {
+        return false;
+    }
+
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+
+    // Transpose W[m,k] → W^T[k,m] once (CPU; rayon-parallel optional, but this
+    // is small enough — e.g. 5120×1024 = 20MB, ~5ms scalar).
+    let mut weight_t = vec![0.0f32; m_us * k_us];
+    for row in 0..m_us {
+        for col in 0..k_us {
+            weight_t[col * m_us + row] = weight[row * k_us + col];
+        }
+    }
+    // Zero bias slot for the kernel (we don't want an additive bias here).
+    let zero_bias = vec![0.0f32; k_us];
+
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    // matmul_blocked: Y[n, k] = X[n, m] @ W^T_kernel + zero_bias
+    //   where W^T_kernel = weight_t laid out as [k, m] row-major — exactly what
+    //   the kernel expects as its "weight" argument.
+    if g.engine.matmul_into(
+        &mut g.dev, &weight_t, &zero_bias, dy, da, n_us, m_us, k_us,
+    ) {
+        return true;
+    }
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// Weight-gradient matmul: dW[m×k] = dY^T[m×n] @ A[n×k] (ASSIGNS, not accumulate).
+///
+/// Implemented via two one-off transposes (dY→dY^T, A→A^T) and a single
+/// `matmul_blocked` dispatch with (N=m, K=n, M=k). Both transposes are small
+/// compared to the matmul FLOPs (O(n·{m+k}) vs O(n·m·k)).
+///
+/// # Preconditions (returns `false` on violation)
+/// * `k % 128 == 0`, `n % 8 == 0`, `m % 32 == 0`
+/// * slice length checks
+pub fn try_matmul_grad(
+    dy: &[f32], a: &[f32], dw: &mut [f32],
+    n: u32, k: u32, m: u32,
+) -> bool {
+    if m == 0 || k == 0 { return true; }
+    if n == 0 {
+        // dw = 0 (sum over empty axis). Assign zeros.
+        for v in dw.iter_mut() { *v = 0.0; }
+        return true;
+    }
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let m_us = m as usize;
+
+    // matmul_blocked requires kernel's M % 128 == 0. Kernel M = k here.
+    if k % 128 != 0 || n % 8 != 0 || m % 32 != 0 { return false; }
+
+    if dy.len() < n_us * m_us
+        || a.len() < n_us * k_us
+        || dw.len() < m_us * k_us
+    {
+        return false;
+    }
+
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+
+    // dY^T: [m, n] row-major.
+    let mut dy_t = vec![0.0f32; m_us * n_us];
+    for row in 0..n_us {
+        for col in 0..m_us {
+            dy_t[col * n_us + row] = dy[row * m_us + col];
+        }
+    }
+    // A^T: [k, n] row-major.
+    let mut a_t = vec![0.0f32; k_us * n_us];
+    for row in 0..n_us {
+        for col in 0..k_us {
+            a_t[col * n_us + row] = a[row * k_us + col];
+        }
+    }
+    let zero_bias = vec![0.0f32; k_us];
+
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    // matmul_blocked: Y[m, k] = X[m, n] @ W^T_kernel + bias
+    //   X = dy_t  ([m, n])
+    //   kernel weight laid out as [k, n] row-major = a_t
+    if g.engine.matmul_into(
+        &mut g.dev, &a_t, &zero_bias, &dy_t, dw, m_us, n_us, k_us,
+    ) {
+        return true;
+    }
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
 /// GPU L2 norm: returns sqrt(sum(x[i]^2)).
 /// Returns None if GPU unavailable or dispatch fails (caller should fall back to CPU).
 pub fn try_l2_norm(data: &[f32]) -> Option<f32> {

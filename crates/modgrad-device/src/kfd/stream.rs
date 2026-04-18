@@ -49,6 +49,7 @@ pub struct StreamEngine {
     cached_sl_bwd_dx: Option<super::dispatch::KernelEntry>,
     cached_reduce_l2: Option<super::dispatch::KernelEntry>,
     cached_adamw: Option<super::dispatch::KernelEntry>,
+    cached_matmul_blocked: Option<super::dispatch::KernelEntry>,
 
     // ─── Chained dispatch scratch buffers ───
     // These stay in VRAM between kernel dispatches so data never
@@ -88,6 +89,7 @@ impl StreamEngine {
             cached_sl_bwd_dx: None,
             cached_reduce_l2: None,
             cached_adamw: None,
+            cached_matmul_blocked: None,
         }
     }
 
@@ -334,6 +336,85 @@ impl StreamEngine {
             std::slice::from_raw_parts(self.y_buf.as_ref().unwrap().cpu_ptr as *const f32, out_dim)
         };
         out[..out_dim].copy_from_slice(src);
+
+        if !self.vram_mode { self.active = 1 - self.active; }
+        true
+    }
+
+    /// Y[n×m] = X[n×k] @ W^T[k×m] + B[m] using the matmul_blocked kernel.
+    /// W is row-major [m×k] (Linear stores weight as [out × in]). X is row-major
+    /// [n×k], Y row-major [n×m]. Bias broadcast across rows.
+    ///
+    /// Precondition (caller MUST validate — violations hang gfx1102):
+    ///   m % 128 == 0, k % 8 == 0, n % 32 == 0
+    ///   weight.len() >= m*k, bias.len() >= m
+    ///   x.len() >= n*k, out.len() >= n*m
+    ///
+    /// Returns false on any upload / dispatch / wait failure; leaves `out`
+    /// untouched. Does NOT verify preconditions — the accel layer does that.
+    pub fn matmul_into(
+        &mut self, dev: &mut HsaDevice,
+        weight: &[f32], bias: &[f32], x: &[f32],
+        out: &mut [f32], n: usize, k: usize, m: usize,
+    ) -> bool {
+        let (w_va, bias_va) = match self.prepare_weights(dev, weight, bias) {
+            Some(v) => v, None => return false,
+        };
+
+        let x_bytes = n * k * 4;
+        let y_bytes = n * m * 4;
+        if !self.ensure_x(x_bytes, dev) { return false; }
+        if !self.ensure_y(y_bytes, dev) { return false; }
+        if !self.ensure_args(dev) { return false; }
+
+        // Upload X through BAR. At N=128, K=1024 that's 512KB — well under the
+        // staging buffer's typical capacity, single memcpy.
+        self.x_buf.as_ref().unwrap().write_f32(0, &x[..n * k]);
+
+        // Build kernargs — layout mirrors the .s file's
+        //   { W, B, X, Y, M, K, N } = 8+8+8+8+4+4+4 = 44 bytes
+        let xva = self.x_buf.as_ref().unwrap().va_addr;
+        let yva = self.y_buf.as_ref().unwrap().va_addr;
+        let args = self.args_buf.as_ref().unwrap();
+        let mut kargs = [0u8; 48];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&bias_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&xva.to_le_bytes());
+        kargs[24..32].copy_from_slice(&yva.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(m as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&(k as u32).to_le_bytes());
+        kargs[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+        args.write(0, &kargs[..44]);
+
+        // Grid: TM=128, TN=32 tiles — one WG per (m/128, n/32) tile pair.
+        let nwg_m = ((m + 127) / 128) as u32;
+        let nwg_n = ((n +  31) /  32) as u32;
+        let total_wg = nwg_m * nwg_n;
+
+        if self.cached_matmul_blocked.is_none() {
+            self.cached_matmul_blocked = dev.resolve_kernel("matmul_blocked");
+        }
+        match &self.cached_matmul_blocked {
+            Some(entry) => {
+                dev.dispatch_enqueue_resolved(entry, args, [total_wg, 1, 1], [256, 1, 1]);
+            }
+            None => return false,
+        }
+
+        dev.queue.cache_wb();
+        // 10s timeout: at 189M param FFN with M=5120 K=1024 N=128 the kernel
+        // runs in single-digit ms; a 10s bound catches real hangs without
+        // false-positive on any healthy dispatch.
+        if !dev.submit_wait(10_000) { return false; }
+
+        // Read Y back through BAR.
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                self.y_buf.as_ref().unwrap().cpu_ptr as *const f32,
+                n * m,
+            )
+        };
+        out[..n * m].copy_from_slice(src);
 
         if !self.vram_mode { self.active = 1 - self.active; }
         true
