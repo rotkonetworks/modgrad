@@ -20,6 +20,7 @@ pub mod compute;
 pub mod accel;
 pub mod stream;
 pub mod arena;
+pub mod vram_mirror;
 pub mod dispatch_queue;
 pub mod gguf;
 pub mod inference;

@@ -496,6 +496,48 @@ pub fn try_matmul(
     false
 }
 
+/// Allocate a `VramMirror` holding permanent VRAM for a list of tensor sizes.
+/// Returns `None` if the GPU is unavailable or any alloc fails.
+///
+/// Every tensor gets four VRAM buffers (weights, grads, m, v). `m` and `v`
+/// start zero-initialised. Uploads to `weights` should follow via
+/// `VramMirror::upload_weight`.
+pub fn make_vram_mirror(sizes: Vec<usize>) -> Option<super::vram_mirror::VramMirror> {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    let guard = gpu().lock().ok()?;
+    let g = guard.as_ref()?;
+    super::vram_mirror::VramMirror::new(&g.dev, sizes)
+}
+
+/// Run AdamW in-place on a VRAM-resident mirror tensor (weights, grads, m, v
+/// all live in the mirror). Zero PCIe / BAR traffic per call — kernel reads
+/// and writes VRAM directly.
+///
+/// Returns `false` on dispatch failure. On timeout, sets the session-wide
+/// DISABLED flag so subsequent calls short-circuit to the caller's fallback.
+pub fn try_adamw_vram(
+    mirror: &super::vram_mirror::VramMirror, idx: usize,
+    lr: f32, beta1: f32, beta2: f32, eps: f32,
+    weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
+) -> bool {
+    if idx >= mirror.sizes.len() { return false; }
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+
+    let n = mirror.sizes[idx];
+    if g.engine.adamw_zerocopy(
+        &mut g.dev,
+        mirror.weight_va(idx), mirror.grad_va(idx),
+        mirror.m_va(idx), mirror.v_va(idx),
+        n, lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv,
+    ) {
+        return true;
+    }
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
 /// Transposed matmul: dA[n×k] = dY[n×m] @ W[m×k] (ASSIGNS, does not accumulate).
 /// Caller is responsible for zero-init / accumulation outside.
 ///

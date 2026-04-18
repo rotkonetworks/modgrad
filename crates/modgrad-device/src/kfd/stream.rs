@@ -1758,6 +1758,50 @@ impl StreamEngine {
         true
     }
 
+    /// Zero-copy AdamW: all four tensors already live in VRAM. Dispatches the
+    /// kernel on the caller's VA pointers directly — no upload, no download.
+    /// This is the form to call when weights/moments/grads are resident VRAM
+    /// buffers (kept across the whole training loop).
+    ///
+    /// # Returns
+    /// `true` on success. `false` on kernel not loaded, args buffer alloc
+    /// failure, or submit_wait timeout.
+    pub fn adamw_zerocopy(
+        &mut self, dev: &mut HsaDevice,
+        w_va: u64, g_va: u64, m_va: u64, v_va: u64, n: usize,
+        lr: f32, beta1: f32, beta2: f32, eps: f32,
+        weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
+    ) -> bool {
+        if !self.ensure_chain_args(0, dev) { return false; }
+
+        let mut kargs = [0u8; 64];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&g_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&m_va.to_le_bytes());
+        kargs[24..32].copy_from_slice(&v_va.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(n as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&lr.to_le_bytes());
+        kargs[40..44].copy_from_slice(&beta1.to_le_bytes());
+        kargs[44..48].copy_from_slice(&beta2.to_le_bytes());
+        kargs[48..52].copy_from_slice(&eps.to_le_bytes());
+        kargs[52..56].copy_from_slice(&weight_decay.to_le_bytes());
+        kargs[56..60].copy_from_slice(&bc1_inv.to_le_bytes());
+        kargs[60..64].copy_from_slice(&bc2_inv.to_le_bytes());
+        let args = self.chain_args[0].as_ref().unwrap();
+        args.write(0, &kargs[..64]);
+
+        if self.cached_adamw.is_none() {
+            self.cached_adamw = dev.resolve_kernel("adamw");
+        }
+        let nwg = (n as u32 + 255) / 256;
+        match &self.cached_adamw {
+            Some(entry) => dev.dispatch_enqueue_resolved(entry, args, [nwg, 1, 1], [256, 1, 1]),
+            None => return false,
+        }
+        dev.queue.cache_wb();
+        dev.submit_wait(10_000)
+    }
+
     /// AdamW optimizer: update weights, moments, and zero grads on GPU.
     /// All four buffers (w, grad, m, v) are uploaded, kernel runs, results read back.
     pub fn adamw(
