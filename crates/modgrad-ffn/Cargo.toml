@@ -1,0 +1,17 @@
+[package]
+name = "modgrad-ffn"
+version = "0.1.0"
+edition = "2024"
+description = "FFN architecture (SwiGLU MLP language model) for the modgrad ML SDK"
+license = "MIT"
+
+[dependencies]
+modgrad-traits  = { path = "../modgrad-traits" }
+modgrad-compute = { path = "../modgrad-compute" }
+modgrad-device  = { path = "../modgrad-device" }
+modgrad-persist = { path = "../modgrad-persist" }
+serde = { version = "1", features = ["derive"] }
+rayon = "1"
+bincode = "1"
+# Pure-Rust SIMD GEMM (cache-blocked matmul). Same version as modgrad-compute.
+matrixmultiply = "0.3"

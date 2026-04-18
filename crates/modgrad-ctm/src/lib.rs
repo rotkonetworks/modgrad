@@ -13,7 +13,8 @@ pub mod weights;
 pub mod forward;
 pub mod train;
 pub mod loss;
-pub mod ffn;
+// FFN architecture moved to the `modgrad-ffn` crate — parallel to
+// `modgrad-transformer`. Depend on it directly for SwiGLU language models.
 pub mod graph;
 pub mod memory;
 pub mod bio;

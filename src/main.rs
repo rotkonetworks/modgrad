@@ -229,7 +229,7 @@ fn learn_ffn(
     xl: bool,
     lr_override: Option<f32>,
 ) {
-    use modgrad_ctm::ffn::{FfnConfig, FfnWeights, FfnAdamW, FfnGradients, ffn_train_step};
+    use modgrad_ffn::{FfnConfig, FfnWeights, FfnAdamW, FfnGradients, ffn_train_step};
 
     // Load data
     let mut all_tokens: Vec<usize> = Vec::new();

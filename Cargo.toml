@@ -6,6 +6,7 @@ members = [
     "crates/modgrad-persist",
     "crates/modgrad-compute",
     "crates/modgrad-ctm",
+    "crates/modgrad-ffn",
     "crates/modgrad-codec",
     "crates/modgrad-data",
     "crates/modgrad-training",
@@ -81,6 +82,7 @@ modgrad-device = { path = "crates/modgrad-device" }
 modgrad-persist = { path = "crates/modgrad-persist" }
 modgrad-compute = { path = "crates/modgrad-compute" }
 modgrad-ctm = { path = "crates/modgrad-ctm" }
+modgrad-ffn = { path = "crates/modgrad-ffn" }
 modgrad-codec = { path = "crates/modgrad-codec" }
 modgrad-data = { path = "crates/modgrad-data" }
 modgrad-training = { path = "crates/modgrad-training" }

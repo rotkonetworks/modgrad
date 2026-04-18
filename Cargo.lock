@@ -2375,6 +2375,7 @@ dependencies = [
  "modgrad-ctm",
  "modgrad-data",
  "modgrad-device",
+ "modgrad-ffn",
  "modgrad-io",
  "modgrad-persist",
  "modgrad-runtime",
@@ -2410,6 +2411,7 @@ version = "0.1.0"
 dependencies = [
  "candle-kernels",
  "cudarc",
+ "matrixmultiply",
  "modgrad-device",
  "rayon",
  "serde",
@@ -2458,6 +2460,20 @@ dependencies = [
  "cudarc",
  "libc",
  "rayon",
+]
+
+[[package]]
+name = "modgrad-ffn"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "matrixmultiply",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-persist",
+ "modgrad-traits",
+ "rayon",
+ "serde",
 ]
 
 [[package]]
