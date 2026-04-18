@@ -246,6 +246,81 @@ impl Matmul for VramTensor<f32> {
     }
 }
 
+/// Row-wise layer normalization with affine transform.
+///
+/// Input `x` is `[n × d]` row-major, `gamma` and `beta` are `[d]`. Output
+/// `y` is `[n × d]` with `y[i,j] = gamma[j] * (x[i,j] - mean_i) * inv_std_i + beta[j]`.
+/// Per-row `means` and `inv_stds` are also returned for the backward pass.
+///
+/// Operands must live on the same device — the type system enforces it.
+pub trait LayerNorm: Sized {
+    fn layer_norm_forward(
+        x: &Self, gamma: &Self, beta: &Self,
+        y: &mut Self, means: &mut CpuTensor<f32>, inv_stds: &mut CpuTensor<f32>,
+        n: usize, d: usize,
+    ) -> Result<(), &'static str>;
+}
+
+fn layer_norm_body(
+    x: &[f32], gamma: &[f32], beta: &[f32],
+    y: &mut [f32], means: &mut [f32], inv_stds: &mut [f32],
+    n: usize, d: usize,
+) -> Result<(), &'static str> {
+    if x.len()        < n * d { return Err("x too small"); }
+    if gamma.len()    < d     { return Err("gamma too small"); }
+    if beta.len()     < d     { return Err("beta too small"); }
+    if y.len()        < n * d { return Err("y too small"); }
+    if means.len()    < n     { return Err("means too small"); }
+    if inv_stds.len() < n     { return Err("inv_stds too small"); }
+    let df = d as f32;
+    for row in 0..n {
+        let x_row = &x[row * d..(row + 1) * d];
+        let y_row = &mut y[row * d..(row + 1) * d];
+        let mean: f32 = x_row.iter().sum::<f32>() / df;
+        let var: f32 = x_row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / df;
+        let inv_std = 1.0 / (var + 1e-5).sqrt();
+        for j in 0..d {
+            y_row[j] = gamma[j] * (x_row[j] - mean) * inv_std + beta[j];
+        }
+        means[row] = mean;
+        inv_stds[row] = inv_std;
+    }
+    Ok(())
+}
+
+impl LayerNorm for CpuTensor<f32> {
+    fn layer_norm_forward(
+        x: &Self, gamma: &Self, beta: &Self,
+        y: &mut Self, means: &mut CpuTensor<f32>, inv_stds: &mut CpuTensor<f32>,
+        n: usize, d: usize,
+    ) -> Result<(), &'static str> {
+        layer_norm_body(
+            x.as_slice(), gamma.as_slice(), beta.as_slice(),
+            y.as_mut_slice(), means.as_mut_slice(), inv_stds.as_mut_slice(),
+            n, d,
+        )
+    }
+}
+
+impl LayerNorm for VramTensor<f32> {
+    fn layer_norm_forward(
+        x: &Self, gamma: &Self, beta: &Self,
+        y: &mut Self, means: &mut CpuTensor<f32>, inv_stds: &mut CpuTensor<f32>,
+        n: usize, d: usize,
+    ) -> Result<(), &'static str> {
+        // BAR-mapped CPU compute — slices point at VRAM directly, no
+        // upload/download. Slower than a dedicated GPU kernel would be
+        // (we don't have an affine-LN kernel yet, only the single-row
+        // whitening one), but no PCIe round trip either. TODO: write a
+        // batched affine-LN kernel and dispatch on VA pointers here.
+        layer_norm_body(
+            x.as_slice(), gamma.as_slice(), beta.as_slice(),
+            y.as_mut_slice(), means.as_mut_slice(), inv_stds.as_mut_slice(),
+            n, d,
+        )
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // NUMERICS MIDDLEWARE — "server as a function" composition.
 // ═══════════════════════════════════════════════════════════════
@@ -423,6 +498,78 @@ mod tests {
         let err = matmul_checked(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu,
                                  n_k_m.0, n_k_m.1, n_k_m.2, "cpu").unwrap_err();
         assert!(err.contains("cpu.w"), "bad-weight should be caught as input, got {err:?}");
+    }
+
+    // ─── LayerNorm — red-green ───────────────────────────────────
+
+    #[test]
+    fn cpu_layer_norm_unit_affine_whitens() {
+        // gamma=1, beta=0 ⇒ output has zero mean and unit variance per row.
+        let (n, d) = (2, 4);
+        let x = CpuTensor::from_vec(
+            vec![1.0f32, 2.0, 3.0, 4.0,
+                 0.0, 10.0, 20.0, 30.0], [n, d]);
+        let g = CpuTensor::from_vec(vec![1.0f32; d], [d]);
+        let b = CpuTensor::from_vec(vec![0.0f32; d], [d]);
+        let mut y = CpuTensor::<f32>::zeros([n, d]);
+        let mut means   = CpuTensor::<f32>::zeros([n]);
+        let mut invstds = CpuTensor::<f32>::zeros([n]);
+        LayerNorm::layer_norm_forward(&x, &g, &b, &mut y, &mut means, &mut invstds, n, d).unwrap();
+        for row in 0..n {
+            let r = &y.as_slice()[row * d..(row + 1) * d];
+            let mean: f32 = r.iter().sum::<f32>() / d as f32;
+            assert!(mean.abs() < 1e-5, "row {row} mean = {mean}");
+            let var: f32 = r.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / d as f32;
+            assert!((var - 1.0).abs() < 1e-3, "row {row} var = {var}");
+        }
+    }
+
+    #[test]
+    fn cpu_layer_norm_affine_scales_and_shifts() {
+        let (n, d) = (1, 4);
+        let x = CpuTensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], [n, d]);
+        let g = CpuTensor::from_vec(vec![5.0f32; d], [d]);   // scale ×5
+        let b = CpuTensor::from_vec(vec![7.0f32; d], [d]);   // shift +7
+        let mut y = CpuTensor::<f32>::zeros([n, d]);
+        let mut means = CpuTensor::<f32>::zeros([n]);
+        let mut invstds = CpuTensor::<f32>::zeros([n]);
+        LayerNorm::layer_norm_forward(&x, &g, &b, &mut y, &mut means, &mut invstds, n, d).unwrap();
+        // Unit-variance normalisation then * 5 + 7 should keep the row mean near 7.
+        let r = &y.as_slice()[..];
+        let mean: f32 = r.iter().sum::<f32>() / d as f32;
+        assert!((mean - 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cpu_vs_vram_layer_norm_parity_or_skip() {
+        modgrad_device::kfd::accel::reset_op(modgrad_device::kfd::accel::GpuOp::Matmul);
+        let (n, d) = (8, 16);
+        let x_data: Vec<f32> = (0..n * d).map(|i| (i as f32 * 0.007).sin()).collect();
+        let g_data: Vec<f32> = (0..d).map(|i| 1.0 + 0.1 * (i as f32 * 0.3).cos()).collect();
+        let b_data: Vec<f32> = (0..d).map(|i| 0.05 * i as f32).collect();
+
+        let x_c = CpuTensor::from_vec(x_data.clone(), [n, d]);
+        let g_c = CpuTensor::from_vec(g_data.clone(), [d]);
+        let b_c = CpuTensor::from_vec(b_data.clone(), [d]);
+        let mut y_c = CpuTensor::<f32>::zeros([n, d]);
+        let mut m_c = CpuTensor::<f32>::zeros([n]);
+        let mut s_c = CpuTensor::<f32>::zeros([n]);
+        LayerNorm::layer_norm_forward(&x_c, &g_c, &b_c, &mut y_c, &mut m_c, &mut s_c, n, d).unwrap();
+
+        let x_v = match x_c.clone().move_to_vram() { Some(t) => t, None => return };
+        let g_v = g_c.clone().move_to_vram().unwrap();
+        let b_v = b_c.clone().move_to_vram().unwrap();
+        let mut y_v = VramTensor::<f32>::zeros([n, d]).unwrap();
+        let mut m_v = CpuTensor::<f32>::zeros([n]);
+        let mut s_v = CpuTensor::<f32>::zeros([n]);
+        LayerNorm::layer_norm_forward(&x_v, &g_v, &b_v, &mut y_v, &mut m_v, &mut s_v, n, d).unwrap();
+        let y_v_back = y_v.download();
+
+        let mut max_err = 0.0f32;
+        for (a, b) in y_c.as_slice().iter().zip(y_v_back.as_slice().iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        assert!(max_err < 1e-5, "CPU/VRAM LN diverge: max_err = {:.3e}", max_err);
     }
 
     #[test]
