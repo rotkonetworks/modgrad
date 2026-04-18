@@ -175,6 +175,77 @@ impl<T: DeviceElem> CpuTensor<T> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// OPERATIONS — dispatch on the operand's device location.
+// ═══════════════════════════════════════════════════════════════
+
+/// Y[n×m] = X[n×k] @ W^T[k×m] + B[m].
+///
+/// `W` is row-major `[m×k]` (the Linear layout: `out × in`). `B` broadcasts
+/// across the N rows. This matches the underlying `matmul_blocked` kernel's
+/// contract and the CPU `matrixmultiply::sgemm` path we already use.
+///
+/// Operands must live on the same device. Mixing CPU and VRAM tensors in
+/// one call is a compile error — explicit `.move_to_vram()` / `.download()`
+/// is required, which is the whole point of the typed-location design.
+pub trait Matmul: Sized {
+    /// Returns `Err` on shape mismatch or dispatch failure. Shape mismatch
+    /// is a bug (the FFN builds its tensors with known shapes); dispatch
+    /// failure only happens on VRAM when the GPU is unavailable, in which
+    /// case the caller typically moves everything to CPU and retries.
+    fn matmul(a: &Self, w: &Self, bias: &Self, y: &mut Self,
+              n: usize, k: usize, m: usize) -> Result<(), &'static str>;
+}
+
+impl Matmul for CpuTensor<f32> {
+    fn matmul(a: &Self, w: &Self, bias: &Self, y: &mut Self,
+              n: usize, k: usize, m: usize) -> Result<(), &'static str> {
+        if a.len() < n * k { return Err("a too small for n*k"); }
+        if w.len() < m * k { return Err("w too small for m*k"); }
+        if bias.len() < m  { return Err("bias too small for m"); }
+        if y.len()    < n * m { return Err("y too small for n*m"); }
+
+        // Bias broadcast.
+        let m_rows = n;
+        let y_slice = y.as_mut_slice();
+        let b_slice = bias.as_slice();
+        for row in 0..m_rows {
+            y_slice[row * m..(row + 1) * m].copy_from_slice(&b_slice[..m]);
+        }
+        // Y += A @ W^T.  A:[n×k] rsa=k csa=1.  W row-major [m×k] viewed as
+        // W^T [k×m] has rsb=1 csb=k.  Y:[n×m] rsc=m csc=1.
+        unsafe {
+            matrixmultiply::sgemm(
+                n, k, m,
+                1.0, a.as_slice().as_ptr(), k as isize, 1,
+                w.as_slice().as_ptr(), 1, k as isize,
+                1.0, y.as_mut_slice().as_mut_ptr(), m as isize, 1,
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Matmul for VramTensor<f32> {
+    fn matmul(a: &Self, w: &Self, bias: &Self, y: &mut Self,
+              n: usize, k: usize, m: usize) -> Result<(), &'static str> {
+        if a.len() < n * k { return Err("a too small for n*k"); }
+        if w.len() < m * k { return Err("w too small for m*k"); }
+        if bias.len() < m  { return Err("bias too small for m"); }
+        if y.len()    < n * m { return Err("y too small for n*m"); }
+        if m % 128 != 0 { return Err("m must be multiple of 128 for matmul_blocked"); }
+        if k % 8   != 0 { return Err("k must be multiple of 8"); }
+        if n % 32  != 0 { return Err("n must be multiple of 32"); }
+
+        // All operands already in VRAM. Zero-copy kernel dispatch.
+        let ok = modgrad_device::kfd::accel::try_matmul_va(
+            a.va(), w.va(), bias.va(), y.va(),
+            n as u32, k as u32, m as u32,
+        );
+        if ok { Ok(()) } else { Err("matmul dispatch failed (GPU disabled or kernel missing)") }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +276,61 @@ mod tests {
         assert_eq!(vram.len(), 4);
         let back = vram.download();
         assert_eq!(back.as_slice(), cpu.as_slice());
+    }
+
+    #[test]
+    fn cpu_matmul_small() {
+        // Y[2×3] = X[2×4] @ W^T[4×3] + b[3], W is row-major [3×4]
+        let x = CpuTensor::from_vec(
+            vec![1.0f32, 2.0, 3.0, 4.0,
+                 5.0, 6.0, 7.0, 8.0], [2, 4]);
+        let w = CpuTensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0], [3, 4]);
+        let b = CpuTensor::from_vec(vec![10.0f32, 20.0, 30.0], [3]);
+        let mut y = CpuTensor::<f32>::zeros([2, 3]);
+        Matmul::matmul(&x, &w, &b, &mut y, 2, 4, 3).unwrap();
+        // y[0] = x[0,:3] + b = [1,2,3]+[10,20,30] = [11, 22, 33]
+        // y[1] = x[1,:3] + b = [5,6,7]+[10,20,30] = [15, 26, 37]
+        assert_eq!(y.as_slice(), &[11.0, 22.0, 33.0, 15.0, 26.0, 37.0]);
+    }
+
+    #[test]
+    fn cpu_vs_vram_matmul_parity_or_skip() {
+        // Other tests in this binary share the GpuOp::Matmul disable flag
+        // via the static OP_DISABLED array. If a concurrent test dispatch
+        // has tripped it, clear here so we test the fresh dispatch path.
+        modgrad_device::kfd::accel::reset_op(
+            modgrad_device::kfd::accel::GpuOp::Matmul
+        );
+
+        // Same shapes the FFN uses at runtime. Both tensors must compute
+        // identical results within f32 tolerance.
+        let (n, k, m) = (32, 128, 128);  // aligned for matmul_blocked
+        let x_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let w_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
+        let b_data: Vec<f32> = (0..m).map(|i| (i as f32 * 0.01).sin()).collect();
+
+        let x_cpu = CpuTensor::from_vec(x_data.clone(), [n, k]);
+        let w_cpu = CpuTensor::from_vec(w_data.clone(), [m, k]);
+        let b_cpu = CpuTensor::from_vec(b_data.clone(), [m]);
+        let mut y_cpu = CpuTensor::<f32>::zeros([n, m]);
+        Matmul::matmul(&x_cpu, &w_cpu, &b_cpu, &mut y_cpu, n, k, m).unwrap();
+
+        // VRAM path (skip if no GPU).
+        let x_v = match x_cpu.clone().move_to_vram() { Some(t) => t, None => return };
+        let w_v = w_cpu.clone().move_to_vram().unwrap();
+        let b_v = b_cpu.clone().move_to_vram().unwrap();
+        let mut y_v = VramTensor::<f32>::zeros([n, m]).unwrap();
+        Matmul::matmul(&x_v, &w_v, &b_v, &mut y_v, n, k, m).unwrap();
+        let y_v_back = y_v.download();
+
+        // f32 accumulation tolerance across K=128 terms.
+        let mut max_err = 0.0f32;
+        for (cpu, vram) in y_cpu.as_slice().iter().zip(y_v_back.as_slice().iter()) {
+            max_err = max_err.max((cpu - vram).abs());
+        }
+        assert!(max_err < 1e-3, "CPU-VRAM matmul parity broken: max_err = {:.3e}", max_err);
     }
 }

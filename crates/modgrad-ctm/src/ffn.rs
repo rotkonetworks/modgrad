@@ -731,7 +731,7 @@ impl FfnAdamW {
     pub fn enable_vram(&mut self, w: &FfnWeights) -> bool {
         use modgrad_device::kfd::accel::make_vram_mirror;
         let sizes = ffn_tensor_sizes(w);
-        let mirror = match make_vram_mirror(sizes) {
+        let mut mirror = match make_vram_mirror(sizes) {
             Some(m) => m, None => return false,
         };
         let n_layers = w.blocks.len();
@@ -918,7 +918,7 @@ impl FfnAdamW {
         scale: f32, b1: f32, b2: f32, bc1: f32, bc2: f32, eps: f32, lr: f32, wd: f32,
     ) -> bool {
         use modgrad_device::kfd::accel::try_adamw_vram_batch;
-        let mirror = self.vram.as_ref().expect("vram must be Some in step_update_vram");
+        let mirror = self.vram.as_mut().expect("vram must be Some in step_update_vram");
         let n_layers = w.blocks.len();
         let bc1_inv = 1.0 / bc1;
         let bc2_inv = 1.0 / bc2;
@@ -926,26 +926,30 @@ impl FfnAdamW {
         // Stage gradients into mirror.grad[*] via BAR (CPU → VRAM). Pre-scale
         // by the clip factor here so the kernel sees correctly-scaled grads.
         // Must happen BEFORE the batched dispatch — kernel reads grads.
+        // The `write` closure takes `&mut VramMirror` so each call sequentially
+        // re-borrows — exactly the exclusivity the `&mut self` signature
+        // wants to enforce.
         {
-            let write = |idx: usize, cpu_grad: &[f32]| {
+            let write = |mirror: &mut modgrad_device::kfd::vram_mirror::VramMirror,
+                         idx: usize, cpu_grad: &[f32]| {
                 let dst = mirror.grad_as_mut_slice(idx);
                 for (d, &s) in dst.iter_mut().zip(cpu_grad.iter()) { *d = s * scale; }
             };
-            write(idx_embed(), &g.embed);
+            write(mirror, idx_embed(), &g.embed);
             for li in 0..n_layers {
                 let bg = &g.blocks[li];
-                write(idx_block(li, BLOCK_LN_GAMMA), &bg.ln_gamma);
-                write(idx_block(li, BLOCK_LN_BETA),  &bg.ln_beta);
-                write(idx_block(li, BLOCK_GATE_W),   &bg.gate_w);
-                write(idx_block(li, BLOCK_GATE_B),   &bg.gate_b);
-                write(idx_block(li, BLOCK_UP_W),     &bg.up_w);
-                write(idx_block(li, BLOCK_UP_B),     &bg.up_b);
-                write(idx_block(li, BLOCK_DOWN_W),   &bg.down_w);
-                write(idx_block(li, BLOCK_DOWN_B),   &bg.down_b);
+                write(mirror, idx_block(li, BLOCK_LN_GAMMA), &bg.ln_gamma);
+                write(mirror, idx_block(li, BLOCK_LN_BETA),  &bg.ln_beta);
+                write(mirror, idx_block(li, BLOCK_GATE_W),   &bg.gate_w);
+                write(mirror, idx_block(li, BLOCK_GATE_B),   &bg.gate_b);
+                write(mirror, idx_block(li, BLOCK_UP_W),     &bg.up_w);
+                write(mirror, idx_block(li, BLOCK_UP_B),     &bg.up_b);
+                write(mirror, idx_block(li, BLOCK_DOWN_W),   &bg.down_w);
+                write(mirror, idx_block(li, BLOCK_DOWN_B),   &bg.down_b);
             }
-            write(idx_final_ln_gamma(n_layers), &g.final_ln_gamma);
-            write(idx_final_ln_beta(n_layers),  &g.final_ln_beta);
-            write(idx_lm_head(n_layers),        &g.lm_head);
+            write(mirror, idx_final_ln_gamma(n_layers), &g.final_ln_gamma);
+            write(mirror, idx_final_ln_beta(n_layers),  &g.final_ln_beta);
+            write(mirror, idx_lm_head(n_layers),        &g.lm_head);
         }
 
         // Per-tensor wd mask: weights get `wd`, everything else (biases,

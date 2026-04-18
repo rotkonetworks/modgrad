@@ -665,6 +665,34 @@ pub fn try_adamw_vram_batch<F: Fn(usize) -> f32>(
     true
 }
 
+/// Zero-copy matmul dispatched on VA pointers already resident in VRAM.
+/// Y[n×m] = X[n×k] @ W^T[k×m] + B[m]. Caller is responsible for:
+///   * M % 128 == 0, K % 8 == 0, N % 32 == 0
+///   * All four VAs reference live VRAM mappings on this device
+///
+/// Returns false on precondition / dispatch failure. Sets `GpuOp::Matmul`
+/// disable on timeout. No CPU-side validation beyond the alignment
+/// preconditions, because we have no access to buffer lengths from here —
+/// the typed `VramTensor::matmul` wrapper does the length checks.
+pub fn try_matmul_va(
+    x_va: u64, w_va: u64, bias_va: u64, y_va: u64,
+    n: u32, k: u32, m: u32,
+) -> bool {
+    if n == 0 || m == 0 { return true; }
+    if k == 0 { return false; }  // can't broadcast bias via kernel; caller handles
+    if m % 128 != 0 || k % 8 != 0 || n % 32 != 0 { return false; }
+    if op_disabled(GpuOp::Matmul) { return false; }
+
+    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
+    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    if g.engine.matmul_zerocopy(&mut g.dev, w_va, bias_va, x_va, y_va,
+        n as usize, k as usize, m as usize) {
+        return true;
+    }
+    disable_op(GpuOp::Matmul);
+    false
+}
+
 /// Transposed matmul: dA[n×k] = dY[n×m] @ W[m×k] (ASSIGNS, does not accumulate).
 /// Caller is responsible for zero-init / accumulation outside.
 ///

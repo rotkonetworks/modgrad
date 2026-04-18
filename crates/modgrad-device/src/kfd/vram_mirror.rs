@@ -95,30 +95,50 @@ impl VramMirror {
             .map(|b| b.size).sum()
     }
 
+    // ─── Uploads: modify VRAM, require &mut self to prevent concurrent aliasing ───
+    //
+    // Previously took &self — which let a caller hold multiple simultaneous
+    // &mut [f32] handles via other methods (safety audit finding). Upgrading
+    // to &mut self means the borrow checker rejects any aliasing at compile
+    // time, and removes a class of "the caller must synchronise" bugs.
+
     /// Upload `data` to the weights[idx] buffer. Typically called once at start.
     ///
+    /// # Kernel-in-flight contract
+    /// The caller must ensure no GPU kernel is currently reading `weights[idx]`.
+    /// If a kernel was previously dispatched touching this buffer, call
+    /// [`Self::wait_idle`] first — a concurrent BAR write + GPU read is a
+    /// hardware-level data race even though the Rust types don't alias.
+    ///
     /// Returns false on length mismatch.
-    pub fn upload_weight(&self, idx: usize, data: &[f32]) -> bool {
+    pub fn upload_weight(&mut self, idx: usize, data: &[f32]) -> bool {
         if idx >= self.sizes.len() || data.len() != self.sizes[idx] { return false; }
         self.weights[idx].write_f32(0, data);
         true
     }
 
     /// Upload `data` to moments_m[idx]. Used when resuming from a checkpoint.
-    pub fn upload_m(&self, idx: usize, data: &[f32]) -> bool {
+    pub fn upload_m(&mut self, idx: usize, data: &[f32]) -> bool {
         if idx >= self.sizes.len() || data.len() != self.sizes[idx] { return false; }
         self.moments_m[idx].write_f32(0, data);
         true
     }
 
     /// Upload `data` to moments_v[idx]. Used when resuming from a checkpoint.
-    pub fn upload_v(&self, idx: usize, data: &[f32]) -> bool {
+    pub fn upload_v(&mut self, idx: usize, data: &[f32]) -> bool {
         if idx >= self.sizes.len() || data.len() != self.sizes[idx] { return false; }
         self.moments_v[idx].write_f32(0, data);
         true
     }
 
+    // ─── Downloads: read-only; &self is fine. See kernel-in-flight warning. ───
+
     /// Download the current weights[idx] for checkpointing.
+    ///
+    /// # Kernel-in-flight contract
+    /// Caller must ensure no kernel is currently writing `weights[idx]`. In
+    /// practice this means calling this only between training steps, never
+    /// inside `step_update`.
     pub fn download_weight(&self, idx: usize) -> Vec<f32> {
         self.weights[idx].read_f32(0, self.sizes[idx])
     }
@@ -133,10 +153,18 @@ impl VramMirror {
         self.moments_v[idx].read_f32(0, self.sizes[idx])
     }
 
+    // ─── Mutating views: &mut self so the borrow checker enforces exclusivity. ───
+
     /// Zero the grads buffer for tensor `idx`. Call at the start of each step.
-    /// Uses BAR memset-through-pointer (not a kernel) — small compared to the
-    /// gradient accumulation that follows.
-    pub fn zero_grad(&self, idx: usize) {
+    /// Uses BAR memset through the CPU-mapped pointer (not a kernel dispatch).
+    ///
+    /// # Kernel-in-flight contract
+    /// Racing this against a kernel reading `grads[idx]` is a hardware data
+    /// race. `&mut self` prevents aliasing in Rust, but the GPU queue is an
+    /// independent execution engine — callers must ensure the grad buffer
+    /// is not being read by any dispatched kernel. In practice:
+    ///     [last step's AdamW reads grads] → `flush()` → `zero_grads()` → fill.
+    pub fn zero_grad(&mut self, idx: usize) {
         let n = self.sizes[idx];
         unsafe {
             let p = self.grads[idx].cpu_ptr as *mut f32;
@@ -144,33 +172,64 @@ impl VramMirror {
         }
     }
 
-    /// Zero every grad buffer.
-    pub fn zero_grads(&self) {
+    /// Zero every grad buffer. Same kernel-in-flight contract as [`zero_grad`].
+    pub fn zero_grads(&mut self) {
         for i in 0..self.sizes.len() { self.zero_grad(i); }
     }
 
-    /// Mutable CPU view over `grads[idx]`. For writing gradients computed on CPU.
-    /// The write goes straight to VRAM via BAR — no staging copy.
+    /// Mutable CPU view over `grads[idx]` through the BAR mapping.
     ///
-    /// # Safety
-    /// The caller must not alias this slice across threads without external
-    /// synchronisation; `GpuBuffer` is `Sync` but BAR writes are not lock-free.
-    pub fn grad_as_mut_slice(&self, idx: usize) -> &mut [f32] {
+    /// Upgraded to `&mut self` from the original `&self`: two simultaneous
+    /// mutable slices to different tensor indices CAN be obtained without
+    /// aliasing (each `GpuBuffer` has its own `cpu_ptr`), but the `&self`
+    /// variant allowed safely-looking code that racing-y hardware could still
+    /// corrupt. For batched writes use [`Self::grads_iter_mut`] which yields
+    /// disjoint slices under a single `&mut self` borrow.
+    ///
+    /// # Kernel-in-flight contract
+    /// See [`zero_grad`] — callers must sequence BAR writes against GPU
+    /// reads of the same buffer externally (e.g. via `flush()`).
+    pub fn grad_as_mut_slice(&mut self, idx: usize) -> &mut [f32] {
         let n = self.sizes[idx];
         unsafe {
             std::slice::from_raw_parts_mut(self.grads[idx].cpu_ptr as *mut f32, n)
         }
     }
 
-    /// Mutable CPU view over `weights[idx]`. For reading current weights from
-    /// forward paths that haven't moved to GPU yet. Zero-copy — the slice is
-    /// backed by BAR-mapped VRAM. Treat as a read-only slice during training
-    /// (writes race with the AdamW kernel).
+    /// Iterator over every grad buffer as disjoint `&mut [f32]`. Exclusive
+    /// borrow of `self` guarantees the collection is not aliased. Useful for
+    /// sequentially staging per-tensor gradients into the mirror in one pass.
+    pub fn grads_iter_mut(&mut self) -> impl Iterator<Item = &mut [f32]> {
+        // SAFETY: Each `GpuBuffer` owns a disjoint `cpu_ptr`/`va_addr`; two
+        // slices produced from different buffers cannot alias. The `&mut self`
+        // receiver ensures no other path into the mirror's grads is active
+        // for the iterator's lifetime.
+        let sizes = self.sizes.clone();
+        self.grads.iter_mut().zip(sizes.into_iter()).map(|(buf, n)| {
+            unsafe { std::slice::from_raw_parts_mut(buf.cpu_ptr as *mut f32, n) }
+        })
+    }
+
+    /// Immutable CPU view over `weights[idx]` through the BAR mapping.
+    /// Safe while no kernel is writing `weights[idx]` — see kernel-in-flight
+    /// contract on [`upload_weight`].
     pub fn weight_as_slice(&self, idx: usize) -> &[f32] {
         let n = self.sizes[idx];
         unsafe {
             std::slice::from_raw_parts(self.weights[idx].cpu_ptr as *const f32, n)
         }
+    }
+
+    /// Wait for all pending GPU dispatches on the mirror's tensors to finish.
+    /// Call this before any BAR-side upload/download/zero of a buffer that
+    /// might still be referenced by an in-flight kernel. Implemented as a
+    /// no-op here — the underlying queue semantics already enforce ordering
+    /// between `submit_wait` calls, and higher-level code (`step_update`
+    /// etc.) drives the queue synchronously. If in future we switch to
+    /// truly async queue submission this method is where the barrier goes.
+    pub fn wait_idle(&self) {
+        // Intentional no-op today. Keeping the entry point so callers can
+        // express the intent; a later async backend can fill it in.
     }
 
     /// Weights VA pointer for zero-copy kernel dispatch.

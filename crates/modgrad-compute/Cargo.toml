@@ -12,6 +12,9 @@ cuda = ["modgrad-device/cuda", "dep:cudarc", "dep:candle-kernels"]
 modgrad-device = { path = "../modgrad-device" }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
+# Pure-Rust SIMD GEMM used by `CpuTensor::matmul`. Same version as the FFN
+# crate already uses; shared so Cargo resolves one copy.
+matrixmultiply = "0.3"
 
 # CUDA (optional)
 cudarc = { version = "0.19", optional = true, default-features = false, features = [

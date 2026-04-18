@@ -343,6 +343,53 @@ impl StreamEngine {
         true
     }
 
+    /// Zero-copy matmul: all four buffers already resident in VRAM, caller
+    /// supplies their VA pointers. Dispatches `matmul_blocked` directly and
+    /// waits — no staging, no prepare_weights cache interaction.
+    ///
+    /// Preconditions (must be checked by the caller; violation hangs gfx1102):
+    ///   m % 128 == 0, k % 8 == 0, n % 32 == 0
+    pub fn matmul_zerocopy(
+        &mut self, dev: &mut HsaDevice,
+        w_va: u64, bias_va: u64, x_va: u64, y_va: u64,
+        n: usize, k: usize, m: usize,
+    ) -> bool {
+        if !self.ensure_chain_args(0, dev) { return false; }
+
+        // matmul_blocked kargs:
+        //   { W, B, X, Y, M, K, N } = 8+8+8+8+4+4+4 = 44 bytes
+        let mut kargs = [0u8; 48];
+        kargs[0..8].copy_from_slice(&w_va.to_le_bytes());
+        kargs[8..16].copy_from_slice(&bias_va.to_le_bytes());
+        kargs[16..24].copy_from_slice(&x_va.to_le_bytes());
+        kargs[24..32].copy_from_slice(&y_va.to_le_bytes());
+        kargs[32..36].copy_from_slice(&(m as u32).to_le_bytes());
+        kargs[36..40].copy_from_slice(&(k as u32).to_le_bytes());
+        kargs[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+        let args = self.chain_args[0].as_ref().unwrap();
+        args.write(0, &kargs[..44]);
+
+        // matmul_blocked: TM=128, TN=32 tiles → ceil(M/128) × ceil(N/32) WGs.
+        let nwg_m = ((m + 127) / 128) as u32;
+        let nwg_n = ((n +  31) /  32) as u32;
+        let total_wg = nwg_m * nwg_n;
+
+        if self.cached_matmul_blocked.is_none() {
+            self.cached_matmul_blocked = dev.resolve_kernel("matmul_blocked");
+        }
+        match &self.cached_matmul_blocked {
+            Some(entry) => {
+                dev.dispatch_enqueue_resolved(entry, args, [total_wg, 1, 1], [256, 1, 1]);
+            }
+            None => {
+                eprintln!("matmul_zerocopy: kernel 'matmul_blocked' not loaded");
+                return false;
+            }
+        }
+        dev.queue.cache_wb();
+        dev.submit_wait(10_000)
+    }
+
     /// Y[n×m] = X[n×k] @ W^T[k×m] + B[m] using the matmul_blocked kernel.
     /// W is row-major [m×k] (Linear stores weight as [out × in]). X is row-major
     /// [n×k], Y row-major [n×m]. Bias broadcast across rows.
