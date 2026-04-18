@@ -12,6 +12,7 @@
 
 use super::HsaDevice;
 use super::arena::VramArena;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 struct Gpu {
@@ -23,8 +24,70 @@ struct Gpu {
 }
 
 static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
-static DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+
+// ───── Per-op DISABLED state ─────
+// Replaces the old single global DISABLED flag. One AtomicBool per op; a
+// failure in `adamw` no longer short-circuits `matmul` the next call, and
+// a user can reset a specific op to retry after fixing the underlying
+// cause. Compile-time indexed via the GpuOp enum's discriminant.
+#[derive(Copy, Clone, Debug)]
+#[repr(usize)]
+pub enum GpuOp {
+    Matvec = 0,
+    MatvecT = 1,
+    Matmul = 2,
+    MatmulT = 3,
+    MatmulGrad = 4,
+    Superlinear = 5,
+    SuperlinearBackward = 6,
+    SynapseForward = 7,
+    SynapseBackward = 8,
+    Glu = 9,
+    GluBackward = 10,
+    PerNeuronGluBackward = 11,
+    Silu = 12,
+    SiluBackward = 13,
+    LayerNorm = 14,
+    LnBackward = 15,
+    TraceShift = 16,
+    SyncUpdate = 17,
+    SyncBackward = 18,
+    OuterProduct = 19,
+    SgdUpdate = 20,
+    Adamw = 21,
+    L2Norm = 22,
+    // Sentinel; keep last. Update if variants change order.
+    _Count = 23,
+}
+const N_GPU_OPS: usize = GpuOp::_Count as usize;
+
+static OP_DISABLED: [AtomicBool; N_GPU_OPS] = [const { AtomicBool::new(false) }; N_GPU_OPS];
+
+#[inline]
+fn op_disabled(op: GpuOp) -> bool {
+    OP_DISABLED[op as usize].load(Ordering::Relaxed)
+}
+
+#[inline]
+fn disable_op(op: GpuOp) {
+    OP_DISABLED[op as usize].store(true, Ordering::Relaxed);
+}
+
+/// Re-enable a previously-disabled op. Call after fixing the underlying
+/// cause (e.g. re-initialising the GPU, reloading a kernel). Subsequent
+/// `try_*` calls for `op` will go through the dispatch path again.
+pub fn reset_op(op: GpuOp) {
+    OP_DISABLED[op as usize].store(false, Ordering::Relaxed);
+}
+
+/// Re-enable every op. Equivalent to calling `reset_op` for each variant.
+pub fn reset_all_ops() {
+    for slot in OP_DISABLED.iter() { slot.store(false, Ordering::Relaxed); }
+}
+
+/// True if the given op is currently short-circuited to CPU fallback.
+/// Exposed for diagnostics; hot-path code uses the internal `op_disabled`.
+pub fn is_op_disabled(op: GpuOp) -> bool { op_disabled(op) }
 
 fn gpu() -> &'static Mutex<Option<Gpu>> {
     GPU.get_or_init(|| {
@@ -101,7 +164,7 @@ pub fn try_matvec(
     x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
     out_dim: u32, in_dim: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Matvec) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -117,7 +180,7 @@ pub fn try_matvec(
     if g.engine.matvec_into(&mut g.dev, weight, bias, x, out, out_dim as usize, in_dim as usize) {
         return true;
     }
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::Matvec);
     false
 }
 
@@ -126,7 +189,7 @@ pub fn try_matvec_t(
     d_out: &[f32], weight: &[f32], d_input: &mut [f32],
     out_dim: u32, in_dim: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::MatvecT) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -142,7 +205,7 @@ pub fn try_matvec_t(
     if g.engine.matvec_t_into(&mut g.dev, weight, d_out, d_input, out_dim as usize, in_dim as usize) {
         return true;
     }
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::MatvecT);
     false
 }
 
@@ -152,7 +215,7 @@ pub fn try_superlinear(
     trace: &[f32], weights: &[f32], biases: &[f32], out: &mut [f32],
     n_neurons: u32, in_per: u32, out_per: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Superlinear) { return false; }
 
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
@@ -173,7 +236,7 @@ pub fn try_superlinear(
         return true;
     }
 
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::Superlinear);
     false
 }
 
@@ -187,7 +250,7 @@ pub fn try_synapse_forward(
     output: &mut [f32], _scratch: &mut [f32],
     out_dim: u32, in_dim: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SynapseForward) { return false; }
     // layer_norm kernel handles up to 1024 elements
     if out_dim > 1024 { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
@@ -228,7 +291,7 @@ pub fn try_synapse_backward(
     inv_std: f32,
     out_dim: u32, in_dim: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SynapseBackward) { return false; }
     if out_dim > 256 { return false; } // ln_bwd kernel limit
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
@@ -249,7 +312,7 @@ pub fn try_synapse_backward(
 
 /// GPU GLU activation.
 pub fn try_glu(input: &[f32], output: &mut [f32], n: u32) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Glu) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -261,7 +324,7 @@ pub fn try_glu(input: &[f32], output: &mut [f32], n: u32) -> bool {
 
 /// GPU SiLU in-place.
 pub fn try_silu_inplace(x: &mut [f32]) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Silu) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.silu_inplace(&mut g.dev, x)
@@ -269,7 +332,7 @@ pub fn try_silu_inplace(x: &mut [f32]) -> bool {
 
 /// GPU layer norm in-place.
 pub fn try_layer_norm_inplace(x: &mut [f32]) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::LayerNorm) { return false; }
     if x.len() > 1024 { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
@@ -281,7 +344,7 @@ pub fn try_trace_shift(
     traces: &mut [f32], new_activations: &[f32],
     n_neurons: u32, memory_length: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::TraceShift) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.trace_shift(&mut g.dev, traces, new_activations,
@@ -297,7 +360,7 @@ pub fn try_sync_update(
     dopamine: f32, n_pairs: u32, initialized: bool,
     sync_out: &mut [f32],
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SyncUpdate) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.sync_update(&mut g.dev, alpha, beta,
@@ -313,7 +376,7 @@ pub fn try_sync_backward(
     n_pairs: u32, d_model: u32,
     d_act: &mut [f32],
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SyncBackward) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.sync_backward(&mut g.dev, d_sync, activated, beta,
@@ -326,7 +389,7 @@ pub fn try_outer_product(
     d_weight: &mut [f32], d_out: &[f32], input: &[f32],
     out_dim: u32, in_dim: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::OuterProduct) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.outer_product(&mut g.dev, d_weight, d_out, input,
@@ -337,7 +400,7 @@ pub fn try_outer_product(
 pub fn try_sgd_update(
     weights: &mut [f32], grads: &mut [f32], lr_scale: f32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SgdUpdate) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.sgd_update(&mut g.dev, weights, grads, lr_scale)
@@ -351,7 +414,7 @@ pub fn try_adamw(
     lr: f32, beta1: f32, beta2: f32, eps: f32,
     weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Adamw) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.adamw(&mut g.dev, weights, grads, m, v,
@@ -365,7 +428,7 @@ pub fn try_superlinear_backward(
     d_weights: &mut [f32], d_input: &mut [f32],
     n_neurons: u32, out_per: u32, in_per: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SuperlinearBackward) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.superlinear_backward(
@@ -378,7 +441,7 @@ pub fn try_superlinear_backward(
 pub fn try_silu_backward(
     d_out: &[f32], pre_silu: &[f32], d_input: &mut [f32],
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::SiluBackward) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.silu_backward(&mut g.dev, d_out, pre_silu, d_input)
@@ -388,7 +451,7 @@ pub fn try_silu_backward(
 pub fn try_glu_backward(
     d_out: &[f32], cached_input: &[f32], d_input: &mut [f32], n: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::GluBackward) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.glu_backward(&mut g.dev, d_out, cached_input, d_input, n as usize)
@@ -399,7 +462,7 @@ pub fn try_per_neuron_glu_backward(
     d_out: &[f32], cached_input: &[f32], d_input: &mut [f32],
     n_neurons: u32, out_per: u32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::PerNeuronGluBackward) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
     g.engine.per_neuron_glu_backward(&mut g.dev, d_out, cached_input, d_input,
@@ -412,7 +475,7 @@ pub fn try_ln_backward(
     d_gamma: &mut [f32], d_beta: &mut [f32], d_input: &mut [f32],
     inv_std: f32,
 ) -> bool {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::LnBackward) { return false; }
     if d_out.len() > 256 { return false; } // single-WG kernel, max 256
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
@@ -479,7 +542,7 @@ pub fn try_matmul(
     }
 
     // ─── GPU availability & locking ───
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Matmul) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -492,7 +555,7 @@ pub fn try_matmul(
 
     // Couldn't complete — assume the queue is wedged. Disable for the session
     // and fall to CPU. Ops/ps this is safer than retrying into a hung GPU.
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::Matmul);
     false
 }
 
@@ -502,7 +565,9 @@ pub fn try_matmul(
 /// Rounds `bytes` up to 4 KiB pages (KFD alloc granularity). Used by
 /// `VramTensor` to back device-located tensors with permanent VRAM storage.
 pub fn alloc_vram(bytes: u64) -> Option<super::memory::GpuBuffer> {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    // Allocation isn't an op; no disable flag. If GPU is present we try; if
+    // the kfd fd is unavailable or the alloc fails, the caller decides what
+    // to do (usually: stay on CPU, don't cascade-fail other ops).
     let guard = gpu().lock().ok()?;
     let g = guard.as_ref()?;
     let cap = ((bytes + 4095) & !4095).max(4096);
@@ -516,7 +581,8 @@ pub fn alloc_vram(bytes: u64) -> Option<super::memory::GpuBuffer> {
 /// start zero-initialised. Uploads to `weights` should follow via
 /// `VramMirror::upload_weight`.
 pub fn make_vram_mirror(sizes: Vec<usize>) -> Option<super::vram_mirror::VramMirror> {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    // As with alloc_vram, this is infrastructure rather than an op — don't
+    // cascade-disable on a single alloc failure.
     let guard = gpu().lock().ok()?;
     let g = guard.as_ref()?;
     super::vram_mirror::VramMirror::new(&g.dev, sizes)
@@ -534,7 +600,7 @@ pub fn try_adamw_vram(
     weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
 ) -> bool {
     if idx >= mirror.sizes.len() { return false; }
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Adamw) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -547,7 +613,7 @@ pub fn try_adamw_vram(
     ) {
         return true;
     }
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::Adamw);
     false
 }
 
@@ -569,7 +635,7 @@ pub fn try_adamw_vram_batch<F: Fn(usize) -> f32>(
 ) -> bool {
     let n_tensors = mirror.sizes.len();
     if n_tensors == 0 { return true; }
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::Adamw) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
     let g = match guard.as_mut() { Some(g) => g, None => return false };
 
@@ -585,7 +651,7 @@ pub fn try_adamw_vram_batch<F: Fn(usize) -> f32>(
             // Enqueue failed mid-batch — still need to flush whatever already
             // went on the queue to avoid leaving the GPU with half-submitted work.
             let _ = g.engine.flush_queue(&mut g.dev, 10_000u32);
-            DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            disable_op(GpuOp::Adamw);
             return false;
         }
     }
@@ -593,7 +659,7 @@ pub fn try_adamw_vram_batch<F: Fn(usize) -> f32>(
     // Single submit_wait amortises ~100 dispatches into one round trip.
     if !g.engine.flush_queue(&mut g.dev, 30_000u32) {
         eprintln!("try_adamw_vram_batch: flush_queue timed out");
-        DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        disable_op(GpuOp::Adamw);
         return false;
     }
     true
@@ -627,7 +693,7 @@ pub fn try_matmul_t(
         return false;
     }
 
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::MatmulT) { return false; }
 
     // Transpose W[m,k] → W^T[k,m] once (CPU; rayon-parallel optional, but this
     // is small enough — e.g. 5120×1024 = 20MB, ~5ms scalar).
@@ -651,7 +717,7 @@ pub fn try_matmul_t(
     ) {
         return true;
     }
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::MatmulT);
     false
 }
 
@@ -688,7 +754,7 @@ pub fn try_matmul_grad(
         return false;
     }
 
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    if op_disabled(GpuOp::MatmulGrad) { return false; }
 
     // dY^T: [m, n] row-major.
     let mut dy_t = vec![0.0f32; m_us * n_us];
@@ -717,14 +783,14 @@ pub fn try_matmul_grad(
     ) {
         return true;
     }
-    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    disable_op(GpuOp::MatmulGrad);
     false
 }
 
 /// GPU L2 norm: returns sqrt(sum(x[i]^2)).
 /// Returns None if GPU unavailable or dispatch fails (caller should fall back to CPU).
 pub fn try_l2_norm(data: &[f32]) -> Option<f32> {
-    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    if op_disabled(GpuOp::L2Norm) { return None; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return None };
     let g = match guard.as_mut() { Some(g) => g, None => return None };
     g.engine.reduce_l2(&mut g.dev, data)
