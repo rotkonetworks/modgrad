@@ -258,7 +258,7 @@ fn learn_ffn(
         FfnConfig::large(vocab)
     };
 
-    let mut w = if std::path::Path::new(save_path).exists() {
+    let w = if std::path::Path::new(save_path).exists() {
         eprintln!("Loading {save_path}...");
         FfnWeights::load(save_path).expect("failed to load")
     } else {
@@ -274,7 +274,7 @@ fn learn_ffn(
         else { 1e-3 }
     });
 
-    let mut opt = if std::path::Path::new(&opt_path).exists() {
+    let opt = if std::path::Path::new(&opt_path).exists() {
         FfnAdamW::load(&opt_path).unwrap_or_else(|_| FfnAdamW::new(&w).with_lr(lr))
     } else {
         FfnAdamW::new(&w).with_lr(lr)
@@ -288,62 +288,63 @@ fn learn_ffn(
     // on external VA pointers (bypassing the cache).
     let _ = gpu;  // silences unused-warning on non-GPU builds
 
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        eprintln!("\nSaving...");
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    }).ok();
+    // ─── Runtime-framework-driven training loop ───
+    //
+    // Replaces the hand-rolled while(running) / Ctrl+C / manual logging
+    // cadence with modgrad_training::TrainerLoop. All tunables sit on
+    // TrainerConfig with defaults; step logic stays in the closure.
+    //
+    // Both closures (step + save) need mutable access to the same state.
+    // RefCell gives us sequential interior mutability — the two closures
+    // never run concurrently, so `borrow_mut` can never panic here.
+    use modgrad_training::{TrainerConfig, TrainerLoop, StepReport};
+    use std::cell::RefCell;
 
-    let mut grads = FfnGradients::zeros(&w);
-    let mut step = 0u64;
-    let mut loss_sum = 0.0f32;
-    let mut acc_sum = 0.0f32;
+    let grads = FfnGradients::zeros(&w);
+    // Bundle w + opt + grads into one mutable unit so both closures
+    // can reach them through `state.borrow_mut()` / `state.borrow()`.
+    let state = RefCell::new((w, opt, grads));
+    let offset = RefCell::new(0usize);
     let n_data = all_tokens.len();
-    let mut offset = 0usize;
 
     eprintln!("\nTraining FFN... (lr={:.1e}, Ctrl+C to save and stop)\n", lr);
 
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        let end = (offset + context_len + 1).min(n_data);
-        if end - offset < 2 {
-            offset = 0;
-            continue;
+    let cfg = TrainerConfig {
+        max_steps: usize::MAX,   // run until SIGINT or `step_fn` returns None
+        log_every: 100,
+        save_every: Some(5_000),
+        ..Default::default()
+    };
+
+    let step_fn = |_step: usize| -> Option<StepReport> {
+        let mut o = offset.borrow_mut();
+        loop {
+            let end = (*o + context_len + 1).min(n_data);
+            if end - *o < 2 {
+                *o = 0;
+                eprintln!("  --- epoch complete ---");
+                continue;
+            }
+            let chunk = &all_tokens[*o..end];
+            let mut s = state.borrow_mut();
+            let (w, opt, grads) = &mut *s;
+            let (loss, acc) = ffn_train_step(w, opt, grads, chunk);
+            *o += context_len;
+            let progress = (*o as f32 / n_data as f32).min(1.0);
+            return Some(StepReport::new(loss).with_accuracy(acc).with_progress(progress));
         }
-        let chunk = &all_tokens[offset..end];
+    };
 
-        let (loss, acc) = ffn_train_step(&mut w, &mut opt, &mut grads, chunk);
+    let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
+        let s = state.borrow();
+        s.0.save(save_path)?;
+        s.1.save(&opt_path)?;
+        Ok(())
+    };
 
-        loss_sum += loss;
-        acc_sum += acc;
-        step += 1;
-        offset += context_len;
-
-        if step % 100 == 0 {
-            let avg_loss = loss_sum / 100.0;
-            let avg_acc = acc_sum / 100.0;
-            let progress = (offset as f64 / n_data as f64 * 100.0).min(100.0);
-            eprintln!("step {step:6} | loss {avg_loss:.3} | acc {:.1}% | data {progress:.0}%",
-                avg_acc * 100.0);
-            loss_sum = 0.0;
-            acc_sum = 0.0;
-        }
-
-        if step % 5000 == 0 {
-            w.save(save_path).expect("save failed");
-            opt.save(&opt_path).expect("opt save failed");
-            eprintln!("  [saved at step {step}]");
-        }
-
-        if offset >= n_data {
-            offset = 0;
-            eprintln!("  --- epoch complete ---");
-        }
-    }
-
-    w.save(save_path).expect("save failed");
-    opt.save(&opt_path).expect("opt save failed");
-    eprintln!("\nSaved to {save_path}");
+    let report = TrainerLoop::new(cfg).run(step_fn, save_fn);
+    eprintln!("\nSaved to {save_path}  ({} steps, best {:.3} @ step {})",
+        report.steps_completed, report.best_avg_loss, report.best_step);
 }
 
 // ─── Generate ─────────────────────────────────────────────
