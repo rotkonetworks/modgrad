@@ -10,6 +10,8 @@ pub use trainer_loop::{TrainerLoop, TrainerConfig, StepReport, TrainerReport};
 pub mod dream;
 pub mod inference;
 pub mod checkpoint;
+pub mod checkpoint_bundle;
+pub use checkpoint_bundle::{CheckpointBundle, BasicMeta, CheckpointError, CURRENT_SCHEMA};
 pub mod metrics;
 pub mod grad_accum;
 pub mod grad_ckpt;
