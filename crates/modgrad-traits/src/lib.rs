@@ -10,6 +10,9 @@
 //! Sampler:  Logits → token index
 //! Generate: Brain + Sampler → tokens (see modgrad-training)
 
+pub mod param_iter;
+pub use param_iter::ParamIter;
+
 /// Trait for weight types that can be viewed as a flat f32 slice.
 /// Enables Optimizer to operate on Brain weights directly.
 pub trait Flattenable {

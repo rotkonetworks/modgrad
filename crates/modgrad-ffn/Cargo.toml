@@ -6,7 +6,7 @@ description = "FFN architecture (SwiGLU MLP language model) for the modgrad ML S
 license = "MIT"
 
 [dependencies]
-modgrad-traits  = { path = "../modgrad-traits" }
+modgrad-traits  = { path = "../modgrad-traits" }  # for ParamIter
 modgrad-compute = { path = "../modgrad-compute" }
 modgrad-device  = { path = "../modgrad-device" }
 modgrad-persist = { path = "../modgrad-persist" }

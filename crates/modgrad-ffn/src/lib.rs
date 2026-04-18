@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use modgrad_compute::neuron::Linear;
+use modgrad_traits::ParamIter;
 use rayon::prelude::*;
 
 /// FFN cerebellum config.
@@ -124,11 +125,10 @@ impl FfnWeights {
         }
     }
 
+    /// Total parameter count. Delegates to `ParamIter::n_params` — single
+    /// source of truth for what "the parameters of this model are".
     pub fn n_params(&self) -> usize {
-        self.embed.len()
-            + self.blocks.iter().map(|b| b.n_params()).sum::<usize>()
-            + self.final_ln_gamma.len() + self.final_ln_beta.len()
-            + self.lm_head.len()
+        <Self as ParamIter>::n_params(self)
     }
 
     pub fn print_summary(&self) {
@@ -1060,9 +1060,134 @@ pub fn ffn_train_step(
     (loss, acc)
 }
 
+// ═══════════════════════════════════════════════════════════════
+// ParamIter impls — single-site declaration of parameter layout.
+// Replaces the canonical-index arithmetic (idx_embed, idx_block, …).
+// Any machinery that wants to upload / checkpoint / norm / iterate
+// parameters walks these and stays correct without coordination.
+// ═══════════════════════════════════════════════════════════════
+
+impl ParamIter for FfnWeights {
+    fn walk_params(&self, f: &mut dyn FnMut(&str, &[f32])) {
+        f("embed", &self.embed);
+        for (i, blk) in self.blocks.iter().enumerate() {
+            f(&format!("blocks.{i}.ln_gamma"),    &blk.ln_gamma);
+            f(&format!("blocks.{i}.ln_beta"),     &blk.ln_beta);
+            f(&format!("blocks.{i}.gate.weight"), &blk.gate.weight);
+            f(&format!("blocks.{i}.gate.bias"),   &blk.gate.bias);
+            f(&format!("blocks.{i}.up.weight"),   &blk.up.weight);
+            f(&format!("blocks.{i}.up.bias"),     &blk.up.bias);
+            f(&format!("blocks.{i}.down.weight"), &blk.down.weight);
+            f(&format!("blocks.{i}.down.bias"),   &blk.down.bias);
+        }
+        f("final_ln_gamma", &self.final_ln_gamma);
+        f("final_ln_beta",  &self.final_ln_beta);
+        f("lm_head",        &self.lm_head);
+    }
+    fn walk_params_mut(&mut self, f: &mut dyn FnMut(&str, &mut [f32])) {
+        f("embed", &mut self.embed);
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            f(&format!("blocks.{i}.ln_gamma"),    &mut blk.ln_gamma);
+            f(&format!("blocks.{i}.ln_beta"),     &mut blk.ln_beta);
+            f(&format!("blocks.{i}.gate.weight"), &mut blk.gate.weight);
+            f(&format!("blocks.{i}.gate.bias"),   &mut blk.gate.bias);
+            f(&format!("blocks.{i}.up.weight"),   &mut blk.up.weight);
+            f(&format!("blocks.{i}.up.bias"),     &mut blk.up.bias);
+            f(&format!("blocks.{i}.down.weight"), &mut blk.down.weight);
+            f(&format!("blocks.{i}.down.bias"),   &mut blk.down.bias);
+        }
+        f("final_ln_gamma", &mut self.final_ln_gamma);
+        f("final_ln_beta",  &mut self.final_ln_beta);
+        f("lm_head",        &mut self.lm_head);
+    }
+}
+
+impl ParamIter for FfnGradients {
+    fn walk_params(&self, f: &mut dyn FnMut(&str, &[f32])) {
+        f("embed", &self.embed);
+        for (i, blk) in self.blocks.iter().enumerate() {
+            f(&format!("blocks.{i}.ln_gamma"), &blk.ln_gamma);
+            f(&format!("blocks.{i}.ln_beta"),  &blk.ln_beta);
+            f(&format!("blocks.{i}.gate.weight"), &blk.gate_w);
+            f(&format!("blocks.{i}.gate.bias"),   &blk.gate_b);
+            f(&format!("blocks.{i}.up.weight"),   &blk.up_w);
+            f(&format!("blocks.{i}.up.bias"),     &blk.up_b);
+            f(&format!("blocks.{i}.down.weight"), &blk.down_w);
+            f(&format!("blocks.{i}.down.bias"),   &blk.down_b);
+        }
+        f("final_ln_gamma", &self.final_ln_gamma);
+        f("final_ln_beta",  &self.final_ln_beta);
+        f("lm_head",        &self.lm_head);
+    }
+    fn walk_params_mut(&mut self, f: &mut dyn FnMut(&str, &mut [f32])) {
+        f("embed", &mut self.embed);
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            f(&format!("blocks.{i}.ln_gamma"), &mut blk.ln_gamma);
+            f(&format!("blocks.{i}.ln_beta"),  &mut blk.ln_beta);
+            f(&format!("blocks.{i}.gate.weight"), &mut blk.gate_w);
+            f(&format!("blocks.{i}.gate.bias"),   &mut blk.gate_b);
+            f(&format!("blocks.{i}.up.weight"),   &mut blk.up_w);
+            f(&format!("blocks.{i}.up.bias"),     &mut blk.up_b);
+            f(&format!("blocks.{i}.down.weight"), &mut blk.down_w);
+            f(&format!("blocks.{i}.down.bias"),   &mut blk.down_b);
+        }
+        f("final_ln_gamma", &mut self.final_ln_gamma);
+        f("final_ln_beta",  &mut self.final_ln_beta);
+        f("lm_head",        &mut self.lm_head);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn param_iter_visits_every_tensor_exactly_once() {
+        let cfg = FfnConfig { vocab: 4, d_model: 8, hidden: 16, n_layers: 3, context: 16 };
+        let w = FfnWeights::new(cfg);
+        let mut names = Vec::new();
+        let mut total_via_walk = 0usize;
+        w.walk_params(&mut |name, data| {
+            names.push(name.to_string());
+            total_via_walk += data.len();
+        });
+        // Expected: embed + 3 blocks × 8 tensors + 3 final = 28
+        assert_eq!(names.len(), 1 + 3 * 8 + 3);
+        assert_eq!(names[0], "embed");
+        assert_eq!(names.last().unwrap(), "lm_head");
+        assert_eq!(total_via_walk, w.n_params(),
+            "walk must hit every tensor the n_params count is built from");
+    }
+
+    #[test]
+    fn param_iter_order_is_stable_and_matches_grads() {
+        // Invariant: walks of FfnWeights and FfnGradients produce the same
+        // tensor name sequence. Any optimizer that zips the two lists
+        // depends on this.
+        let cfg = FfnConfig { vocab: 4, d_model: 8, hidden: 16, n_layers: 2, context: 16 };
+        let w = FfnWeights::new(cfg);
+        let g = FfnGradients::zeros(&w);
+        let mut w_names = Vec::new();
+        let mut g_names = Vec::new();
+        w.walk_params(&mut |n, _| w_names.push(n.to_string()));
+        g.walk_params(&mut |n, _| g_names.push(n.to_string()));
+        assert_eq!(w_names, g_names,
+            "FfnWeights and FfnGradients walks must emit identical names");
+    }
+
+    #[test]
+    fn param_iter_mut_can_zero_all_weights() {
+        let cfg = FfnConfig { vocab: 4, d_model: 8, hidden: 16, n_layers: 1, context: 16 };
+        let mut w = FfnWeights::new(cfg);
+        w.walk_params_mut(&mut |_, data| {
+            for x in data.iter_mut() { *x = 0.0; }
+        });
+        let mut total_nonzero = 0usize;
+        w.walk_params(&mut |_, data| {
+            total_nonzero += data.iter().filter(|&&v| v != 0.0).count();
+        });
+        assert_eq!(total_nonzero, 0);
+    }
 
     #[test]
     fn ffn_forward_shape() {
