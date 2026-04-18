@@ -2377,6 +2377,7 @@ dependencies = [
  "modgrad-device",
  "modgrad-ffn",
  "modgrad-io",
+ "modgrad-memory",
  "modgrad-persist",
  "modgrad-runtime",
  "modgrad-training",
@@ -2426,6 +2427,7 @@ dependencies = [
  "matrixmultiply",
  "modgrad-compute",
  "modgrad-device",
+ "modgrad-memory",
  "modgrad-persist",
  "modgrad-traits",
  "rayon",
@@ -2495,6 +2497,15 @@ dependencies = [
  "tokenizers 0.21.4",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "modgrad-memory"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "rayon",
+ "serde",
 ]
 
 [[package]]
