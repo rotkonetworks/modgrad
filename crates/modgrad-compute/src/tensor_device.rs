@@ -321,6 +321,37 @@ impl LayerNorm for VramTensor<f32> {
     }
 }
 
+/// Elementwise in-place add: `acc[i] += src[i]` for `i in 0..n`.
+/// Used for residual connections and batched bias-add reductions.
+/// Operands share device.
+pub trait AddInPlace: Sized {
+    fn add_in_place(acc: &mut Self, src: &Self, n: usize) -> Result<(), &'static str>;
+}
+
+impl AddInPlace for CpuTensor<f32> {
+    fn add_in_place(acc: &mut Self, src: &Self, n: usize) -> Result<(), &'static str> {
+        if acc.len() < n { return Err("acc too small"); }
+        if src.len() < n { return Err("src too small"); }
+        let a = acc.as_mut_slice();
+        let s = src.as_slice();
+        for i in 0..n { a[i] += s[i]; }
+        Ok(())
+    }
+}
+
+impl AddInPlace for VramTensor<f32> {
+    fn add_in_place(acc: &mut Self, src: &Self, n: usize) -> Result<(), &'static str> {
+        if acc.len() < n { return Err("acc too small"); }
+        if src.len() < n { return Err("src too small"); }
+        // BAR-mapped CPU add. Elementwise adds are tiny vs matmul; a dedicated
+        // GPU kernel buys us nothing here and would pay launch overhead.
+        let a = acc.as_mut_slice();
+        let s = src.as_slice();
+        for i in 0..n { a[i] += s[i]; }
+        Ok(())
+    }
+}
+
 /// SwiGLU activation: hidden[i] = silu(gate[i]) * up[i]  where  silu(x) = x*sigmoid(x).
 /// Pure elementwise over `n` elements. All three tensors share device.
 pub trait SwiGLU: Sized {
@@ -604,6 +635,48 @@ mod tests {
             max_err = max_err.max((a - b).abs());
         }
         assert!(max_err < 1e-5, "CPU/VRAM LN diverge: max_err = {:.3e}", max_err);
+    }
+
+    // ─── AddInPlace — red-green ─────────────────────────────────
+
+    #[test]
+    fn cpu_add_in_place_accumulates() {
+        let mut a = CpuTensor::from_vec(vec![1.0f32, 2.0, 3.0], [3]);
+        let b = CpuTensor::from_vec(vec![10.0f32, 20.0, 30.0], [3]);
+        AddInPlace::add_in_place(&mut a, &b, 3).unwrap();
+        assert_eq!(a.as_slice(), &[11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn cpu_add_in_place_size_mismatch_errors() {
+        let mut a = CpuTensor::<f32>::zeros([2]);
+        let b = CpuTensor::<f32>::zeros([2]);
+        assert!(AddInPlace::add_in_place(&mut a, &b, 4).is_err());
+    }
+
+    #[test]
+    fn cpu_vs_vram_add_parity_or_skip() {
+        modgrad_device::kfd::accel::reset_op(modgrad_device::kfd::accel::GpuOp::Matmul);
+        let n = 128;
+        let a_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.1).sin()).collect();
+        let b_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.2).cos()).collect();
+
+        let mut a_c = CpuTensor::from_vec(a_data.clone(), [n]);
+        let b_c = CpuTensor::from_vec(b_data.clone(), [n]);
+        AddInPlace::add_in_place(&mut a_c, &b_c, n).unwrap();
+
+        let mut a_v = match CpuTensor::from_vec(a_data.clone(), [n]).move_to_vram() {
+            Some(t) => t, None => return,
+        };
+        let b_v = CpuTensor::from_vec(b_data.clone(), [n]).move_to_vram().unwrap();
+        AddInPlace::add_in_place(&mut a_v, &b_v, n).unwrap();
+
+        let a_v_back = a_v.download();
+        let mut max_err = 0.0f32;
+        for (x, y) in a_c.as_slice().iter().zip(a_v_back.as_slice().iter()) {
+            max_err = max_err.max((x - y).abs());
+        }
+        assert!(max_err < 1e-6, "CPU/VRAM Add diverge: max_err = {:.3e}", max_err);
     }
 
     // ─── SwiGLU — red-green ──────────────────────────────────────
