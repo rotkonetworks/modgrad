@@ -194,6 +194,47 @@ where
     }
 }
 
+/// Save a `BasicMeta` checkpoint with the common defaults filled in —
+/// `schema = CURRENT_SCHEMA`, `timestamp_unix = now`, zeroed loss fields.
+///
+/// Collapses the 13-line boilerplate every training loop would otherwise
+/// repeat (model + optimizer cloned into a bundle, `CURRENT_SCHEMA`
+/// wired in, `SystemTime::now()` called, `loss_at_save` / `best_loss`
+/// defaulted). Callers that need richer meta fields construct
+/// [`CheckpointBundle`] directly.
+pub fn save_training_checkpoint<M, O>(
+    path: impl AsRef<Path>,
+    model_kind: &str,
+    model: &M,
+    optimizer: &O,
+    step: u64,
+    tokens_seen: u64,
+    elapsed_secs: u64,
+) -> Result<(), CheckpointError>
+where
+    M: Serialize + DeserializeOwned + Clone,
+    O: Serialize + DeserializeOwned + Clone,
+{
+    let bundle = CheckpointBundle {
+        schema: CURRENT_SCHEMA,
+        model_kind: model_kind.to_string(),
+        model: model.clone(),
+        optimizer: optimizer.clone(),
+        meta: BasicMeta {
+            step,
+            tokens_seen,
+            loss_at_save: 0.0,
+            best_loss: 0.0,
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            elapsed_secs,
+        },
+    };
+    bundle.save(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +322,26 @@ mod tests {
         bundle("fake-model", 7).save(&path).unwrap();
         assert!(path.exists(), "target file should exist after successful save");
         assert!(!tmp.exists(), ".tmp file should be renamed away after successful save");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn helper_fills_defaults_and_roundtrips() {
+        let path = std::env::temp_dir().join("mgck_test_helper.ckpt");
+        let m = FakeModel { weights: vec![1.0, 2.0], label: "h".into() };
+        let o = FakeOpt { lr: 1e-3, step: 7, moments: vec![0.1, 0.2] };
+        save_training_checkpoint(&path, "helper-test", &m, &o, 7, 42, 3).unwrap();
+        let loaded = CheckpointBundle::<FakeModel, FakeOpt>::load(&path, "helper-test").unwrap();
+        assert_eq!(loaded.model, m);
+        assert_eq!(loaded.optimizer, o);
+        assert_eq!(loaded.meta.step, 7);
+        assert_eq!(loaded.meta.tokens_seen, 42);
+        assert_eq!(loaded.meta.elapsed_secs, 3);
+        assert_eq!(loaded.meta.loss_at_save, 0.0);
+        assert_eq!(loaded.meta.best_loss, 0.0);
+        assert!(loaded.meta.timestamp_unix > 1_700_000_000,
+            "timestamp should be a recent unix time, got {}", loaded.meta.timestamp_unix);
+        assert_eq!(loaded.schema, CURRENT_SCHEMA);
         let _ = std::fs::remove_file(&path);
     }
 

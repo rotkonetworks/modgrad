@@ -11,7 +11,7 @@ pub mod dream;
 pub mod inference;
 pub mod checkpoint;
 pub mod checkpoint_bundle;
-pub use checkpoint_bundle::{CheckpointBundle, BasicMeta, CheckpointError, CURRENT_SCHEMA};
+pub use checkpoint_bundle::{CheckpointBundle, BasicMeta, CheckpointError, CURRENT_SCHEMA, save_training_checkpoint};
 pub mod metrics;
 pub mod grad_accum;
 pub mod grad_ckpt;

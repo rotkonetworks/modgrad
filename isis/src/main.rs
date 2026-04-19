@@ -369,28 +369,20 @@ fn learn_ffn(
         }
     };
 
-    // Save closure: pack state + live counters into a CheckpointBundle
-    // and write atomically. Resume pulls the same bundle back on next
-    // launch (see earlier in this fn).
+    // Save closure: delegate to `save_training_checkpoint`, which fills
+    // schema / timestamp defaults. Resume pulls the same bundle back on
+    // next launch (see earlier in this fn).
     let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
         let s = state.borrow();
-        let bundle = CheckpointBundle {
-            schema: modgrad_training::CURRENT_SCHEMA,
-            model_kind: MODEL_KIND.to_string(),
-            model: s.0.clone(),
-            optimizer: s.1.clone(),
-            meta: BasicMeta {
-                step: s.1.step as u64,
-                tokens_seen: tokens_seen.get(),
-                loss_at_save: 0.0,
-                best_loss: 0.0,
-                timestamp_unix: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0),
-                elapsed_secs: resumed_meta.elapsed_secs + run_started.elapsed().as_secs(),
-            },
-        };
-        bundle.save(save_path)?;
+        modgrad_training::save_training_checkpoint(
+            save_path,
+            MODEL_KIND,
+            &s.0,
+            &s.1,
+            s.1.step as u64,
+            tokens_seen.get(),
+            resumed_meta.elapsed_secs + run_started.elapsed().as_secs(),
+        )?;
         Ok(())
     };
 
@@ -1159,23 +1151,15 @@ fn develop_staged(
         }
 
         // Save checkpoint after each phase as one atomic CheckpointBundle.
-        let bundle = CheckpointBundle {
-            schema: modgrad_training::CURRENT_SCHEMA,
-            model_kind: MODEL_KIND_CTM.to_string(),
-            model: w.clone(),
-            optimizer: opt.clone(),
-            meta: BasicMeta {
-                step: opt.step as u64,
-                tokens_seen: total_tokens,
-                loss_at_save: 0.0,
-                best_loss: 0.0,
-                timestamp_unix: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0),
-                elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
-            },
-        };
-        bundle.save(save_path).expect("failed to save checkpoint");
+        modgrad_training::save_training_checkpoint(
+            save_path,
+            MODEL_KIND_CTM,
+            &w,
+            &opt,
+            opt.step as u64,
+            total_tokens,
+            resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+        ).expect("failed to save checkpoint");
         eprintln!("  Checkpoint saved to {save_path} ({total_tokens} tokens trained)");
     }
 
@@ -1205,23 +1189,15 @@ fn develop_staged(
         eprintln!("  \"{prompt_str}\" -> \"{output_str}\"");
     }
 
-    let bundle = CheckpointBundle {
-        schema: modgrad_training::CURRENT_SCHEMA,
-        model_kind: MODEL_KIND_CTM.to_string(),
-        model: w.clone(),
-        optimizer: opt.clone(),
-        meta: BasicMeta {
-            step: opt.step as u64,
-            tokens_seen: total_tokens,
-            loss_at_save: 0.0,
-            best_loss: 0.0,
-            timestamp_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0),
-            elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
-        },
-    };
-    bundle.save(save_path).expect("failed to save final checkpoint");
+    modgrad_training::save_training_checkpoint(
+        save_path,
+        MODEL_KIND_CTM,
+        &w,
+        &opt,
+        opt.step as u64,
+        total_tokens,
+        resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+    ).expect("failed to save final checkpoint");
     let size = std::fs::metadata(save_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("\nFinal save to {save_path} ({size} bytes, {total_tokens} tokens)");
 }
@@ -1566,28 +1542,19 @@ fn learn(
         }
     };
 
-    // Save closure: pack model + optimizer + live counters into a
-    // CheckpointBundle. One atomic file replaces the old weights +
-    // .opt.bin sidecar pair.
+    // Save closure: delegate to the helper — single source of truth
+    // for CURRENT_SCHEMA + timestamp_unix + default loss fields.
     let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
         let s = state.borrow();
-        let bundle = CheckpointBundle {
-            schema: modgrad_training::CURRENT_SCHEMA,
-            model_kind: MODEL_KIND_CTM.to_string(),
-            model: s.0.clone(),
-            optimizer: s.1.clone(),
-            meta: BasicMeta {
-                step: s.1.step as u64,
-                tokens_seen: total_tokens.get(),
-                loss_at_save: 0.0,
-                best_loss: 0.0,
-                timestamp_unix: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0),
-                elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
-            },
-        };
-        bundle.save(save_path)?;
+        modgrad_training::save_training_checkpoint(
+            save_path,
+            MODEL_KIND_CTM,
+            &s.0,
+            &s.1,
+            s.1.step as u64,
+            total_tokens.get(),
+            resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+        )?;
         Ok(())
     };
 
