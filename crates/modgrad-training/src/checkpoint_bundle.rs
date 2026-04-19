@@ -52,6 +52,14 @@ pub const CURRENT_SCHEMA: u32 = 1;
 /// trying to deserialise.
 const MAGIC: &[u8; 4] = b"MGCK";  // "MoGrad ChecKpoint"
 
+/// Pre-read size cap. A billion-param f32 model + AdamW state is about
+/// 12 GiB, doubled in the worst case by optimizer moments — 32 GiB is a
+/// comfortable ceiling above realistic checkpoints while rejecting
+/// a file that would try to allocate more memory than any machine we
+/// support. Also guards against a ~quintillion-byte file that `bincode`
+/// would happily dereference.
+const MAX_CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
 /// Default metadata — covers the things a resumable trainer needs.
 /// Implementations that want more fields define their own struct;
 /// `CheckpointBundle<M, O, Meta>` is generic over it.
@@ -110,6 +118,10 @@ pub enum CheckpointError {
     /// `model_kind` in the file doesn't match what the caller expected.
     /// Prevents loading an FFN checkpoint into a CTM slot.
     ModelKindMismatch { found: String, expected: String },
+    /// File on disk is larger than `MAX_CHECKPOINT_BYTES`. Refused
+    /// before reading so we never try to allocate an attacker-sized
+    /// buffer (bincode trusts the length prefixes inside it).
+    FileTooLarge { found: u64, max: u64 },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -124,6 +136,9 @@ impl std::fmt::Display for CheckpointError {
             }
             CheckpointError::ModelKindMismatch { found, expected } => {
                 write!(f, "checkpoint is '{found}', expected '{expected}'")
+            }
+            CheckpointError::FileTooLarge { found, max } => {
+                write!(f, "checkpoint is {found} bytes, refusing to load (cap: {max})")
             }
         }
     }
@@ -173,7 +188,19 @@ where
     /// Load and verify. `expected_kind` is the `model_kind` string the
     /// caller requires; mismatch is rejected before any weight
     /// deserialisation happens.
+    ///
+    /// Files larger than [`MAX_CHECKPOINT_BYTES`] are refused at metadata
+    /// time — before any allocation — so a corrupt or adversarial file
+    /// can't coerce us into an enormous read.
     pub fn load(path: impl AsRef<Path>, expected_kind: &str) -> Result<Self, CheckpointError> {
+        let path = path.as_ref();
+        let size = std::fs::metadata(path)?.len();
+        if size > MAX_CHECKPOINT_BYTES {
+            return Err(CheckpointError::FileTooLarge {
+                found: size,
+                max: MAX_CHECKPOINT_BYTES,
+            });
+        }
         let data = std::fs::read(path)?;
         if data.len() < 8 || &data[..4] != MAGIC {
             return Err(CheckpointError::NotACheckpoint);
