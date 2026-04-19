@@ -7,6 +7,15 @@
 //!
 //! File format detection: `.bin` → bincode, `.json` → JSON.
 //! Unknown extension → bincode (the default for new code).
+//!
+//! **Performance opt-in**: [`save_wincode`] / [`load_wincode`] are
+//! available for types that have added `#[derive(SchemaRead,
+//! SchemaWrite)]`. Wincode is wire-compatible with bincode's default
+//! encoding, so a file written with [`save`] reads back fine with
+//! [`load_wincode`] and vice versa. The win is avoiding bincode's
+//! intermediate staging buffer on deserialize — ~2× faster on
+//! primitive-heavy types (Vec<f32> weight tensors). Opt in per-type
+//! once the schema derives are in place.
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::io;
@@ -63,6 +72,52 @@ pub fn load<T: DeserializeOwned>(path: impl AsRef<Path>) -> io::Result<T> {
     }
 }
 
+// ─── Wincode opt-in fast paths ─────────────────────────────
+//
+// Wire-compatible with the bincode-based `save`/`load` above —
+// files round-trip both ways. Use for types that have opted into
+// `#[derive(SchemaRead, SchemaWrite)]`.
+
+/// Save via wincode. Wire-compatible with [`save`]; opt in when the
+/// type has `#[derive(SchemaWrite)]`.
+pub fn save_wincode<T>(value: &T, path: impl AsRef<Path>) -> io::Result<()>
+where
+    T: wincode::SchemaWrite<wincode::config::DefaultConfig, Src = T>,
+{
+    let path = path.as_ref();
+    let payload = wincode::serialize(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("wincode serialize: {e:?}")))?;
+    let mut data = Vec::with_capacity(5 + payload.len());
+    data.extend_from_slice(MAGIC);
+    data.push(VERSION);
+    data.extend_from_slice(&payload);
+    std::fs::write(path, data)
+}
+
+/// Load via wincode. Reads files written by [`save`] (bincode) or
+/// [`save_wincode`] identically. Opt in when the type has
+/// `#[derive(SchemaRead)]`.
+pub fn load_wincode<T>(path: impl AsRef<Path>) -> io::Result<T>
+where
+    T: for<'de> wincode::SchemaRead<'de, wincode::config::DefaultConfig, Dst = T>,
+{
+    let path = path.as_ref();
+    let data = std::fs::read(path)?;
+    if data.len() < 5 || &data[..4] != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "not an ISIS binary file"));
+    }
+    let version = data[4];
+    if version > VERSION {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("file version {} > supported {}", version, VERSION)));
+    }
+    wincode::deserialize(&data[5..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("wincode deserialize: {e:?}")))
+}
+
 /// File size estimate for a serialized value (bincode).
 pub fn estimated_size<T: Serialize>(value: &T) -> usize {
     bincode::serialized_size(value).unwrap_or(0) as usize
@@ -78,11 +133,55 @@ fn is_json(path: &Path) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use wincode_derive::{SchemaRead, SchemaWrite};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct TestWeights {
         data: Vec<f32>,
         name: String,
+    }
+
+    /// A type that speaks both serde and wincode — used to verify
+    /// that `save` (bincode) and `load_wincode` (wincode) are
+    /// wire-compatible, so callers can migrate per-type without
+    /// breaking existing files.
+    #[derive(Debug, PartialEq, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+    struct DualTestWeights {
+        data: Vec<f32>,
+        vocab: u32,
+        d_model: u32,
+    }
+
+    #[test]
+    fn wincode_reads_bincode_written_files() {
+        let w = DualTestWeights {
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            vocab: 256,
+            d_model: 128,
+        };
+        let path = format!("/tmp/isis_test_wincode_reads_bincode_{}.bin",
+            std::process::id());
+        // Write via the bincode path...
+        save(&w, &path).unwrap();
+        // ...read via the wincode path. Same file, different deserializer.
+        let loaded: DualTestWeights = load_wincode(&path).unwrap();
+        assert_eq!(w, loaded);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bincode_reads_wincode_written_files() {
+        let w = DualTestWeights {
+            data: vec![0.1, 0.2, 0.3],
+            vocab: 512,
+            d_model: 64,
+        };
+        let path = format!("/tmp/isis_test_bincode_reads_wincode_{}.bin",
+            std::process::id());
+        save_wincode(&w, &path).unwrap();
+        let loaded: DualTestWeights = load(&path).unwrap();
+        assert_eq!(w, loaded);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

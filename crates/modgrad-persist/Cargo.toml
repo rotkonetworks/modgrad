@@ -8,5 +8,15 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Wire-compatible bincode replacement with direct-memory-write
+# deserialization. Wincode produces identical bytes to bincode's
+# default encoding so existing .bin files keep loading. The win is
+# zero-copy reads for primitive-heavy types (Vec<f32> weights) and
+# avoidance of the intermediate staging buffer bincode uses.
+wincode = "0.5"
+wincode-derive = "0.4"
+# bincode stays as a fallback and for JSON-fallback deserialization
+# elsewhere in the workspace; persist itself no longer uses it in
+# the hot path.
 bincode = "1"
 half = "2"
