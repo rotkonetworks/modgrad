@@ -455,7 +455,8 @@ fn learn_ffn(
                     num_steps: report.steps_completed as u64,
                     num_params_m: (w.n_params() as f32) / 1.0e6,
                 }.print();
-                eprintln!("  (val_bpb computed over {n_eval} target positions from {val_path})");
+                eprintln!("  (val_bpb over {n_eval} positions, {} bytes of {val_path}, ctx {context_len})",
+                    val_bytes.len());
             }
             Err(msg) => {
                 eprintln!("val_bpb eval failed: {msg}");
@@ -523,13 +524,16 @@ fn eval_ffn(checkpoint: &str, data_paths: &[String], context_len: usize, max_byt
     };
     let total_seconds = t_start.elapsed().as_secs_f32();
 
+    // `total_tokens_m` in the autoresearch contract means *training*
+    // tokens — for a standalone eval with no training, emit 0 to match
+    // the semantic the driving agent expects.
     AutoresearchSummary {
         val_bpb,
         training_seconds: 0.0,
         total_seconds,
         peak_vram_mb: 0.0,
         mfu_percent: 0.0,
-        total_tokens_m: (val_tokens.len() as f32) / 1.0e6,
+        total_tokens_m: 0.0,
         num_steps: 0,
         num_params_m: (w.n_params() as f32) / 1.0e6,
     }.print();
