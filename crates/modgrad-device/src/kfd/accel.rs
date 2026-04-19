@@ -529,6 +529,8 @@ pub fn try_matmul(
 
     // ─── Kernel tiling preconditions (violation → GPU OOB → hang) ───
     if m % 128 != 0 || k % 8 != 0 || n % 32 != 0 {
+        eprintln!("gpu matmul: shape precondition failed (n={n} k={k} m={m}); \
+            need n%32==0, k%8==0, m%128==0");
         return false;
     }
 
@@ -538,23 +540,43 @@ pub fn try_matmul(
         || x.len() < n_us * k_us
         || out.len() < n_us * m_us
     {
+        eprintln!("gpu matmul: buffer length check failed (n={n} k={k} m={m}); \
+            weight={} (need {}), bias={} (need {m_us}), x={} (need {}), out={} (need {})",
+            weight.len(), m_us * k_us, bias.len(),
+            x.len(), n_us * k_us, out.len(), n_us * m_us);
         return false;
     }
 
     // ─── GPU availability & locking ───
-    if op_disabled(GpuOp::Matmul) { return false; }
-    let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
-    let g = match guard.as_mut() { Some(g) => g, None => return false };
+    if op_disabled(GpuOp::Matmul) {
+        // Not worth logging — this is the steady state after a prior
+        // disable. Only the first failure matters; the rest just
+        // short-circuit here.
+        return false;
+    }
+    let mut guard = match gpu().lock() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("gpu matmul: gpu().lock() poisoned: {e}");
+            return false;
+        }
+    };
+    let g = match guard.as_mut() {
+        Some(g) => g,
+        None => {
+            eprintln!("gpu matmul: GPU singleton is None (init failed earlier)");
+            return false;
+        }
+    };
 
-    // ─── Dispatch. engine.matmul_into returns false on upload, alloc, or
-    //     submit_wait failure. A submit_wait timeout is the most dangerous
-    //     signal — we set DISABLED so a second bad call doesn't re-trigger.
+    // ─── Dispatch. engine.matmul_into logs its own which-stage failure
+    //     message inside stream.rs; we only set DISABLED here.
     if g.engine.matmul_into(&mut g.dev, weight, bias, x, out, n_us, k_us, m_us) {
         return true;
     }
 
-    // Couldn't complete — assume the queue is wedged. Disable for the session
-    // and fall to CPU. Ops/ps this is safer than retrying into a hung GPU.
+    // Couldn't complete — assume the queue is wedged. Disable for the session;
+    // caller panics per the no-fallback contract.
     disable_op(GpuOp::Matmul);
     false
 }

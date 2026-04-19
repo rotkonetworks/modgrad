@@ -406,15 +406,35 @@ impl StreamEngine {
         weight: &[f32], bias: &[f32], x: &[f32],
         out: &mut [f32], n: usize, k: usize, m: usize,
     ) -> bool {
+        // Each early-return path logs *which stage* failed. Before this
+        // instrumentation a failed matmul just said `return false` and
+        // the caller lost the information — making real GPU driver
+        // bugs indistinguishable from each other. Prefix the origin so
+        // autoresearch log scraping can grep `^gpu matmul:`.
         let (w_va, bias_va) = match self.prepare_weights(dev, weight, bias) {
-            Some(v) => v, None => return false,
+            Some(v) => v,
+            None => {
+                eprintln!("gpu matmul: prepare_weights failed (n={n} k={k} m={m}, \
+                    weight.len={}, bias.len={}) — upload/VRAM alloc path",
+                    weight.len(), bias.len());
+                return false;
+            }
         };
 
         let x_bytes = n * k * 4;
         let y_bytes = n * m * 4;
-        if !self.ensure_x(x_bytes, dev) { return false; }
-        if !self.ensure_y(y_bytes, dev) { return false; }
-        if !self.ensure_args(dev) { return false; }
+        if !self.ensure_x(x_bytes, dev) {
+            eprintln!("gpu matmul: ensure_x failed (wanted {x_bytes} B, n={n} k={k})");
+            return false;
+        }
+        if !self.ensure_y(y_bytes, dev) {
+            eprintln!("gpu matmul: ensure_y failed (wanted {y_bytes} B, n={n} m={m})");
+            return false;
+        }
+        if !self.ensure_args(dev) {
+            eprintln!("gpu matmul: ensure_args failed (kernargs buffer alloc)");
+            return false;
+        }
 
         // Upload X through BAR. At N=128, K=1024 that's 512KB — well under the
         // staging buffer's typical capacity, single memcpy.
@@ -447,14 +467,22 @@ impl StreamEngine {
             Some(entry) => {
                 dev.dispatch_enqueue_resolved(entry, args, [total_wg, 1, 1], [256, 1, 1]);
             }
-            None => return false,
+            None => {
+                eprintln!("gpu matmul: resolve_kernel('matmul_blocked') returned None \
+                    — kernel not loaded");
+                return false;
+            }
         }
 
         dev.queue.cache_wb();
         // 10s timeout: at 189M param FFN with M=5120 K=1024 N=128 the kernel
         // runs in single-digit ms; a 10s bound catches real hangs without
         // false-positive on any healthy dispatch.
-        if !dev.submit_wait(10_000) { return false; }
+        if !dev.submit_wait(10_000) {
+            eprintln!("gpu matmul: submit_wait(10_000ms) timed out — GPU hang? \
+                (n={n} k={k} m={m} total_wg={total_wg})");
+            return false;
+        }
 
         // Read Y back through BAR.
         let src = unsafe {
