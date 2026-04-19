@@ -537,11 +537,75 @@ impl HsaDevice {
             let args_buf = match args.upload(&dev.alloc) { Ok(b) => b, Err(_) => continue };
 
             dev.dispatch_enqueue("matvec", &args_buf, [nwg, 1, 1], [256, 1, 1]);
+            // cache_wb before submit_wait so the BAR read sees what the
+            // kernel actually wrote. Without this, y0 reads stale
+            // zero-initialized memory and silently looks "OK".
+            dev.queue.cache_wb();
             let ok = dev.submit_wait(2000);
             let y0 = if ok { unsafe { (y_buf.cpu_ptr as *const f32).read_volatile() } } else { f32::NAN };
-            eprintln!("    matvec {}WG ({}x{}): {} y0={:.4}",
-                nwg, m, k, if ok { "OK" } else { "HANG" }, y0);
+            // Expected: y[0] = sum_j(w[0][j] * x[j]) = k * 0.01 * 1.0
+            let expected = k as f32 * 0.01;
+            let correct = ok && (y0 - expected).abs() < 1e-3;
+            eprintln!("    matvec {}WG ({}x{}): {} y0={:.4} (want {:.4}){}",
+                nwg, m, k,
+                if !ok { "HANG" } else if correct { "OK" } else { "WRONG" },
+                y0, expected,
+                if ok && !correct { " ← KERNEL PRODUCED GARBAGE" } else { "" });
             if !ok { break; }
+        }
+
+        // matmul_blocked probe: this kernel is what FFN training uses, and
+        // on gfx1102 it has been observed to dispatch but never signal.
+        // Probe a grid of sizes so boot output tells us exactly where the
+        // kernel breaks. Expected y0 = sum(w * x) + b = k * 0.01 * 1.0.
+        // Non-fatal: app still starts, probe just logs.
+        //
+        // Shapes:
+        //   128x8x32    — minimum tile, 1 WG
+        //   256x8x32    — 2 WGs in m direction
+        //   128x8x64    — 2 WGs in n direction
+        //   512x128x64  — the exact FFN-small shape that hangs in training
+        for (m, k, n) in [(128, 8, 32), (256, 8, 32), (128, 8, 64), (512, 128, 64)] {
+            let m: u32 = m; let k: u32 = k; let n: u32 = n;
+            let expected = k as f32 * 0.01;
+            let w_data = vec![0.01f32; (m * k) as usize];
+            let b_data = vec![0.0f32;  m as usize];
+            let x_data = vec![1.0f32;  (n * k) as usize];
+            let probe_ok = (|| -> Option<bool> {
+                let w_buf = dev.upload_f32(&w_data).ok()?;
+                let b_buf = dev.upload_f32(&b_data).ok()?;
+                let x_buf = dev.upload_f32(&x_data).ok()?;
+                let y_buf = dev.alloc_output((m * n) as usize * 4 + 64).ok()?;
+                let mut args = KernArgs::new();
+                args.push_ptr(&w_buf); args.push_ptr(&b_buf);
+                args.push_ptr(&x_buf); args.push_ptr(&y_buf);
+                args.push_u32(m); args.push_u32(k); args.push_u32(n);
+                let args_buf = args.upload(&dev.alloc).ok()?;
+                let nwg_m = ((m + 127) / 128) as u32;
+                let nwg_n = ((n +  31) /  32) as u32;
+                let total_wg = nwg_m * nwg_n;
+                dev.dispatch_enqueue("matmul_blocked", &args_buf,
+                    [total_wg, 1, 1], [256, 1, 1]);
+                // cache_wb flushes GPU L2 so the BAR read below actually
+                // sees what the kernel wrote. Without it, y0 reads stale
+                // zeros even when the kernel succeeded (GPU's L2 holds
+                // the store; CPU reads around it through BAR).
+                dev.queue.cache_wb();
+                let ok = dev.submit_wait(3000);
+                let y0 = if ok { unsafe { (y_buf.cpu_ptr as *const f32).read_volatile() } }
+                    else { f32::NAN };
+                let correct = ok && (y0 - expected).abs() < 1e-3;
+                eprintln!("    matmul_blocked {}WG ({}x{}x{}): {} y0={:.4} (want {:.4}){}",
+                    total_wg, m, k, n,
+                    if !ok { "HANG" } else if correct { "OK" } else { "WRONG" },
+                    y0, expected,
+                    if ok && !correct { " ← KERNEL PRODUCED GARBAGE" } else { "" });
+                Some(ok && correct)
+            })();
+            // Don't break on failure — show every size so the pattern
+            // (where does it go wrong? when does it hang vs. produce
+            // garbage?) is visible at boot.
+            let _ = probe_ok;
         }
 
         Ok(dev)
