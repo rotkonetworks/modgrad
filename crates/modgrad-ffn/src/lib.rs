@@ -413,23 +413,30 @@ fn layer_norm_forward_batched(x: &[f32], gamma: &[f32], beta: &[f32],
 /// `tokens`: input sequence [t0, t1, ..., tN-1]
 /// For each position i, target is tokens[i+1].
 /// Returns (loss, d_logits per position).
-pub fn ffn_loss(logits: &[Vec<f32>], tokens: &[usize]) -> (f32, Vec<Vec<f32>>) {
+/// Cross-entropy loss + gradient. `logits[pos]` predicts `targets[pos]`;
+/// the two slices must have the same length.
+///
+/// Caller (see `ffn_train_step`) is responsible for producing aligned
+/// inputs/targets — typically `inputs = &tokens[..n-1]`, `targets =
+/// &tokens[1..]`. This used to be inlined here as "last position has no
+/// target"; splitting it out means the forward pass receives a
+/// correctly-shaped input slice (length n-1) instead of length n with
+/// one wasted position. Aligning to 2ⁿ / multiple-of-32 boundaries
+/// matters for GPU matmul kernels, which require n%32==0.
+pub fn ffn_loss(logits: &[Vec<f32>], targets: &[usize]) -> (f32, Vec<Vec<f32>>) {
     let n = logits.len();
-    if n < 2 { return (0.0, vec![vec![0.0; logits.get(0).map_or(0, |l| l.len())]; n]); }
-
+    assert_eq!(n, targets.len(),
+        "ffn_loss: logits and targets must have equal length (got {} vs {})",
+        n, targets.len());
+    if n == 0 { return (0.0, vec![]); }
     let mut total_loss = 0.0f32;
     let mut d_logits = Vec::with_capacity(n);
-
-    for pos in 0..n - 1 {
-        let target = tokens[pos + 1];
-        let (loss, grad) = modgrad_traits::cross_entropy_grad(&logits[pos], target);
+    for pos in 0..n {
+        let (loss, grad) = modgrad_traits::cross_entropy_grad(&logits[pos], targets[pos]);
         total_loss += loss;
         d_logits.push(grad);
     }
-    // Last position has no target
-    d_logits.push(vec![0.0; logits[0].len()]);
-
-    (total_loss / (n - 1) as f32, d_logits)
+    (total_loss / n as f32, d_logits)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1070,17 +1077,29 @@ pub fn ffn_train_step(
     tokens: &[usize],
 ) -> (f32, f32) {
     grads.zero();
-    let (logits, cache) = ffn_forward(w, tokens);
-    let (loss, d_logits) = ffn_loss(&logits, tokens);
+    if tokens.len() < 2 { return (0.0, 0.0); }
 
-    // Accuracy
+    // Split `tokens` into aligned input/target views so the forward pass
+    // gets exactly `context_len` rows (a multiple of 32 for the standard
+    // --context 64/128/256 knobs). Previously `ffn_forward` was called
+    // with all `tokens` (length context_len+1) and the trailing row was
+    // silently discarded — which meant every FFN training step produced
+    // an n=65 matmul that the GPU kernels reject (n%32==0 precondition),
+    // making --gpu a silent no-op.
+    let inputs = &tokens[..tokens.len() - 1];
+    let targets = &tokens[1..];
+
+    let (logits, cache) = ffn_forward(w, inputs);
+    let (loss, d_logits) = ffn_loss(&logits, targets);
+
+    // Accuracy — same positions the loss scored.
     let mut correct = 0usize;
-    let n = tokens.len() - 1;
+    let n = inputs.len();
     for pos in 0..n {
         let pred = logits[pos].iter().enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i).unwrap_or(0);
-        if pred == tokens[pos + 1] { correct += 1; }
+        if pred == targets[pos] { correct += 1; }
     }
     let acc = correct as f32 / n.max(1) as f32;
 
