@@ -785,9 +785,11 @@ impl Gemma4Model {
             std::slice::from_raw_parts(base_ptr.add(row_offset), row_bytes)
         };
 
-        // Dequantize based on type
-        // TODO: implement Q5_K dequant, for now just use zeros
-        // This is wrong but lets us test the pipeline
+        // Dequantize based on type. FIXME: any dtype that isn't Q5_K
+        // or Q4_K silently falls through to an all-zeros embedding
+        // below — produces garbage logits rather than a loud error.
+        // If we ever want to support Q8_0, Q6_K, etc., add branches
+        // here; until then, reject unknown dtypes at load time.
         let mut embedding = vec![0.0f32; row_elements];
 
         if matches!(dtype, GgmlType::Q5_K) {
@@ -802,9 +804,14 @@ impl Gemma4Model {
         }
 
         // Scale by sqrt(d_model) — line 20 of reference.
+        //
+        // FIXME: this scale is borrowed from the reference impl's
+        // embedding hook but we haven't confirmed that combined with
+        // our dequant + matvec path it produces bit-exact logits
+        // against a known-good CPU implementation. Before trusting
+        // outputs, run a golden-file comparison.
         let scale = (self.d_model as f32).sqrt();
         for v in embedding.iter_mut() { *v *= scale; }
-        // TODO: verify this produces correct logits
 
         embedding
     }

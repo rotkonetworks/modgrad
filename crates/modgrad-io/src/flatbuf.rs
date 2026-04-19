@@ -124,7 +124,10 @@ pub fn deserialize(buf: &[u8]) -> Result<RtBank, String> {
             quant: mid.quant().unwrap_or("").into(),
             hidden_dim: mid.hidden_dim(),
             extraction: mid.extraction().unwrap_or("").into(),
-            eos_token_id: 151643, // TODO: store in FlatBuffers schema
+            eos_token_id: 151643, // FIXME: hardcoded to Qwen2-style EOS;
+            // different tokenizers use different IDs. Loading a non-Qwen
+            // model via this path gives wrong EOS detection. Add
+            // `eos_token_id` to the FlatBuffers schema and read it back.
         }
     } else {
         crate::memory::ModelId::default()

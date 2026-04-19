@@ -124,7 +124,8 @@ pub fn generate(
 /// identical to normal decoding. For stochastic sampling, the current
 /// implementation uses token-matching (not rejection sampling), so the
 /// output distribution may differ slightly from normal decoding.
-/// TODO: implement proper rejection sampling for stochastic losslessness.
+/// Proper rejection sampling would make the stochastic path bit-
+/// equivalent to normal decoding — not implemented yet.
 pub fn generate_speculative(
     draft: StepFn<'_>,
     verify: VerifyFn<'_>,

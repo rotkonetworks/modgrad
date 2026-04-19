@@ -351,7 +351,9 @@ fn handle_client(
             }
 
             DebugRequest::Subscribe | DebugRequest::Unsubscribe => {
-                DebugResponse::Ok // TODO: streaming subscription
+                // Streaming subscription not implemented — subscribe/
+                // unsubscribe ack'd but no stream is established.
+                DebugResponse::Ok
             }
         };
 

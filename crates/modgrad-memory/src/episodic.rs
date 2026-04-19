@@ -323,7 +323,8 @@ pub fn store_with_valence(
     (mem, true)
 }
 
-// TODO: re-enable when CtmOutput gains a trajectory field.
+// TODO(BLOCKED on CtmOutput trajectory field): re-enable once CtmOutput
+// exposes the per-tick trajectory. No action here until that lands.
 // pub fn store_from_output(
 //     mem: EpisodicMemory,
 //     output: &crate::forward::CtmOutput,
@@ -885,7 +886,8 @@ mod tests {
         assert_eq!(order[0], 1, "episode 1 should be first (most retrieved)");
     }
 
-    // TODO: re-enable when CtmOutput gains a trajectory field.
+    // TODO(BLOCKED on CtmOutput trajectory field): re-enable once
+    // CtmOutput exposes the per-tick trajectory.
     // Full integration: CTM forward → store → retrieve → compare.
     // #[test]
     // fn ctm_forward_episodic_round_trip() { ... }

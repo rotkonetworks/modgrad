@@ -2060,7 +2060,7 @@ fn load_video_tokens(path: &str, _fps: f32) -> Vec<Vec<usize>> {
     let result: Vec<Vec<usize>> = Vec::new();
 
     // Each subdirectory = one video with frame files + optional audio.wav
-    // TODO: implement with modgrad_codec when needed
+    // (wire up via modgrad_codec when a downstream caller actually needs it).
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {

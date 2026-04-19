@@ -85,9 +85,9 @@ impl Backend for GgufBackend {
         // proxy for hidden states. This is a known limitation — the proper fix is
         // to modify candle's forward to return hidden states.
         //
-        // TODO: Fork candle_transformers::models::quantized_llama to expose
-        // pre-lm_head hidden states. For memory keys, we need the LAST hidden
-        // state before the lm_head projection.
+        // Proper fix: fork candle_transformers::models::quantized_llama
+        // to expose pre-lm_head hidden states. For memory keys, we
+        // need the LAST hidden state before the lm_head projection.
 
         let ids: Vec<u32> = token_ids.iter().map(|&id| id as u32).collect();
         let input = Tensor::new(ids.as_slice(), &self.device)?;

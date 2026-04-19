@@ -98,8 +98,10 @@ mod inner {
 
         fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                        output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
-            // For now: batched matmul on CPU (GPU batched small-matrix not worth it at <64 neurons).
-            // TODO: custom CUDA kernel for batched per-neuron MLP when n_neurons > 256.
+            // For now: batched matmul on CPU (GPU batched small-matrix
+            // not worth it at <64 neurons). A custom CUDA kernel for
+            // batched per-neuron MLP would earn its keep at n_neurons
+            // > 256 or so.
             for n in 0..n_neurons {
                 let w_offset = n * out_per * in_per;
                 let b_offset = n * out_per;

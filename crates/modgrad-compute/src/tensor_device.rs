@@ -311,8 +311,8 @@ impl LayerNorm for VramTensor<f32> {
         // BAR-mapped CPU compute — slices point at VRAM directly, no
         // upload/download. Slower than a dedicated GPU kernel would be
         // (we don't have an affine-LN kernel yet, only the single-row
-        // whitening one), but no PCIe round trip either. TODO: write a
-        // batched affine-LN kernel and dispatch on VA pointers here.
+        // whitening one), but no PCIe round trip either. A batched
+        // affine-LN kernel dispatched on VA pointers would go here.
         layer_norm_body(
             x.as_slice(), gamma.as_slice(), beta.as_slice(),
             y.as_mut_slice(), means.as_mut_slice(), inv_stds.as_mut_slice(),

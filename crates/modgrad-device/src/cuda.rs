@@ -238,8 +238,8 @@ pub fn try_superlinear(
     _trace: &[f32], _weights: &[f32], _biases: &[f32], _out: &mut [f32],
     _n_neurons: u32, _in_per: u32, _out_per: u32,
 ) -> bool {
-    // TODO: implement via NVRTC-compiled PTX kernel dispatch
-    // For now, fall through to Vulkan or CPU.
+    // Unimplemented on CUDA — caller falls through to Vulkan or CPU.
+    // Would be NVRTC-compiled PTX kernel dispatch here.
     false
 }
 
