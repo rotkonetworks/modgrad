@@ -40,8 +40,15 @@ pub struct CtmConfig {
 }
 
 /// Tick-loop exit strategy. Exactly one mechanism — no overlap, no ambiguity.
+///
+/// Serde uses the *default externally-tagged* representation — bincode-
+/// compatible. An earlier version had `#[serde(tag = "kind")]` for
+/// human-readable JSON, but that requires `deserialize_any` which
+/// bincode doesn't support, breaking `.bin` round-trips of any type
+/// transitively containing an ExitStrategy (RegionalWeights, CtmWeights,
+/// CheckpointBundle<_, _>). The tagged representation was a
+/// human-readable convenience that cost us binary persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
 pub enum ExitStrategy {
     /// Run all ticks unconditionally.
     None,
