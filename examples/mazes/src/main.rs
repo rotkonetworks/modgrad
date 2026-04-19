@@ -76,7 +76,7 @@ fn main() {
     let maze_size = maze_size | 1;
 
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary);
         return;
     }
 
@@ -322,7 +322,9 @@ fn run_brain(
     maze_size: usize, ticks: usize, steps: usize, route_len: usize,
     lr: f32, seed: u64, batch_size: usize, imagination: bool, pain_mode: bool,
     plural_mode: bool, csv_mode: bool, cereb_size: usize, frozen_cereb: bool,
+    autoresearch_summary: bool,
 ) {
+    let t_train_start = std::time::Instant::now();
     use std::io::Write;
     use modgrad_ctm::bio::dream;
     use modgrad_ctm::memory::episodic::EpisodicConfig;
@@ -713,10 +715,30 @@ fn run_brain(
     }
 
     let avg_prefix = prefix_lengths.iter().sum::<usize>() as f32 / n_valid.max(1) as f32;
+    let first_step_acc = first_correct as f32 / n_valid.max(1) as f32;
     eprintln!("First step acc:     {first_correct}/{n_valid} ({:.1}%)",
-        first_correct as f32 / n_valid.max(1) as f32 * 100.0);
+        first_step_acc * 100.0);
     eprintln!("Per-step acc:       {route_correct}/{route_total} ({:.1}%)",
         if route_total > 0 { route_correct as f32 / route_total as f32 * 100.0 } else { 0.0 });
     eprintln!("Avg correct prefix: {avg_prefix:.1} steps (of {route_len})");
+
+    // Same autoresearch summary shape as run_single — see that function
+    // for the `val_bpb = 1 - first_step_acc` rationale.
+    if autoresearch_summary {
+        let total_seconds = t_train_start.elapsed().as_secs_f32();
+        modgrad_training::AutoresearchSummary {
+            val_bpb: 1.0 - first_step_acc,
+            training_seconds: total_seconds,  // no separate eval start — brain mode interleaves
+            total_seconds,
+            peak_vram_mb: 0.0,
+            mfu_percent: 0.0,
+            total_tokens_m: 0.0,
+            num_steps: steps as u64,
+            num_params_m: (w.n_params() as f32) / 1.0e6,
+        }.print();
+        eprintln!("  (task=mazes-brain size={maze_size} route_len={route_len}, \
+                   val_bpb = 1 - first_step_acc = {:.6})",
+                   1.0 - first_step_acc);
+    }
 }
 
