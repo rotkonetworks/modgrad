@@ -436,23 +436,32 @@ fn learn_ffn(
     if let Some(val_path) = val_data_path {
         let s = state.borrow();
         let w = &s.0;
-        let val_bytes = std::fs::read(val_path)
+        let mut val_bytes = std::fs::read(val_path)
             .unwrap_or_else(|e| { eprintln!("Failed to read {val_path}: {e}"); std::process::exit(1); });
+        // Cap read at EVAL_MAX_BYTES so a huge val file doesn't eat
+        // multiple minutes past the training budget.
+        val_bytes.truncate(EVAL_MAX_BYTES);
         let val_tokens: Vec<usize> = val_bytes.iter().map(|&b| b as usize).collect();
-        let (val_bpb, n_eval) = compute_ffn_val_bpb(w, &val_tokens, context_len);
-        let total_seconds = run_started.elapsed().as_secs_f32();
-
-        modgrad_training::AutoresearchSummary {
-            val_bpb,
-            training_seconds,
-            total_seconds,
-            peak_vram_mb: 0.0,
-            mfu_percent: 0.0,
-            total_tokens_m: (tokens_seen.get() as f32) / 1.0e6,
-            num_steps: report.steps_completed as u64,
-            num_params_m: (w.n_params() as f32) / 1.0e6,
-        }.print();
-        eprintln!("  (val_bpb computed over {n_eval} target positions from {val_path})");
+        match compute_ffn_val_bpb(w, &val_tokens, context_len) {
+            Ok((val_bpb, n_eval)) => {
+                let total_seconds = run_started.elapsed().as_secs_f32();
+                modgrad_training::AutoresearchSummary {
+                    val_bpb,
+                    training_seconds,
+                    total_seconds,
+                    peak_vram_mb: 0.0,
+                    mfu_percent: 0.0,
+                    total_tokens_m: (tokens_seen.get() as f32) / 1.0e6,
+                    num_steps: report.steps_completed as u64,
+                    num_params_m: (w.n_params() as f32) / 1.0e6,
+                }.print();
+                eprintln!("  (val_bpb computed over {n_eval} target positions from {val_path})");
+            }
+            Err(msg) => {
+                eprintln!("val_bpb eval failed: {msg}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -460,15 +469,24 @@ fn learn_ffn(
 /// in non-overlapping `context_len`-sized windows and accumulates
 /// cross-entropy into a `BitsPerByte` metric.
 ///
-/// Returns `(val_bpb, n_target_positions)`. `n_target_positions` is the
-/// denominator the metric saw — useful for agents to sanity-check that
-/// the eval actually ran over enough tokens.
+/// Returns `Ok((val_bpb, n_target_positions))` on success, or
+/// `Err(message)` when there isn't enough data for a single window.
+/// The explicit error path matters: a silent `val_bpb = 0.0` would
+/// look like a perfect score and trick the driving agent into
+/// keeping a mutation that actually can't be evaluated.
 fn compute_ffn_val_bpb(
     w: &modgrad_ffn::FfnWeights,
     val_tokens: &[usize],
     context_len: usize,
-) -> (f32, usize) {
+) -> Result<(f32, usize), String> {
     use modgrad_training::metrics::{BitsPerByte, Metric};
+    if val_tokens.len() < context_len + 1 {
+        return Err(format!(
+            "val data too short: {} tokens, need at least context_len + 1 = {}",
+            val_tokens.len(),
+            context_len + 1,
+        ));
+    }
     let mut bpb = BitsPerByte::new();
     let mut offset = 0usize;
     let mut n_positions = 0usize;
@@ -481,8 +499,23 @@ fn compute_ffn_val_bpb(
         }
         offset += context_len;
     }
-    (bpb.compute(), n_positions)
+    // Defensive: the loop above guarantees n_positions >= context_len
+    // when we got past the length gate, so this really shouldn't fire.
+    // Keep the check so that a future refactor can't reintroduce the
+    // silent-zero failure mode.
+    if n_positions == 0 {
+        return Err(format!(
+            "no target positions evaluated (val_tokens={}, context_len={context_len})",
+            val_tokens.len(),
+        ));
+    }
+    Ok((bpb.compute(), n_positions))
 }
+
+/// Shared cap on end-of-run eval reads — same as `Eval`'s default, kept
+/// here so `learn-ffn`'s post-training eval can't OOM or balloon the
+/// total_seconds field on a huge val.txt.
+const EVAL_MAX_BYTES: usize = 262_144;
 
 /// `isis eval <checkpoint> <data…>` — load an FFN CheckpointBundle, compute
 /// val_bpb on the concatenated data, print the autoresearch summary block.
@@ -511,13 +544,15 @@ fn eval_ffn(checkpoint: &str, data_paths: &[String], context_len: usize, max_byt
         if val_bytes.len() >= max_bytes { break; }
     }
     val_bytes.truncate(max_bytes);
-    if val_bytes.len() < context_len + 1 {
-        eprintln!("Not enough val data: {} bytes, need at least {}", val_bytes.len(), context_len + 1);
-        std::process::exit(1);
-    }
     let val_tokens: Vec<usize> = val_bytes.iter().map(|&b| b as usize).collect();
 
-    let (val_bpb, n_positions) = compute_ffn_val_bpb(&w, &val_tokens, context_len);
+    let (val_bpb, n_positions) = match compute_ffn_val_bpb(&w, &val_tokens, context_len) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("val_bpb eval failed: {msg}");
+            std::process::exit(1);
+        }
+    };
     let total_seconds = t_start.elapsed().as_secs_f32();
 
     AutoresearchSummary {
