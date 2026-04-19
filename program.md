@@ -139,21 +139,34 @@ On each iteration:
    hypothesis in one sentence before editing.
 3. **Edit the code**.
 4. **Commit**: `git add -A && git commit -m "<short description>"`.
-5. **Run**:
+5. **Check you didn't touch read-only files**:
+   ```
+   ./scripts/autoresearch-check.sh HEAD~1
+   ```
+   If it reports a violation, `git reset --hard HEAD~1` and try a
+   different mutation. The ground-truth evaluation harness is sacred;
+   accidentally editing it invalidates every prior `val_bpb` row in
+   `results.tsv`.
+6. **Delete the prior checkpoint** so the new run starts fresh
+   (resuming a prior checkpoint biases the val_bpb):
+   ```
+   rm -f /tmp/autoresearch_ckpt.bin
+   ```
+7. **Run**:
    ```
    cargo build --release -p isis && \
      ./target/release/isis learn-ffn --budget 300 --val-data val.txt \
        /tmp/autoresearch_ckpt.bin train_climbmix_5m.txt > run.log 2>&1
    ```
-6. **Extract results**: `grep "^val_bpb:\|^peak_vram_mb:" run.log`.
-7. **Log to results.tsv**.
-8. **Decide**:
-   - val_bpb strictly lower than the current branch tip → **keep** (do
-     nothing, the commit stands).
-   - val_bpb equal or higher → **discard**:
-     `git reset --hard HEAD~1`.
-   - crash → **discard**:
-     `git reset --hard HEAD~1`, log `crash`.
+8. **Extract results**: `grep "^val_bpb:\|^peak_vram_mb:" run.log`.
+9. **Log to results.tsv**.
+10. **Decide**:
+    - val_bpb strictly lower than the current branch tip → **keep** (do
+      nothing, the commit stands).
+    - val_bpb equal or higher → **discard**:
+      `git reset --hard HEAD~1`.
+    - crash → **discard**:
+      `git reset --hard HEAD~1`, log `crash`.
 
 Repeat. Forever.
 
