@@ -37,6 +37,7 @@ maze_*.csv
 
 # Autoresearch scratch — agent logs & per-run TSV
 results.tsv
+results-*.tsv
 run.log
 val.txt
 

@@ -42,6 +42,7 @@ READ_ONLY_PATTERNS=(
   '^crates/modgrad-training/src/autoresearch\.rs$'
   '^crates/modgrad-training/src/checkpoint_bundle\.rs$'
   '^crates/modgrad-device/'
+  '^examples/mazes/src/maze_gen\.rs$'
   '^program\.md$'
   '^val\.txt$'
   '^Cargo\.toml$'

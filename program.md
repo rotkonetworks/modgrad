@@ -78,21 +78,70 @@ val_bpb gains. Don't blow up VRAM dramatically.
 code is probably not worth keeping. A 0 bpb change that deletes code is
 a keep. Err toward simpler.
 
+## Choosing a task
+
+Two tasks share the same autoresearch contract (same `val_bpb:` grep,
+same keep/discard decision rule). Pick one per branch — don't interleave
+them in the same branch, because the two `val_bpb` numbers mean different
+things and aren't directly comparable.
+
+- **Language** (`isis learn-ffn`): FFN cerebellum trained on byte-level
+  text. `val_bpb` = cross-entropy per byte on `val.txt`. Standard
+  LM-style iteration: architecture, LR schedule, activation, width.
+  Results go in `results-language.tsv`.
+
+- **Mazes** (`mazes` binary): CTM trained on route prediction from maze
+  pixels. `val_bpb` = `1 - first_step_accuracy` (0 = perfect routing,
+  1 = random guess). Iteration focus: CTM ticks, d_model, exit
+  strategy, loss mix. Results go in `results-mazes.tsv`.
+
+The "CAN change" / "CANNOT change" sets below depend on which task
+you pick; see the per-task subsections under "Running one experiment".
+
 ## Running one experiment
+
+### Language task (`learn-ffn`)
 
 ```
 cargo build --release -p isis && \
   ./target/release/isis learn-ffn --budget 300 --val-data val.txt \
-    /tmp/autoresearch_ckpt.bin train_climbmix_5m.txt > run.log 2>&1
+    /tmp/autoresearch_ffn.bin train_climbmix_5m.txt > run.log 2>&1
 ```
 
-Flags to know:
-- `--budget 300` — 5-minute wall-clock training cap (autoresearch standard).
-- `--val-data val.txt` — triggers the end-of-run val_bpb eval + summary print.
-- `/tmp/autoresearch_ckpt.bin` — throwaway path. A fresh file per run; do
-  not reuse a checkpoint across experiments (biases the start point).
+Flags:
+- `--budget 300` — 5-minute wall-clock training cap.
+- `--val-data val.txt` — triggers end-of-run val_bpb eval + summary.
+- `/tmp/autoresearch_ffn.bin` — throwaway path, fresh file per run
+  (do not reuse a checkpoint across experiments — biases the start).
 
-Reading the result:
+Task-specific mutable set (in addition to the global "CAN change" list):
+- `crates/modgrad-ffn/src/**`
+- `isis/src/main.rs` → `learn_ffn` function body only
+- **Do not** touch `eval_ffn` / `compute_ffn_val_bpb` — evaluation harness.
+
+### Maze task (`mazes`)
+
+```
+cargo build --release -p mazes && \
+  ./target/release/mazes --size 21 --ticks 16 --steps 5000 --batch 8 \
+    --autoresearch-summary > run.log 2>&1
+```
+
+Flags:
+- `--steps 5000` — per-experiment iteration cap (mazes doesn't yet have
+  `--budget`; keep steps low enough to finish in ~5 minutes).
+- `--autoresearch-summary` — triggers the summary print after the
+  200-maze eval.
+- `--size` / `--ticks` / `--d-model` — task knobs, fair game to mutate.
+
+Task-specific mutable set:
+- `crates/modgrad-ctm/src/**` — the CTM regional graph and core.
+- `examples/mazes/src/main.rs` → training body only.
+- **Do not** touch the `eval()` function in `examples/mazes/src/main.rs`
+  or `examples/mazes/src/maze_gen.rs` — evaluation harness.
+
+### Reading the result (either task)
+
 ```
 grep "^val_bpb:\|^peak_vram_mb:" run.log
 ```
@@ -103,11 +152,16 @@ and re-run. Fundamentally broken idea — log as `crash` and move on.
 
 ## Logging results
 
-`results.tsv` at repo root. Tab-separated (commas break descriptions).
-Header row:
+`results-language.tsv` or `results-mazes.tsv` at repo root, depending
+on the task this branch is iterating on. Tab-separated (commas break
+descriptions). Header row (identical for both files):
 ```
 commit	val_bpb	memory_gb	status	description
 ```
+
+Keep tasks in separate files because the `val_bpb` numbers aren't
+directly comparable across tasks — mazes reports `1 - accuracy`, language
+reports actual cross-entropy per byte.
 
 Five columns:
 1. `git rev-parse --short HEAD` (7 chars).
@@ -126,9 +180,9 @@ c3d4e5f	1.245900	0.0	discard	replace SwiGLU with GeLU
 d4e5f6g	0.000000	0.0	crash	quadruple model width (OOM)
 ```
 
-**Do NOT commit `results.tsv`.** Leave it untracked (add to `.gitignore`
-if needed). The file is your scratch log, not repo history; git commit
-messages carry the keep decisions.
+**Do NOT commit `results-*.tsv`.** Already in `.gitignore`. The file is
+your scratch log, not repo history; git commit messages carry the keep
+decisions.
 
 ## The loop
 
@@ -148,15 +202,18 @@ On each iteration:
    accidentally editing it invalidates every prior `val_bpb` row in
    `results.tsv`.
 6. **Delete the prior checkpoint** so the new run starts fresh
-   (resuming a prior checkpoint biases the val_bpb):
+   (resuming a prior checkpoint biases the val_bpb). For the language
+   task:
    ```
-   rm -f /tmp/autoresearch_ckpt.bin
+   rm -f /tmp/autoresearch_ffn.bin
    ```
-7. **Run**:
+   Mazes trains from scratch every call and has no checkpoint to delete.
+7. **Run** (pick the command for this branch's task — see "Running one
+   experiment" above for both). Default (language):
    ```
    cargo build --release -p isis && \
      ./target/release/isis learn-ffn --budget 300 --val-data val.txt \
-       /tmp/autoresearch_ckpt.bin train_climbmix_5m.txt > run.log 2>&1
+       /tmp/autoresearch_ffn.bin train_climbmix_5m.txt > run.log 2>&1
    ```
 8. **Extract results**: `grep "^val_bpb:\|^peak_vram_mb:" run.log`.
 9. **Log to results.tsv**.
