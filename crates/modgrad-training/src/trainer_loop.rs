@@ -293,10 +293,23 @@ impl TrainerLoop {
         }
 
         // Final save on signal or natural completion.
-        if report.stopped_by_signal || self.config.save_every.is_some() {
+        //
+        // Skip on loss explosion: the last periodic save wrote a clean
+        // checkpoint, but the in-memory weights are corrupted by the
+        // exploded step. Writing them here would overwrite the good
+        // checkpoint with the bad state — strictly worse for resume,
+        // and for autoresearch's git-reset flow it means a failed
+        // experiment leaves its wreckage where the next experiment
+        // will pick it up.
+        let should_final_save = !report.stopped_by_loss_explosion
+            && (report.stopped_by_signal || self.config.save_every.is_some());
+        if should_final_save {
             if let Err(e) = save_fn() {
                 eprintln!("{}  [final save failed: {e}]", self.config.log_prefix);
             }
+        } else if report.stopped_by_loss_explosion {
+            eprintln!("{}  [skipping final save — last periodic checkpoint is cleaner]",
+                self.config.log_prefix);
         }
 
         report.final_avg_loss =
@@ -454,6 +467,32 @@ mod tests {
         assert!(!report.stopped_by_budget);
         assert_eq!(report.steps_completed, 3,
             "the NaN step is counted (step ran), then the abort fires");
+    }
+
+    #[test]
+    fn loss_explosion_skips_final_save() {
+        // An exploded run must NOT overwrite the last good periodic
+        // checkpoint with the corrupted in-memory state. Check via
+        // a save counter: periodic saves fire during good steps,
+        // then the NaN triggers, and the final-save path is skipped.
+        let cfg = TrainerConfig {
+            max_steps: 100, log_every: 100,
+            save_every: Some(2), install_ctrlc: false,
+            abort_on_loss_above: Some(100.0),
+            ..Default::default()
+        };
+        let saves = Cell::new(0);
+        let report = TrainerLoop::new(cfg).run(
+            |step| Some(StepReport::new(if step == 4 { f32::NAN } else { 0.5 })),
+            || { saves.set(saves.get() + 1); Ok(()) },
+        );
+        assert!(report.stopped_by_loss_explosion);
+        // Periodic saves fire at steps 2, 4 (right after the good
+        // step, before the NaN step). Then the NaN step runs; abort
+        // skips the final save. Total: 2 periodic, 0 final = 2.
+        assert_eq!(saves.get(), 2,
+            "exploded runs must skip final save to preserve the last \
+             good periodic checkpoint on disk");
     }
 
     #[test]
