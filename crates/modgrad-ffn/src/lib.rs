@@ -692,6 +692,9 @@ pub struct FfnAdamW {
     pub wd: f32,
     pub clip: f32,
     pub step: usize,
+    // Manual Clone below — can't derive because `vram: Option<Box<dyn ...>>`
+    // isn't Clone. Semantics: cloning for save drops the VRAM mirror;
+    // re-materialising happens via enable_vram() on the clone if needed.
     // Flat moment buffers — one per parameter group
     m: FfnGradients,
     v: FfnGradients,
@@ -704,6 +707,21 @@ pub struct FfnAdamW {
     /// cudarc-backed impl, etc. The FFN code here never names either.
     #[serde(skip)]
     vram: Option<Box<dyn modgrad_compute::optimizer_state::OptimizerState>>,
+}
+
+// Manual Clone: VramMirror isn't Clone (holds raw GPU buffer handles),
+// so the clone drops the mirror. Callers that want the mirror on the
+// clone re-allocate it with `enable_vram(&weights)` on the clone.
+impl Clone for FfnAdamW {
+    fn clone(&self) -> Self {
+        Self {
+            lr: self.lr, beta1: self.beta1, beta2: self.beta2,
+            eps: self.eps, wd: self.wd, clip: self.clip, step: self.step,
+            m: self.m.clone(),
+            v: self.v.clone(),
+            vram: None,
+        }
+    }
 }
 
 impl FfnAdamW {

@@ -258,27 +258,52 @@ fn learn_ffn(
         FfnConfig::large(vocab)
     };
 
-    let w = if std::path::Path::new(save_path).exists() {
-        eprintln!("Loading {save_path}...");
-        FfnWeights::load(save_path).expect("failed to load")
+    // Try to resume from a CheckpointBundle. If the file exists but is in
+    // the legacy two-file format (cerebellum.bin + cerebellum.bin.opt),
+    // fall back to that path — preserves backward compatibility during
+    // the rollout.
+    use modgrad_training::{CheckpointBundle, BasicMeta};
+    const MODEL_KIND: &str = "ffn-cerebellum";
+
+    let (w, opt, resumed_meta) = if std::path::Path::new(save_path).exists() {
+        match CheckpointBundle::<FfnWeights, FfnAdamW>::load(save_path, MODEL_KIND) {
+            Ok(bundle) => {
+                eprintln!("Resumed {save_path} — step {}, {} tokens seen",
+                    bundle.meta.step, bundle.meta.tokens_seen);
+                (bundle.model, bundle.optimizer, bundle.meta)
+            }
+            Err(e) => {
+                // Probably a legacy two-file checkpoint. Try loading the
+                // individual files; on success we'll migrate on the next
+                // save.
+                eprintln!("  (not a checkpoint bundle: {e})");
+                eprintln!("  trying legacy two-file format...");
+                let w = FfnWeights::load(save_path).expect("failed to load legacy weights");
+                let opt_legacy = save_path.replace(".bin", ".opt.bin")
+                                           .replace(".json", ".opt.json");
+                let opt = if std::path::Path::new(&opt_legacy).exists() {
+                    FfnAdamW::load(&opt_legacy).unwrap_or_else(|_| FfnAdamW::new(&w))
+                } else {
+                    FfnAdamW::new(&w)
+                };
+                (w, opt, BasicMeta::default())
+            }
+        }
     } else {
         eprintln!("Creating FFN cerebellum...");
-        FfnWeights::new(cfg)
+        let w = FfnWeights::new(cfg);
+        let opt = FfnAdamW::new(&w);
+        (w, opt, BasicMeta::default())
     };
     w.print_summary();
 
-    let opt_path = save_path.replace(".bin", ".opt.bin").replace(".json", ".opt.json");
     let lr = lr_override.unwrap_or_else(|| {
         if w.n_params() > 100_000_000 { 1e-4 }
         else if w.n_params() > 20_000_000 { 3e-4 }
         else { 1e-3 }
     });
-
-    let opt = if std::path::Path::new(&opt_path).exists() {
-        FfnAdamW::load(&opt_path).unwrap_or_else(|_| FfnAdamW::new(&w).with_lr(lr))
-    } else {
-        FfnAdamW::new(&w).with_lr(lr)
-    };
+    let mut opt = opt;
+    opt = opt.with_lr(lr);
 
     // NOTE: VRAM-resident AdamW path is available via opt.enable_vram(&w)
     // but turns out to be net-slower than the cache-based path because
@@ -335,10 +360,28 @@ fn learn_ffn(
         }
     };
 
+    // Save closure: pack state + live counters into a CheckpointBundle
+    // and write atomically. Resume pulls the same bundle back on next
+    // launch (see earlier in this fn).
     let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
         let s = state.borrow();
-        s.0.save(save_path)?;
-        s.1.save(&opt_path)?;
+        let bundle = CheckpointBundle {
+            schema: modgrad_training::CURRENT_SCHEMA,
+            model_kind: MODEL_KIND.to_string(),
+            model: s.0.clone(),
+            optimizer: s.1.clone(),
+            meta: BasicMeta {
+                step: s.1.step as u64,
+                tokens_seen: resumed_meta.tokens_seen,
+                loss_at_save: 0.0,
+                best_loss: 0.0,
+                timestamp_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0),
+                elapsed_secs: 0,
+            },
+        };
+        bundle.save(save_path)?;
         Ok(())
     };
 
