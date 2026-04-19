@@ -34,7 +34,33 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Process-wide signal flag. First `TrainerLoop::run(install_ctrlc=true)`
+/// installs the Ctrl+C handler; later runs reset and reuse the same flag.
+/// Without this every run after the first would silently fail to install
+/// (the `ctrlc` crate rejects a second handler) and lose graceful save.
+static SIGNAL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+fn signal_flag() -> &'static Arc<AtomicBool> {
+    SIGNAL_FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(true));
+        let handler_flag = Arc::clone(&flag);
+        // Errors here are only possible if *another* install raced ahead
+        // of us (impossible under OnceLock::get_or_init's synchronisation)
+        // or if the OS rejects the handler. Surface that rather than
+        // swallow it — `ctrlc` failing silently was a latent debuggability
+        // trap.
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!("\n  [signal received — finishing current step, then saving…]");
+            handler_flag.store(false, Ordering::SeqCst);
+        }) {
+            eprintln!("warning: TrainerLoop failed to install Ctrl+C handler: {e}");
+        }
+        flag
+    })
+}
 
 /// Report the step closure returns to describe one training step.
 #[derive(Debug, Clone)]
@@ -147,16 +173,16 @@ impl TrainerLoop {
         Step: FnMut(usize) -> Option<StepReport>,
         Save: FnMut() -> Result<(), Box<dyn std::error::Error>>,
     {
-        let running = Arc::new(AtomicBool::new(true));
-        let _ctrlc_guard = if self.config.install_ctrlc {
-            let r = Arc::clone(&running);
-            let _ = ctrlc::set_handler(move || {
-                eprintln!("\n  [signal received — finishing current step, then saving…]");
-                r.store(false, Ordering::SeqCst);
-            });
-            true
+        // `running` is either the shared process-wide signal flag (if the
+        // caller opted into Ctrl+C) or a fresh local flag that never
+        // transitions. Reset to `true` on entry so a prior run's signal
+        // doesn't kill this one before it starts.
+        let running: Arc<AtomicBool> = if self.config.install_ctrlc {
+            let shared = Arc::clone(signal_flag());
+            shared.store(true, Ordering::SeqCst);
+            shared
         } else {
-            false
+            Arc::new(AtomicBool::new(true))
         };
 
         let started = Instant::now();
@@ -301,6 +327,34 @@ mod tests {
         );
         assert_eq!(report.best_step, 20);
         assert!((report.best_avg_loss - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn signal_flag_is_reset_between_runs_with_ctrlc() {
+        // Regression: the shared Ctrl+C flag used to silently stay `false`
+        // after a signal-stopped run, so the next `run` would bail out
+        // at step 0 thinking it had just been interrupted. The fix resets
+        // the flag to `true` on entry — here we verify that a run with
+        // `install_ctrlc: true` still executes the full step schedule
+        // after a prior run, without needing any external intervention.
+        let cfg = TrainerConfig {
+            max_steps: 5, log_every: 100, install_ctrlc: true,
+            ..Default::default()
+        };
+        // Seed the flag to `false` (as if a prior run was signal-stopped).
+        // Touch the OnceLock so the static exists; handler install is
+        // side-effect-free for the test.
+        signal_flag().store(false, Ordering::SeqCst);
+
+        let report = TrainerLoop::new(cfg).run(
+            |_| Some(StepReport::new(0.1)),
+            || Ok(()),
+        );
+        assert_eq!(report.steps_completed, 5,
+            "entry should reset signal flag so a stale `false` from a prior \
+             run doesn't make the loop exit at step 0");
+        assert!(!report.stopped_by_signal,
+            "no signal was raised during this run");
     }
 
     #[test]

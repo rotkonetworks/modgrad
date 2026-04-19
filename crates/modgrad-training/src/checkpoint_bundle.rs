@@ -99,6 +99,9 @@ pub enum CheckpointError {
     Io(io::Error),
     /// The file isn't a CheckpointBundle at all — wrong magic or too short.
     NotACheckpoint,
+    /// Bincode failed to serialise the payload on save. Rare — typically
+    /// means an unserialisable type slipped into the model/optimizer.
+    Serialize(Box<bincode::ErrorKind>),
     /// Bincode failed to deserialise the payload. Usually schema skew
     /// that slipped past our explicit version check.
     Deserialize(Box<bincode::ErrorKind>),
@@ -114,6 +117,7 @@ impl std::fmt::Display for CheckpointError {
         match self {
             CheckpointError::Io(e) => write!(f, "checkpoint I/O error: {e}"),
             CheckpointError::NotACheckpoint => write!(f, "file is not a modgrad checkpoint bundle"),
+            CheckpointError::Serialize(e) => write!(f, "checkpoint serialize failed: {e}"),
             CheckpointError::Deserialize(e) => write!(f, "checkpoint deserialize failed: {e}"),
             CheckpointError::SchemaMismatch { found, supported_max } => {
                 write!(f, "checkpoint schema {found} is newer than supported max {supported_max}")
@@ -151,7 +155,7 @@ where
         // Serialise to a Vec first so an error mid-bincode doesn't leave
         // a partially-written tmp file either.
         let payload = bincode::serialize(self)
-            .map_err(|e| CheckpointError::Deserialize(e))?;
+            .map_err(CheckpointError::Serialize)?;
 
         {
             let mut f = std::fs::File::create(&tmp)?;
