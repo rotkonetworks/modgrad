@@ -171,6 +171,57 @@ impl Metric for Perplexity {
     fn reset(&mut self) { self.inner.reset(); }
 }
 
+/// Windowed bits-per-byte over a token stream, forward-only.
+///
+/// Slides over `tokens` in non-overlapping `context_len`-sized windows
+/// and accumulates cross-entropy into a `BitsPerByte` metric. `forward`
+/// is supplied by the caller — it gets a slice of length `context_len`
+/// and must return per-position logits, one row per input position.
+///
+/// Generic over the model: pass any closure that does a forward pass.
+/// Tests use a fake uniform forward; isis passes `ffn_forward`. Keeps
+/// the metric logic in one place (no per-architecture copies) and out
+/// of a circular dep (training doesn't depend on ffn).
+///
+/// Returns `Err` on too-short data rather than a silent `0.0` — a
+/// zero bpb looks like a perfect score to an autoresearch agent and
+/// would cause it to keep a mutation that actually can't be evaluated.
+pub fn compute_bpb<F>(
+    tokens: &[usize],
+    context_len: usize,
+    mut forward: F,
+) -> Result<(f32, usize), String>
+where
+    F: FnMut(&[usize]) -> Vec<Vec<f32>>,
+{
+    if tokens.len() < context_len + 1 {
+        return Err(format!(
+            "val data too short: {} tokens, need at least context_len + 1 = {}",
+            tokens.len(),
+            context_len + 1,
+        ));
+    }
+    let mut bpb = BitsPerByte::new();
+    let mut offset = 0usize;
+    let mut n_positions = 0usize;
+    while offset + context_len + 1 <= tokens.len() {
+        let chunk = &tokens[offset..offset + context_len + 1];
+        let logits = forward(&chunk[..context_len]);
+        for (pos, row) in logits.iter().enumerate() {
+            bpb.update(row, chunk[pos + 1]);
+            n_positions += 1;
+        }
+        offset += context_len;
+    }
+    if n_positions == 0 {
+        return Err(format!(
+            "no target positions evaluated ({} tokens, ctx {context_len})",
+            tokens.len(),
+        ));
+    }
+    Ok((bpb.compute(), n_positions))
+}
+
 /// Run evaluation: given a Brain, data, and metrics, compute all metrics.
 /// Returns a vec of (metric_name, value) pairs.
 pub fn evaluate(
@@ -219,6 +270,75 @@ mod tests {
         }
         // Perplexity of uniform 10-class = 10.0
         assert!((ppl.compute() - 10.0).abs() < 0.5, "uniform 10-class PPL should be ~10, got {}", ppl.compute());
+    }
+
+    #[test]
+    fn compute_bpb_rejects_too_short_data() {
+        // Context 8 needs at least 9 tokens. 5 tokens should fail
+        // loudly, not return a bogus 0.0.
+        let tokens = vec![0usize; 5];
+        let err = compute_bpb(&tokens, 8, |_| vec![])
+            .expect_err("should refuse to evaluate on too-short data");
+        assert!(err.contains("too short"), "err = {err}");
+    }
+
+    #[test]
+    fn compute_bpb_uniform_forward_hits_log2_vocab() {
+        // A model that predicts a uniform distribution over 256 symbols
+        // should score exactly 8 bpb (= log2(256)). The closure returns
+        // all-zero logits, which softmax to uniform. Any deviation in
+        // this test means either the windowing or the softmax is wrong.
+        const VOCAB: usize = 256;
+        const CTX: usize = 8;
+        let tokens: Vec<usize> = (0..100).map(|i| i % VOCAB).collect();
+
+        let (bpb, n) = compute_bpb(&tokens, CTX, |chunk| {
+            chunk.iter().map(|_| vec![0.0f32; VOCAB]).collect()
+        }).unwrap();
+
+        // Expect exactly (100 / 8) windows * 8 positions = 96 targets.
+        assert_eq!(n, 96);
+        assert!((bpb - 8.0).abs() < 0.05, "expected ~8.0 bpb, got {bpb}");
+    }
+
+    #[test]
+    fn compute_bpb_confident_correct_forward_is_near_zero() {
+        // Opposite end of the range from the uniform test: a forward
+        // that always predicts token 0 with huge confidence, evaluated
+        // on a stream where every token is 0, should score ~0 bpb.
+        // Confirms cross-entropy is correctly signed and targets line
+        // up with the logit rows.
+        const VOCAB: usize = 16;
+        const CTX: usize = 4;
+        let tokens = vec![0usize; 25];   // every target will be token 0
+
+        let (bpb, n) = compute_bpb(&tokens, CTX, |chunk| {
+            chunk.iter().map(|_| {
+                let mut row = vec![0.0f32; VOCAB];
+                row[0] = 20.0;   // near-1 softmax mass on token 0
+                row
+            }).collect()
+        }).unwrap();
+
+        assert!(n > 0);
+        assert!(bpb < 0.01,
+            "confident correct predictions should collapse bpb to ~0, got {bpb}");
+    }
+
+    #[test]
+    fn compute_bpb_count_matches_window_math() {
+        // n_positions should equal floor(len / CTX) * CTX once the
+        // length gate passes. Regression guard against an off-by-one
+        // in the windowing.
+        const CTX: usize = 8;
+        let tokens = vec![0usize; 100];
+        let (_, n) = compute_bpb(&tokens, CTX, |chunk| {
+            chunk.iter().map(|_| vec![0.0f32; 4]).collect()
+        }).unwrap();
+        // 100 tokens, windows advance by CTX=8. Last window starts at
+        // offset where offset + CTX + 1 <= 100 ⇒ offset <= 91. Offsets
+        // are 0, 8, 16, …, 88 — that's 12 windows × 8 positions = 96.
+        assert_eq!(n, 96);
     }
 
     #[test]

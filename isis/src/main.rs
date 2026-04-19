@@ -465,51 +465,19 @@ fn learn_ffn(
     }
 }
 
-/// Forward-only val_bpb for an FFN cerebellum. Slides over `val_tokens`
-/// in non-overlapping `context_len`-sized windows and accumulates
-/// cross-entropy into a `BitsPerByte` metric.
-///
-/// Returns `Ok((val_bpb, n_target_positions))` on success, or
-/// `Err(message)` when there isn't enough data for a single window.
-/// The explicit error path matters: a silent `val_bpb = 0.0` would
-/// look like a perfect score and trick the driving agent into
-/// keeping a mutation that actually can't be evaluated.
+/// Thin adapter: `modgrad_training::metrics::compute_bpb` with an FFN
+/// forward closure. Lives in the binary because `modgrad-training` has
+/// no dependency on `modgrad-ffn` (and shouldn't gain one — keeps the
+/// metric generic).
 fn compute_ffn_val_bpb(
     w: &modgrad_ffn::FfnWeights,
     val_tokens: &[usize],
     context_len: usize,
 ) -> Result<(f32, usize), String> {
-    use modgrad_training::metrics::{BitsPerByte, Metric};
-    if val_tokens.len() < context_len + 1 {
-        return Err(format!(
-            "val data too short: {} tokens, need at least context_len + 1 = {}",
-            val_tokens.len(),
-            context_len + 1,
-        ));
-    }
-    let mut bpb = BitsPerByte::new();
-    let mut offset = 0usize;
-    let mut n_positions = 0usize;
-    while offset + context_len + 1 <= val_tokens.len() {
-        let chunk = &val_tokens[offset..offset + context_len + 1];
-        let (logits, _cache) = modgrad_ffn::ffn_forward(w, &chunk[..context_len]);
-        for (pos, logit_row) in logits.iter().enumerate() {
-            bpb.update(logit_row, chunk[pos + 1]);
-            n_positions += 1;
-        }
-        offset += context_len;
-    }
-    // Defensive: the loop above guarantees n_positions >= context_len
-    // when we got past the length gate, so this really shouldn't fire.
-    // Keep the check so that a future refactor can't reintroduce the
-    // silent-zero failure mode.
-    if n_positions == 0 {
-        return Err(format!(
-            "no target positions evaluated (val_tokens={}, context_len={context_len})",
-            val_tokens.len(),
-        ));
-    }
-    Ok((bpb.compute(), n_positions))
+    modgrad_training::metrics::compute_bpb(val_tokens, context_len, |chunk| {
+        let (logits, _cache) = modgrad_ffn::ffn_forward(w, chunk);
+        logits
+    })
 }
 
 /// Shared cap on end-of-run eval reads — same as `Eval`'s default, kept
