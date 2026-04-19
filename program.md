@@ -123,16 +123,19 @@ Task-specific mutable set (in addition to the global "CAN change" list):
 
 ```
 cargo build --release -p mazes && \
-  ./target/release/mazes --size 21 --ticks 16 --steps 5000 --batch 8 \
+  ./target/release/mazes --size 21 --ticks 16 --budget 300 --batch 8 \
     --autoresearch-summary > run.log 2>&1
 ```
 
 Flags:
-- `--steps 5000` — per-experiment iteration cap (mazes doesn't yet have
-  `--budget`; keep steps low enough to finish in ~5 minutes).
+- `--budget 300` — 5-minute wall-clock cap, same contract as learn-ffn.
+  `--steps N` still works as an upper bound; whichever fires first wins.
 - `--autoresearch-summary` — triggers the summary print after the
   200-maze eval.
 - `--size` / `--ticks` / `--d-model` — task knobs, fair game to mutate.
+- Add `--brain` to iterate on the 8-region CTM instead of the single-CTM
+  baseline. Keep runs of the two variants in separate branches; the
+  per-run summary's trailer says `task=mazes` vs `task=mazes-brain`.
 
 Task-specific mutable set:
 - `crates/modgrad-ctm/src/**` — the CTM regional graph and core.
