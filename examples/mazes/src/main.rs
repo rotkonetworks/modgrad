@@ -41,6 +41,7 @@ fn main() {
     let mut cereb_size = 0usize; // 0 = use preset default
     let mut frozen_cereb = false;
     let mut autoresearch_summary = false;
+    let mut budget_secs: Option<u64> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -62,6 +63,7 @@ fn main() {
             "--cereb-size" => { cereb_size = args[i+1].parse().unwrap(); i += 2; }
             "--frozen-cereb" => { frozen_cereb = true; i += 1; }
             "--autoresearch-summary" => { autoresearch_summary = true; i += 1; }
+            "--budget" => { budget_secs = Some(args[i+1].parse().unwrap()); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -76,7 +78,7 @@ fn main() {
     let maze_size = maze_size | 1;
 
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs);
         return;
     }
 
@@ -135,12 +137,21 @@ fn main() {
 
     // ── Training ──
     let t_train_start = std::time::Instant::now();
+    let budget = budget_secs.map(std::time::Duration::from_secs);
     let mut rng = MazeRng::new(seed);
     let mut loss_history = Vec::new();
     let mut acc_history = Vec::new();
     let mut step = 0usize;
 
     while step < steps {
+        // Budget check — stops at the batch boundary, not mid-batch,
+        // to keep the gradient update atomic.
+        if let Some(d) = budget {
+            if t_train_start.elapsed() >= d {
+                eprintln!("(--budget {}s exhausted at step {step})", d.as_secs());
+                break;
+            }
+        }
         let mut batch_grads = Ctm::zero_gradients(&w);
         let mut batch_loss = 0.0f32;
         let mut batch_correct = 0usize;
@@ -322,9 +333,10 @@ fn run_brain(
     maze_size: usize, ticks: usize, steps: usize, route_len: usize,
     lr: f32, seed: u64, batch_size: usize, imagination: bool, pain_mode: bool,
     plural_mode: bool, csv_mode: bool, cereb_size: usize, frozen_cereb: bool,
-    autoresearch_summary: bool,
+    autoresearch_summary: bool, budget_secs: Option<u64>,
 ) {
     let t_train_start = std::time::Instant::now();
+    let budget = budget_secs.map(std::time::Duration::from_secs);
     use std::io::Write;
     use modgrad_ctm::bio::dream;
     use modgrad_ctm::memory::episodic::EpisodicConfig;
@@ -447,8 +459,16 @@ fn run_brain(
 
     let mut first_step_hits = 0usize;
     let mut first_step_total = 0usize;
+    let mut steps_completed = 0usize;
 
     for step in 1..=steps {
+        if let Some(d) = budget {
+            if t_train_start.elapsed() >= d {
+                eprintln!("(--budget {}s exhausted at step {step})", d.as_secs());
+                break;
+            }
+        }
+        steps_completed = step;
         let mut grads = RegionalGradients::zeros(&w);
         let mut batch_loss = 0.0f32;
         let mut batch_correct = 0usize;
@@ -733,7 +753,7 @@ fn run_brain(
             peak_vram_mb: 0.0,
             mfu_percent: 0.0,
             total_tokens_m: 0.0,
-            num_steps: steps as u64,
+            num_steps: steps_completed as u64,
             num_params_m: (w.n_params() as f32) / 1.0e6,
         }.print();
         eprintln!("  (task=mazes-brain size={maze_size} route_len={route_len}, \
