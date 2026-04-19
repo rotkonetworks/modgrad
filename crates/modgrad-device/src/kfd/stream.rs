@@ -139,7 +139,14 @@ impl StreamEngine {
 
     fn ensure_x(&mut self, bytes: usize, dev: &HsaDevice) -> bool {
         if self.x_cap < bytes {
-            let cap = ((bytes + 4095) & !4095).max(4096) as u64;
+            // Over-allocate to minimize realloc churn. Each realloc on
+            // gfx1102 appears to correlate with a subsequent submit_wait
+            // hang (bisected to matmul[18] in an FFN training trace).
+            // Growing geometrically and padding to a 2 MiB floor means
+            // a typical FFN training run hits exactly one alloc — the
+            // first one — instead of dozens.
+            let target = bytes.max(self.x_cap * 2).max(2 * 1024 * 1024);
+            let cap = ((target + 4095) & !4095).max(4096) as u64;
             self.x_buf = dev.alloc.alloc_vram(cap).ok();
             self.x_cap = cap as usize;
         }
@@ -148,7 +155,9 @@ impl StreamEngine {
 
     fn ensure_y(&mut self, bytes: usize, dev: &mut HsaDevice) -> bool {
         if self.y_cap < bytes {
-            let cap = ((bytes + 4095) & !4095).max(4096) as u64;
+            // Same rationale as ensure_x — see above.
+            let target = bytes.max(self.y_cap * 2).max(2 * 1024 * 1024);
+            let cap = ((target + 4095) & !4095).max(4096) as u64;
             self.y_buf = dev.alloc_output(cap as usize).ok();
             self.y_cap = cap as usize;
         }
