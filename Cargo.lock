@@ -2580,7 +2580,6 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
- "flatbuffers",
  "half",
  "modgrad-persist",
  "ort",
@@ -2592,6 +2591,8 @@ dependencies = [
  "tokenizers 0.21.4",
  "tokio",
  "toml",
+ "wincode",
+ "wincode-derive",
 ]
 
 [[package]]

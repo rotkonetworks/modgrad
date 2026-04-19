@@ -13,10 +13,11 @@ telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
 [dependencies]
 modgrad-persist = { path = "../modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
+wincode = "0.5"
+wincode-derive = "0.4"
 serde_json = "1"
 toml = "0.8"
 tokenizers = "0.21"
-flatbuffers = "25.2.10"
 half = "2"
 
 # ONNX backend

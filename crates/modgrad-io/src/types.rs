@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 /// A memory key — the hidden state fingerprint of a prompt context.
 /// 896 floats for Qwen 2.5-0.5B, stored as f32 or quantized to i8.
 pub type Key = Vec<f32>;
 
 /// Logit bias for one answer token position.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct LogitBias {
     pub token_id: u32,
     pub token: String,
@@ -18,7 +19,7 @@ pub struct LogitBias {
 /// Emotional valence of a memory.
 /// Fear memories resist consolidation (PTSD model).
 /// Joy memories consolidate faster.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub enum Valence {
     /// Neutral: normal consolidation dynamics
     Neutral,
@@ -35,7 +36,7 @@ impl Default for Valence {
 }
 
 /// One episodic memory — a fact with multi-key retrieval and consolidation strength.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Episode {
     pub prompt: String,
     pub answer: String,
@@ -75,7 +76,7 @@ pub struct Episode {
 }
 
 /// A key associated with a content word at a specific position.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct ContentKey {
     pub key: Key,
     pub token: String,
@@ -83,7 +84,7 @@ pub struct ContentKey {
 }
 
 /// One self-state with its own memory bank and CTM configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Alter {
     pub name: String,
     pub episodes: Vec<Episode>,
@@ -102,7 +103,7 @@ pub struct Alter {
 }
 
 /// A behavioral rule (cerebellar procedural memory).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Rule {
     pub instruction: String,
     pub priority: f32,
@@ -113,7 +114,7 @@ pub struct Rule {
 }
 
 /// An avoidance pattern (amygdala).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Avoidance {
     pub pattern: String,
     pub reason: String,

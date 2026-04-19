@@ -4,6 +4,7 @@
 //! Serialize to JSON for persistence, IPFS, or on-chain storage.
 
 use serde::{Deserialize, Serialize};
+use wincode_derive::{SchemaRead, SchemaWrite};
 use crate::types::*;
 use crate::episode::{find_competitors, effective_strength};
 
@@ -15,7 +16,7 @@ fn now() -> f64 {
 
 /// The complete memory bank — all brain state in one serializable struct.
 /// Model identity — exactly which weights produced these keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct ModelId {
     /// HuggingFace model name (e.g. "Qwen/Qwen2.5-0.5B")
     pub model: String,
@@ -83,7 +84,7 @@ impl std::fmt::Display for ModelId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct MemoryBank {
     pub version: u32,
     /// Exact model identity — keys are ONLY valid for this exact config.
@@ -246,35 +247,81 @@ impl MemoryBank {
         Ok(serde_json::from_str(&data)?)
     }
 
-    /// Save as FlatBuffers with the given key quantization format.
-    pub fn save_fb(&self, path: &str, format: modgrad_persist::quantize::KeyFormat) -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = crate::flatbuf::serialize(self, format);
-        std::fs::write(path, bytes)?;
+    /// Smart load: JSON for `.json` paths, wincode binary otherwise.
+    /// Replaces the earlier three-way split (save_fb / save / write) — one
+    /// format decision, no FlatBuffers schema to keep in sync with the
+    /// Rust struct. Legacy `.fb` files are no longer supported; migrate
+    /// them by loading through JSON once and re-saving here.
+    pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(modgrad_persist::persist::load(path)?)
+    }
+
+    /// Smart save: format follows extension (`.json` → JSON, else binary).
+    pub fn write(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        modgrad_persist::persist::save(self, path)?;
         Ok(())
     }
+}
 
-    /// Load from FlatBuffers. Keys are dequantized back to f32.
-    pub fn load_fb(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)?;
-        crate::flatbuf::deserialize(&bytes).map_err(|e| e.into())
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Smart load: picks format based on file extension (.fb → FlatBuffers, else JSON).
-    pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        if path.ends_with(".fb") {
-            Self::load_fb(path)
-        } else {
-            Self::load(path)
-        }
-    }
+    /// Round-trip a populated MemoryBank through the wincode binary and
+    /// JSON paths. Verifies that nested fields (ModelId, Alter,
+    /// Episode) all survive. Replaces the coverage that lived in the
+    /// deleted `flatbuf.rs` tests.
+    #[test]
+    fn memory_bank_binary_and_json_roundtrip() {
+        let pid = std::process::id();
+        let mut bank = MemoryBank::default();
+        bank.model_id = ModelId {
+            model: "test/test-model".into(),
+            backend: "onnx".into(),
+            quant: "f32".into(),
+            hidden_dim: 128,
+            extraction: "pre_mlp_layer3".into(),
+            eos_token_id: 42,
+        };
+        bank.threshold = 0.81;
+        bank.alters.push(Alter {
+            name: "unit-test-alter".into(),
+            episodes: vec![Episode {
+                prompt: "what is X".into(),
+                answer: "the answer is X".into(),
+                alter: "unit-test-alter".into(),
+                keys: Vec::new(),
+                logit_biases: Vec::new(),
+                strength: 0.9,
+                recall_count: 3,
+                created_at: 1_700_000_000.0,
+                consolidated: false,
+                consolidation_score: 0.0,
+                sleep_cycles: 0,
+                valence: Valence::Positive,
+                last_recalled_at: 0.0,
+                visible_to: Vec::new(),
+            }],
+            attention_bias: Vec::new(),
+            can_see: Vec::new(),
+        });
 
-    /// Smart save: picks format based on file extension.
-    /// FlatBuffers defaults to f32; use save_fb() for other quantization.
-    pub fn write(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if path.ends_with(".fb") {
-            self.save_fb(path, modgrad_persist::quantize::KeyFormat::F32)
-        } else {
-            self.save(path)
-        }
+        // Binary (.bin) path — wincode underneath.
+        let bin_path = format!("/tmp/mb_test_{}.bin", pid);
+        bank.write(&bin_path).unwrap();
+        let loaded: MemoryBank = MemoryBank::open(&bin_path).unwrap();
+        assert_eq!(loaded.model_id.eos_token_id, 42);
+        assert_eq!(loaded.alters.len(), 1);
+        assert_eq!(loaded.alters[0].episodes[0].answer, "the answer is X");
+        assert_eq!(loaded.alters[0].episodes[0].recall_count, 3);
+        std::fs::remove_file(&bin_path).ok();
+
+        // JSON (.json) path — same write/open API, different backend.
+        let json_path = format!("/tmp/mb_test_{}.json", pid);
+        bank.write(&json_path).unwrap();
+        let loaded_json: MemoryBank = MemoryBank::open(&json_path).unwrap();
+        assert_eq!(loaded_json.model_id.hidden_dim, 128);
+        assert_eq!(loaded_json.alters[0].episodes[0].valence, Valence::Positive);
+        std::fs::remove_file(&json_path).ok();
     }
 }
