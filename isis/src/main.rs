@@ -215,7 +215,7 @@ fn main() {
             } else if gpu {
                 // Hybrid/MegaTrain: weights stream through PCIe, GPU for compute.
                 let _ = modgrad_compute::backend::set_backend(
-                    Box::new(modgrad_compute::backend::HybridGpuBackend::new())
+                    Box::new(modgrad_compute::backend::StreamGpuBackend::new())
                 );
             }
             learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port, frozen_cereb.as_deref());

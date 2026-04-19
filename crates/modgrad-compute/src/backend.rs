@@ -840,9 +840,9 @@ mod tests {
         modgrad_device::kfd::accel::available()
     }
 
-    fn init_gpu_backend() -> HybridGpuBackend {
+    fn init_gpu_backend() -> StreamGpuBackend {
         modgrad_device::kfd::accel::enable_vram_mode();
-        HybridGpuBackend::new()
+        StreamGpuBackend::new()
     }
 
     #[test]
@@ -1129,13 +1129,18 @@ pub fn set_backend(b: Box<dyn ComputeBackend>) -> Result<(), Box<dyn ComputeBack
     BACKEND.set(b)
 }
 
-/// Hybrid backend: GPU for matvec/superlinear, CPU for everything else.
-/// Uses the KFD stream engine for large matrix ops, CpuBackend for the rest.
-pub struct HybridGpuBackend {
+/// Stream GPU backend: weights stream through BAR per-call; ops routed
+/// to GPU above `GPU_MIN_FLOPS`, CPU below (where dispatch overhead
+/// dominates). Named for the per-call streaming behaviour — pairs with
+/// `VramGpuBackend`, which keeps weights resident in a VRAM arena.
+///
+/// Not "hybrid": that said nothing about *how* it was hybrid.
+/// Not "fusion": that term is already overloaded for kernel fusion.
+pub struct StreamGpuBackend {
     cpu: CpuBackend,
 }
 
-impl HybridGpuBackend {
+impl StreamGpuBackend {
     pub fn new() -> Self {
         Self { cpu: CpuBackend::new() }
     }
@@ -1143,7 +1148,7 @@ impl HybridGpuBackend {
 
 const GPU_MIN_FLOPS: usize = 32;
 
-impl ComputeBackend for HybridGpuBackend {
+impl ComputeBackend for StreamGpuBackend {
     // Fail-fast contract — same as the FFN path in modgrad-ffn. GPU
     // failures panic with shape info rather than silently routing to
     // CPU. The cpu field is still used for the sub-GPU_MIN_FLOPS path
