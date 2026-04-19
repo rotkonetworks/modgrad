@@ -116,6 +116,38 @@ mod tests {
         assert_eq!(opt.rounds(), 5);
     }
 
+    /// Demonstration impl: returns `after = before + α · (after - before)` —
+    /// the shape a real SparseLoCo aggregate would take, with α=1
+    /// meaning "keep inner step result" (same as NoOp).
+    ///
+    /// Exists only in the test module; doesn't pretend to be useful.
+    /// The point is to exercise the mutate-path of the trait so a
+    /// regression that breaks mutability is caught.
+    struct ScaledDelta { alpha: f32 }
+    impl OuterOptimizer<FakeParams> for ScaledDelta {
+        fn end_round(&mut self, before: &FakeParams, after: &mut FakeParams) {
+            assert_eq!(before.0.len(), after.0.len(),
+                "before/after must match shape — upstream concern");
+            for (a, b) in after.0.iter_mut().zip(before.0.iter()) {
+                let delta = *a - b;
+                *a = b + self.alpha * delta;
+            }
+        }
+    }
+
+    #[test]
+    fn mutating_impl_applies_scaled_delta() {
+        let mut opt = ScaledDelta { alpha: 0.5 };
+        let before = FakeParams(vec![0.0, 0.0, 0.0]);
+        let mut after = FakeParams(vec![2.0, 4.0, 6.0]);
+
+        opt.end_round(&before, &mut after);
+
+        // α=0.5 means the new state is halfway between before and
+        // the post-inner-step result.
+        assert_eq!(after, FakeParams(vec![1.0, 2.0, 3.0]));
+    }
+
     #[test]
     fn trait_is_object_safe() {
         // Type-check that `dyn OuterOptimizer<P>` compiles — catches
