@@ -475,6 +475,26 @@ fn compute_ffn_val_bpb(
     val_tokens: &[usize],
     context_len: usize,
 ) -> Result<(f32, usize), String> {
+    // Force CPU for eval. GPU dispatch has per-call PCIe overhead that
+    // kills small-matmul throughput — a 4095-window × 13-matmul eval
+    // against a 189M-param FFN takes minutes over PCIe even though each
+    // individual dispatch runs in single-digit ms. CPU sgemm is
+    // orders-of-magnitude faster on the tiny-to-medium shapes eval
+    // sees. Training still gets GPU; eval drops to CPU.
+    //
+    // RAII-style: remember the flag, disable, restore on scope exit
+    // (including panic). If GPU wasn't enabled in the first place,
+    // this is a no-op.
+    let was_gpu = modgrad_compute::neuron::gpu_enabled();
+    if was_gpu { modgrad_compute::neuron::disable_gpu(); }
+    struct GpuRestore(bool);
+    impl Drop for GpuRestore {
+        fn drop(&mut self) {
+            if self.0 { modgrad_compute::neuron::enable_gpu(); }
+        }
+    }
+    let _restore = GpuRestore(was_gpu);
+
     modgrad_training::metrics::compute_bpb(val_tokens, context_len, |chunk| {
         let (logits, _cache) = modgrad_ffn::ffn_forward(w, chunk);
         logits
