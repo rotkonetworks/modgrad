@@ -35,6 +35,11 @@ test_gen*.json
 maze_*.csv
 *.log
 
+# Autoresearch scratch — agent logs & per-run TSV
+results.tsv
+run.log
+val.txt
+
 # Datasets (large)
 datasets/qec_brain.json
 
