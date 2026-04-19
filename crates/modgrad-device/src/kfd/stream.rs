@@ -66,6 +66,11 @@ pub struct StreamEngine {
     /// Per-dispatch kernarg slots. Enough to enqueue one full-FFN AdamW step
     /// (embed + 12 layers × 8 tensors + 3 final = up to 100) plus headroom.
     chain_args: [Option<GpuBuffer>; 128],
+
+    /// Monotonic matmul call counter — logged when `MODGRAD_TRACE_MATMUL=1`
+    /// so a production-hang log trace shows exactly which dispatch was
+    /// in flight when the GPU stopped responding.
+    matmul_call_count: u64,
 }
 
 impl StreamEngine {
@@ -92,7 +97,19 @@ impl StreamEngine {
             cached_reduce_l2: None,
             cached_adamw: None,
             cached_matmul_blocked: None,
+            matmul_call_count: 0,
         }
+    }
+
+    /// Is the per-call matmul trace log enabled? Checked once per call;
+    /// cheap even when on. Off by default; set `MODGRAD_TRACE_MATMUL=1`
+    /// in the environment to turn on.
+    #[inline]
+    fn trace_matmul(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("MODGRAD_TRACE_MATMUL").map(|v| v == "1").unwrap_or(false)
+        })
     }
 
     /// Resolve and cache kernel entries for hot-path dispatch.
@@ -406,6 +423,16 @@ impl StreamEngine {
         weight: &[f32], bias: &[f32], x: &[f32],
         out: &mut [f32], n: usize, k: usize, m: usize,
     ) -> bool {
+        self.matmul_call_count += 1;
+        let call_idx = self.matmul_call_count;
+        let t_start = std::time::Instant::now();
+        let trace = self.trace_matmul();
+        if trace {
+            eprintln!("matmul[{call_idx}] start n={n} k={k} m={m} \
+                active={} vram_mode={} weight.len={} x.len={}",
+                self.active, self.vram_mode, weight.len(), x.len());
+        }
+
         // Each early-return path logs *which stage* failed. Before this
         // instrumentation a failed matmul just said `return false` and
         // the caller lost the information — making real GPU driver
@@ -475,14 +502,18 @@ impl StreamEngine {
         }
 
         dev.queue.cache_wb();
+        let t_submit = std::time::Instant::now();
         // 10s timeout: at 189M param FFN with M=5120 K=1024 N=128 the kernel
         // runs in single-digit ms; a 10s bound catches real hangs without
         // false-positive on any healthy dispatch.
         if !dev.submit_wait(10_000) {
             eprintln!("gpu matmul: submit_wait(10_000ms) timed out — GPU hang? \
-                (n={n} k={k} m={m} total_wg={total_wg})");
+                (n={n} k={k} m={m} total_wg={total_wg}, call_idx={call_idx}, \
+                submit_elapsed_ms={})",
+                t_submit.elapsed().as_millis());
             return false;
         }
+        let submit_ms = t_submit.elapsed().as_millis();
 
         // Read Y back through BAR.
         let src = unsafe {
@@ -494,6 +525,12 @@ impl StreamEngine {
         out[..n * m].copy_from_slice(src);
 
         if !self.vram_mode { self.active = 1 - self.active; }
+
+        if trace {
+            eprintln!("matmul[{call_idx}] done n={n} k={k} m={m} \
+                submit_ms={submit_ms} total_ms={} y[0]={:.4}",
+                t_start.elapsed().as_millis(), src[0]);
+        }
         true
     }
 

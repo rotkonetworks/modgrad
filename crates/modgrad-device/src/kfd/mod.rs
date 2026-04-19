@@ -561,11 +561,17 @@ impl HsaDevice {
         // Non-fatal: app still starts, probe just logs.
         //
         // Shapes:
-        //   128x8x32    — minimum tile, 1 WG
-        //   256x8x32    — 2 WGs in m direction
-        //   128x8x64    — 2 WGs in n direction
-        //   512x128x64  — the exact FFN-small shape that hangs in training
-        for (m, k, n) in [(128, 8, 32), (256, 8, 32), (128, 8, 64), (512, 128, 64)] {
+        //   128x8x32     — minimum tile, 1 WG
+        //   256x8x32     — 2 WGs in m direction
+        //   128x8x64     — 2 WGs in n direction
+        //   512x128x64   — the FFN-small forward shape (8 WGs)
+        //   128x64x256   — 8 WGs in n direction (high-nwg_n variant)
+        //   128x64x512   — 16 WGs in n direction — the training hang shape
+        //   128x64x1024  — 32 WGs, well past the suspected limit
+        for (m, k, n) in [
+            (128, 8, 32),   (256, 8, 32),  (128, 8, 64),   (512, 128, 64),
+            (128, 64, 256), (128, 64, 512), (128, 64, 1024),
+        ] {
             let m: u32 = m; let k: u32 = k; let n: u32 = n;
             let expected = k as f32 * 0.01;
             let w_data = vec![0.01f32; (m * k) as usize];
