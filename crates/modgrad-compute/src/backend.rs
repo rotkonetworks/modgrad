@@ -1144,61 +1144,85 @@ impl HybridGpuBackend {
 const GPU_MIN_FLOPS: usize = 32;
 
 impl ComputeBackend for HybridGpuBackend {
+    // Fail-fast contract — same as the FFN path in modgrad-ffn. GPU
+    // failures panic with shape info rather than silently routing to
+    // CPU. The cpu field is still used for the sub-GPU_MIN_FLOPS path
+    // below on matvec/superlinear, where dispatching to GPU isn't
+    // worth the overhead at all; that's a size gate, not a fallback.
+
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
               y: &mut [f32], out_dim: usize, in_dim: usize) {
         if out_dim * in_dim >= GPU_MIN_FLOPS {
-            if modgrad_device::kfd::accel::try_matvec(
+            if !modgrad_device::kfd::accel::try_matvec(
                 x, weight, bias, y, out_dim as u32, in_dim as u32,
-            ) { return; }
+            ) {
+                panic!("GPU matvec failed: out_dim={out_dim} in_dim={in_dim}. \
+                        --gpu requires a working GPU dispatch path.");
+            }
+            return;
         }
+        // Too small for GPU to amortize dispatch overhead — CPU is the
+        // intended path at this size, not a fallback.
         self.cpu.matvec(weight, bias, x, y, out_dim, in_dim);
     }
 
     fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                    output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
         if n_neurons * in_per * out_per >= GPU_MIN_FLOPS {
-            if modgrad_device::kfd::accel::try_superlinear(
+            if !modgrad_device::kfd::accel::try_superlinear(
                 trace, weights, biases, output,
                 n_neurons as u32, in_per as u32, out_per as u32,
-            ) { return; }
+            ) {
+                panic!("GPU superlinear failed: n_neurons={n_neurons} \
+                        in_per={in_per} out_per={out_per}. --gpu requires \
+                        a working GPU dispatch path.");
+            }
+            return;
         }
         self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
     }
 
-    // ─── Element-wise ops: try GPU, fall back to CPU ───
-
     fn glu(&self, input: &[f32], output: &mut [f32]) {
         let n = input.len() / 2;
-        if modgrad_device::kfd::accel::try_glu(input, output, n as u32) { return; }
-        self.cpu.glu(input, output);
+        if !modgrad_device::kfd::accel::try_glu(input, output, n as u32) {
+            panic!("GPU glu failed: n={n}. --gpu requires a working GPU dispatch path.");
+        }
     }
 
     fn silu_inplace(&self, x: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_silu_inplace(x) { return; }
-        self.cpu.silu_inplace(x);
+        if !modgrad_device::kfd::accel::try_silu_inplace(x) {
+            panic!("GPU silu_inplace failed: len={}. --gpu requires a working GPU \
+                    dispatch path.", x.len());
+        }
     }
 
     fn layer_norm_inplace(&self, x: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_layer_norm_inplace(x) { return; }
-        self.cpu.layer_norm_inplace(x);
+        if !modgrad_device::kfd::accel::try_layer_norm_inplace(x) {
+            panic!("GPU layer_norm_inplace failed: len={}. --gpu requires a \
+                    working GPU dispatch path.", x.len());
+        }
     }
 
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
                        output: &mut [f32], scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
-        // Fused GPU path: single PCIe round-trip for matvec→GLU→SiLU→LN
-        if modgrad_device::kfd::accel::try_synapse_forward(
+        if !modgrad_device::kfd::accel::try_synapse_forward(
             x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
-        ) { return; }
-        self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
+        ) {
+            panic!("GPU synapse_forward failed: out_dim={out_dim} in_dim={in_dim}. \
+                    --gpu requires a working GPU dispatch path.");
+        }
     }
 
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
-        if modgrad_device::kfd::accel::try_trace_shift(
+        if !modgrad_device::kfd::accel::try_trace_shift(
             traces, new_activations, n_neurons as u32, memory_length as u32,
-        ) { return; }
-        self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
+        ) {
+            panic!("GPU trace_shift failed: n_neurons={n_neurons} \
+                    memory_length={memory_length}. --gpu requires a working \
+                    GPU dispatch path.");
+        }
     }
 
     fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
@@ -1207,14 +1231,14 @@ impl ComputeBackend for HybridGpuBackend {
                    decay: &[f32], decay_shift: &[f32],
                    dopamine: f32, n_pairs: usize, initialized: bool,
                    sync_out: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_sync_update(
+        if !modgrad_device::kfd::accel::try_sync_update(
             alpha, beta, activations_left, activations_right,
             phases_left, phases_right, decay, decay_shift,
             dopamine, n_pairs as u32, initialized, sync_out,
-        ) { return; }
-        self.cpu.sync_update(alpha, beta, activations_left, activations_right,
-            phases_left, phases_right, decay, decay_shift, dopamine, n_pairs,
-            initialized, sync_out);
+        ) {
+            panic!("GPU sync_update failed: n_pairs={n_pairs}. --gpu requires \
+                    a working GPU dispatch path.");
+        }
     }
 }
 
@@ -1228,66 +1252,87 @@ impl ComputeBackend for HybridGpuBackend {
 // Use with `--vram`. Requires model to fit in GPU memory.
 
 pub struct VramGpuBackend {
-    cpu: CpuBackend,
+    // No cpu fallback — VRAM mode is GPU-only by design. A silent CPU
+    // fallback would defeat the "zero PCIe in the inner loop" promise
+    // and make perf regressions invisible. Panic on GPU failure.
+    _private: (),
 }
 
 impl VramGpuBackend {
     pub fn new(arena_mb: usize) -> Self {
         modgrad_device::kfd::accel::enable_vram_mode();
         modgrad_device::kfd::accel::init_arena(arena_mb);
-        Self { cpu: CpuBackend::new() }
+        Self { _private: () }
     }
 }
 
 impl ComputeBackend for VramGpuBackend {
+    // Fail-fast contract. VRAM mode exists to avoid PCIe in the inner
+    // loop — silently falling back to CPU would defeat the purpose
+    // AND be indistinguishable from slow-success. Panic loudly.
+
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
               y: &mut [f32], out_dim: usize, in_dim: usize) {
-        if modgrad_device::kfd::accel::try_matvec(
+        if !modgrad_device::kfd::accel::try_matvec(
             x, weight, bias, y, out_dim as u32, in_dim as u32,
-        ) { return; }
-        self.cpu.matvec(weight, bias, x, y, out_dim, in_dim);
+        ) {
+            panic!("VRAM matvec failed: out_dim={out_dim} in_dim={in_dim}. \
+                    --vram requires a working GPU dispatch path.");
+        }
     }
 
     fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                    output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
-        if modgrad_device::kfd::accel::try_superlinear(
+        if !modgrad_device::kfd::accel::try_superlinear(
             trace, weights, biases, output,
             n_neurons as u32, in_per as u32, out_per as u32,
-        ) { return; }
-        self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
+        ) {
+            panic!("VRAM superlinear failed: n_neurons={n_neurons} in_per={in_per} \
+                    out_per={out_per}. --vram requires a working GPU dispatch path.");
+        }
     }
 
     fn glu(&self, input: &[f32], output: &mut [f32]) {
         let n = input.len() / 2;
-        if modgrad_device::kfd::accel::try_glu(input, output, n as u32) { return; }
-        self.cpu.glu(input, output);
+        if !modgrad_device::kfd::accel::try_glu(input, output, n as u32) {
+            panic!("VRAM glu failed: n={n}. --vram requires a working GPU dispatch path.");
+        }
     }
 
     fn silu_inplace(&self, x: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_silu_inplace(x) { return; }
-        self.cpu.silu_inplace(x);
+        if !modgrad_device::kfd::accel::try_silu_inplace(x) {
+            panic!("VRAM silu_inplace failed: len={}. --vram requires a working \
+                    GPU dispatch path.", x.len());
+        }
     }
 
     fn layer_norm_inplace(&self, x: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_layer_norm_inplace(x) { return; }
-        self.cpu.layer_norm_inplace(x);
+        if !modgrad_device::kfd::accel::try_layer_norm_inplace(x) {
+            panic!("VRAM layer_norm_inplace failed: len={}. --vram requires a \
+                    working GPU dispatch path.", x.len());
+        }
     }
 
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
                        output: &mut [f32], scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
-        if modgrad_device::kfd::accel::try_synapse_forward(
+        if !modgrad_device::kfd::accel::try_synapse_forward(
             x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
-        ) { return; }
-        self.cpu.synapse_forward(weight, bias, x, output, scratch, out_dim, in_dim);
+        ) {
+            panic!("VRAM synapse_forward failed: out_dim={out_dim} in_dim={in_dim}. \
+                    --vram requires a working GPU dispatch path.");
+        }
     }
 
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
-        if modgrad_device::kfd::accel::try_trace_shift(
+        if !modgrad_device::kfd::accel::try_trace_shift(
             traces, new_activations, n_neurons as u32, memory_length as u32,
-        ) { return; }
-        self.cpu.trace_shift(traces, new_activations, n_neurons, memory_length);
+        ) {
+            panic!("VRAM trace_shift failed: n_neurons={n_neurons} \
+                    memory_length={memory_length}. --vram requires a working \
+                    GPU dispatch path.");
+        }
     }
 
     fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
@@ -1296,14 +1341,14 @@ impl ComputeBackend for VramGpuBackend {
                    decay: &[f32], decay_shift: &[f32],
                    dopamine: f32, n_pairs: usize, initialized: bool,
                    sync_out: &mut [f32]) {
-        if modgrad_device::kfd::accel::try_sync_update(
+        if !modgrad_device::kfd::accel::try_sync_update(
             alpha, beta, activations_left, activations_right,
             phases_left, phases_right, decay, decay_shift,
             dopamine, n_pairs as u32, initialized, sync_out,
-        ) { return; }
-        self.cpu.sync_update(alpha, beta, activations_left, activations_right,
-            phases_left, phases_right, decay, decay_shift, dopamine, n_pairs,
-            initialized, sync_out);
+        ) {
+            panic!("VRAM sync_update failed: n_pairs={n_pairs}. --vram requires \
+                    a working GPU dispatch path.");
+        }
     }
 
     fn alloc_f32(&self, n: usize) -> GpuVec {
