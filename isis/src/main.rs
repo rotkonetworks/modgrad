@@ -825,10 +825,35 @@ fn develop_staged(
     };
     let vocab_size = if multimodal { VOCAB_MULTIMODAL } else { VOCAB_TEXT };
 
-    // Load or create model
-    let mut w = if std::path::Path::new(save_path).exists() {
-        eprintln!("Loading model from {save_path}...");
-        RegionalWeights::load(save_path).expect("failed to load model")
+    // Load model + optimizer via CheckpointBundle (canonical format).
+    // On legacy two-file layouts, fall back to RegionalWeights::load +
+    // the .opt.bin sidecar so older checkpoints keep working. Next save
+    // writes a bundle regardless.
+    use modgrad_training::{CheckpointBundle, BasicMeta};
+    const MODEL_KIND_CTM: &str = "ctm-regional";
+    let legacy_opt_path = save_path
+        .replace(".bin", ".opt.bin")
+        .replace(".json", ".opt.bin");
+
+    let (mut w, mut opt, resumed_meta_ctm) = if std::path::Path::new(save_path).exists() {
+        match CheckpointBundle::<RegionalWeights, RegionalAdamW>::load(save_path, MODEL_KIND_CTM) {
+            Ok(bundle) => {
+                eprintln!("Resumed {save_path} — step {}, {} tokens seen",
+                    bundle.meta.step, bundle.meta.tokens_seen);
+                (bundle.model, bundle.optimizer, bundle.meta)
+            }
+            Err(e) => {
+                eprintln!("  (not a CheckpointBundle: {e})");
+                eprintln!("  falling back to legacy two-file checkpoint...");
+                let w = RegionalWeights::load(save_path).expect("failed to load model");
+                let opt = if std::path::Path::new(&legacy_opt_path).exists() {
+                    RegionalAdamW::load(&legacy_opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
+                } else {
+                    RegionalAdamW::new(&w).with_lr(3e-3).with_wd(0.001).with_clip(5.0)
+                };
+                (w, opt, BasicMeta::default())
+            }
+        }
     } else {
         let cfg = match (n_regions, multimodal) {
             (4, true) => RegionalConfig::four_region_multimodal(embed_dim, ticks),
@@ -836,22 +861,16 @@ fn develop_staged(
             (_, true) => RegionalConfig::eight_region_multimodal(embed_dim, ticks),
             (_, false) => RegionalConfig::eight_region(embed_dim, vocab_size, ticks),
         };
-        RegionalWeights::new(cfg)
+        let w = RegionalWeights::new(cfg);
+        let opt = RegionalAdamW::new(&w).with_lr(3e-3).with_wd(0.001).with_clip(5.0);
+        (w, opt, BasicMeta::default())
     };
     w.print_summary();
-
-    // Load or create AdamW optimizer state
-    let opt_path = save_path.replace(".bin", ".opt.bin").replace(".json", ".opt.bin");
-    let mut opt = if std::path::Path::new(&opt_path).exists() {
-        RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
-    } else {
-        RegionalAdamW::new(&w)
-            .with_lr(3e-3)
-            .with_wd(0.001)
-            .with_clip(5.0)
-    };
     eprintln!("  AdamW: lr={}, wd={}, clip={}, step={}",
         opt.lr, opt.weight_decay, opt.grad_clip, opt.step);
+
+    // Wall clock for meta.elapsed_secs; added to resumed_meta_ctm.elapsed_secs.
+    let run_started = std::time::Instant::now();
 
     // Ctrl+C handler for clean save
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1139,9 +1158,24 @@ fn develop_staged(
             eprintln!("  Phase {phase} not mastered after {max_steps_per_phase} steps (avg loss={avg:.3})");
         }
 
-        // Save checkpoint after each phase
-        w.save(save_path).expect("failed to save model");
-        opt.save(&opt_path).expect("failed to save optimizer");
+        // Save checkpoint after each phase as one atomic CheckpointBundle.
+        let bundle = CheckpointBundle {
+            schema: modgrad_training::CURRENT_SCHEMA,
+            model_kind: MODEL_KIND_CTM.to_string(),
+            model: w.clone(),
+            optimizer: opt.clone(),
+            meta: BasicMeta {
+                step: opt.step as u64,
+                tokens_seen: total_tokens,
+                loss_at_save: 0.0,
+                best_loss: 0.0,
+                timestamp_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0),
+                elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+            },
+        };
+        bundle.save(save_path).expect("failed to save checkpoint");
         eprintln!("  Checkpoint saved to {save_path} ({total_tokens} tokens trained)");
     }
 
@@ -1171,8 +1205,23 @@ fn develop_staged(
         eprintln!("  \"{prompt_str}\" -> \"{output_str}\"");
     }
 
-    w.save(save_path).expect("failed to save");
-    opt.save(&opt_path).expect("failed to save optimizer");
+    let bundle = CheckpointBundle {
+        schema: modgrad_training::CURRENT_SCHEMA,
+        model_kind: MODEL_KIND_CTM.to_string(),
+        model: w.clone(),
+        optimizer: opt.clone(),
+        meta: BasicMeta {
+            step: opt.step as u64,
+            tokens_seen: total_tokens,
+            loss_at_save: 0.0,
+            best_loss: 0.0,
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0),
+            elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+        },
+    };
+    bundle.save(save_path).expect("failed to save final checkpoint");
     let size = std::fs::metadata(save_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("\nFinal save to {save_path} ({size} bytes, {total_tokens} tokens)");
 }
