@@ -100,6 +100,10 @@ pub struct TrainerReport {
     pub stopped_by_signal: bool,
     /// `max_elapsed` fired — wall-clock budget exhausted.
     pub stopped_by_budget: bool,
+    /// Loss went NaN or exceeded `abort_on_loss_above`. The saved
+    /// checkpoint (if any) is from the last good step; the current
+    /// step's update is *not* applied before this flag trips.
+    pub stopped_by_loss_explosion: bool,
 }
 
 // ─── Configuration ──────────────────────────────────────────
@@ -140,6 +144,15 @@ pub struct TrainerConfig {
     /// Non-deterministic across machines — intended for autoresearch-style
     /// budget runs, not reproducible tests. Prefer `max_steps` for CI.
     pub max_elapsed: Option<Duration>,
+
+    /// Fail-fast on divergent training. When `Some(x)`, abort as soon
+    /// as a step's reported loss is NaN or exceeds `x`. Default
+    /// `Some(100.0)` matches `karpathy/autoresearch`'s convention: a
+    /// loss above ~100 in standard LM training means the run has
+    /// diverged and any further steps are wasted compute. Set to
+    /// `None` for callers that legitimately see large transient
+    /// losses (e.g. RL reward-signal trainers).
+    pub abort_on_loss_above: Option<f32>,
 }
 
 impl Default for TrainerConfig {
@@ -151,6 +164,7 @@ impl Default for TrainerConfig {
             install_ctrlc: true,
             log_prefix: String::new(),
             max_elapsed: None,
+            abort_on_loss_above: Some(100.0),
         }
     }
 }
@@ -229,6 +243,20 @@ impl TrainerLoop {
             };
             report.steps_completed = step_idx + 1;
 
+            // Fail-fast on divergent training. A silently-NaN loss
+            // would otherwise propagate into `val_bpb: NaN` and
+            // pollute autoresearch's results.tsv. Karpathy's
+            // convention: loss above ~100 in standard LM training
+            // means the run has diverged.
+            if out.loss.is_nan() || self.config.abort_on_loss_above
+                .is_some_and(|cap| out.loss > cap)
+            {
+                eprintln!("{prefix}  [loss diverged at step {step_idx}: {:.3}] — aborting",
+                    out.loss);
+                report.stopped_by_loss_explosion = true;
+                break;
+            }
+
             window_loss += out.loss;
             if let Some(a) = out.accuracy { window_acc_sum += a; window_acc_count += 1; }
             if let Some(p) = out.data_progress { last_progress = p; }
@@ -292,6 +320,7 @@ mod tests {
             install_ctrlc: false,  // isolated tests shouldn't touch signals
             log_prefix: String::new(),
             max_elapsed: None,
+            abort_on_loss_above: None,
         };
         let calls = Cell::new(0);
         let report = TrainerLoop::new(cfg).run(
@@ -404,6 +433,62 @@ mod tests {
             "budget should fire long before max_steps");
         assert!(report.steps_completed >= 1,
             "at least one step should complete before the budget check");
+    }
+
+    #[test]
+    fn nan_loss_aborts_run_with_explosion_flag() {
+        // Step 2 returns NaN. The loop should stop immediately and
+        // set stopped_by_loss_explosion — not propagate NaN into
+        // downstream smoothed-loss / best-loss tracking.
+        let cfg = TrainerConfig {
+            max_steps: 100, log_every: 100, install_ctrlc: false,
+            abort_on_loss_above: Some(100.0),
+            ..Default::default()
+        };
+        let report = TrainerLoop::new(cfg).run(
+            |step| Some(StepReport::new(if step == 2 { f32::NAN } else { 0.5 })),
+            || Ok(()),
+        );
+        assert!(report.stopped_by_loss_explosion);
+        assert!(!report.stopped_by_signal);
+        assert!(!report.stopped_by_budget);
+        assert_eq!(report.steps_completed, 3,
+            "the NaN step is counted (step ran), then the abort fires");
+    }
+
+    #[test]
+    fn loss_above_threshold_aborts_run() {
+        // A huge-but-finite loss (e.g. LR too high, weights exploded)
+        // triggers the same abort path as NaN.
+        let cfg = TrainerConfig {
+            max_steps: 100, log_every: 100, install_ctrlc: false,
+            abort_on_loss_above: Some(100.0),
+            ..Default::default()
+        };
+        let report = TrainerLoop::new(cfg).run(
+            |step| Some(StepReport::new(if step == 5 { 250.0 } else { 1.0 })),
+            || Ok(()),
+        );
+        assert!(report.stopped_by_loss_explosion);
+        assert_eq!(report.steps_completed, 6);
+    }
+
+    #[test]
+    fn abort_on_loss_above_none_allows_large_losses() {
+        // Opt-out: setting the threshold to None (for RL-style
+        // trainers where losses can legitimately spike) lets the
+        // loop run through a big loss without aborting.
+        let cfg = TrainerConfig {
+            max_steps: 5, log_every: 100, install_ctrlc: false,
+            abort_on_loss_above: None,
+            ..Default::default()
+        };
+        let report = TrainerLoop::new(cfg).run(
+            |_| Some(StepReport::new(10_000.0)),
+            || Ok(()),
+        );
+        assert!(!report.stopped_by_loss_explosion);
+        assert_eq!(report.steps_completed, 5);
     }
 
     #[test]
