@@ -3831,6 +3831,22 @@ pub struct NeuralComputer {
     pub last_ticks_used: usize,
 }
 
+/// Continuity payload persisted alongside the NC checkpoint. The
+/// fields here are the minimum needed to replay the CTM trajectory
+/// back into its pre-save state: `history` (tokens) + `rng_state`
+/// (sampling seed) + `max_history` (truncation horizon).
+///
+/// Bumping this struct means bumping the sidecar file format —
+/// keep additions backwards-compatible via `#[serde(default)]`.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct NcContinuity {
+    history: Vec<usize>,
+    rng_state: u64,
+    #[serde(default = "default_max_history")]
+    max_history: usize,
+}
+fn default_max_history() -> usize { 4096 }
+
 impl NeuralComputer {
     pub fn new(weights: RegionalWeights) -> Self {
         let state = RegionalState::new(&weights);
@@ -3850,10 +3866,69 @@ impl NeuralComputer {
         }
     }
 
-    /// Load from checkpoint.
+    /// Save weights + a continuity sidecar. Weights go to `path` via
+    /// `RegionalWeights::save` (persist module, `ISIS` magic). The
+    /// continuity blob (`history + rng_state + max_history` — the
+    /// trajectory that reconstructs state on replay) goes to a sibling
+    /// `<path>.ncstate.bin`.
+    ///
+    /// Known limitation — `isis nc` loading *training-produced*
+    /// bundle checkpoints (`MGCK` magic) is still broken: bincode
+    /// cannot deserialize `RegionalWeights` (hits
+    /// `DeserializeAnyNotSupported`). This sidecar scheme works for
+    /// the legacy pure-weights ISIS-magic path and is a no-op-safe
+    /// baseline for when the bundle-load bug is fixed.
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        self.weights.save(path)?;
+        let bytes = bincode::serialize(&NcContinuity {
+            history: self.history.clone(),
+            rng_state: self.rng_state,
+            max_history: self.max_history,
+        }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(Self::sidecar_path(path), bytes)?;
+        Ok(())
+    }
+
+    /// Path for the continuity sidecar alongside the weights file.
+    pub fn sidecar_path(path: &str) -> String {
+        if let Some(stripped) = path.strip_suffix(".bin") {
+            format!("{stripped}.ncstate.bin")
+        } else if let Some(stripped) = path.strip_suffix(".json") {
+            format!("{stripped}.ncstate.bin")
+        } else {
+            format!("{path}.ncstate")
+        }
+    }
+
+    /// Load from checkpoint. If a continuity sidecar exists, the NC
+    /// wakes up with its previous token history and the CTM's state
+    /// is reconstructed by replaying that history through `step()`.
+    /// No sidecar = fresh state (legacy behavior).
     pub fn load(path: &str) -> std::io::Result<Self> {
         let weights = RegionalWeights::load(path)?;
-        Ok(Self::new(weights))
+        let mut nc = Self::new(weights);
+        Self::replay_sidecar(&mut nc, path);
+        Ok(nc)
+    }
+
+    /// Replay history from the sidecar to reconstruct state. No-op if
+    /// sidecar is missing or corrupt.
+    fn replay_sidecar(nc: &mut Self, path: &str) {
+        let sidecar = Self::sidecar_path(path);
+        let Ok(bytes) = std::fs::read(&sidecar) else { return };
+        let Ok(cont) = bincode::deserialize::<NcContinuity>(&bytes) else { return };
+        nc.max_history = cont.max_history;
+        nc.rng_state = cont.rng_state;
+        eprintln!("  NC continuity: replaying {} tokens of history to \
+            reconstruct state...", cont.history.len());
+        for &tok in &cont.history {
+            let _ = nc.step(tok);
+        }
+        nc.history = cont.history;
+        if nc.history.len() > nc.max_history {
+            let drop = nc.history.len() - nc.max_history;
+            nc.history.drain(..drop);
+        }
     }
 
     /// F_θ: process one input token, update state, return output logits.
@@ -3999,5 +4074,50 @@ mod tests {
         let max = 4 + 16 + 64; // short + mid + long capacity
         assert!(epi.n_tokens() <= max,
             "episodic memory should be bounded: {} > {}", epi.n_tokens(), max);
+    }
+
+    #[test]
+    fn nc_continuity_survives_save_load() {
+        // Clive-Wearing fix #1: after save/load, the NC should have the
+        // same history and — via history replay through the CTM dynamics
+        // — a state that behaves identically to the pre-save NC.
+        let cfg = RegionalConfig::eight_region(16, 256, 2);
+        let w = RegionalWeights::new(cfg);
+        let mut nc = NeuralComputer::new(w);
+
+        // Build some trajectory.
+        for i in 0..30usize {
+            let _ = nc.step(i % 256);
+        }
+        let history_before: Vec<usize> = nc.history.clone();
+        let rng_before = nc.rng_state;
+
+        // Save to a temp path, then load back.
+        let path = std::env::temp_dir()
+            .join(format!("nc_continuity_{}.json",
+                std::process::id())).to_string_lossy().into_owned();
+        nc.save(&path).expect("save");
+        let nc2 = NeuralComputer::load(&path).expect("load");
+
+        // History and RNG seed should match exactly — those are the
+        // trajectory proxies for identity.
+        assert_eq!(nc2.history, history_before, "history must round-trip");
+        assert_eq!(nc2.rng_state, rng_before, "rng_state must round-trip");
+
+        // The next step from either NC should produce identical logits —
+        // proof the replayed state is a faithful reconstruction.
+        let mut nc_a = nc;
+        let mut nc_b = nc2;
+        let logits_a = nc_a.step(42);
+        let logits_b = nc_b.step(42);
+        assert_eq!(logits_a.len(), logits_b.len());
+        for (a, b) in logits_a.iter().zip(logits_b.iter()) {
+            assert!((a - b).abs() < 1e-3,
+                "post-load logits must match pre-save logits (within fp noise): {a} vs {b}");
+        }
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(NeuralComputer::sidecar_path(&path));
     }
 }
