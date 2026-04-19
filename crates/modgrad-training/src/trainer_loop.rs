@@ -35,7 +35,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Process-wide signal flag. First `TrainerLoop::run(install_ctrlc=true)`
 /// installs the Ctrl+C handler; later runs reset and reuse the same flag.
@@ -98,6 +98,8 @@ pub struct TrainerReport {
     pub best_step: usize,
     pub elapsed_secs: f64,
     pub stopped_by_signal: bool,
+    /// `max_elapsed` fired — wall-clock budget exhausted.
+    pub stopped_by_budget: bool,
 }
 
 // ─── Configuration ──────────────────────────────────────────
@@ -130,6 +132,14 @@ pub struct TrainerConfig {
     /// Log line prefix. Useful to distinguish multiple trainers. Empty
     /// by default.
     pub log_prefix: String,
+
+    /// Wall-clock budget. `Some(d)` stops the loop after *d* of elapsed
+    /// training time, checked between steps. Whichever of `max_steps`,
+    /// `max_elapsed`, or a step returning `None` fires first wins.
+    ///
+    /// Non-deterministic across machines — intended for autoresearch-style
+    /// budget runs, not reproducible tests. Prefer `max_steps` for CI.
+    pub max_elapsed: Option<Duration>,
 }
 
 impl Default for TrainerConfig {
@@ -140,6 +150,7 @@ impl Default for TrainerConfig {
             save_every: None,
             install_ctrlc: true,
             log_prefix: String::new(),
+            max_elapsed: None,
         }
     }
 }
@@ -158,6 +169,7 @@ impl TrainerLoop {
     /// Drive the training loop. Stops when any of these happen:
     ///   * `step` returned `None` (dataset exhausted, user decided to stop)
     ///   * `step_idx` reached `config.max_steps`
+    ///   * `config.max_elapsed` wall-clock budget is exhausted
     ///   * Ctrl+C was pressed (if `install_ctrlc`)
     ///
     /// `save_fn` is called every `save_every` steps (when set) and once
@@ -198,10 +210,17 @@ impl TrainerLoop {
         let mut last_progress: f32 = 0.0;
 
         let max = self.config.max_steps;
+        let deadline = self.config.max_elapsed.map(|d| started + d);
         for step_idx in 0..max {
             if !running.load(Ordering::SeqCst) {
                 report.stopped_by_signal = true;
                 break;
+            }
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    report.stopped_by_budget = true;
+                    break;
+                }
             }
 
             let out = match step(step_idx) {
@@ -272,6 +291,7 @@ mod tests {
             save_every: None,
             install_ctrlc: false,  // isolated tests shouldn't touch signals
             log_prefix: String::new(),
+            max_elapsed: None,
         };
         let calls = Cell::new(0);
         let report = TrainerLoop::new(cfg).run(
@@ -355,6 +375,35 @@ mod tests {
              run doesn't make the loop exit at step 0");
         assert!(!report.stopped_by_signal,
             "no signal was raised during this run");
+    }
+
+    #[test]
+    fn max_elapsed_stops_run_with_budget_flag() {
+        use std::thread;
+        // 200 ms budget; each "step" sleeps 50 ms. Expect ~4 steps then
+        // the budget check fires. Run under max_steps=1000 so we're
+        // verifying the *budget* path, not the step cap.
+        let cfg = TrainerConfig {
+            max_steps: 1000,
+            log_every: 100,
+            install_ctrlc: false,
+            max_elapsed: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let report = TrainerLoop::new(cfg).run(
+            |_| {
+                thread::sleep(Duration::from_millis(50));
+                Some(StepReport::new(0.1))
+            },
+            || Ok(()),
+        );
+        assert!(report.stopped_by_budget,
+            "expected stopped_by_budget=true after max_elapsed fired");
+        assert!(!report.stopped_by_signal);
+        assert!(report.steps_completed < 1000,
+            "budget should fire long before max_steps");
+        assert!(report.steps_completed >= 1,
+            "at least one step should complete before the budget check");
     }
 
     #[test]
