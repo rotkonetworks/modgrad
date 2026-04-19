@@ -40,6 +40,7 @@ fn main() {
     let mut csv_mode = false;
     let mut cereb_size = 0usize; // 0 = use preset default
     let mut frozen_cereb = false;
+    let mut autoresearch_summary = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -60,6 +61,7 @@ fn main() {
             "--csv" => { csv_mode = true; i += 1; }
             "--cereb-size" => { cereb_size = args[i+1].parse().unwrap(); i += 2; }
             "--frozen-cereb" => { frozen_cereb = true; i += 1; }
+            "--autoresearch-summary" => { autoresearch_summary = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -132,6 +134,7 @@ fn main() {
     };
 
     // ── Training ──
+    let t_train_start = std::time::Instant::now();
     let mut rng = MazeRng::new(seed);
     let mut loss_history = Vec::new();
     let mut acc_history = Vec::new();
@@ -211,14 +214,19 @@ fn main() {
     }
 
     // ── Evaluation ──
+    let training_seconds = t_train_start.elapsed().as_secs_f32();
     eprintln!("\n--- Evaluation (200 mazes) ---");
-    eval(&w, &encoder, loss_fn, maze_size, route_len, seed + 999);
+    eval(&w, &encoder, loss_fn, maze_size, route_len, seed + 999,
+         autoresearch_summary, training_seconds, step, w.n_params());
 }
 
 fn eval(
     w: &CtmWeights, encoder: &VisualRetina, _loss_fn: &dyn LossFn<Target = [usize]>,
     maze_size: usize, route_len: usize, seed: u64,
+    autoresearch_summary: bool, training_seconds: f32,
+    num_steps: usize, num_params: usize,
 ) {
+    let t_eval_start = std::time::Instant::now();
     let mut rng = MazeRng::new(seed);
     let n_eval = 200;
     let mut first_correct = 0usize;
@@ -274,12 +282,36 @@ fn eval(
     let avg_prefix = prefix_lengths.iter().sum::<usize>() as f32 / n_valid.max(1) as f32;
     let avg_ticks = total_ticks as f32 / n_valid.max(1) as f32;
 
+    let first_step_acc = first_correct as f32 / n_valid.max(1) as f32;
     eprintln!("First step acc:     {first_correct}/{n_valid} ({:.1}%)",
-        first_correct as f32 / n_valid.max(1) as f32 * 100.0);
+        first_step_acc * 100.0);
     eprintln!("Per-step acc:       {route_correct}/{route_total} ({:.1}%)",
         if route_total > 0 { route_correct as f32 / route_total as f32 * 100.0 } else { 0.0 });
     eprintln!("Avg correct prefix: {avg_prefix:.1} steps (of {route_len})");
     eprintln!("Avg ticks used:     {avg_ticks:.1}");
+
+    // Autoresearch contract: grep-parseable summary block on stderr so the
+    // same driving-agent workflow that iterates FFN on val_bpb can iterate
+    // on maze routing. `val_bpb` is the field name the agent already looks
+    // for; we map it to `1 - first_step_acc` (lower-is-better, in [0,1],
+    // 0 = perfect routing). Not literally bits-per-byte, but the agent
+    // doesn't care about the underlying unit — only the direction.
+    if autoresearch_summary {
+        let total_seconds = training_seconds + t_eval_start.elapsed().as_secs_f32();
+        modgrad_training::AutoresearchSummary {
+            val_bpb: 1.0 - first_step_acc,
+            training_seconds,
+            total_seconds,
+            peak_vram_mb: 0.0,
+            mfu_percent: 0.0,
+            total_tokens_m: 0.0,
+            num_steps: num_steps as u64,
+            num_params_m: (num_params as f32) / 1.0e6,
+        }.print();
+        eprintln!("  (task=mazes size={maze_size} route_len={route_len}, \
+                   val_bpb = 1 - first_step_acc = {:.6})",
+                   1.0 - first_step_acc);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
