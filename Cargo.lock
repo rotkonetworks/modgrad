@@ -2574,6 +2574,7 @@ dependencies = [
 name = "modgrad-training"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "ctrlc",
  "modgrad-compute",
  "modgrad-data",

@@ -1274,10 +1274,30 @@ fn learn(
         (32, 8, 2)
     };
 
-    // Load or create model
-    let mut w = if std::path::Path::new(save_path).exists() {
-        eprintln!("Loading {save_path}...");
-        RegionalWeights::load(save_path).expect("failed to load")
+    // ─── Resume or create ───
+    //
+    // Try CheckpointBundle first — it's the new canonical save format.
+    // If the file exists but isn't a bundle (pre-migration two-file
+    // checkpoint), fall back to loading RegionalWeights + RegionalAdamW
+    // individually. The next save always writes a bundle regardless,
+    // so the legacy path is a one-shot migration.
+    use modgrad_training::{CheckpointBundle, BasicMeta};
+    const MODEL_KIND_CTM: &str = "ctm-regional";
+
+    let (maybe_opt, resumed_meta_ctm, mut w) = if std::path::Path::new(save_path).exists() {
+        match CheckpointBundle::<RegionalWeights, RegionalAdamW>::load(save_path, MODEL_KIND_CTM) {
+            Ok(bundle) => {
+                eprintln!("Resumed {save_path} — step {}, {} tokens seen",
+                    bundle.meta.step, bundle.meta.tokens_seen);
+                (Some(bundle.optimizer), bundle.meta, bundle.model)
+            }
+            Err(e) => {
+                eprintln!("  (not a CheckpointBundle: {e})");
+                eprintln!("  falling back to legacy two-file checkpoint...");
+                let w = RegionalWeights::load(save_path).expect("failed to load");
+                (None, BasicMeta::default(), w)
+            }
+        }
     } else {
         let cfg = if billion {
             eprintln!("Creating billion-scale model (d_model=1024, ~1B params)...");
@@ -1293,7 +1313,7 @@ fn learn(
         } else {
             RegionalConfig::eight_region(embed_dim, vocab, ticks)
         };
-        RegionalWeights::new(cfg)
+        (None, BasicMeta::default(), RegionalWeights::new(cfg))
     };
     // Frozen cerebellum: load from safetensors (native) or ONNX
     let frozen_cereb: Option<Box<dyn modgrad_ctm::cerebellum::FrozenCerebellum>> =
@@ -1336,18 +1356,21 @@ fn learn(
 
     w.print_summary();
 
-    let opt_path = if save_path.ends_with(".bin") {
-        save_path.replace(".bin", ".opt.bin")
-    } else if save_path.ends_with(".json") {
-        save_path.replace(".json", ".opt.json")
+    // Optimizer: bundle path already loaded it; legacy path tries the
+    // .opt.bin sidecar; fresh-create tunes LR/clip by model size.
+    let opt = if let Some(o) = maybe_opt {
+        o
     } else {
-        format!("{save_path}.opt")
-    };
-    let opt = if std::path::Path::new(&opt_path).exists() {
-        RegionalAdamW::load(&opt_path).unwrap_or_else(|_| RegionalAdamW::new(&w))
-    } else {
-        {
-            // Scale lr and grad clip with model size
+        let legacy_opt = if save_path.ends_with(".bin") {
+            save_path.replace(".bin", ".opt.bin")
+        } else if save_path.ends_with(".json") {
+            save_path.replace(".json", ".opt.json")
+        } else {
+            format!("{save_path}.opt")
+        };
+        if std::path::Path::new(&legacy_opt).exists() {
+            RegionalAdamW::load(&legacy_opt).unwrap_or_else(|_| RegionalAdamW::new(&w))
+        } else {
             let (lr, clip) = if w.n_params() > 50_000_000 { (3e-4, 1.0) }
                              else if w.n_params() > 10_000_000 { (1e-3, 2.0) }
                              else { (3e-3, 5.0) };
@@ -1381,7 +1404,8 @@ fn learn(
 
     let grads = RegionalGradients::zeros(&w);
     let workspace = TrainWorkspace::new(&w);
-    let initial_total_tokens = opt.step as u64;
+    // Resumed token count comes from the bundle (legacy path: defaults to 0).
+    let initial_total_tokens = resumed_meta_ctm.tokens_seen;
 
     // Bundle the big mutables.  `frozen_cereb` is Option<Box<dyn ...>>; when
     // present every step borrows it mutably for `encode_context_layers`.
@@ -1392,6 +1416,7 @@ fn learn(
     let dream_counter = Cell::new(0u64);
     let tokens_ref: &Vec<usize> = &all_tokens;
     let n_data = all_tokens.len();
+    let run_started = std::time::Instant::now();
 
     eprintln!("\nLearning... (Ctrl+C to save and stop)\n");
 
@@ -1492,10 +1517,28 @@ fn learn(
         }
     };
 
+    // Save closure: pack model + optimizer + live counters into a
+    // CheckpointBundle. One atomic file replaces the old weights +
+    // .opt.bin sidecar pair.
     let save_fn = || -> Result<(), Box<dyn std::error::Error>> {
         let s = state.borrow();
-        s.0.save(save_path)?;
-        s.1.save(&opt_path)?;
+        let bundle = CheckpointBundle {
+            schema: modgrad_training::CURRENT_SCHEMA,
+            model_kind: MODEL_KIND_CTM.to_string(),
+            model: s.0.clone(),
+            optimizer: s.1.clone(),
+            meta: BasicMeta {
+                step: s.1.step as u64,
+                tokens_seen: total_tokens.get(),
+                loss_at_save: 0.0,
+                best_loss: 0.0,
+                timestamp_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0),
+                elapsed_secs: resumed_meta_ctm.elapsed_secs + run_started.elapsed().as_secs(),
+            },
+        };
+        bundle.save(save_path)?;
         Ok(())
     };
 
