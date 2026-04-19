@@ -157,6 +157,32 @@ enum Commands {
         /// Learning rate (defaults by size).
         #[arg(long)]
         lr: Option<f32>,
+        /// Stop training after N wall-clock seconds. Intended for the
+        /// autoresearch workflow (fixed per-experiment budget).
+        #[arg(long)]
+        budget: Option<u64>,
+        /// Validation file for end-of-run val_bpb. When set, autoresearch
+        /// summary block is printed to stderr after training. Kept
+        /// optional so non-autoresearch runs skip the eval cost.
+        #[arg(long)]
+        val_data: Option<String>,
+    },
+    /// Evaluate a checkpoint — compute val_bpb on held-out data and print
+    /// the autoresearch-compatible summary block to stderr. Paired with
+    /// `learn-ffn --budget` for the autonomous research workflow.
+    Eval {
+        #[arg(default_value = "cerebellum.bin")]
+        checkpoint: String,
+        /// File(s) of validation bytes. Concatenated, truncated to --max-bytes.
+        #[arg(required = true)]
+        data: Vec<String>,
+        /// Context window for forward passes. Must match the training context.
+        #[arg(long, default_value = "64")]
+        context: usize,
+        /// Cap on evaluation bytes — trims wall-clock. 256 KiB is plenty for
+        /// a statistically stable val_bpb and keeps eval under a few seconds.
+        #[arg(long, default_value = "262144")]
+        max_bytes: usize,
     },
 }
 
@@ -203,14 +229,17 @@ fn main() {
         Commands::Devices => {
             show_devices();
         }
-        Commands::LearnFfn { checkpoint, data, context, vocab, gpu, small, medium, large, xl, lr } => {
+        Commands::LearnFfn { checkpoint, data, context, vocab, gpu, small, medium, large, xl, lr, budget, val_data } => {
             if gpu {
                 modgrad_compute::neuron::enable_gpu();
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::VramGpuBackend::new(1024))
                 );
             }
-            learn_ffn(&checkpoint, &data, context, vocab, gpu, small, medium, large, xl, lr);
+            learn_ffn(&checkpoint, &data, context, vocab, gpu, small, medium, large, xl, lr, budget, val_data.as_deref());
+        }
+        Commands::Eval { checkpoint, data, context, max_bytes } => {
+            eval_ffn(&checkpoint, &data, context, max_bytes);
         }
     }
 }
@@ -228,6 +257,8 @@ fn learn_ffn(
     large: bool,
     xl: bool,
     lr_override: Option<f32>,
+    budget_secs: Option<u64>,
+    val_data_path: Option<&str>,
 ) {
     use modgrad_ffn::{FfnConfig, FfnWeights, FfnAdamW, FfnGradients, ffn_train_step};
 
@@ -338,12 +369,17 @@ fn learn_ffn(
     // Start-of-run wall clock for the elapsed_secs metadata.
     let run_started = std::time::Instant::now();
 
-    eprintln!("\nTraining FFN... (lr={:.1e}, Ctrl+C to save and stop)\n", lr);
+    if let Some(secs) = budget_secs {
+        eprintln!("\nTraining FFN... (lr={:.1e}, budget {}s, Ctrl+C to save early)\n", lr, secs);
+    } else {
+        eprintln!("\nTraining FFN... (lr={:.1e}, Ctrl+C to save and stop)\n", lr);
+    }
 
     let cfg = TrainerConfig {
-        max_steps: usize::MAX,   // run until SIGINT or `step_fn` returns None
+        max_steps: usize::MAX,   // run until SIGINT, `step_fn` returns None, or budget fires
         log_every: 100,
         save_every: Some(5_000),
+        max_elapsed: budget_secs.map(std::time::Duration::from_secs),
         ..Default::default()
     };
 
@@ -387,8 +423,115 @@ fn learn_ffn(
     };
 
     let report = TrainerLoop::new(cfg).run(step_fn, save_fn);
+    let training_seconds = run_started.elapsed().as_secs_f32();
     eprintln!("\nSaved to {save_path}  ({} steps, best {:.3} @ step {})",
         report.steps_completed, report.best_avg_loss, report.best_step);
+    if report.stopped_by_budget {
+        eprintln!("  (stopped by --budget)");
+    }
+
+    // Autoresearch summary: only printed when the caller asked for it
+    // (via --val-data). The summary's val_bpb is the ground truth the
+    // driving agent greps to decide keep/revert.
+    if let Some(val_path) = val_data_path {
+        let s = state.borrow();
+        let w = &s.0;
+        let val_bytes = std::fs::read(val_path)
+            .unwrap_or_else(|e| { eprintln!("Failed to read {val_path}: {e}"); std::process::exit(1); });
+        let val_tokens: Vec<usize> = val_bytes.iter().map(|&b| b as usize).collect();
+        let (val_bpb, n_eval) = compute_ffn_val_bpb(w, &val_tokens, context_len);
+        let total_seconds = run_started.elapsed().as_secs_f32();
+
+        modgrad_training::AutoresearchSummary {
+            val_bpb,
+            training_seconds,
+            total_seconds,
+            peak_vram_mb: 0.0,
+            mfu_percent: 0.0,
+            total_tokens_m: (tokens_seen.get() as f32) / 1.0e6,
+            num_steps: report.steps_completed as u64,
+            num_params_m: (w.n_params() as f32) / 1.0e6,
+        }.print();
+        eprintln!("  (val_bpb computed over {n_eval} target positions from {val_path})");
+    }
+}
+
+/// Forward-only val_bpb for an FFN cerebellum. Slides over `val_tokens`
+/// in non-overlapping `context_len`-sized windows and accumulates
+/// cross-entropy into a `BitsPerByte` metric.
+///
+/// Returns `(val_bpb, n_target_positions)`. `n_target_positions` is the
+/// denominator the metric saw — useful for agents to sanity-check that
+/// the eval actually ran over enough tokens.
+fn compute_ffn_val_bpb(
+    w: &modgrad_ffn::FfnWeights,
+    val_tokens: &[usize],
+    context_len: usize,
+) -> (f32, usize) {
+    use modgrad_training::metrics::{BitsPerByte, Metric};
+    let mut bpb = BitsPerByte::new();
+    let mut offset = 0usize;
+    let mut n_positions = 0usize;
+    while offset + context_len + 1 <= val_tokens.len() {
+        let chunk = &val_tokens[offset..offset + context_len + 1];
+        let (logits, _cache) = modgrad_ffn::ffn_forward(w, &chunk[..context_len]);
+        for (pos, logit_row) in logits.iter().enumerate() {
+            bpb.update(logit_row, chunk[pos + 1]);
+            n_positions += 1;
+        }
+        offset += context_len;
+    }
+    (bpb.compute(), n_positions)
+}
+
+/// `isis eval <checkpoint> <data…>` — load an FFN CheckpointBundle, compute
+/// val_bpb on the concatenated data, print the autoresearch summary block.
+/// For CTM/RegionalWeights checkpoints use a future dedicated subcommand;
+/// this one is intentionally FFN-only to keep the eval harness honest.
+fn eval_ffn(checkpoint: &str, data_paths: &[String], context_len: usize, max_bytes: usize) {
+    use modgrad_training::{CheckpointBundle, AutoresearchSummary};
+    use modgrad_ffn::{FfnWeights, FfnAdamW};
+    const MODEL_KIND: &str = "ffn-cerebellum";
+
+    let t_start = std::time::Instant::now();
+
+    let bundle: CheckpointBundle<FfnWeights, FfnAdamW> =
+        CheckpointBundle::load(checkpoint, MODEL_KIND).unwrap_or_else(|e| {
+            eprintln!("Failed to load {checkpoint} as FFN bundle: {e}");
+            std::process::exit(1);
+        });
+    let w = bundle.model;
+
+    let mut val_bytes: Vec<u8> = Vec::new();
+    for p in data_paths {
+        match std::fs::read(p) {
+            Ok(b) => val_bytes.extend_from_slice(&b),
+            Err(e) => { eprintln!("Failed to read {p}: {e}"); std::process::exit(1); }
+        }
+        if val_bytes.len() >= max_bytes { break; }
+    }
+    val_bytes.truncate(max_bytes);
+    if val_bytes.len() < context_len + 1 {
+        eprintln!("Not enough val data: {} bytes, need at least {}", val_bytes.len(), context_len + 1);
+        std::process::exit(1);
+    }
+    let val_tokens: Vec<usize> = val_bytes.iter().map(|&b| b as usize).collect();
+
+    let (val_bpb, n_positions) = compute_ffn_val_bpb(&w, &val_tokens, context_len);
+    let total_seconds = t_start.elapsed().as_secs_f32();
+
+    AutoresearchSummary {
+        val_bpb,
+        training_seconds: 0.0,
+        total_seconds,
+        peak_vram_mb: 0.0,
+        mfu_percent: 0.0,
+        total_tokens_m: (val_tokens.len() as f32) / 1.0e6,
+        num_steps: 0,
+        num_params_m: (w.n_params() as f32) / 1.0e6,
+    }.print();
+    eprintln!("  (eval over {n_positions} target positions, {} bytes, ctx {context_len})",
+        val_bytes.len());
 }
 
 // ─── Generate ─────────────────────────────────────────────
