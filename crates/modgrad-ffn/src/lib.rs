@@ -263,23 +263,32 @@ const GEMM_N_CHUNK: usize = 4;
 
 /// Forward matmul: Y[n×m] = A[n×k] @ W^T[k×m] + bias[m].
 /// GPU-accelerated via `accel::try_matmul` (uses matmul_blocked kernel).
-/// Falls back to rayon + matrixmultiply sgemm on shape-mismatch or GPU failure.
+/// CPU path (rayon + matrixmultiply sgemm) runs when GPU is disabled.
+///
+/// Fail-fast contract: if `gpu_enabled()`, GPU dispatch *must* succeed.
+/// Any failure panics with diagnostic shape info. A silent CPU fallback
+/// on GPU failure would hide dispatch bugs and turn 5-minute runs into
+/// hours of slow-CPU training while the user thinks they're on GPU —
+/// exactly the failure mode that cost 4h of training time before the
+/// fallback was removed.
 ///
 /// GPU path constraints: m%128==0, k%8==0, n%32==0. For our FFN sizes
 /// (N=128, K∈{1024, 5120}, M∈{1024, 5120}) all natural shapes pass.
 #[inline]
 fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
                 n: usize, k: usize, m: usize) {
-    // Try GPU first. try_matmul itself validates everything and falls back
-    // silently by returning false — no panic risk, no device-hang risk.
-    if modgrad_compute::neuron::gpu_enabled()
-        && modgrad_device::kfd::accel::try_matmul(
+    if modgrad_compute::neuron::gpu_enabled() {
+        if !modgrad_device::kfd::accel::try_matmul(
             a, weight, bias, y, n as u32, k as u32, m as u32)
-    {
+        {
+            panic!("GPU matmul failed: n={n} k={k} m={m}. \
+                    --gpu requires a working GPU dispatch path; either \
+                    fix the kernel or run without --gpu for CPU training.");
+        }
         return;
     }
 
-    // CPU fallback: rayon-parallel matrixmultiply sgemm.
+    // CPU path (no --gpu): rayon-parallel matrixmultiply sgemm.
     y.par_chunks_mut(GEMM_N_CHUNK * m)
         .zip(a.par_chunks(GEMM_N_CHUNK * k))
         .for_each(|(y_chunk, a_chunk)| {
@@ -301,7 +310,8 @@ fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
 }
 
 /// Transposed matmul: dA[n×k] += dY[n×m] @ W[m×k] (ACCUMULATES).
-/// GPU path first (try_matmul_t), CPU rayon fallback via matrixmultiply.
+/// GPU path when `--gpu` enabled; CPU path otherwise. Fail-fast — no
+/// silent fallback (see `matmul_rayon` for the rationale).
 #[inline]
 fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
                   n: usize, k: usize, m: usize) {
@@ -310,15 +320,17 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
         // case where `da` was pre-zeroed, the add collapses to a copy, but
         // we keep the pattern uniform for safety.
         let mut tmp = vec![0.0f32; n * k];
-        if modgrad_device::kfd::accel::try_matmul_t(
+        if !modgrad_device::kfd::accel::try_matmul_t(
             dy, weight, &mut tmp, n as u32, k as u32, m as u32)
         {
-            da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
-            return;
+            panic!("GPU matmul_t failed: n={n} k={k} m={m}. \
+                    --gpu requires a working GPU dispatch path.");
         }
+        da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
+        return;
     }
 
-    // CPU fallback: rayon-split batch + matrixmultiply sgemm (beta=1.0 accumulates).
+    // CPU path (no --gpu): rayon-split batch + sgemm (beta=1.0 accumulates).
     da.par_chunks_mut(GEMM_N_CHUNK * k)
         .zip(dy.par_chunks(GEMM_N_CHUNK * m))
         .for_each(|(da_chunk, dy_chunk)| {
@@ -335,21 +347,24 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
 }
 
 /// Weight-gradient matmul: dW[m×k] += dY^T[m×n] @ A[n×k] (ACCUMULATES).
-/// GPU path first (try_matmul_grad), CPU rayon fallback.
+/// GPU path when `--gpu` enabled; CPU path otherwise. Fail-fast — no
+/// silent fallback.
 #[inline]
 fn matmul_grad_rayon(dy: &[f32], a: &[f32], dw: &mut [f32],
                      n: usize, k: usize, m: usize) {
     if modgrad_compute::neuron::gpu_enabled() {
         let mut tmp = vec![0.0f32; m * k];
-        if modgrad_device::kfd::accel::try_matmul_grad(
+        if !modgrad_device::kfd::accel::try_matmul_grad(
             dy, a, &mut tmp, n as u32, k as u32, m as u32)
         {
-            dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
-            return;
+            panic!("GPU matmul_grad failed: n={n} k={k} m={m}. \
+                    --gpu requires a working GPU dispatch path.");
         }
+        dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
+        return;
     }
 
-    // CPU fallback. Chunk size chosen for ~32 chunks on an m=5120 matmul.
+    // CPU path (no --gpu). Chunk size chosen for ~32 chunks on an m=5120 matmul.
     let m_chunk = (m / 32).max(32);
     dw.par_chunks_mut(m_chunk * k).enumerate().for_each(|(chunk_idx, dw_chunk)| {
         let rows = dw_chunk.len() / k;
@@ -1021,15 +1036,17 @@ fn adamw_apply(
         let mut g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
         let bc1_inv = 1.0 / bc1;
         let bc2_inv = 1.0 / bc2;
-        if modgrad_device::kfd::accel::try_adamw(
+        if !modgrad_device::kfd::accel::try_adamw(
             weights, &mut g_scaled, m, v,
             lr, beta1, beta2, eps, wd, bc1_inv, bc2_inv,
         ) {
-            return;
+            panic!("GPU AdamW failed: n={}. --gpu requires a working \
+                    GPU dispatch path.", weights.len());
         }
+        return;
     }
 
-    // CPU fallback
+    // CPU path (no --gpu, or tensor too small for GPU launch overhead).
     for i in 0..weights.len() {
         let g = grads[i] * clip_scale;
         m[i] = beta1 * m[i] + (1.0 - beta1) * g;
