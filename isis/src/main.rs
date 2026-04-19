@@ -323,7 +323,7 @@ fn learn_ffn(
     // RefCell gives us sequential interior mutability — the two closures
     // never run concurrently, so `borrow_mut` can never panic here.
     use modgrad_training::{TrainerConfig, TrainerLoop, StepReport};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     let grads = FfnGradients::zeros(&w);
     // Bundle w + opt + grads into one mutable unit so both closures
@@ -331,6 +331,12 @@ fn learn_ffn(
     let state = RefCell::new((w, opt, grads));
     let offset = RefCell::new(0usize);
     let n_data = all_tokens.len();
+    // Live token counter — resumed value + per-step deltas. save_fn reads
+    // this instead of the snapshotted `resumed_meta.tokens_seen`, so
+    // each save records an up-to-date count.
+    let tokens_seen = Cell::new(resumed_meta.tokens_seen);
+    // Start-of-run wall clock for the elapsed_secs metadata.
+    let run_started = std::time::Instant::now();
 
     eprintln!("\nTraining FFN... (lr={:.1e}, Ctrl+C to save and stop)\n", lr);
 
@@ -355,6 +361,9 @@ fn learn_ffn(
             let (w, opt, grads) = &mut *s;
             let (loss, acc) = ffn_train_step(w, opt, grads, chunk);
             *o += context_len;
+            // Count the tokens we just stepped over — one chunk = context_len
+            // targets (we train one prediction per position in [0, context_len)).
+            tokens_seen.set(tokens_seen.get() + context_len as u64);
             let progress = (*o as f32 / n_data as f32).min(1.0);
             return Some(StepReport::new(loss).with_accuracy(acc).with_progress(progress));
         }
@@ -372,13 +381,13 @@ fn learn_ffn(
             optimizer: s.1.clone(),
             meta: BasicMeta {
                 step: s.1.step as u64,
-                tokens_seen: resumed_meta.tokens_seen,
+                tokens_seen: tokens_seen.get(),
                 loss_at_save: 0.0,
                 best_loss: 0.0,
                 timestamp_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs()).unwrap_or(0),
-                elapsed_secs: 0,
+                elapsed_secs: resumed_meta.elapsed_secs + run_started.elapsed().as_secs(),
             },
         };
         bundle.save(save_path)?;
