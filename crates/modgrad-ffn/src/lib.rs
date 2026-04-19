@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use modgrad_compute::neuron::Linear;
 use modgrad_traits::ParamIter;
 use rayon::prelude::*;
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 /// FFN cerebellum config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnConfig {
     pub vocab: usize,
     pub d_model: usize,
@@ -54,7 +55,7 @@ impl FfnConfig {
 }
 
 /// One SwiGLU block with residual + pre-norm.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnBlock {
     /// Pre-norm gamma: [d_model].
     pub ln_gamma: Vec<f32>,
@@ -88,7 +89,7 @@ impl FfnBlock {
 }
 
 /// FFN cerebellum weights.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnWeights {
     pub config: FfnConfig,
     /// Token embedding: [vocab × d_model].
@@ -444,7 +445,7 @@ pub fn ffn_loss(logits: &[Vec<f32>], targets: &[usize]) -> (f32, Vec<Vec<f32>>) 
 // ═══════════════════════════════════════════════════════════════
 
 /// Gradients for FFN training.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnGradients {
     pub embed: Vec<f32>,
     pub blocks: Vec<FfnBlockGrads>,
@@ -453,7 +454,7 @@ pub struct FfnGradients {
     pub lm_head: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnBlockGrads {
     pub ln_gamma: Vec<f32>,
     pub ln_beta: Vec<f32>,
@@ -705,7 +706,7 @@ fn ffn_tensor_sizes(w: &FfnWeights) -> Vec<usize> {
     sizes
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnAdamW {
     pub lr: f32,
     pub beta1: f32,
@@ -728,6 +729,7 @@ pub struct FfnAdamW {
     /// Device-agnostic — on AMD this is a KFD `VramMirror`, on CUDA it's a
     /// cudarc-backed impl, etc. The FFN code here never names either.
     #[serde(skip)]
+    #[wincode(skip)]
     vram: Option<Box<dyn modgrad_compute::optimizer_state::OptimizerState>>,
 }
 

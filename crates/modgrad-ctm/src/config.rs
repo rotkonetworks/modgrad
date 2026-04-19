@@ -1,12 +1,13 @@
 //! Configuration for the faithful Ctm CTM (single neuron pool).
 
 use serde::{Deserialize, Serialize};
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 /// Configuration matching the Ctm AI Continuous Thought Machine.
 ///
 /// One neuron pool of `d_model` neurons. One U-Net synapse. One NLM.
 /// Two sync readouts (action for attention, output for predictions).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct CtmConfig {
     /// Number of internal ticks (T in paper).
     pub iterations: usize,
@@ -48,7 +49,7 @@ pub struct CtmConfig {
 /// transitively containing an ExitStrategy (RegionalWeights, CtmWeights,
 /// CheckpointBundle<_, _>). The tagged representation was a
 /// human-readable convenience that cost us binary persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub enum ExitStrategy {
     /// Run all ticks unconditionally.
     None,

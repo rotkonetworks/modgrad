@@ -13,6 +13,8 @@ modgrad-persist = { path = "../modgrad-persist" }
 modgrad-memory = { path = "../modgrad-memory" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+wincode = "0.5"
+wincode-derive = "0.4"
 half = "2"
 rayon = "1"
 bincode = "1"

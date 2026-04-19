@@ -18,6 +18,7 @@
 //! trust world knowledge (deep layers).
 
 use serde::{Deserialize, Serialize};
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 // ─── Cache ──────────────────────────────────────────────────
 
@@ -140,7 +141,7 @@ pub trait FrozenCerebellum: Send {
 ///
 /// Now includes learned layer weights (softmax over N transformer layers)
 /// that determine which depth of representation the cerebellum uses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct CerebProjection {
     /// cortex d_model → frozen input dim (used by RandomExpansion)
     pub proj_in_w: Vec<f32>,
@@ -393,7 +394,7 @@ impl SimpleRng {
 
 // ─── Config ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub enum CerebMode {
     Ctm,
     Expansion { expansion_factor: usize, seed: u64 },

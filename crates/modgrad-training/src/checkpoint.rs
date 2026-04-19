@@ -60,13 +60,16 @@ impl CheckpointManager {
     }
 
     /// Save a checkpoint. Returns true if this is the new best.
-    pub fn save<T: Serialize>(
+    pub fn save<T>(
         &mut self,
         weights: &T,
         step: usize,
         loss: f32,
         metrics: &[(String, f32)],
-    ) -> io::Result<bool> {
+    ) -> io::Result<bool>
+    where
+        T: Serialize + wincode::SchemaWrite<modgrad_persist::persist::ModgradConfig, Src = T>,
+    {
         let path = self.dir.join(format!("step_{:08}.bin", step));
         modgrad_persist::persist::save(weights, &path)?;
 
@@ -114,7 +117,11 @@ impl CheckpointManager {
     }
 
     /// Load the latest checkpoint.
-    pub fn load_latest<T: DeserializeOwned>(&self) -> io::Result<(T, CheckpointMeta)> {
+    pub fn load_latest<T>(&self) -> io::Result<(T, CheckpointMeta)>
+    where
+        T: DeserializeOwned
+            + for<'de> wincode::SchemaRead<'de, modgrad_persist::persist::ModgradConfig, Dst = T>,
+    {
         let (path, meta_path) = self.find_latest()?;
         let weights: T = modgrad_persist::persist::load(&path)?;
         let meta_str = std::fs::read_to_string(&meta_path)?;
@@ -124,7 +131,11 @@ impl CheckpointManager {
     }
 
     /// Load the best checkpoint.
-    pub fn load_best<T: DeserializeOwned>(&self) -> io::Result<T> {
+    pub fn load_best<T>(&self) -> io::Result<T>
+    where
+        T: DeserializeOwned
+            + for<'de> wincode::SchemaRead<'de, modgrad_persist::persist::ModgradConfig, Dst = T>,
+    {
         let path = self.dir.join("best.bin");
         modgrad_persist::persist::load(&path)
     }

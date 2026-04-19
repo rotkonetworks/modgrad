@@ -11,6 +11,8 @@ modgrad-compute = { path = "../modgrad-compute" }
 modgrad-data = { path = "../modgrad-data" }
 modgrad-persist = { path = "../modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
+wincode = "0.5"
+wincode-derive = "0.4"
 serde_json = "1"
 # bincode 1.x for the on-disk format of CheckpointBundle. Same codec the
 # rest of the SDK already uses (FfnWeights::save, modgrad-persist, etc.).

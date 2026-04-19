@@ -12,11 +12,12 @@
 
 use serde::{Deserialize, Serialize};
 use super::retina::Conv2d;
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 // ─── Vector Quantization ───────────────────────────────────
 
 /// Vector Quantization layer with codebook.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct VectorQuantizer {
     /// Codebook: [n_codes × code_dim]
     pub codebook: Vec<f32>,
@@ -158,7 +159,7 @@ impl VectorQuantizer {
 // ─── Transposed Conv2d (for decoder upsampling) ────────────
 
 /// Transposed 2D convolution for upsampling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct ConvTranspose2d {
     /// Weights: [in_channels × out_channels × kh × kw]
     pub weight: Vec<f32>,
@@ -248,7 +249,7 @@ pub struct VqVaeOutput {
 /// Encoder: 3 → 32 → 64 → 128 → code_dim (conv + relu + downsample)
 /// VQ: codebook lookup
 /// Decoder: code_dim → 128 → 64 → 32 → 3 (conv + relu + upsample)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct VqVae {
     // Encoder
     pub enc1: Conv2d,   // 3 → 32, stride 2 (32×32 → 16×16)

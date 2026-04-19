@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
 use modgrad_compute::neuron::{Linear, SimpleRng};
+use wincode_derive::{SchemaRead, SchemaWrite};
 use crate::config::CtmConfig;
 use crate::weights::{CtmWeights, CtmState};
 use crate::forward::ctm_forward;
@@ -117,7 +118,7 @@ pub const VOCAB_MULTIMODAL: usize = ACT_END + 1; // 9134
 // ─── Configuration ─────────────────────────────────────────
 
 /// Describes one inter-region connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Connection {
     /// Source region indices — their activated states are concatenated.
     pub from: Vec<usize>,
@@ -132,7 +133,7 @@ pub struct Connection {
 /// Toggleable auxiliary losses inspired by neuroscience.
 /// Each adds a gradient signal to specific regions on top of the main BPTT loss.
 /// All default to off — enable to test if they help.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct AuxLossConfig {
     /// Cerebellar prediction error: cerebellum region predicts next region outputs.
     /// Loss = MSE between predicted and actual next-tick activations.
@@ -168,7 +169,7 @@ impl Default for AuxLossConfig {
 /// Inspired by Mixture of States (MoS): each destination region
 /// selects its top-k source regions per tick, weighted by a learned
 /// affinity conditioned on (tick, global_sync).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct RouterConfig {
     /// Common routing dimension — all regions project to/from this.
     pub d_route: usize,
@@ -194,7 +195,7 @@ impl Default for RouterConfig {
 ///
 /// Total params ≈ n×d_model×d_route + n×d_route×d_input + sync×n² + ticks×t_dim
 /// For 8 regions: ~40K params (<0.3% of model). True zero-cost.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct RegionalRouter {
     pub config: RouterConfig,
     pub n_regions: usize,
@@ -404,7 +405,7 @@ impl RouterGradients {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct RegionalConfig {
     /// Per-region CTM configs.
     pub regions: Vec<CtmConfig>,
@@ -824,7 +825,7 @@ impl RegionalConfig {
 // ─── Weights ───────────────────────────────────────────────
 
 /// All weights for the regional CTM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct RegionalWeights {
     pub config: RegionalConfig,
 
@@ -2742,7 +2743,7 @@ fn regional_train_step_inner(
 // ─── AdamW Trainer ────────────────────────────────────────
 
 /// Per-parameter AdamW state: first moment, second moment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 struct AdamWBuf {
     m: Vec<f32>,
     v: Vec<f32>,
@@ -2780,7 +2781,7 @@ impl AdamWBuf {
 /// AdamW optimizer state for the entire RegionalCtm.
 /// Uses AdamW for outer weights (embeddings, connections, projections)
 /// and the SDK's built-in SGD for inner CTM region weights.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct RegionalAdamW {
     pub step: usize,
     pub lr: f32,
@@ -4092,9 +4093,10 @@ mod tests {
         let history_before: Vec<usize> = nc.history.clone();
         let rng_before = nc.rng_state;
 
-        // Save to a temp path, then load back.
+        // Save to a temp path (.bin — verifies the bincode roundtrip,
+        // which was broken before the ExitStrategy detagging fix).
         let path = std::env::temp_dir()
-            .join(format!("nc_continuity_{}.json",
+            .join(format!("nc_continuity_{}.bin",
                 std::process::id())).to_string_lossy().into_owned();
         nc.save(&path).expect("save");
         let nc2 = NeuralComputer::load(&path).expect("load");

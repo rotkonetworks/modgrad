@@ -7,6 +7,7 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 use super::ops::dot;
 
@@ -66,7 +67,7 @@ pub fn layer_norm(x: &mut [f32]) {
 // ─── Weight matrices ────────────────────────────────────────
 
 /// Dense linear layer: y = Wx + b
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Linear {
     pub weight: Vec<f32>,  // [out_dim × in_dim] row-major
     pub bias: Vec<f32>,    // [out_dim]
@@ -137,7 +138,7 @@ impl SimpleRng {
 
 /// Per-neuron parallel MLP: each neuron has its own weight matrix.
 /// Input: [n_neurons, memory_length] → Output: [n_neurons, out_per_neuron]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct SuperLinear {
     /// Weights: [n_neurons × out_per_neuron × in_per_neuron]
     pub weights: Vec<f32>,

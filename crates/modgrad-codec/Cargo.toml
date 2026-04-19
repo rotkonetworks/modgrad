@@ -11,3 +11,5 @@ modgrad-persist = { path = "../modgrad-persist" }
 modgrad-traits = { path = "../modgrad-traits" }
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
+wincode = "0.5"
+wincode-derive = "0.4"

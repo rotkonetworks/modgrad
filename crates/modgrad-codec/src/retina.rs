@@ -18,6 +18,7 @@
 //! - Learning is Hebbian (local, no backprop)
 
 use serde::{Deserialize, Serialize};
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 /// Common interface for all sensory adapters.
 pub trait Retina {
@@ -50,7 +51,7 @@ fn simple_rng_normal(state: &mut u64) -> f32 {
 
 /// 2D convolutional layer with Hebbian-compatible design.
 /// Uses small kernels (3×3) like V1 simple cells.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Conv2d {
     /// Weights: [out_channels × in_channels × kh × kw]
     pub weight: Vec<f32>,
@@ -232,7 +233,7 @@ impl Conv2d {
 }
 
 /// 1D convolutional layer for audio processing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Conv1d {
     pub weight: Vec<f32>,  // [out_ch × in_ch × kernel]
     pub bias: Vec<f32>,
@@ -475,7 +476,7 @@ fn adaptive_avg_pool(input: &[f32], channels: usize, h: usize, w: usize) -> Vec<
 /// - V2 (learnable): contours, texture boundaries
 /// - V4 (learnable): shapes, curvature
 /// Pool: global average → observation vector
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct VisualRetina {
     pub v1: Conv2d,     // edges: 3 → 32 channels
     pub v2: Conv2d,     // contours: 32 → 64 channels
@@ -699,7 +700,7 @@ impl Retina for VisualRetina {
 /// Cochlea: frequency decomposition (like mel filterbank)
 /// A1: temporal patterns (1D conv on frequency bands)
 /// A2: abstract audio features (1D conv)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct AuditoryRetina {
     pub cochlea: Conv1d,  // raw waveform → frequency bands
     pub a1: Conv1d,       // frequency → temporal patterns
@@ -759,7 +760,7 @@ impl Retina for AuditoryRetina {
 
 /// Text retina: converts byte stream to observation vectors.
 /// This is our existing embedding table — just wrapped as a Retina.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct TextRetina {
     pub embeddings: Vec<f32>,  // [vocab_size × d_output]
     pub vocab_size: usize,
@@ -808,7 +809,7 @@ impl Retina for TextRetina {
 // with its own performance (surprise, sleep pressure, etc.)
 
 /// A discovered hardware sensor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Sensor {
     /// File path to read (e.g. "/sys/class/hwmon/hwmon2/temp1_input").
     pub path: String,

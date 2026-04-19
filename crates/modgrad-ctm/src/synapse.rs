@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use modgrad_compute::neuron::Linear;
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 // ─── Affine LayerNorm ──────────────────────────────────────
 
@@ -46,7 +47,7 @@ fn silu_vec(x: &mut [f32]) {
 // ─── SynapseBlock ──────────────────────────────────────────
 
 /// One block: Linear → LayerNorm(affine) → SiLU.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct SynapseBlock {
     pub linear: Linear,
     pub ln_gamma: Vec<f32>,
@@ -88,7 +89,7 @@ fn compute_widths(out_dims: usize, min_width: usize, depth: usize) -> Vec<usize>
 }
 
 /// Faithful Ctm U-Net synapse.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct SynapseUNet {
     pub widths: Vec<usize>,
 

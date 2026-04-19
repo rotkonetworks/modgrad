@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use modgrad_compute::neuron::{Linear, SuperLinear, SimpleRng};
 use super::config::CtmConfig;
 use super::synapse::SynapseUNet;
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 /// All trainable weights for the Ctm CTM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct CtmWeights {
     pub config: CtmConfig,
 

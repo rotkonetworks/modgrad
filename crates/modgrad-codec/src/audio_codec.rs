@@ -10,11 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 use super::vqvae::VectorQuantizer;
+use wincode_derive::{SchemaRead, SchemaWrite};
 
 // ─── 1D Convolution ────────────────────────────────────────
 
 /// 1D causal convolution layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct Conv1d {
     /// Weights: [out_channels × in_channels × kernel_size]
     pub weight: Vec<f32>,
@@ -73,7 +74,7 @@ impl Conv1d {
 }
 
 /// 1D transposed convolution for upsampling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct ConvTranspose1d {
     pub weight: Vec<f32>,
     pub bias: Vec<f32>,
@@ -151,7 +152,7 @@ pub struct AudioCodecOutput {
 /// Encoder downsamples by 320× (factors: 2, 4, 5, 8).
 /// At 24kHz: 75 frames/second, each → 1 codebook entry.
 /// Single quantizer with 4096 codes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct AudioCodec {
     // Encoder: 1 → 32 → 64 → 128 → 256 → code_dim
     pub enc1: Conv1d,  // stride 2

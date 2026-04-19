@@ -13,5 +13,7 @@ modgrad-persist = { path = "../modgrad-persist" }
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
 bincode = "1"
+wincode = "0.5"
+wincode-derive = "0.4"
 # Pure-Rust SIMD GEMM (cache-blocked matmul). Same version as modgrad-compute.
 matrixmultiply = "0.3"
