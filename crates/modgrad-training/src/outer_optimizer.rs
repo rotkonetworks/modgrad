@@ -33,7 +33,12 @@
 /// keep their own per-peer state (error-feedback buffers, moments,
 /// communication clients) inside `self`; the trait only specifies
 /// the *step*.
-pub trait OuterOptimizer<P: Clone> {
+///
+/// No bounds on `P`: the trait is purely a protocol. Implementations
+/// that need `Clone`, `Default`, `Serialize`, etc. declare those on
+/// their own `impl` — keeps the interface honest about what the
+/// *trait* needs versus what a *specific implementation* needs.
+pub trait OuterOptimizer<P> {
     /// Called once per outer round, after the inner optimizer has
     /// run its `H` inner steps. Receives the parameters as they
     /// were at round start (`before`) and as inner steps produced
@@ -74,7 +79,7 @@ impl NoOpOuter {
     pub fn rounds(&self) -> u64 { self.rounds }
 }
 
-impl<P: Clone> OuterOptimizer<P> for NoOpOuter {
+impl<P> OuterOptimizer<P> for NoOpOuter {
     fn end_round(&mut self, _before: &P, _after: &mut P) {
         self.rounds += 1;
     }
