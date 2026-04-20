@@ -170,6 +170,136 @@ fn channels_to_ppm(
     write_ppm(path, &grid, gh, gw)
 }
 
+/// Collapse a `[channels × h × w]` activation tensor to a single
+/// `h × w` "where is the retina active" heatmap via per-position
+/// L2 norm across channels. Answers "how strongly does the retina
+/// respond at each spatial location".
+fn layer_norm_map(data: &[f32], channels: usize, h: usize, w: usize) -> Vec<f32> {
+    let mut m = vec![0.0f32; h * w];
+    for c in 0..channels {
+        for i in 0..h * w { m[i] += data[c * h * w + i].powi(2); }
+    }
+    for v in m.iter_mut() { *v = v.sqrt(); }
+    m
+}
+
+/// Convert a `h × w` scalar heatmap into an upscaled RGB image with
+/// a diverging blue-to-red palette (low=blue, high=red) so intensity
+/// is visible at a glance.
+fn heatmap_rgb(vals: &[f32], h: usize, w: usize, upscale: usize) -> Vec<u8> {
+    let (mn, mx) = vals.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+        |(a, b), &v| (a.min(v), b.max(v)));
+    let span = (mx - mn).max(1e-6);
+    let oh = h * upscale;
+    let ow = w * upscale;
+    let mut out = vec![0u8; 3 * oh * ow];
+    for y in 0..h {
+        for x in 0..w {
+            let v = (vals[y * w + x] - mn) / span;
+            let r = (v * 255.0).clamp(0.0, 255.0) as u8;
+            let b = ((1.0 - v) * 255.0).clamp(0.0, 255.0) as u8;
+            let g = ((0.5 - (v - 0.5).abs()) * 200.0).clamp(0.0, 255.0) as u8;
+            for dy in 0..upscale {
+                for dx in 0..upscale {
+                    let off = ((y * upscale + dy) * ow + (x * upscale + dx)) * 3;
+                    out[off] = r;
+                    out[off + 1] = g;
+                    out[off + 2] = b;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Side-by-side panel: input maze + V1/V2/V4 norm heatmaps, all at
+/// matched visual height. Each panel rendered so the output is a
+/// single PPM answering "what does the retina see when shown this
+/// maze". If V1's panel looks like edge-lit walls, V1 is seeing
+/// edges. If V4's panel is approximately input-shaped, V4's encoding
+/// preserves maze structure.
+fn render_combined(
+    path: &Path,
+    pixels: &[f32], ih: usize, iw: usize,
+    v1: &LayerOut, v2: &LayerOut, v4: &LayerOut,
+    upscale: usize,
+) -> std::io::Result<()> {
+    // Match visual heights: input is ih, the layer maps are v1.h etc.
+    // Scale each so they render at the same panel height. Simplest:
+    // scale each panel so its height equals input * upscale.
+    let panel_h = ih * upscale;
+    let input_w_px = iw * upscale;
+    let input_rgb = {
+        let mut rgb = vec![0u8; 3 * panel_h * input_w_px];
+        for y in 0..ih {
+            for x in 0..iw {
+                let r = (pixels[0 * ih * iw + y * iw + x] * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (pixels[1 * ih * iw + y * iw + x] * 255.0).clamp(0.0, 255.0) as u8;
+                let b = (pixels[2 * ih * iw + y * iw + x] * 255.0).clamp(0.0, 255.0) as u8;
+                for dy in 0..upscale {
+                    for dx in 0..upscale {
+                        let off = ((y * upscale + dy) * input_w_px + (x * upscale + dx)) * 3;
+                        rgb[off] = r;
+                        rgb[off + 1] = g;
+                        rgb[off + 2] = b;
+                    }
+                }
+            }
+        }
+        rgb
+    };
+
+    let v1_norm = layer_norm_map(&v1.data, v1.channels, v1.h, v1.w);
+    let v2_norm = layer_norm_map(&v2.data, v2.channels, v2.h, v2.w);
+    let v4_norm = layer_norm_map(&v4.data, v4.channels, v4.h, v4.w);
+
+    // Per-layer upscale chosen so panel height matches input panel_h.
+    let v1_us = panel_h / v1.h;
+    let v2_us = panel_h / v2.h;
+    let v4_us = panel_h / v4.h;
+    let v1_rgb = heatmap_rgb(&v1_norm, v1.h, v1.w, v1_us);
+    let v2_rgb = heatmap_rgb(&v2_norm, v2.h, v2.w, v2_us);
+    let v4_rgb = heatmap_rgb(&v4_norm, v4.h, v4.w, v4_us);
+
+    let v1_w_px = v1.w * v1_us;
+    let v2_w_px = v2.w * v2_us;
+    let v4_w_px = v4.w * v4_us;
+
+    let border = 6usize;
+    let total_w = input_w_px + v1_w_px + v2_w_px + v4_w_px + 5 * border;
+    let total_h = panel_h + 2 * border;
+    let mut canvas = vec![40u8; 3 * total_h * total_w];
+
+    // Each source panel may have a smaller effective height than
+    // `panel_h` because integer-div upscaling can't always hit the
+    // exact target (e.g. panel_h=336, source h=11 → upscale 30 gives
+    // 330 ≠ 336). Blit uses the source's own height; any vertical
+    // slack stays at the background colour.
+    let blit = |canvas: &mut Vec<u8>, src: &[u8], sh: usize, sw: usize, ox: usize| {
+        for y in 0..sh {
+            for x in 0..sw {
+                let s = (y * sw + x) * 3;
+                let d = ((border + y) * total_w + (ox + x)) * 3;
+                canvas[d]     = src[s];
+                canvas[d + 1] = src[s + 1];
+                canvas[d + 2] = src[s + 2];
+            }
+        }
+    };
+
+    let v1_h_px = v1.h * v1_us;
+    let v2_h_px = v2.h * v2_us;
+    let v4_h_px = v4.h * v4_us;
+
+    let mut ox = border;
+    blit(&mut canvas, &input_rgb, panel_h, input_w_px, ox); ox += input_w_px + border;
+    blit(&mut canvas, &v1_rgb,    v1_h_px, v1_w_px,    ox); ox += v1_w_px    + border;
+    blit(&mut canvas, &v2_rgb,    v2_h_px, v2_w_px,    ox); ox += v2_w_px    + border;
+    blit(&mut canvas, &v4_rgb,    v4_h_px, v4_w_px,    ox);
+
+    write_ppm(path, &canvas, total_h, total_w)
+}
+
 /// Render the [3 × h × w] input pixel tensor at scale.
 fn render_input(path: &Path, pixels: &[f32], h: usize, w: usize, upscale: usize) -> std::io::Result<()> {
     let out_h = h * upscale;
@@ -264,6 +394,17 @@ fn dump_condition(
     channels_to_ppm(&out_dir.join("v1.ppm"), &v1.data, v1.channels, v1.h, v1.w, 8,  upscale.max(8))?;
     channels_to_ppm(&out_dir.join("v2.ppm"), &v2.data, v2.channels, v2.h, v2.w, 8,  upscale.max(6))?;
     channels_to_ppm(&out_dir.join("v4.ppm"), &v4.data, v4.channels, v4.h, v4.w, 16, upscale.max(4))?;
+
+    // ── Combined "what does the retina see" view ──
+    // Stack: input  |  V1 norm-map  |  V2 norm-map  |  V4 norm-map
+    // Each norm-map is a single heatmap where pixel value = L2 norm
+    // across channels at that spatial position — "total activation"
+    // at each location. If the retina is seeing walls, walls light up.
+    render_combined(
+        &out_dir.join("combined.ppm"),
+        pixels, retina.input_h, retina.input_w,
+        &v1, &v2, &v4, upscale,
+    )?;
 
     // Summary stats per layer — cheap way to spot a dead layer.
     let stats = |x: &[f32]| {
