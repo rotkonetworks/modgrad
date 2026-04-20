@@ -2296,6 +2296,19 @@ pub fn regional_train_step(
         }
     }
 
+    // After the outermost `.rev()` iteration (tick 0), the router source-
+    // feedback carry holds the gradient that should flow back into the
+    // region_outputs consumed by the tick-0 forward — which are literally
+    // `w.regions[r].start_activated`. No next iteration exists to absorb
+    // it, so drain it into each region's `d_start_activated` accumulator.
+    for i in 0..n_regions {
+        let carry = &d_region_activated_carry[i];
+        let dst = &mut grads.region_grads[i].d_start_activated;
+        for k in 0..dst.len().min(carry.len()) {
+            dst[k] += carry[k];
+        }
+    }
+
     (loss, pred_class)
 }
 
@@ -2864,6 +2877,19 @@ fn regional_train_step_inner(
                     }
                 }
             }
+        }
+    }
+
+    // Drain the tick-0 router source-feedback carry into each region's
+    // `d_start_activated` — same rationale as in `regional_train_step`.
+    // The tick-0 forward read `region_outputs` straight from
+    // `w.regions[r].start_activated`, so whatever the router backward
+    // wrote into the carry at the outermost iteration belongs there.
+    for i in 0..n_regions {
+        let carry = &d_region_activated_carry[i];
+        let dst = &mut grads.region_grads[i].d_start_activated;
+        for k in 0..dst.len().min(carry.len()) {
+            dst[k] += carry[k];
         }
     }
 

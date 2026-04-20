@@ -342,7 +342,7 @@ pub enum Op<'a> {
 
     // ─── fused (Stage 1) ──────────────────────────────────────
 
-    /// Fused synapse forward: matvec → GLU → SiLU → LayerNorm.
+    /// Fused synapse forward: matvec → GLU(halves) → SiLU(inplace) → LayerNorm(no affine).
     /// `weight` has shape [2*out_dim × in_dim] (GLU halves the channel
     /// dim), `bias` has length `2*out_dim`, `x` has length `in_dim`,
     /// and `out` has length `out_dim`.
@@ -351,6 +351,16 @@ pub enum Op<'a> {
     /// intermediate is a backend-private implementation detail. CPU
     /// composes and allocates its own Vec; KFD dispatches the fused
     /// kernel against its preallocated VRAM slot.
+    ///
+    /// **NOT** a fused form of `modgrad_ctm::synapse::SynapseBlock`.
+    /// `SynapseBlock::forward` is Linear → LayerNorm(with learnable
+    /// affine γ/β) → SiLU, no GLU stage. Op::SynapseForward is a
+    /// *different* fused primitive: GLU is present and LayerNorm has
+    /// zero-mean-unit-variance only (no γ/β). Fusing `SynapseBlock`
+    /// through this op would silently drop γ·x+β and insert a GLU
+    /// gate — do not do it. Callers who want the affine-LN sequence
+    /// must compose explicitly: `Op::Matvec` + `Op::LayerNormFwd`
+    /// (which takes gamma/beta) + `Op::SiluFwd`/`SiluFwdInplace`.
     SynapseForward {
         weight: &'a [f32],
         bias: &'a [f32],
@@ -366,6 +376,14 @@ pub enum Op<'a> {
     /// pipeline where weight/bias already handled scaling).
     ///
     /// `n_rows * n_cols` must equal `x.len()`.
+    ///
+    /// **Pure zero-mean / unit-variance normalization only.** This op
+    /// does NOT apply a learnable γ·norm + β affine transform — no
+    /// scale, no shift. Callers that need affine LayerNorm (matching
+    /// PyTorch `nn.LayerNorm(elementwise_affine=True)`, or anything
+    /// carrying trainable `ln_gamma`/`ln_beta` parameters such as
+    /// `modgrad_ctm::synapse::SynapseBlock`) must use
+    /// [`Op::LayerNormFwd`] instead, which takes `gamma`/`beta` slices.
     LayerNormInplace {
         x: &'a mut [f32],
         n_rows: usize,
