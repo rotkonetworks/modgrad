@@ -659,14 +659,15 @@ mod tests {
     fn cpu_declines_q4k() {
         let be = CpuBackend::new();
         let x = [0.0f32; 4];
-        let weight = [0u8; 0]; // empty — won't be dereferenced
+        // Previously built an empty slice from a mis-aligned `[u8; 0]`
+        // via `from_raw_parts` — that's UB (pointer not f32-aligned)
+        // and aborted in debug under Rust 2024. Use a real, aligned,
+        // zero-length slice of f32.
+        let weight: &[f32] = &[];
         let bias = [0.0f32; 4];
         let mut out = [0.0f32; 4];
-        let weight_bytes: &[f32] = unsafe {
-            std::slice::from_raw_parts(weight.as_ptr() as *const f32, 0)
-        };
         let op = Op::Matvec {
-            x: &x, weight: weight_bytes, bias: &bias, out: &mut out,
+            x: &x, weight, bias: &bias, out: &mut out,
             out_dim: 4, in_dim: 4, quant: QuantKind::Q4K,
         };
         assert!(!be.supports(&op));
