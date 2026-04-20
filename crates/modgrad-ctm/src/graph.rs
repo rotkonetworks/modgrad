@@ -247,6 +247,21 @@ pub struct RouterGradients {
     pub tick_embed_grad: Vec<f32>,
     pub route_proj_dw: Vec<f32>,
     pub route_proj_db: Vec<f32>,
+
+    // Scratch buffers — allocated once in `zeros`, reused across every
+    // router backward call in the BPTT outer-tick loop. Flat layouts
+    // replace the old `Vec<Vec<f32>>` nesting; each router-backward just
+    // `.fill(0.0)`s these and indexes with `j * d + k` / `i * n + j`.
+    //
+    // These scratches have exactly the lifetime of the gradients they
+    // feed into (both cleared at the start of a batch), so owning them
+    // here is a straight alloc/lifecycle improvement, not a semantic
+    // change.
+    pub scratch_d_routed: Vec<f32>,       // n * d_route
+    pub scratch_d_projected: Vec<f32>,    // n * d_route
+    pub scratch_d_weights: Vec<f32>,      // n * n
+    pub scratch_d_logits: Vec<f32>,       // n * n
+    pub scratch_d_proj_input: Vec<f32>,   // route_proj.in_dim
 }
 
 impl RegionalRouter {
@@ -399,6 +414,9 @@ impl RegionalRouter {
 
 impl RouterGradients {
     pub fn zeros(router: &RegionalRouter) -> Self {
+        let n = router.n_regions;
+        let d = router.config.d_route;
+        let rp_in = router.route_proj.in_dim;
         Self {
             to_route_dw: router.to_route.iter().map(|l| vec![0.0; l.weight.len()]).collect(),
             to_route_db: router.to_route.iter().map(|l| vec![0.0; l.bias.len()]).collect(),
@@ -407,6 +425,12 @@ impl RouterGradients {
             tick_embed_grad: vec![0.0; router.tick_embed.len()],
             route_proj_dw: vec![0.0; router.route_proj.weight.len()],
             route_proj_db: vec![0.0; router.route_proj.bias.len()],
+
+            scratch_d_routed: vec![0.0; n * d],
+            scratch_d_projected: vec![0.0; n * d],
+            scratch_d_weights: vec![0.0; n * n],
+            scratch_d_logits: vec![0.0; n * n],
+            scratch_d_proj_input: vec![0.0; rp_in],
         }
     }
 
@@ -418,6 +442,8 @@ impl RouterGradients {
         self.tick_embed_grad.fill(0.0);
         self.route_proj_dw.fill(0.0);
         self.route_proj_db.fill(0.0);
+        // Scratch buffers are fresh-zeroed at the start of each backward
+        // call, not here — keeping `zero()` as "reset accumulators" only.
     }
 }
 
@@ -2038,12 +2064,16 @@ pub fn regional_train_step(
             let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
                 &predictions, &lambdas, target, beta);
 
+            // Scratch lifted out of the exit-gate loop; gate.in_dim is
+            // fixed, one buffer serves every tick.
+            let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
             for (t, d_lambda) in d_lambdas.iter().enumerate() {
                 if let Some(ref cache) = tick_caches[t].exit_gate_cache {
                     let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
                     let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                    let _d_sync = crate::train::linear_backward(
-                        gate, &[*d_lambda], cache, gw, gb);
+                    crate::train::linear_backward(
+                        gate, &[*d_lambda], cache, gw, gb,
+                        &mut d_gate_in_scratch);
                 }
             }
         }
@@ -2147,9 +2177,18 @@ pub fn regional_train_step(
             let n = router.n_regions;
             let d = router.config.d_route;
 
+            // Scratch reuse: buffers live on RouterGradients (same lifetime
+            // as the gradients). Zero them instead of re-allocating. Flat
+            // layout: `d_routed[j][k]` → `d_routed[j * d + k]`,
+            // `d_projected[i][dd]` → `d_projected[i * d + dd]`.
+            rg.scratch_d_routed.fill(0.0);
+            rg.scratch_d_projected.fill(0.0);
+            rg.scratch_d_weights.fill(0.0);
+            rg.scratch_d_logits.fill(0.0);
+            rg.scratch_d_proj_input.fill(0.0);
+
             // Per-destination: backprop through from_route Linear
             // Bug 1 fix: use cached `rc.routed[j]` as the Linear input for dW.
-            let mut d_routed = vec![vec![0.0f32; d]; n]; // d_routed[j][d_route]
             for j in 0..n {
                 let d_obs = &d_region_obs[j];
                 if d_obs.is_empty() { continue; }
@@ -2163,29 +2202,30 @@ pub fn regional_train_step(
                     }
                 }
                 // d_routed = W^T @ d_obs
+                let base = j * d;
                 for k in 0..d {
                     for i in 0..fr.out_dim.min(d_obs.len()) {
-                        d_routed[j][k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
+                        rg.scratch_d_routed[base + k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
                     }
                 }
             }
 
             // Backprop through weighted sum and softmax → d_projected_sources, d_weights
-            let mut d_projected = vec![vec![0.0f32; d]; n];
-            let mut d_weights = vec![0.0f32; n * n]; // [source * n + dest]
             for j in 0..n {
+                let rb = j * d;
                 for &i in &rc.selected[j] {
                     let wij = rc.weights[i * n + j];
+                    let pb = i * d;
                     // d_projected[i] += wij * d_routed[j]
                     for dd in 0..d {
-                        d_projected[i][dd] += wij * d_routed[j][dd];
+                        rg.scratch_d_projected[pb + dd] += wij * rg.scratch_d_routed[rb + dd];
                     }
                     // d_weight[i,j] = dot(d_routed[j], projected_sources[i])
                     let mut dw = 0.0f32;
                     for dd in 0..d {
-                        dw += d_routed[j][dd] * rc.projected_sources[i][dd];
+                        dw += rg.scratch_d_routed[rb + dd] * rc.projected_sources[i][dd];
                     }
-                    d_weights[i * n + j] = dw;
+                    rg.scratch_d_weights[i * n + j] = dw;
                 }
             }
 
@@ -2196,11 +2236,12 @@ pub fn regional_train_step(
             for i in 0..n {
                 let tr = &router.to_route[i];
                 let src_in = &rc.region_outputs[i];
+                let pb = i * d;
                 for oi in 0..tr.out_dim.min(d) {
-                    rg.to_route_db[i][oi] += d_projected[i][oi];
+                    rg.to_route_db[i][oi] += rg.scratch_d_projected[pb + oi];
                     for k in 0..tr.in_dim.min(src_in.len()) {
                         rg.to_route_dw[i][oi * tr.in_dim + k] +=
-                            d_projected[i][oi] * src_in[k];
+                            rg.scratch_d_projected[pb + oi] * src_in[k];
                     }
                 }
                 // Source-feedback gradient: contributes to tick t-1's
@@ -2209,22 +2250,21 @@ pub fn regional_train_step(
                 let carry = &mut d_region_activated_carry[i];
                 for k in 0..tr.in_dim.min(carry.len()) {
                     for oi in 0..tr.out_dim.min(d) {
-                        carry[k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                        carry[k] += rg.scratch_d_projected[pb + oi] * tr.weight[oi * tr.in_dim + k];
                     }
                 }
             }
 
             // Softmax backward → d_logits
-            let mut d_logits = vec![0.0f32; n * n];
             for j in 0..n {
                 // Only selected entries contribute
                 let mut wdw_sum = 0.0f32;
                 for &i in &rc.selected[j] {
-                    wdw_sum += rc.weights[i * n + j] * d_weights[i * n + j];
+                    wdw_sum += rc.weights[i * n + j] * rg.scratch_d_weights[i * n + j];
                 }
                 for &i in &rc.selected[j] {
                     let wij = rc.weights[i * n + j];
-                    d_logits[i * n + j] = wij * (d_weights[i * n + j] - wdw_sum);
+                    rg.scratch_d_logits[i * n + j] = wij * (rg.scratch_d_weights[i * n + j] - wdw_sum);
                 }
             }
 
@@ -2232,9 +2272,9 @@ pub fn regional_train_step(
             let rp = &router.route_proj;
             let n_sq = n * n;
             for i in 0..n_sq.min(rp.out_dim) {
-                rg.route_proj_db[i] += d_logits[i];
+                rg.route_proj_db[i] += rg.scratch_d_logits[i];
                 for j in 0..rp.in_dim.min(rc.proj_input.len()) {
-                    rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
+                    rg.route_proj_dw[i * rp.in_dim + j] += rg.scratch_d_logits[i] * rc.proj_input[j];
                 }
             }
 
@@ -2243,10 +2283,9 @@ pub fn regional_train_step(
             // and accumulate the tick-embedding tail into `tick_embed_grad`.
             // The global-sync half is not wired further here (sync pairs are
             // index-based; a backward path through them is a separate commit).
-            let mut d_proj_input = vec![0.0f32; rp.in_dim];
             for j in 0..rp.in_dim {
                 for i in 0..n_sq.min(rp.out_dim) {
-                    d_proj_input[j] += d_logits[i] * rp.weight[i * rp.in_dim + j];
+                    rg.scratch_d_proj_input[j] += rg.scratch_d_logits[i] * rp.weight[i * rp.in_dim + j];
                 }
             }
             let t_idx = t.min(router.max_ticks - 1);
@@ -2254,12 +2293,12 @@ pub fn regional_train_step(
             let n_sync_grad = rp.in_dim.saturating_sub(t_dim);
             for k in 0..t_dim {
                 let idx = n_sync_grad + k;
-                if idx < d_proj_input.len() {
-                    rg.tick_embed_grad[t_idx * t_dim + k] += d_proj_input[idx];
+                if idx < rg.scratch_d_proj_input.len() {
+                    rg.tick_embed_grad[t_idx * t_dim + k] += rg.scratch_d_proj_input[idx];
                 }
             }
-            // TODO(future): d_proj_input[..n_sync_grad] is d_global_sync — add
-            // a backward path through the global-sync pairs.
+            // TODO(future): scratch_d_proj_input[..n_sync_grad] is d_global_sync —
+            // add a backward path through the global-sync pairs.
         } else {
             // Fixed connection synapse backward
             for (ci, conn) in cfg.connections.iter().enumerate().rev() {
@@ -2593,12 +2632,14 @@ fn regional_train_step_inner(
             let beta = cfg.exit_strategy.beta();
             let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
                 &predictions, &lambdas, target, beta);
+            let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
             for (t, d_lambda) in d_lambdas.iter().enumerate() {
                 if let Some(ref cache) = tick_caches[t].exit_gate_cache {
                     let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
                     let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                    let _d_sync = crate::train::linear_backward(
-                        gate, &[*d_lambda], cache, gw, gb);
+                    crate::train::linear_backward(
+                        gate, &[*d_lambda], cache, gw, gb,
+                        &mut d_gate_in_scratch);
                 }
             }
         }
@@ -2721,8 +2762,16 @@ fn regional_train_step_inner(
             let n = router.n_regions;
             let d = router.config.d_route;
 
+            // Reuse scratch buffers on RouterGradients (same lifetime as
+            // the gradients). Flat layout: d_routed[j][k] → [j*d+k],
+            // d_projected[i][dd] → [i*d+dd].
+            rg.scratch_d_routed.fill(0.0);
+            rg.scratch_d_projected.fill(0.0);
+            rg.scratch_d_weights.fill(0.0);
+            rg.scratch_d_logits.fill(0.0);
+            rg.scratch_d_proj_input.fill(0.0);
+
             // Bug 1: from_route weight grad now uses cached rc.routed[j].
-            let mut d_routed = vec![vec![0.0f32; d]; n];
             for j in 0..n {
                 let d_obs = &d_region_obs[j];
                 if d_obs.is_empty() { continue; }
@@ -2734,26 +2783,27 @@ fn regional_train_step_inner(
                         rg.from_route_dw[j][i * fr.in_dim + k] += d_obs[i] * routed_j[k];
                     }
                 }
+                let base = j * d;
                 for k in 0..d {
                     for i in 0..fr.out_dim.min(d_obs.len()) {
-                        d_routed[j][k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
+                        rg.scratch_d_routed[base + k] += d_obs[i] * fr.weight[i * fr.in_dim + k];
                     }
                 }
             }
 
-            let mut d_projected = vec![vec![0.0f32; d]; n];
-            let mut d_weights = vec![0.0f32; n * n];
             for j in 0..n {
+                let rb = j * d;
                 for &i in &rc.selected[j] {
                     let wij = rc.weights[i * n + j];
+                    let pb = i * d;
                     for dd in 0..d {
-                        d_projected[i][dd] += wij * d_routed[j][dd];
+                        rg.scratch_d_projected[pb + dd] += wij * rg.scratch_d_routed[rb + dd];
                     }
                     let mut dw = 0.0f32;
                     for dd in 0..d {
-                        dw += d_routed[j][dd] * rc.projected_sources[i][dd];
+                        dw += rg.scratch_d_routed[rb + dd] * rc.projected_sources[i][dd];
                     }
-                    d_weights[i * n + j] = dw;
+                    rg.scratch_d_weights[i * n + j] = dw;
                 }
             }
 
@@ -2763,48 +2813,47 @@ fn regional_train_step_inner(
             for i in 0..n {
                 let tr = &router.to_route[i];
                 let src_in = &rc.region_outputs[i];
+                let pb = i * d;
                 for oi in 0..tr.out_dim.min(d) {
-                    rg.to_route_db[i][oi] += d_projected[i][oi];
+                    rg.to_route_db[i][oi] += rg.scratch_d_projected[pb + oi];
                     for k in 0..tr.in_dim.min(src_in.len()) {
                         rg.to_route_dw[i][oi * tr.in_dim + k] +=
-                            d_projected[i][oi] * src_in[k];
+                            rg.scratch_d_projected[pb + oi] * src_in[k];
                     }
                 }
                 let carry = &mut d_region_activated_carry[i];
                 for k in 0..tr.in_dim.min(carry.len()) {
                     for oi in 0..tr.out_dim.min(d) {
-                        carry[k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                        carry[k] += rg.scratch_d_projected[pb + oi] * tr.weight[oi * tr.in_dim + k];
                     }
                 }
             }
 
-            let mut d_logits = vec![0.0f32; n * n];
             for j in 0..n {
                 let mut wdw_sum = 0.0f32;
                 for &i in &rc.selected[j] {
-                    wdw_sum += rc.weights[i * n + j] * d_weights[i * n + j];
+                    wdw_sum += rc.weights[i * n + j] * rg.scratch_d_weights[i * n + j];
                 }
                 for &i in &rc.selected[j] {
                     let wij = rc.weights[i * n + j];
-                    d_logits[i * n + j] = wij * (d_weights[i * n + j] - wdw_sum);
+                    rg.scratch_d_logits[i * n + j] = wij * (rg.scratch_d_weights[i * n + j] - wdw_sum);
                 }
             }
 
             let rp = &router.route_proj;
             let n_sq = n * n;
             for i in 0..n_sq.min(rp.out_dim) {
-                rg.route_proj_db[i] += d_logits[i];
+                rg.route_proj_db[i] += rg.scratch_d_logits[i];
                 for j in 0..rp.in_dim.min(rc.proj_input.len()) {
-                    rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
+                    rg.route_proj_dw[i * rp.in_dim + j] += rg.scratch_d_logits[i] * rc.proj_input[j];
                 }
             }
 
             // Bug 4: propagate d_logits back through route_proj input; tail
             // of the input is the tick embedding slice → tick_embed_grad.
-            let mut d_proj_input = vec![0.0f32; rp.in_dim];
             for j in 0..rp.in_dim {
                 for i in 0..n_sq.min(rp.out_dim) {
-                    d_proj_input[j] += d_logits[i] * rp.weight[i * rp.in_dim + j];
+                    rg.scratch_d_proj_input[j] += rg.scratch_d_logits[i] * rp.weight[i * rp.in_dim + j];
                 }
             }
             let t_idx = t.min(router.max_ticks - 1);
@@ -2812,8 +2861,8 @@ fn regional_train_step_inner(
             let n_sync_grad = rp.in_dim.saturating_sub(t_dim);
             for k in 0..t_dim {
                 let idx = n_sync_grad + k;
-                if idx < d_proj_input.len() {
-                    rg.tick_embed_grad[t_idx * t_dim + k] += d_proj_input[idx];
+                if idx < rg.scratch_d_proj_input.len() {
+                    rg.tick_embed_grad[t_idx * t_dim + k] += rg.scratch_d_proj_input[idx];
                 }
             }
         } else {
@@ -3833,12 +3882,14 @@ impl modgrad_traits::Brain for RegionalBrain {
             let beta = cfg.exit_strategy.beta();
             let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
                 &predictions, &lambdas, 0, beta);
+            let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
             for (t, d_lambda) in d_lambdas.iter().enumerate() {
                 if let Some(ref ec) = cache.tick_caches[t].exit_gate_cache {
                     let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
                     let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                    let _d_sync = crate::train::linear_backward(
-                        gate, &[*d_lambda], ec, gw, gb);
+                    crate::train::linear_backward(
+                        gate, &[*d_lambda], ec, gw, gb,
+                        &mut d_gate_in_scratch);
                 }
             }
         }

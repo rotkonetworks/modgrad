@@ -23,7 +23,12 @@ pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, Li
     (linear.forward(x), LinearCache { input: x.to_vec() })
 }
 
-/// Returns d_input. Accumulates into d_weight, d_bias.
+/// Writes d_input into the caller-supplied scratch slice. Accumulates
+/// into d_weight, d_bias.
+///
+/// Contract: caller guarantees `d_input.len() == linear.in_dim`. The
+/// scratch is fully overwritten (not accumulated into) — callers that
+/// need accumulation do it themselves after the call.
 ///
 /// d_weight (outer product) and d_input (matvec_t) dispatch through the
 /// `Backend` registry: each op routes to the fastest registered backend
@@ -36,11 +41,14 @@ pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, Li
 pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
-) -> Vec<f32> {
+    d_input: &mut [f32],
+) {
     use modgrad_device::backend::ops;
 
     let in_dim = linear.in_dim;
     let out_dim = linear.out_dim;
+    debug_assert_eq!(d_input.len(), in_dim,
+        "linear_backward: d_input scratch must match linear.in_dim");
 
     // d_bias: a trivial accumulation, not worth an Op variant.
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
@@ -48,10 +56,9 @@ pub(crate) fn linear_backward(
     // d_weight[i,j] += d_out[i] * input[j]
     ops::outer_product_acc(d_out, &cache.input, d_weight, out_dim, in_dim);
 
-    // d_input = W^T @ d_out
-    let mut d_input = vec![0.0f32; in_dim];
-    ops::matvec_t(d_out, &linear.weight, &mut d_input, out_dim, in_dim);
-    d_input
+    // d_input = W^T @ d_out (overwrites)
+    for v in d_input.iter_mut() { *v = 0.0; }
+    ops::matvec_t(d_out, &linear.weight, d_input, out_dim, in_dim);
 }
 
 // ─── Affine LayerNorm ──────────────────────────────────────
@@ -204,7 +211,10 @@ fn block_backward(
     let d_silu = silu_backward(d_out, &cache.pre_silu);
     let d_ln = affine_ln_backward(&d_silu, &cache.ln, &block.ln_gamma,
         &mut grads.d_gamma, &mut grads.d_beta);
-    linear_backward(&block.linear, &d_ln, &cache.lin, &mut grads.d_weight, &mut grads.d_bias)
+    let mut d_input = vec![0.0f32; block.linear.in_dim];
+    linear_backward(&block.linear, &d_ln, &cache.lin,
+        &mut grads.d_weight, &mut grads.d_bias, &mut d_input);
+    d_input
 }
 
 // ─── SynapseUNet ───────────────────────────────────────────
@@ -468,7 +478,8 @@ fn mha_backward(
     let scale = 1.0 / (d_head as f32).sqrt();
 
     // out_proj backward
-    let d_concat = linear_backward(out_proj, d_out, &cache.out_lin, d_out_w, d_out_b);
+    let mut d_concat = vec![0.0f32; out_proj.in_dim];
+    linear_backward(out_proj, d_out, &cache.out_lin, d_out_w, d_out_b, &mut d_concat);
 
     // Per-head backward
     let mut d_q_full = vec![0.0f32; d_input];
@@ -1130,13 +1141,17 @@ pub fn train_step(
         let (loss, d_preds, d_lambdas) = adaptive_exit_loss(
             &predictions, &lambdas, target, beta);
 
-        // Backward through exit gate (detached from main BPTT)
+        // Backward through exit gate (detached from main BPTT).
+        // Scratch lifted out of the loop — gate.in_dim is constant across
+        // ticks, so one allocation serves every d_lambda.
+        let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
         for (tick, d_lambda) in d_lambdas.iter().enumerate() {
             if let Some(ref gate_lin) = tick_caches[tick].exit_gate_lin {
-                let d_gate_logit = vec![*d_lambda];
+                let d_gate_logit = [*d_lambda];
                 let gw = grads.exit_gate_w.as_mut().unwrap();
                 let gb = grads.exit_gate_b.as_mut().unwrap();
-                let _d_sync = linear_backward(gate, &d_gate_logit, gate_lin, gw, gb);
+                linear_backward(gate, &d_gate_logit, gate_lin, gw, gb,
+                    &mut d_gate_in_scratch);
             }
         }
 
@@ -1147,16 +1162,22 @@ pub fn train_step(
 
     // ── Backward through tick loop ──
     let mut d_activated = vec![0.0f32; d];
+    // Hot-loop scratches: shapes are constant across ticks, so one
+    // allocation each kills ~2 Vec allocs per tick.
+    let mut d_sync_out_scratch = vec![0.0f32; w.output_proj.in_dim];
+    let mut d_sync_action_scratch = vec![0.0f32; w.q_proj.in_dim];
 
     for tick in (0..cfg.iterations).rev() {
         let tc = &tick_caches[tick];
 
         // output_proj backward
-        let d_sync_out = linear_backward(&w.output_proj, &d_preds[tick], &tc.out_lin,
-            &mut grads.out_proj_w, &mut grads.out_proj_b);
+        linear_backward(&w.output_proj, &d_preds[tick], &tc.out_lin,
+            &mut grads.out_proj_w, &mut grads.out_proj_b,
+            &mut d_sync_out_scratch);
+        let d_sync_out: &[f32] = &d_sync_out_scratch;
 
         // Sync out backward → d_activated
-        let d_from_sync_out = sync_backward(&d_sync_out, &tc.activated_post, &tc.beta_out,
+        let d_from_sync_out = sync_backward(d_sync_out, &tc.activated_post, &tc.beta_out,
             &w.sync_out_left, &w.sync_out_right, d);
         for i in 0..d { d_activated[i] += d_from_sync_out[i]; }
 
@@ -1188,8 +1209,10 @@ pub fn train_step(
             &mut grads.mha_out_w, &mut grads.mha_out_b);
 
         // q_proj backward → d_sync_action
-        let d_sync_action = linear_backward(&w.q_proj, &d_q, &tc.q_lin,
-            &mut grads.q_proj_w, &mut grads.q_proj_b);
+        linear_backward(&w.q_proj, &d_q, &tc.q_lin,
+            &mut grads.q_proj_w, &mut grads.q_proj_b,
+            &mut d_sync_action_scratch);
+        let d_sync_action: &[f32] = &d_sync_action_scratch;
 
         // Sync action backward → d_activated_prev
         let d_from_sync_action = sync_backward(&d_sync_action, &tc.activated_prev, &tc.beta_action,
@@ -1420,14 +1443,19 @@ impl Brain for Ctm {
 
         let mut grads = Self::zero_gradients(w);
         let mut d_activated = vec![0.0f32; d];
+        // Hot-loop scratches — same pattern as `train_step` above.
+        let mut d_sync_out_scratch = vec![0.0f32; w.output_proj.in_dim];
+        let mut d_sync_action_scratch = vec![0.0f32; w.q_proj.in_dim];
 
         for tick in (0..cfg.iterations).rev() {
             let tc = &cache.tick_caches[tick];
 
-            let d_sync_out = linear_backward(&w.output_proj, &d_predictions[tick], &tc.out_lin,
-                &mut grads.out_proj_w, &mut grads.out_proj_b);
+            linear_backward(&w.output_proj, &d_predictions[tick], &tc.out_lin,
+                &mut grads.out_proj_w, &mut grads.out_proj_b,
+                &mut d_sync_out_scratch);
+            let d_sync_out: &[f32] = &d_sync_out_scratch;
 
-            let d_from_sync_out = sync_backward(&d_sync_out, &tc.activated_post, &tc.beta_out,
+            let d_from_sync_out = sync_backward(d_sync_out, &tc.activated_post, &tc.beta_out,
                 &w.sync_out_left, &w.sync_out_right, d);
             for i in 0..d { d_activated[i] += d_from_sync_out[i]; }
 
@@ -1449,10 +1477,12 @@ impl Brain for Ctm {
                 &mut grads.mha_in_w, &mut grads.mha_in_b,
                 &mut grads.mha_out_w, &mut grads.mha_out_b);
 
-            let d_sync_action = linear_backward(&w.q_proj, &d_q, &tc.q_lin,
-                &mut grads.q_proj_w, &mut grads.q_proj_b);
+            linear_backward(&w.q_proj, &d_q, &tc.q_lin,
+                &mut grads.q_proj_w, &mut grads.q_proj_b,
+                &mut d_sync_action_scratch);
+            let d_sync_action: &[f32] = &d_sync_action_scratch;
 
-            let d_from_sync_action = sync_backward(&d_sync_action, &tc.activated_prev, &tc.beta_action,
+            let d_from_sync_action = sync_backward(d_sync_action, &tc.activated_prev, &tc.beta_action,
                 &w.sync_action_left, &w.sync_action_right, d);
 
             d_activated = vec![0.0f32; d];
@@ -1551,6 +1581,9 @@ pub fn backward_from_activated(
     // Accumulate d_kv across all ticks (gradient w.r.t. KV tokens)
     let mut d_kv_accumulated = vec![0.0f32; cache.n_tokens * d_in];
 
+    // Hot-loop scratch — q_proj.in_dim is constant across ticks.
+    let mut d_sync_action_scratch = vec![0.0f32; w.q_proj.in_dim];
+
     for tick in (0..k).rev() {
         let tc = &cache.tick_caches[tick];
 
@@ -1601,10 +1634,12 @@ pub fn backward_from_activated(
             }
         }
 
-        let d_sync_action = linear_backward(&w.q_proj, &d_q, &tc.q_lin,
-            &mut grads.q_proj_w, &mut grads.q_proj_b);
+        linear_backward(&w.q_proj, &d_q, &tc.q_lin,
+            &mut grads.q_proj_w, &mut grads.q_proj_b,
+            &mut d_sync_action_scratch);
+        let d_sync_action: &[f32] = &d_sync_action_scratch;
 
-        let d_from_sync_action = sync_backward(&d_sync_action, &tc.activated_prev, &tc.beta_action,
+        let d_from_sync_action = sync_backward(d_sync_action, &tc.activated_prev, &tc.beta_action,
             &w.sync_action_left, &w.sync_action_right, d);
 
         // Propagate to previous tick
