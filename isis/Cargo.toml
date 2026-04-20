@@ -18,10 +18,12 @@ name = "isisd"
 path = "src/isisd.rs"
 
 [features]
-# The isis binary is the end-user entry point, so the runtime defaults
-# live here: ROCm + CUDA enabled by default, KFD opt-in. Opt out with
-# `--no-default-features` for a CPU-only build.
-default = ["rocm", "cuda"]
+# The isis binary is the end-user entry point. CUDA is default-on
+# because cudarc uses fallback-dynamic-loading and builds cleanly on
+# any host. ROCm is opt-in until modgrad-device/rocm.rs is ported
+# from `#[link]` to libloading — see crates/modgrad-device/Cargo.toml
+# for the background. Opt out with `--no-default-features` for CPU-only.
+default = ["cuda"]
 onnx = ["isis-runtime/onnx", "modgrad-io/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 sdp  = ["isis-runtime/sdp"]

@@ -6,10 +6,11 @@ description = "isis runtime — the default brain built on the modgrad SDK"
 license = "MIT"
 
 [features]
-# Runtime defaults match the top-level modgrad crate: ROCm + CUDA so a
-# plain `cargo build -p isis-runtime` gets a binary that works on either
-# AMD or NVIDIA hardware.
-default = ["rocm", "cuda"]
+# Defaults match the top-level modgrad crate: CUDA is default-on
+# (dynamic-loading cudarc, builds on any host). ROCm is opt-in via
+# `--features rocm` until rocm.rs is ported from `#[link]` to
+# libloading and stops demanding libamdhip64/libhipblas at link time.
+default = ["cuda"]
 cuda = ["modgrad-device/cuda"]
 rocm = ["modgrad-device/rocm"]
 kfd  = ["modgrad-device/kfd"]
