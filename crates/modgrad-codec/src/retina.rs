@@ -116,6 +116,63 @@ impl Conv2d {
         self.weight.len() + self.bias.len()
     }
 
+    /// Transpose (adjoint) convolution.
+    ///
+    /// Inverts the spatial geometry of `forward`: given activations on
+    /// the output grid `[out_ch × out_h × out_w]`, scatter them through
+    /// the kernel weights back onto the input grid `[in_ch × in_h × in_w]`.
+    ///
+    /// This is the operation Hoel's "overfitted brain" hypothesis needs:
+    /// a top-down pass where noise seeded at a high cortical layer is
+    /// projected back down to pixel space, producing synthesized
+    /// "dream" input that is sparse, hallucinatory, and coherent with
+    /// the model's learned priors — the stochastic-dropout-like signal
+    /// dreams are theorised to inject into the perceptual hierarchy.
+    ///
+    /// Callers must supply `in_h`, `in_w` — these are the spatial dims
+    /// of the original forward-input, which `forward` collapsed to
+    /// `out_h`, `out_w` according to `stride`/`padding`. Adjoint
+    /// restores them exactly.
+    pub fn transpose_forward(
+        &self, input: &[f32], out_h: usize, out_w: usize,
+        in_h: usize, in_w: usize,
+    ) -> Vec<f32> {
+        let k = self.kernel_size;
+        let s = self.stride;
+        let p = self.padding;
+        assert_eq!(input.len(), self.out_channels * out_h * out_w,
+            "transpose_forward: input shape mismatch");
+        let mut output = vec![0.0f32; self.in_channels * in_h * in_w];
+
+        for oc in 0..self.out_channels {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let val = input[oc * out_h * out_w + oh * out_w + ow];
+                    if val == 0.0 { continue; }
+                    for ic in 0..self.in_channels {
+                        for kh in 0..k {
+                            for kw in 0..k {
+                                let ih = (oh * s + kh) as isize - p as isize;
+                                let iw = (ow * s + kw) as isize - p as isize;
+                                if ih >= 0 && ih < in_h as isize
+                                    && iw >= 0 && iw < in_w as isize
+                                {
+                                    let w_idx = oc * (self.in_channels * k * k)
+                                        + ic * (k * k) + kh * k + kw;
+                                    output[ic * in_h * in_w
+                                        + ih as usize * in_w
+                                        + iw as usize]
+                                        += val * self.weight[w_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        output
+    }
+
     /// Hebbian sparse coding update (Olshausen & Field 1996).
     ///
     /// For each spatial position, extract the input patch, encode through
@@ -644,6 +701,86 @@ impl VisualRetina {
 
         (tokens, n_tokens, channels)
     }
+
+    /// Spatial dims of each stage's output, given the retina's
+    /// configured input size. Returns (h1, w1, h2, w2, h4, w4).
+    /// Useful when you need to seed dream-pixel synthesis at a
+    /// specific layer without running a full forward probe.
+    pub fn stage_dims(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let (h, w) = (self.input_h, self.input_w);
+        let out_dim = |in_h: usize, k: usize, s: usize, p: usize| (in_h + 2 * p - k) / s + 1;
+        let (k1, s1, p1) = (self.v1.kernel_size, self.v1.stride, self.v1.padding);
+        let (k2, s2, p2) = (self.v2.kernel_size, self.v2.stride, self.v2.padding);
+        let (k4, s4, p4) = (self.v4.kernel_size, self.v4.stride, self.v4.padding);
+        let h1 = out_dim(h, k1, s1, p1);
+        let w1 = out_dim(w, k1, s1, p1);
+        let h2 = out_dim(h1, k2, s2, p2);
+        let w2 = out_dim(w1, k2, s2, p2);
+        let h4 = out_dim(h2, k4, s4, p4);
+        let w4 = out_dim(w2, k4, s4, p4);
+        (h1, w1, h2, w2, h4, w4)
+    }
+
+    /// Dream-pixel synthesis (Hoel 2021).
+    ///
+    /// Seeds V4 with sparse noise, projects top-down through the
+    /// learned cortex via the transpose operator of each conv layer,
+    /// and returns a synthesized `[3 × input_h × input_w]` pixel
+    /// tensor. Output is the adjoint image of the seed — sparse,
+    /// hallucinatory, and statistically coherent with the model's
+    /// learned V2/V4 weights, which is exactly the "corrupted,
+    /// top-down generated sensory input" the overfitted-brain
+    /// hypothesis posits as the regularization signal of sleep.
+    ///
+    /// `sparsity_k`: number of active (non-zero) V4 channels per
+    /// spatial position — the Hoel-style dropout/sparsity factor.
+    /// Typical: 8 of 128 for maze-scale retinas.
+    ///
+    /// `seed`: RNG seed so the same seed produces the same dream.
+    pub fn dream_pixel(&self, seed: u64, sparsity_k: usize) -> Vec<f32> {
+        let (h1, w1, h2, w2, h4, w4) = self.stage_dims();
+
+        // 1. Seed V4 with sparse Gaussian noise. K winners per spatial
+        //    cell, rest zero — matches V2/V4's Hebbian sparse code.
+        let ch4 = self.v4.out_channels;
+        let mut v4_seed = vec![0.0f32; ch4 * h4 * w4];
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for y in 0..h4 {
+            for x in 0..w4 {
+                let spatial = y * w4 + x;
+                // draw ch4 noise samples
+                let mut vals: Vec<(usize, f32)> = (0..ch4)
+                    .map(|c| {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let u = ((rng >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                        (c, u)
+                    })
+                    .collect();
+                // keep top-K by magnitude
+                vals.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+                for &(c, v) in vals.iter().take(sparsity_k) {
+                    v4_seed[c * h4 * w4 + spatial] = v;
+                }
+            }
+        }
+
+        // 2. V4 adjoint: [128 × h4 × w4] → [64 × h2 × w2]
+        let v2_grid = self.v4.transpose_forward(&v4_seed, h4, w4, h2, w2);
+        // ReLU-ish in reverse: nonlinearity was forward leaky_relu;
+        // for synthesis, we keep the linear adjoint as-is — adding a
+        // nonlinearity here would break the adjoint identity and
+        // invent distribution-shifted outputs.
+
+        // 3. V2 adjoint: [64 × h2 × w2] → [32 × h1 × w1]
+        let v1_grid = self.v2.transpose_forward(&v2_grid, h2, w2, h1, w1);
+
+        // 4. V1 adjoint: [32 × h1 × w1] → [3 × input_h × input_w]
+        let pixel_grid = self.v1.transpose_forward(
+            &v1_grid, h1, w1, self.input_h, self.input_w,
+        );
+
+        pixel_grid
+    }
 }
 
 impl modgrad_traits::Encoder for VisualRetina {
@@ -1132,4 +1269,100 @@ impl Retina for ProprioceptiveRetina {
     fn d_output(&self) -> usize { self.d_out }
 
     fn param_count(&self) -> usize { self.projection.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dot(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    fn fill_rand(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// The adjoint identity: for any x, y of matching shapes,
+    ///   <forward(x), y> == <x, transpose_forward(y)>
+    /// This is *the* correctness test for a transpose operator — it
+    /// holds iff the two operations are true adjoints of each other
+    /// under the Euclidean inner product. Failing this means the
+    /// Hoel dream-pixel synthesis is not inverting what encode did.
+    #[test]
+    fn transpose_is_forward_adjoint_stride1() {
+        let conv = Conv2d::new(3, 5, 3, 1, 1);
+        let (in_h, in_w) = (7usize, 7usize);
+        let (out_h, out_w) = (7usize, 7usize); // stride 1, same padding
+
+        let x = fill_rand(3 * in_h * in_w, 42);
+        let y = fill_rand(5 * out_h * out_w, 1337);
+
+        let fx = {
+            let (out, h, w) = conv.forward(&x, in_h, in_w);
+            assert_eq!((h, w), (out_h, out_w));
+            // forward() adds bias — subtract it to isolate the linear op
+            let mut out = out;
+            for oc in 0..conv.out_channels {
+                for hw in 0..out_h * out_w {
+                    out[oc * out_h * out_w + hw] -= conv.bias[oc];
+                }
+            }
+            out
+        };
+        let ty = conv.transpose_forward(&y, out_h, out_w, in_h, in_w);
+
+        let lhs = dot(&fx, &y);
+        let rhs = dot(&x, &ty);
+        let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-6);
+        assert!(rel < 1e-5, "adjoint identity failed: <Ax,y>={lhs} <x,A*y>={rhs} rel={rel}");
+    }
+
+    #[test]
+    fn dream_pixel_shape_and_nonzero() {
+        let retina = VisualRetina::maze(11, 11);
+        let pixels = retina.dream_pixel(1234, 8);
+        assert_eq!(pixels.len(), 3 * 11 * 11);
+        // With random seeding and a learned-but-random cortex, the
+        // synthesized image should be non-degenerate — not all zero,
+        // not all one. Variance > 0 is the cheapest sanity check.
+        let mean: f32 = pixels.iter().sum::<f32>() / pixels.len() as f32;
+        let var: f32 = pixels.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+            / pixels.len() as f32;
+        assert!(var > 1e-6, "dream_pixel produced a near-constant image (var={var})");
+    }
+
+    #[test]
+    fn transpose_is_forward_adjoint_stride2() {
+        let conv = Conv2d::new(2, 4, 3, 2, 1);
+        let (in_h, in_w) = (8usize, 8usize);
+        let (out_h, out_w) = (4usize, 4usize); // stride 2
+
+        let x = fill_rand(2 * in_h * in_w, 42);
+        let y = fill_rand(4 * out_h * out_w, 1337);
+
+        let fx = {
+            let (out, h, w) = conv.forward(&x, in_h, in_w);
+            assert_eq!((h, w), (out_h, out_w));
+            let mut out = out;
+            for oc in 0..conv.out_channels {
+                for hw in 0..out_h * out_w {
+                    out[oc * out_h * out_w + hw] -= conv.bias[oc];
+                }
+            }
+            out
+        };
+        let ty = conv.transpose_forward(&y, out_h, out_w, in_h, in_w);
+
+        let lhs = dot(&fx, &y);
+        let rhs = dot(&x, &ty);
+        let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-6);
+        assert!(rel < 1e-5, "adjoint identity failed (stride 2): <Ax,y>={lhs} <x,A*y>={rhs} rel={rel}");
+    }
 }
