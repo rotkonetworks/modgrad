@@ -1,0 +1,12 @@
+[package]
+name = "modgrad-prompts"
+version = "0.1.0"
+edition = "2024"
+description = "Canonical system/user prompts used across the modgrad stack."
+license = "MIT"
+
+[lib]
+name = "modgrad_prompts"
+path = "src/lib.rs"
+
+[dependencies]

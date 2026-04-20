@@ -9,6 +9,7 @@ members = [
     "crates/modgrad-ffn",
     "crates/modgrad-memory",
     "crates/modgrad-codec",
+    "crates/modgrad-prompts",
     "crates/modgrad-data",
     "crates/modgrad-training",
     "crates/modgrad-transformer",
