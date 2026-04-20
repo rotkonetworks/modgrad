@@ -129,6 +129,13 @@ impl Conv2d {
     /// - Update: W += lr * (patch - recon) ⊗ sparse_activations
     ///
     /// Fully local (Hebbian): each weight updates from pre/post activity only.
+    ///
+    /// Serial online update: each position sees the weights updated by
+    /// prior positions within the same call. A rayon-parallel batch
+    /// variant was tried but changes semantics non-trivially (sum-over-
+    /// positions ≠ online, average-over-positions underscales) — needs
+    /// calibration (likely 1/sqrt(N) scaling) before it can ship.
+    /// Leaving serial here; use GPU conv2d for real-scale speedups.
     pub fn hebbian_update(&mut self, input: &[f32], h: usize, w: usize, lr: f32, sparsity_k: usize) {
         let k = self.kernel_size;
         let s = self.stride;
