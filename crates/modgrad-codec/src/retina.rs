@@ -708,6 +708,149 @@ impl VisualRetina {
         let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
         self.train_hebbian(&refs, epochs, lr)
     }
+
+    /// Enter an LSD-style cortical state: a temporary plasticity
+    /// window driven by stochastic top-down activity, with a
+    /// configurable wear-off.
+    ///
+    /// Mechanism — 5-HT2A agonism reduces the precision of top-down
+    /// priors and raises entropy in higher visual cortex
+    /// (Carhart-Harris & Friston 2019, REBUS). Stochastic V4 activity
+    /// then propagates downward through learned feedback weights
+    /// producing structured (not random) hallucinations. The cortex
+    /// is simultaneously in a plasticity-enhanced state (Gu et al.
+    /// 2023, psilocybin reopens critical-period plasticity in mouse
+    /// visual cortex), so it learns from those hallucinations. When
+    /// the drug metabolises (~8 hours for LSD, ~4 for psilocybin),
+    /// receptors desensitise and the cortex partially integrates the
+    /// trip's delta — controlled here by `integration ∈ [0, 1]`:
+    ///
+    ///   - `0.0` — full wear-off, a clean diagnostic probe (cortex
+    ///     returns to pre-trip weights, useful for measuring what the
+    ///     trip would have done without committing).
+    ///   - `1.0` — full permanent integration (equivalent to the
+    ///     legacy `train_dream`, which empirically overfits OOD:
+    ///     see experiments in examples/mazes).
+    ///   - `0.1..0.5` — biologically realistic: partial integration.
+    ///     HPPD (Hallucinogen Persisting Perception Disorder) is the
+    ///     failure mode where integration is too high and the cortex
+    ///     cannot return to baseline perceptual function.
+    ///
+    /// Returns an `TripReport` with weight-delta diagnostics so the
+    /// caller can verify the trip actually changed something (non-zero
+    /// pre-integration delta) and that wear-off actually wore off
+    /// (scaled post-integration delta).
+    pub fn lsd(&mut self, cfg: LsdConfig) -> TripReport {
+        let integration = cfg.integration.clamp(0.0, 1.0);
+
+        // Snapshot the "sober" V2/V4 state. V1 is fixed; no snapshot.
+        let v2_before = self.v2.weight.clone();
+        let v4_before = self.v4.weight.clone();
+
+        // Elevated plasticity during the trip.
+        let tripping_lr = cfg.lr * cfg.plasticity_boost;
+        let per_epoch_energies = self.train_dream(
+            cfg.duration, cfg.epochs, tripping_lr, cfg.dose, cfg.seed,
+        );
+
+        // Measure the peak (pre-integration) delta — how far the
+        // cortex strayed during the trip.
+        let peak_v2_delta = l2_diff(&self.v2.weight, &v2_before);
+        let peak_v4_delta = l2_diff(&self.v4.weight, &v4_before);
+
+        // Wear-off: interpolate back toward the sober snapshot.
+        //   W_final = integration * W_trip + (1 - integration) * W_sober
+        // integration=0 fully reverts; integration=1 keeps the trip.
+        if integration < 1.0 {
+            let alpha = integration;
+            let beta = 1.0 - alpha;
+            for (w, &w_pre) in self.v2.weight.iter_mut().zip(&v2_before) {
+                *w = alpha * *w + beta * w_pre;
+            }
+            for (w, &w_pre) in self.v4.weight.iter_mut().zip(&v4_before) {
+                *w = alpha * *w + beta * w_pre;
+            }
+        }
+
+        let post_v2_delta = l2_diff(&self.v2.weight, &v2_before);
+        let post_v4_delta = l2_diff(&self.v4.weight, &v4_before);
+
+        TripReport {
+            peak_v2_delta,
+            peak_v4_delta,
+            post_v2_delta,
+            post_v4_delta,
+            integration,
+            per_epoch_energies,
+        }
+    }
+}
+
+fn l2_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+}
+
+/// Configuration for `VisualRetina::lsd`.
+///
+/// Field mapping to the pharmacological analog:
+///   - `dose`        → top-K sparsity of the V4 seed. Higher K = more
+///                     active channels per spatial cell = richer
+///                     hallucination. Typical: 8–16 of 128.
+///   - `duration`    → number of synthesized "dream" images processed
+///                     during the trip.
+///   - `epochs`      → passes over the dream bank (Hebbian update
+///                     rounds).
+///   - `lr`          → base Hebbian rate (sober baseline).
+///   - `plasticity_boost` → multiplier on `lr` during the trip. The
+///                     drug-induced elevation of cortical plasticity.
+///                     1.0 = no boost; 2.0–4.0 = biologically modest;
+///                     >10.0 = microdosing fantasy.
+///   - `integration` → [0, 1]. Fraction of the trip's weight delta
+///                     retained after wear-off. See `lsd` docs.
+///   - `seed`        → RNG seed — deterministic trip for reproducibility.
+#[derive(Debug, Clone, Copy)]
+pub struct LsdConfig {
+    pub dose: usize,
+    pub duration: usize,
+    pub epochs: usize,
+    pub lr: f32,
+    pub plasticity_boost: f32,
+    pub integration: f32,
+    pub seed: u64,
+}
+
+impl Default for LsdConfig {
+    /// Conservative default: moderate dose, short duration, single
+    /// epoch, normal plasticity, low integration (mostly a probe).
+    fn default() -> Self {
+        Self {
+            dose: 8,
+            duration: 200,
+            epochs: 1,
+            lr: 2e-4,
+            plasticity_boost: 1.0,
+            integration: 0.2,
+            seed: 0,
+        }
+    }
+}
+
+/// Diagnostic report from `VisualRetina::lsd`.
+///
+/// `peak_*_delta` is the L2 distance between the trip's peak weights
+/// and the pre-trip snapshot — how far the cortex moved during the
+/// drug's action. `post_*_delta` is the same measurement after
+/// wear-off — how far the cortex settled from baseline once the drug
+/// metabolised. For a well-posed trip, `peak > post` and the ratio
+/// approximates the `integration` parameter.
+#[derive(Debug, Clone)]
+pub struct TripReport {
+    pub peak_v2_delta: f32,
+    pub peak_v4_delta: f32,
+    pub post_v2_delta: f32,
+    pub post_v4_delta: f32,
+    pub integration: f32,
+    pub per_epoch_energies: Vec<f32>,
 }
 
 impl VisualRetina {
@@ -1374,6 +1517,66 @@ mod tests {
         let rhs = dot(&x, &ty);
         let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-6);
         assert!(rel < 1e-5, "adjoint identity failed: <Ax,y>={lhs} <x,A*y>={rhs} rel={rel}");
+    }
+
+    #[test]
+    fn lsd_integration_zero_fully_reverts() {
+        let mut retina = VisualRetina::maze(11, 11);
+        let v4_sober: Vec<f32> = retina.v4.weight.clone();
+        let v2_sober: Vec<f32> = retina.v2.weight.clone();
+
+        let report = retina.lsd(LsdConfig {
+            dose: 8, duration: 50, epochs: 1, lr: 1e-4,
+            plasticity_boost: 2.0, integration: 0.0, seed: 42,
+        });
+
+        // The trip did something — peak deltas must be non-zero, else
+        // we aren't testing wear-off, we're testing a no-op.
+        assert!(report.peak_v4_delta > 1e-4,
+            "trip didn't move V4: peak_v4_delta={}", report.peak_v4_delta);
+
+        // Post-integration delta must be ~0 — cortex fully returned
+        // to the sober snapshot. Float roundoff tolerance only.
+        assert!(report.post_v4_delta < 1e-5,
+            "integration=0 left V4 drifted: post_v4_delta={}", report.post_v4_delta);
+        assert!(report.post_v2_delta < 1e-5,
+            "integration=0 left V2 drifted: post_v2_delta={}", report.post_v2_delta);
+
+        // Weights themselves match the snapshot bit-for-bit under tolerance.
+        let max_v4_diff: f32 = retina.v4.weight.iter().zip(&v4_sober)
+            .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let max_v2_diff: f32 = retina.v2.weight.iter().zip(&v2_sober)
+            .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_v4_diff < 1e-6, "V4 max residual = {max_v4_diff}");
+        assert!(max_v2_diff < 1e-6, "V2 max residual = {max_v2_diff}");
+    }
+
+    #[test]
+    fn lsd_integration_one_equals_train_dream() {
+        // integration=1.0 is the legacy-train_dream equivalent path.
+        // Running lsd with integration=1 should leave the cortex at
+        // the same state train_dream would have — modulo the fact
+        // that lsd uses plasticity_boost as an lr multiplier.
+        let mut a = VisualRetina::maze(11, 11);
+        let mut b = VisualRetina::maze(11, 11);
+
+        // Seed deterministically so both start from the same random init.
+        // VisualRetina::new uses a deterministic RNG under the hood, so
+        // fresh constructions from the same params match bit-for-bit.
+        for (x, y) in a.v4.weight.iter().zip(&b.v4.weight) {
+            assert_eq!(x, y, "fresh retinas should have identical weights");
+        }
+
+        a.lsd(LsdConfig {
+            dose: 8, duration: 50, epochs: 1, lr: 1e-4,
+            plasticity_boost: 1.0, integration: 1.0, seed: 42,
+        });
+        b.train_dream(50, 1, 1e-4, 8, 42);
+
+        let v4_diff: f32 = a.v4.weight.iter().zip(&b.v4.weight)
+            .map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(v4_diff < 1e-6,
+            "lsd(integration=1) diverged from train_dream on V4: max diff {v4_diff}");
     }
 
     #[test]
