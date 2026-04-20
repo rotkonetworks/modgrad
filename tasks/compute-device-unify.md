@@ -1,17 +1,9 @@
 # `modgrad-compute` × `modgrad-device` — layering audit + staged unification
 
-**Design doc + task breakdown (v2 — decisions encoded).**
+**Design doc + task breakdown.**
 Owner: @hdevalence (lead) · Reviewers: @redshiftzero (correctness) + @koute (perf) + @micay (defensive)
 
-v1 → v2 delta: addressed nine adversarial-review gaps. `DeviceBuffer` is
-now backend-affine (not cross-backend). Layering is explicit. Scratch
-removed from `Op::SynapseForward`. `BatchedOptimizer` moved to `ops::`
-layer. Deprecation-window fiction dropped — atomic migration only.
-Global-state stance committed. Test mitigations for gfx1102-absent CI.
-Tolerance + long-horizon convergence bar set. Stage 1 failure-mode
-decision criterion encoded.
-
----
+Working document — edit in place. Git log is the change trail.
 
 ## Motivation
 
