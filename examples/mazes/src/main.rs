@@ -44,6 +44,10 @@ fn main() {
     let mut budget_secs: Option<u64> = None;
     let mut train_bank_path: Option<String> = None;
     let mut test_bank_path: Option<String> = None;
+    let mut hebbian_epochs = 0usize;
+    let mut hebbian_samples = 500usize;
+    let mut hebbian_lr = 2e-4f32;
+    let mut ood_size = 0usize;
 
     let mut i = 1;
     while i < args.len() {
@@ -68,6 +72,10 @@ fn main() {
             "--budget" => { budget_secs = Some(args[i+1].parse().unwrap()); i += 2; }
             "--load-mazes" => { train_bank_path = Some(args[i+1].clone()); i += 2; }
             "--load-mazes-test" => { test_bank_path = Some(args[i+1].clone()); i += 2; }
+            "--hebbian-epochs" => { hebbian_epochs = args[i+1].parse().unwrap(); i += 2; }
+            "--hebbian-samples" => { hebbian_samples = args[i+1].parse().unwrap(); i += 2; }
+            "--hebbian-lr" => { hebbian_lr = args[i+1].parse().unwrap(); i += 2; }
+            "--ood-size" => { ood_size = args[i+1].parse().unwrap(); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -108,7 +116,7 @@ fn main() {
                route_len={route_len} batch={batch_size}");
 
     // ── Encoder: visual retina → spatial tokens ──
-    let encoder = VisualRetina::maze(maze_size, maze_size);
+    let mut encoder = VisualRetina::maze(maze_size, maze_size);
     let token_dim = encoder.token_dim();
 
     // Probe token count with dummy image
@@ -116,6 +124,24 @@ fn main() {
     let probe = encoder.encode(&dummy);
     eprintln!("Encoder: {maze_size}×{maze_size} pixels → {} spatial tokens × {token_dim}-dim",
         probe.n_tokens);
+
+    // ── Optional Hebbian pretraining of cortex (V2, V4) ──
+    // V1 stays fixed (evolved). V2/V4 learn unsupervised sparse-coding on
+    // the task pixel distribution before the brain sees anything.
+    if hebbian_epochs > 0 {
+        let t0 = std::time::Instant::now();
+        let mut pretrain_rng = MazeRng::new(seed ^ 0xA5A5);
+        let mut bank: Vec<Vec<f32>> = Vec::with_capacity(hebbian_samples);
+        while bank.len() < hebbian_samples {
+            let m = generate_maze(maze_size, &mut pretrain_rng);
+            if m.path_length < 3 { continue; }
+            bank.push(render_maze(&m));
+        }
+        let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
+        eprintln!("Hebbian pretraining: {hebbian_samples} mazes × {hebbian_epochs} epochs (lr={hebbian_lr})");
+        encoder.train_hebbian(&refs, hebbian_epochs, hebbian_lr);
+        eprintln!("Hebbian pretraining done in {:.1}s", t0.elapsed().as_secs_f32());
+    }
 
     // ── Brain: CTM ──
     let out_dims = route_len * N_DIRECTIONS;
@@ -248,9 +274,41 @@ fn main() {
 
     // ── Evaluation ──
     let training_seconds = t_train_start.elapsed().as_secs_f32();
-    eprintln!("\n--- Evaluation (200 mazes) ---");
-    eval(&w, &encoder, loss_fn, maze_size, route_len, seed + 999,
+    eprintln!("\n--- Evaluation (200 mazes, size={maze_size}) ---");
+    let id_stats = eval(&w, &encoder, loss_fn, maze_size, route_len, seed + 999,
          autoresearch_summary, training_seconds, step, w.n_params());
+
+    // ── OOD evaluation: larger mazes than training, same brain weights ──
+    // The Hoel generalization test: if regularization (dreams, etc.) helps,
+    // the gap between in-distribution and OOD accuracy should shrink.
+    if ood_size > 0 && ood_size != maze_size {
+        let ood_size = ood_size | 1;
+        eprintln!("\n--- OOD Evaluation (200 mazes, size={ood_size}) ---");
+        let ood_encoder = VisualRetina::maze(ood_size, ood_size);
+        let ood_stats = eval(&w, &ood_encoder, loss_fn, ood_size, route_len, seed + 1999,
+             false, training_seconds, step, w.n_params());
+        eprintln!("\n--- Generalization gap (ID={maze_size} → OOD={ood_size}) ---");
+        eprintln!("First step:  ID={:.1}% OOD={:.1}% gap={:.1} pp",
+            id_stats.first_step_acc * 100.0,
+            ood_stats.first_step_acc * 100.0,
+            (id_stats.first_step_acc - ood_stats.first_step_acc) * 100.0);
+        eprintln!("Per-step:    ID={:.1}% OOD={:.1}% gap={:.1} pp",
+            id_stats.per_step_acc * 100.0,
+            ood_stats.per_step_acc * 100.0,
+            (id_stats.per_step_acc - ood_stats.per_step_acc) * 100.0);
+        eprintln!("Prefix len:  ID={:.2} OOD={:.2} gap={:.2}",
+            id_stats.avg_prefix, ood_stats.avg_prefix,
+            id_stats.avg_prefix - ood_stats.avg_prefix);
+    }
+}
+
+/// Eval summary returned by `eval` so callers can compute gaps between
+/// in-distribution and out-of-distribution runs (Hoel generalization test).
+#[derive(Debug, Clone, Copy)]
+struct EvalStats {
+    first_step_acc: f32,
+    per_step_acc: f32,
+    avg_prefix: f32,
 }
 
 fn eval(
@@ -258,7 +316,7 @@ fn eval(
     maze_size: usize, route_len: usize, seed: u64,
     autoresearch_summary: bool, training_seconds: f32,
     num_steps: usize, num_params: usize,
-) {
+) -> EvalStats {
     let t_eval_start = std::time::Instant::now();
     let mut rng = MazeRng::new(seed);
     let n_eval = 200;
@@ -344,6 +402,15 @@ fn eval(
         eprintln!("  (task=mazes size={maze_size} route_len={route_len}, \
                    val_bpb = 1 - first_step_acc = {:.6})",
                    1.0 - first_step_acc);
+    }
+
+    let per_step_acc = if route_total > 0 {
+        route_correct as f32 / route_total as f32
+    } else { 0.0 };
+    EvalStats {
+        first_step_acc,
+        per_step_acc,
+        avg_prefix,
     }
 }
 
