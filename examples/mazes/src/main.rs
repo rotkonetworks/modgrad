@@ -19,7 +19,7 @@ use modgrad_ctm::graph::{
     RegionalConfig, RegionalWeights, RegionalGradients, RegionalState,
     RegionalAdamW, RegionalBrain, regional_forward,
 };
-use modgrad_codec::retina::VisualRetina;
+use modgrad_codec::retina::{LsdConfig, VisualRetina};
 use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination};
 
 fn main() {
@@ -50,6 +50,10 @@ fn main() {
     let mut dream_epochs = 0usize;
     let mut dream_sparsity_k = 8usize;
     let mut ood_size = 0usize;
+    // --lsd-integration F: if <1.0 AND --dream-epochs>0, route dream
+    // pretraining through VisualRetina::lsd with this integration. 1.0
+    // falls through to the legacy permanent train_dream path.
+    let mut lsd_integration = 1.0f32;
 
     let mut i = 1;
     while i < args.len() {
@@ -80,11 +84,13 @@ fn main() {
             "--dream-epochs" => { dream_epochs = args[i+1].parse().unwrap(); i += 2; }
             "--dream-sparsity-k" => { dream_sparsity_k = args[i+1].parse().unwrap(); i += 2; }
             "--ood-size" => { ood_size = args[i+1].parse().unwrap(); i += 2; }
+            "--lsd-integration" => { lsd_integration = args[i+1].parse().unwrap(); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
                 eprintln!("             [--imagination] [--brain] [--pain] [--plural] [--csv]");
                 eprintln!("             [--cereb-size N] [--frozen-cereb]");
+                eprintln!("             [--dream-epochs N] [--lsd-integration F (default 1.0)]");
                 return;
             }
             _ => { i += 1; }
@@ -154,10 +160,31 @@ fn main() {
     // then refine with dream augmentation.
     if dream_epochs > 0 {
         let t0 = std::time::Instant::now();
-        eprintln!("Dream pretraining: {hebbian_samples} synthesized × {dream_epochs} epochs \
-                   (lr={hebbian_lr}, sparsity_k={dream_sparsity_k})");
-        encoder.train_dream(hebbian_samples, dream_epochs, hebbian_lr,
-                            dream_sparsity_k, seed);
+        if lsd_integration < 1.0 {
+            // LSD path: dream synthesis with a wear-off window. The cortex
+            // tours the dream manifold then interpolates back toward pre-trip
+            // weights by (1 - integration). integration=0.0 fully reverts,
+            // integration=1.0 would equal the legacy train_dream branch.
+            eprintln!("LSD pretraining: {hebbian_samples} dreams × {dream_epochs} epochs \
+                       (lr={hebbian_lr}, sparsity_k={dream_sparsity_k}, integration={lsd_integration:.2})");
+            let report = encoder.lsd(LsdConfig {
+                dose: dream_sparsity_k,
+                duration: hebbian_samples,
+                epochs: dream_epochs,
+                lr: hebbian_lr,
+                plasticity_boost: 1.0,
+                integration: lsd_integration,
+                seed,
+            });
+            eprintln!("  trip: peak v2={:.4} v4={:.4} / post v2={:.4} v4={:.4}",
+                report.peak_v2_delta, report.peak_v4_delta,
+                report.post_v2_delta, report.post_v4_delta);
+        } else {
+            eprintln!("Dream pretraining: {hebbian_samples} synthesized × {dream_epochs} epochs \
+                       (lr={hebbian_lr}, sparsity_k={dream_sparsity_k})");
+            encoder.train_dream(hebbian_samples, dream_epochs, hebbian_lr,
+                                dream_sparsity_k, seed);
+        }
         eprintln!("Dream pretraining done in {:.1}s", t0.elapsed().as_secs_f32());
     }
 
