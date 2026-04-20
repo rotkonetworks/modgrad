@@ -548,6 +548,73 @@ pub struct VisualRetina {
     pub pool_dim: usize, // output of global avg pool = 128
     pub input_h: usize,
     pub input_w: usize,
+    /// Pharmacological state of V2/V4 — modulates `lsd()` effect.
+    /// `#[serde(default)]` so older checkpoints without this field
+    /// still load as a sober-baseline retina.
+    #[serde(default)]
+    pub receptors: ReceptorState,
+}
+
+/// Receptor-level state of the visual cortex.
+///
+/// Models the availability of 5-HT2A receptors (the primary target of
+/// classical psychedelics). In biology: each trip binds and
+/// desensitises receptors for hours-to-days; full sensitivity recovers
+/// over days. In code: `ht2a` is a scalar in [0, 1], consumed by
+/// `VisualRetina::lsd` to scale effective plasticity, and restored by
+/// `VisualRetina::tick(rate)`.
+///
+/// This is intentionally a separate abstraction from the transmitter-
+/// level `modgrad_ctm::bio::Neuromodulators` — that models *how much
+/// serotonin is in the synaptic cleft*, this models *how many
+/// receptors are available to bind it*. A cortex can have normal
+/// transmitter levels and desensitised receptors, which is exactly
+/// what produces psychedelic tolerance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub struct ReceptorState {
+    /// 5-HT2A receptor availability. 1.0 = sober baseline, fully
+    /// sensitive. Decreases with `lsd()` use, recovers with `tick()`.
+    /// Floored at 0.05 so even a chronically-tripping cortex retains
+    /// minimal responsiveness — matches biology: complete receptor
+    /// wipe-out doesn't happen from drug exposure alone.
+    pub ht2a: f32,
+    /// Steps since last call to `lsd`. Useful for callers that gate
+    /// re-dosing on a minimum recovery window. `u64::MAX` until the
+    /// first trip.
+    pub steps_since_trip: u64,
+}
+
+impl Default for ReceptorState {
+    fn default() -> Self {
+        Self { ht2a: 1.0, steps_since_trip: u64::MAX }
+    }
+}
+
+impl ReceptorState {
+    /// Consume receptors for a trip. `dose_fraction` is the effective
+    /// dose in [0, 1+] (caller-normalised — a full-sensitisation
+    /// dose is 1.0, smaller is sub-clinical, larger is heroic but not
+    /// linearly more effective due to the floor and the cap below).
+    /// Returns the effective potency after availability scaling:
+    ///   potency = ht2a * min(dose_fraction, 1.0)
+    /// Then desensitises: ht2a *= 1 - 0.25 * min(dose, 1.0).
+    pub fn apply_dose(&mut self, dose_fraction: f32) -> f32 {
+        let dose = dose_fraction.max(0.0).min(1.0);
+        let potency = self.ht2a * dose;
+        let desens = 0.25 * dose;
+        self.ht2a = (self.ht2a * (1.0 - desens)).max(0.05);
+        self.steps_since_trip = 0;
+        potency
+    }
+
+    /// Advance time — exponential recovery toward full sensitivity.
+    /// Typical rates: 1e-3 for step-level aging (full recovery over
+    /// several thousand steps), 1e-2 for coarse-grained time.
+    pub fn tick(&mut self, recovery_rate: f32) {
+        self.steps_since_trip = self.steps_since_trip.saturating_add(1);
+        let rate = recovery_rate.clamp(0.0, 1.0);
+        self.ht2a += rate * (1.0 - self.ht2a);
+    }
 }
 
 impl VisualRetina {
@@ -570,7 +637,8 @@ impl VisualRetina {
         let v2 = Conv2d::new(32, 64, 3, 2, 1);
         let v4 = Conv2d::new(64, 128, 3, 2, 1);
 
-        Self { v1, v2, v4, pool_dim: 128, input_h: h, input_w: w }
+        Self { v1, v2, v4, pool_dim: 128, input_h: h, input_w: w,
+               receptors: ReceptorState::default() }
     }
 
     /// For CIFAR-10 (32×32×3)
@@ -590,7 +658,8 @@ impl VisualRetina {
         init_retinal_filters(&mut v1);
         let v2 = Conv2d::new(32, 64, 3, 1, 1);    // stride 1: preserve spatial
         let v4 = Conv2d::new(64, 128, 3, 1, 1);   // stride 1: preserve spatial
-        Self { v1, v2, v4, pool_dim: 128, input_h: h, input_w: w }
+        Self { v1, v2, v4, pool_dim: 128, input_h: h, input_w: w,
+               receptors: ReceptorState::default() }
     }
 
     /// Train the visual retina with Hebbian sparse coding.
@@ -743,12 +812,23 @@ impl VisualRetina {
     pub fn lsd(&mut self, cfg: LsdConfig) -> TripReport {
         let integration = cfg.integration.clamp(0.0, 1.0);
 
+        // Consume receptors — desensitises for future trips.
+        // `dose` is top-K channels out of 128; we normalise into a
+        // [0,1] dose fraction using 16 channels as "full dose."
+        // Above that, more dose doesn't bind more receptors (saturation).
+        let dose_fraction = (cfg.dose as f32 / 16.0).min(1.0);
+        let potency = self.receptors.apply_dose(dose_fraction);
+
         // Snapshot the "sober" V2/V4 state. V1 is fixed; no snapshot.
         let v2_before = self.v2.weight.clone();
         let v4_before = self.v4.weight.clone();
 
-        // Elevated plasticity during the trip.
-        let tripping_lr = cfg.lr * cfg.plasticity_boost;
+        // Elevated plasticity during the trip, scaled by receptor
+        // availability. A desensitised cortex receives less trip.
+        // Floor at 0.01 of base lr so repeat callers still see *some*
+        // movement (matches biology: tolerance ≠ zero-effect).
+        let effective_boost = (cfg.plasticity_boost * potency).max(0.01);
+        let tripping_lr = cfg.lr * effective_boost;
         let per_epoch_energies = self.train_dream(
             cfg.duration, cfg.epochs, tripping_lr, cfg.dose, cfg.seed,
         );
@@ -832,6 +912,18 @@ impl Default for LsdConfig {
             integration: 0.2,
             seed: 0,
         }
+    }
+}
+
+impl VisualRetina {
+    /// Advance pharmacological time: recover 5-HT2A receptor
+    /// sensitivity toward baseline. Callers invoke this between
+    /// trips to model the hours-to-days receptor recovery of real
+    /// psychedelic pharmacology. For a typical training loop, one
+    /// `tick_receptors` per gradient step with rate ~1e-3 gives
+    /// ~thousand-step recovery to ≥95% availability.
+    pub fn tick_receptors(&mut self, recovery_rate: f32) {
+        self.receptors.tick(recovery_rate);
     }
 }
 
@@ -1552,31 +1644,74 @@ mod tests {
     }
 
     #[test]
-    fn lsd_integration_one_equals_train_dream() {
-        // integration=1.0 is the legacy-train_dream equivalent path.
-        // Running lsd with integration=1 should leave the cortex at
-        // the same state train_dream would have — modulo the fact
-        // that lsd uses plasticity_boost as an lr multiplier.
-        let mut a = VisualRetina::maze(11, 11);
-        let mut b = VisualRetina::maze(11, 11);
+    fn lsd_tachyphylaxis_second_trip_smaller() {
+        // The biological invariant: without recovery between trips,
+        // the second trip must move the cortex LESS than the first.
+        // This is what the receptor state buys us — a natural
+        // self-limiting mechanism against spam dosing.
+        let mut retina = VisualRetina::maze(11, 11);
+        let cfg = LsdConfig {
+            dose: 12, duration: 50, epochs: 1, lr: 1e-4,
+            plasticity_boost: 4.0, integration: 1.0, seed: 42,
+        };
 
-        // Seed deterministically so both start from the same random init.
-        // VisualRetina::new uses a deterministic RNG under the hood, so
-        // fresh constructions from the same params match bit-for-bit.
-        for (x, y) in a.v4.weight.iter().zip(&b.v4.weight) {
-            assert_eq!(x, y, "fresh retinas should have identical weights");
-        }
+        let r1 = retina.lsd(cfg);
+        let availability_after_1 = retina.receptors.ht2a;
 
-        a.lsd(LsdConfig {
-            dose: 8, duration: 50, epochs: 1, lr: 1e-4,
-            plasticity_boost: 1.0, integration: 1.0, seed: 42,
+        // Second trip — no tick_receptors between, so receptors are
+        // still desensitised.
+        let r2 = retina.lsd(cfg);
+        let availability_after_2 = retina.receptors.ht2a;
+
+        // Receptors must have desensitised further.
+        assert!(availability_after_2 < availability_after_1,
+            "second trip didn't desensitise further: {availability_after_1} → {availability_after_2}");
+        // The second trip's cortical delta must be smaller.
+        // peak_v4_delta is cumulative here since integration=1 keeps
+        // each trip's changes, so compare the per-trip movement via
+        // post - peak on each report's snapshot — but since both
+        // reports were taken against different baselines, the cleaner
+        // comparison is: r2.peak_v4_delta is measured from BEFORE
+        // the second trip (already containing trip 1's delta),
+        // so r2 < r1 directly.
+        assert!(r2.peak_v4_delta < r1.peak_v4_delta,
+            "second trip moved V4 more than first: r1={} r2={}",
+            r1.peak_v4_delta, r2.peak_v4_delta);
+    }
+
+    #[test]
+    fn lsd_receptor_recovery_via_tick() {
+        // After a trip, `tick_receptors` should restore sensitivity
+        // toward 1.0 asymptotically. High rate should hit ≥95% fast.
+        let mut retina = VisualRetina::maze(11, 11);
+        retina.lsd(LsdConfig {
+            dose: 16, duration: 20, epochs: 1, lr: 1e-4,
+            plasticity_boost: 1.0, integration: 0.0, seed: 1,
         });
-        b.train_dream(50, 1, 1e-4, 8, 42);
+        let after_trip = retina.receptors.ht2a;
+        assert!(after_trip < 0.9, "heavy dose didn't desensitise much: {after_trip}");
 
-        let v4_diff: f32 = a.v4.weight.iter().zip(&b.v4.weight)
-            .map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-        assert!(v4_diff < 1e-6,
-            "lsd(integration=1) diverged from train_dream on V4: max diff {v4_diff}");
+        // 500 ticks at rate=0.01 should asymptotically approach 1.0:
+        // 1 - (1 - a)(1 - r)^n → ~0.993 for a=0.75, r=0.01, n=500.
+        for _ in 0..500 { retina.tick_receptors(0.01); }
+        assert!(retina.receptors.ht2a > 0.95,
+            "receptors didn't recover: {}", retina.receptors.ht2a);
+    }
+
+    #[test]
+    fn lsd_availability_floor() {
+        // Even with many heavy trips and no recovery, availability
+        // never hits zero — biology doesn't wipe out receptors from
+        // agonist exposure alone.
+        let mut retina = VisualRetina::maze(11, 11);
+        for i in 0..20 {
+            retina.lsd(LsdConfig {
+                dose: 16, duration: 10, epochs: 1, lr: 1e-5,
+                plasticity_boost: 1.0, integration: 0.0, seed: i,
+            });
+        }
+        assert!(retina.receptors.ht2a >= 0.05,
+            "availability went below floor: {}", retina.receptors.ht2a);
     }
 
     #[test]
