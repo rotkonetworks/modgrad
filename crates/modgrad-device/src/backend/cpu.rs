@@ -140,8 +140,8 @@ impl Backend for CpuBackend {
                 sync_backward_scatter(args);
                 Ok(())
             }
-            Op::TraceShiftFwd { trace, new_val, d_model, memory_length } => {
-                trace_shift_fwd(trace, new_val, *d_model, *memory_length);
+            Op::TraceRotateInplace { trace, new_val, d_model, memory_length } => {
+                trace_rotate_inplace(trace, new_val, *d_model, *memory_length);
                 Ok(())
             }
         }
@@ -434,7 +434,7 @@ fn sync_backward_scatter(args: &mut SyncBackwardScatterArgs<'_>) {
     }
 }
 
-fn trace_shift_fwd(trace: &mut [f32], new_val: &[f32], d_model: usize, memory_length: usize) {
+fn trace_rotate_inplace(trace: &mut [f32], new_val: &[f32], d_model: usize, memory_length: usize) {
     // Shift each neuron's trace history by one slot; write new_val into slot 0.
     for n in 0..d_model {
         let base = n * memory_length;

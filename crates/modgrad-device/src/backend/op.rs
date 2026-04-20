@@ -321,7 +321,7 @@ pub enum Op<'a> {
 
     /// Rotate trace memory: shift column-wise by one and write `new_val`
     /// into the most-recent column. In-place on `trace`.
-    TraceShiftFwd {
+    TraceRotateInplace {
         trace: &'a mut [f32],
         new_val: &'a [f32],
         d_model: usize,
@@ -355,7 +355,7 @@ impl<'a> Op<'a> {
             Op::SuperLinearBwdDx { .. } => "superlinear_bwd_dx",
             Op::SyncUpdateFwd { .. } => "sync_update_fwd",
             Op::SyncBackwardScatter(_) => "sync_backward_scatter",
-            Op::TraceShiftFwd { .. } => "trace_shift_fwd",
+            Op::TraceRotateInplace { .. } => "trace_rotate_inplace",
         }
     }
 }
@@ -384,7 +384,7 @@ impl<'a> Op<'a> {
 //   SuperLinearBwdDx       → superlinear_bwd_dx
 //   SyncUpdateFwd          → sync_update_fwd
 //   SyncBackwardScatter    → sync_backward_scatter
-//   TraceShiftFwd          → trace_shift_fwd
+//   TraceRotateInplace     → trace_shift_fwd
 //
 // Debug/test kernels (test_store, addr_dump, coop_test, lds_test,
 // matmul_dbg) are intentionally NOT exposed — they're dispatch

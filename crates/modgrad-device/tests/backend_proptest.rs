@@ -385,11 +385,11 @@ proptest! {
         }
     }
 
-    // ─── TraceShiftFwd ───────────────────────────────────────
+    // ─── TraceRotateInplace ──────────────────────────────────
     // In-place rotation of per-neuron memory. Non-trivial because it
     // mutates `trace` (both a new value is pushed and old values shift).
     #[test]
-    fn prop_trace_shift_fwd_parity(
+    fn prop_trace_rotate_inplace_parity(
         d_model in 1usize..=64,
         memory_length in 2usize..=32,
         seed in 0u64..u64::MAX,
@@ -406,7 +406,7 @@ proptest! {
 
         for backend in &bs {
             let mut trace = trace_init.clone();
-            let mut op = Op::TraceShiftFwd {
+            let mut op = Op::TraceRotateInplace {
                 trace: &mut trace, new_val: &new_val,
                 d_model, memory_length,
             };

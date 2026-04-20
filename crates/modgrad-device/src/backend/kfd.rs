@@ -111,11 +111,11 @@ impl Backend for KfdBackend {
             // GluFwd: input has length 2*half; gate on that.
             Op::GluFwd { x, .. }  if x.len() >= 64 && x.len() % 64 == 0 => true,
             Op::SgdUpdate { w, .. } if w.len() >= 32 && w.len() % 32 == 0 => true,
-            // TraceShiftFwd: proptest found divergence at non-aligned
+            // TraceRotateInplace: proptest found divergence at non-aligned
             // (d_model, memory_length) e.g. (3, 27). Gate on total
             // elements being a multiple of 32 (wavefront). Production
             // shapes (d_model × memory_length in {32×8, 512×64}) clear this.
-            Op::TraceShiftFwd { d_model, memory_length, .. }
+            Op::TraceRotateInplace { d_model, memory_length, .. }
                 if d_model * memory_length >= 32
                     && (d_model * memory_length) % 32 == 0 => true,
             // KFD outer_product: proptest finds divergence at many
@@ -225,7 +225,7 @@ impl Backend for KfdBackend {
                 try_result(accel::try_sgd_update(w, &mut grads_copy, *lr), "sgd_update")
             }
 
-            Op::TraceShiftFwd { trace, new_val, d_model, memory_length } => try_result(
+            Op::TraceRotateInplace { trace, new_val, d_model, memory_length } => try_result(
                 accel::try_trace_shift(trace, new_val, *d_model as u32, *memory_length as u32),
                 "trace_shift",
             ),
