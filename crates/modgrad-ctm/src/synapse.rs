@@ -16,32 +16,30 @@ use serde::{Deserialize, Serialize};
 use modgrad_compute::neuron::Linear;
 use wincode_derive::{SchemaRead, SchemaWrite};
 
-// ─── Affine LayerNorm ──────────────────────────────────────
+// ─── Affine LayerNorm (now backend-dispatched) ─────────────
 
 /// LayerNorm with learnable affine parameters (gamma, beta).
 /// Matches PyTorch nn.LayerNorm default: elementwise_affine=True.
+///
+/// Dispatches through `modgrad_device::backend::ops::layer_norm_fwd`,
+/// which routes to the fastest registered backend (CPU fallback always
+/// available). Prior inline implementation is preserved as a fallback
+/// inside the CPU backend; this function is now just a thin dispatch
+/// shim so every hot-path call participates in GPU routing.
 #[inline]
 fn affine_layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
     let n = x.len();
     if n == 0 { return; }
-    let nf = n as f32;
-    let mean: f32 = x.iter().sum::<f32>() / nf;
-    let var: f32 = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / nf;
-    let inv_std = 1.0 / (var + 1e-5).sqrt();
-    for i in 0..n {
-        x[i] = gamma[i] * (x[i] - mean) * inv_std + beta[i];
-    }
-}
-
-#[inline]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-fn silu_vec(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v = silu(*v);
-    }
+    // Allocate a tmp output — layer_norm_fwd is not in-place by default.
+    // The dispatched op writes into `out`, then we copy back into `x`.
+    // Cheap on CPU (single memcpy); on GPU would be two passes but the
+    // fused `ln_silu_fwd` path avoids this when the caller actually
+    // wants LN+SiLU (see SynapseBlock::forward).
+    let mut out = vec![0.0f32; n];
+    modgrad_device::backend::ops::layer_norm_fwd(
+        x, gamma, beta, &mut out, None, 1, n,
+    ).expect("layer_norm_fwd dispatch");
+    x.copy_from_slice(&out);
 }
 
 // ─── SynapseBlock ──────────────────────────────────────────
@@ -64,10 +62,19 @@ impl SynapseBlock {
     }
 
     /// Forward: Linear → LayerNorm → SiLU.
+    ///
+    /// Both the matmul (`linear.forward` → `ops::matvec`) and the
+    /// fused LN+SiLU (`ops::ln_silu_fwd`) now dispatch through the
+    /// `Backend` registry — the full block is GPU-ready when a
+    /// capable backend is registered, CPU-fallback otherwise.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         let mut y = self.linear.forward(x);
-        affine_layer_norm(&mut y, &self.ln_gamma, &self.ln_beta);
-        silu_vec(&mut y);
+        let n = y.len();
+        let mut out = vec![0.0f32; n];
+        modgrad_device::backend::ops::ln_silu_fwd(
+            &y, &self.ln_gamma, &self.ln_beta, &mut out, None, 1, n,
+        ).expect("ln_silu_fwd dispatch");
+        y = out;
         y
     }
 }
