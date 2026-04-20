@@ -109,10 +109,11 @@ pub fn init() -> Result<Platform, std::io::Error> {
 }
 
 /// `init` with an explicit config. Use when you want a non-default arena
-/// size or to force CPU.
+/// size or to force CPU. Backend selection is handled by modgrad-device's
+/// registry (via detection + MODGRAD_BACKEND env var); `prefer_gpu` here
+/// only controls the KFD VRAM arena sizing.
 pub fn init_with(cfg: RuntimeConfig) -> Result<Platform, std::io::Error> {
     if cfg.prefer_gpu && std::path::Path::new("/dev/kfd").exists() {
-        modgrad_compute::neuron::enable_gpu();
         modgrad_device::kfd::accel::init_arena(cfg.vram_arena_mb);
         return Ok(Platform::AmdKfd);
     }

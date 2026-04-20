@@ -8,7 +8,7 @@
 //! decides at runtime whether to upload. That leads to:
 //!   * hidden caches (prepare_weights keyed by ptr identity),
 //!   * duplicated storage (VramMirror + prepare_weights cache),
-//!   * per-call `gpu_enabled()` branches on the hot path,
+//!   * per-call registry probes on the hot path,
 //!   * and — most painfully — "works on CPU, silently CPU on GPU" bugs like
 //!     the `adamw.co`-as-relocatable-ELF issue this session.
 //!

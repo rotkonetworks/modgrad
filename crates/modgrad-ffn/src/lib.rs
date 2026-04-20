@@ -259,18 +259,19 @@ pub fn ffn_forward(w: &FfnWeights, tokens: &[usize]) -> (Vec<Vec<f32>>, FfnCache
 }
 
 /// Forward matmul: Y[n×m] = A[n×k] @ W^T[k×m] + bias[m].
-/// GPU-accelerated via `accel::try_matmul` (uses matmul_blocked kernel).
-/// CPU path (rayon + matrixmultiply sgemm) runs when GPU is disabled.
+/// Dispatches through the backend registry — whichever backend claims
+/// `Op::MatmulNT` for the shape handles it; CPU is the always-available
+/// fallback.
 ///
-/// Fail-fast contract: if `gpu_enabled()`, GPU dispatch *must* succeed.
-/// Any failure panics with diagnostic shape info. A silent CPU fallback
-/// on GPU failure would hide dispatch bugs and turn 5-minute runs into
-/// hours of slow-CPU training while the user thinks they're on GPU —
-/// exactly the failure mode that cost 4h of training time before the
-/// fallback was removed.
+/// Fail-fast contract: `registry().dispatch(...).expect(..)` surfaces any
+/// dispatch failure immediately instead of a silent CPU fallback that
+/// would hide dispatch bugs and turn 5-minute runs into hours of slow
+/// training while the user thinks they're on GPU — exactly the failure
+/// mode that cost 4h of training time before the old fallback was removed.
 ///
-/// GPU path constraints: m%128==0, k%8==0, n%32==0. For our FFN sizes
-/// (N=128, K∈{1024, 5120}, M∈{1024, 5120}) all natural shapes pass.
+/// KFD shape gate: m%128==0, k%8==0, n%32==0. For our FFN sizes
+/// (N=128, K∈{1024, 5120}, M∈{1024, 5120}) all natural shapes pass;
+/// non-conforming shapes fall through to CPU via `supports()`.
 #[inline]
 fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
                 n: usize, k: usize, m: usize) {

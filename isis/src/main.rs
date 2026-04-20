@@ -189,8 +189,11 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Train { checkpoint, curriculum, multimodal, images, audio, video, video_fps, gpu, debug_port } => {
-            if gpu { modgrad_compute::neuron::enable_gpu(); }
+        Commands::Train { checkpoint, curriculum, multimodal, images, audio, video, video_fps, gpu: _, debug_port } => {
+            // Backend selection is handled by modgrad-device's registry
+            // (auto-detect + MODGRAD_BACKEND env var). The --gpu flag is
+            // kept in the CLI for script compatibility but no longer
+            // toggles a process-global.
             develop_staged(&checkpoint, curriculum.as_deref(), multimodal,
                 images.as_deref(), audio.as_deref(), video.as_deref(), video_fps, debug_port);
         }
@@ -203,17 +206,14 @@ fn main() {
             run_generate(&checkpoint, &prompt, max_tokens, temperature, frozen_cereb.as_deref());
         }
         Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port, frozen_cereb } => {
-            if gpu || vram {
-                modgrad_compute::neuron::enable_gpu();
-            }
+            // Registry picks the backend automatically. `set_backend` still
+            // installs the ComputeBackend variant for VRAM vs Stream lifecycle —
+            // it gets removed in the compute-device-unify plan Stage 3.
             if vram {
-                // Full VRAM: all activations + weights cached in GPU memory.
-                // Zero PCIe in the inner loop.
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::VramGpuBackend::new(512))
                 );
             } else if gpu {
-                // Hybrid/MegaTrain: weights stream through PCIe, GPU for compute.
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::StreamGpuBackend::new())
                 );
@@ -231,7 +231,6 @@ fn main() {
         }
         Commands::LearnFfn { checkpoint, data, context, vocab, gpu, small, medium, large, xl, lr, budget, val_data } => {
             if gpu {
-                modgrad_compute::neuron::enable_gpu();
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::VramGpuBackend::new(1024))
                 );
@@ -482,18 +481,12 @@ fn compute_ffn_val_bpb(
     // orders-of-magnitude faster on the tiny-to-medium shapes eval
     // sees. Training still gets GPU; eval drops to CPU.
     //
-    // RAII-style: remember the flag, disable, restore on scope exit
-    // (including panic). If GPU wasn't enabled in the first place,
-    // this is a no-op.
-    let was_gpu = modgrad_compute::neuron::gpu_enabled();
-    if was_gpu { modgrad_compute::neuron::disable_gpu(); }
-    struct GpuRestore(bool);
-    impl Drop for GpuRestore {
-        fn drop(&mut self) {
-            if self.0 { modgrad_compute::neuron::enable_gpu(); }
-        }
-    }
-    let _restore = GpuRestore(was_gpu);
+    // NOTE: the RAII "disable GPU during eval" dance was removed here.
+    // After the backend-registry migration, nothing reads a GPU-enabled
+    // flag — dispatch routing goes through supports()/registry per op.
+    // If eval perf on GPU becomes a problem again, the principled
+    // replacement is `MODGRAD_BACKEND=cpu` at process start, not a
+    // mid-process mutable toggle.
 
     modgrad_training::metrics::compute_bpb(val_tokens, context_len, |chunk| {
         let (logits, _cache) = modgrad_ffn::ffn_forward(w, chunk);

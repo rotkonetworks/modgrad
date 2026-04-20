@@ -6,22 +6,9 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
 use super::ops::dot;
-
-/// Global GPU enable flag. Off by default. Caller sets via `enable_gpu()`.
-static GPU_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Enable GPU dispatch for Linear::forward(). Call once at startup.
-pub fn enable_gpu() { GPU_ENABLED.store(true, Ordering::Relaxed); }
-
-/// Disable GPU dispatch.
-pub fn disable_gpu() { GPU_ENABLED.store(false, Ordering::Relaxed); }
-
-/// Check if GPU dispatch is enabled.
-pub fn gpu_enabled() -> bool { GPU_ENABLED.load(Ordering::Relaxed) }
 
 // ─── Activation functions ──────────────────────────────────
 
