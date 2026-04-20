@@ -169,20 +169,14 @@ impl Backend for KfdBackend {
                 )
             }
 
-            Op::AdamW(args) => {
-                // try_adamw requires mutable grads (FFI shape); our Op
-                // keeps them immutable semantically. Local copy per
-                // step is O(params) and negligible.
-                let mut grads_copy = args.g.to_vec();
-                try_result(
-                    accel::try_adamw(
-                        args.w, &mut grads_copy, args.m, args.v,
-                        args.lr, args.beta1, args.beta2, args.eps, args.weight_decay,
-                        args.bc1_inv, args.bc2_inv,
-                    ),
-                    "adamw",
-                )
-            }
+            Op::AdamW(args) => try_result(
+                accel::try_adamw(
+                    args.w, args.g, args.m, args.v,
+                    args.lr, args.beta1, args.beta2, args.eps, args.weight_decay,
+                    args.bc1_inv, args.bc2_inv,
+                ),
+                "adamw",
+            ),
 
             Op::SiluFwd { x, out } => {
                 // KFD kernel is in-place; copy input over first, then
@@ -226,13 +220,10 @@ impl Backend for KfdBackend {
                 }
             }
 
-            Op::SgdUpdate { w, g, lr } => {
-                // try_sgd_update mutates grads (zeroes them). Our Op
-                // keeps grads immutable for semantic clarity; clone
-                // once per step to satisfy FFI. See AdamW note above.
-                let mut grads_copy = g.to_vec();
-                try_result(accel::try_sgd_update(w, &mut grads_copy, *lr), "sgd_update")
-            }
+            Op::SgdUpdate { w, g, lr } => try_result(
+                accel::try_sgd_update(w, g, *lr),
+                "sgd_update",
+            ),
 
             Op::TraceRotateInplace { trace, new_val, d_model, memory_length } => try_result(
                 accel::try_trace_shift(trace, new_val, *d_model as u32, *memory_length as u32),

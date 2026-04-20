@@ -977,16 +977,11 @@ fn adamw_apply(
     beta1: f32, beta2: f32, bc1: f32, bc2: f32, eps: f32,
     lr: f32, wd: f32, clip_scale: f32,
 ) {
-    // GPU AdamW: one dispatch handles update + zero-grads.
-    // try_adamw expects grads as &mut (it zeros them), but we want to keep them for logging.
-    // Make a copy for the GPU call (grads are still live for multiple weight groups).
-    // For now use CPU — the GPU kernel signature doesn't match cleanly (mutates grads).
-    // TODO: add try_adamw_noclear variant or clone grads.
-
     // Pre-scale grads once on CPU; then dispatch via the backend
     // registry. The registry picks the fastest backend that supports
     // AdamW at this shape; size-gated KFD paths are honored inside
-    // supports(). Callers don't branch on hardware.
+    // supports(). Grads are read-only for the optimizer; caller owns
+    // zero-after-step if needed.
     let g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
     use modgrad_device::backend::{registry, AdamWArgs, Op};
     registry().dispatch(&mut Op::AdamW(AdamWArgs {

@@ -396,9 +396,10 @@ pub fn try_outer_product(
         out_dim as usize, in_dim as usize)
 }
 
-/// GPU SGD update: w[i] -= lr_scale * grad[i]; grad[i] = 0
+/// GPU SGD update: `w[i] -= lr_scale * grad[i]`. Grads are read-only;
+/// callers own the zero-after-step policy (consistent with Op::SgdUpdate).
 pub fn try_sgd_update(
-    weights: &mut [f32], grads: &mut [f32], lr_scale: f32,
+    weights: &mut [f32], grads: &[f32], lr_scale: f32,
 ) -> bool {
     if op_disabled(GpuOp::SgdUpdate) { return false; }
     let mut guard = match gpu().lock() { Ok(g) => g, Err(_) => return false };
@@ -406,10 +407,12 @@ pub fn try_sgd_update(
     g.engine.sgd_update(&mut g.dev, weights, grads, lr_scale)
 }
 
-/// GPU AdamW optimizer: update weights, moments, zero grads.
-/// Bias correction terms are pre-computed by caller: bc1_inv = 1/(1-beta1^t), bc2_inv = 1/(1-beta2^t).
+/// GPU AdamW optimizer: update weights + moments. Grads are read-only;
+/// callers own the zero-after-step policy (consistent with Op::AdamW).
+/// Bias-correction terms are pre-computed by the caller:
+///   bc1_inv = 1/(1-beta1^t), bc2_inv = 1/(1-beta2^t).
 pub fn try_adamw(
-    weights: &mut [f32], grads: &mut [f32],
+    weights: &mut [f32], grads: &[f32],
     m: &mut [f32], v: &mut [f32],
     lr: f32, beta1: f32, beta2: f32, eps: f32,
     weight_decay: f32, bc1_inv: f32, bc2_inv: f32,

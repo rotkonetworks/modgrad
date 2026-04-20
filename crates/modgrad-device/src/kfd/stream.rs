@@ -1833,7 +1833,7 @@ impl StreamEngine {
     /// SGD update: w[i] -= lr_scale * grad[i]; grad[i] = 0
     pub fn sgd_update(
         &mut self, dev: &mut HsaDevice,
-        weights: &mut [f32], grads: &mut [f32], lr_scale: f32,
+        weights: &mut [f32], grads: &[f32], lr_scale: f32,
     ) -> bool {
         let n = weights.len();
         if n != grads.len() { return false; }
@@ -1876,8 +1876,6 @@ impl StreamEngine {
             std::slice::from_raw_parts(sa.cpu_ptr as *const f32, n)
         };
         weights[..n].copy_from_slice(result);
-        // Grads are zeroed on GPU — reflect in CPU
-        grads.fill(0.0);
         true
     }
 
@@ -1994,7 +1992,7 @@ impl StreamEngine {
     /// All four buffers (w, grad, m, v) are uploaded, kernel runs, results read back.
     pub fn adamw(
         &mut self, dev: &mut HsaDevice,
-        weights: &mut [f32], grads: &mut [f32],
+        weights: &mut [f32], grads: &[f32],
         m: &mut [f32], v: &mut [f32],
         lr: f32, beta1: f32, beta2: f32, eps: f32,
         weight_decay: f32, bc1_inv: f32, bc2_inv: f32,
@@ -2070,9 +2068,6 @@ impl StreamEngine {
             std::slice::from_raw_parts(ybuf.cpu_ptr as *const f32, n)
         };
         v[..n].copy_from_slice(v_result);
-
-        // Grads zeroed on GPU
-        grads.fill(0.0);
         true
     }
 
