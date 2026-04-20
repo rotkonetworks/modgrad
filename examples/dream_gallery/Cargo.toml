@@ -1,0 +1,12 @@
+[package]
+name = "dream_gallery"
+version = "0.1.0"
+edition = "2024"
+description = "Dump dream-pixel samples as PPM images; compare sober vs LSD-pretrained cortex"
+
+[[bin]]
+name = "dream_gallery"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
