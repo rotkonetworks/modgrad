@@ -9,7 +9,6 @@ use modgrad_training::trainer::StepHook;
 use isis_runtime::nc_socket;
 
 use clap::{Parser, Subcommand};
-use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "isis", version, about = "8-region hierarchical CTM — a neural computer")]
@@ -651,71 +650,13 @@ fn run_generate(checkpoint: &str, prompt: &str, max_tokens: usize, temperature: 
 
 // ─── Daemon ───────────────────────────────────────────────
 
+/// `isis daemon` subcommand — thin delegate over `isis::daemon::run`.
+/// The dedicated `isisd` binary also calls the same fn; keeping both
+/// entry points ensures the CLI remains a convenience, the daemon
+/// is the canonical production surface.
 fn run_daemon(checkpoint: &str, port: u16) {
-    let w = if std::path::Path::new(checkpoint).exists() {
-        eprintln!("Loading {checkpoint}...");
-        RegionalWeights::load(checkpoint)
-            .unwrap_or_else(|e| { eprintln!("Failed: {e}"); std::process::exit(1); })
-    } else {
-        eprintln!("No checkpoint at {checkpoint}, creating fresh 8-region model...");
-        let cfg = RegionalConfig::eight_region(32, 256, 2);
-        RegionalWeights::new(cfg)
-    };
-    w.print_summary();
-
-    let mut nc = NeuralComputer::new(w);
-
-    // Start debug server (this IS the daemon — accepts commands via the debug protocol)
-    let view = nc_socket::NcDebugView::from_nc(&nc);
-    let view = std::sync::Arc::new(std::sync::Mutex::new(view));
-    let handle = nc_socket::start_debug_server(port, view.clone());
-
-    eprintln!("Daemon running on port {port}. Ctrl+C to stop.");
-    eprintln!("Connect with: modgrad-debugger 127.0.0.1:{port}");
-    eprintln!("Or send text: isis send \"hello world\" --addr 127.0.0.1:{port}");
-
-    // Block forever, updating state when debug clients inject tokens
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        eprintln!("\nShutting down...");
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    }).ok();
-
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        // Check for injected tokens from debug clients
-        if let Some(event) = handle.poll_control() {
-            match event {
-                nc_socket::DebugEvent::Inject(tokens) => {
-                    let response = nc.act(&tokens, 256, 0.8);
-                    // Update view for debugger
-                    if let Ok(mut v) = view.try_lock() {
-                        *v = nc_socket::NcDebugView::from_nc(&nc);
-                    }
-                    // Print response as text
-                    for &t in &response {
-                        if t < 256 { print!("{}", t as u8 as char); }
-                    }
-                    io::stdout().flush().ok();
-                }
-                nc_socket::DebugEvent::Pause | nc_socket::DebugEvent::Resume => {}
-                nc_socket::DebugEvent::Step(token) => {
-                    nc.step(token);
-                    if let Ok(mut v) = view.try_lock() {
-                        *v = nc_socket::NcDebugView::from_nc(&nc);
-                    }
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    // Save on exit
-    if let Err(e) = nc.weights.save(checkpoint) {
-        eprintln!("Save failed: {e}");
-    } else {
-        eprintln!("Saved to {checkpoint}");
-    }
+    ::isis::daemon::init_logging();
+    ::isis::daemon::run(checkpoint, port);
 }
 
 // ─── Send ─────────────────────────────────────────────────

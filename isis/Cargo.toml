@@ -5,9 +5,17 @@ edition = "2024"
 description = "isis — 8-region hierarchical CTM runtime built on the modgrad SDK"
 license = "MIT"
 
+[lib]
+name = "isis"
+path = "src/lib.rs"
+
 [[bin]]
 name = "isis"
 path = "src/main.rs"
+
+[[bin]]
+name = "isisd"
+path = "src/isisd.rs"
 
 [features]
 # The isis binary is the end-user entry point, so the runtime defaults
@@ -48,6 +56,12 @@ isis-runtime = { path = "runtime" }
 # CLI + signal handling.
 clap  = { version = "4", features = ["derive"] }
 ctrlc = "3"
+
+# Structured logging for the daemon. tracing is the de-facto Rust
+# logging ecosystem; tracing-subscriber's fmt layer gives us timestamped,
+# level-filtered stderr output (set via RUST_LOG / --log-level).
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Data munging and serialisation used across subcommands.
 serde      = { version = "1", features = ["derive"] }
