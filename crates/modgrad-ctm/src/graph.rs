@@ -1145,16 +1145,16 @@ fn global_sync_backward(
     d_sync: &[f32], activated: &[f32], beta: &[f32],
     left: &[usize], right: &[usize], d_model: usize,
 ) -> Vec<f32> {
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::{registry, Op, SyncBackwardScatterArgs};
     let n_pairs = left.len();
     let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
     let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
     let mut d_act = vec![0.0f32; d_model];
-    registry().dispatch(&mut Op::SyncBackwardScatter {
+    registry().dispatch(&mut Op::SyncBackwardScatter(SyncBackwardScatterArgs {
         d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
         activated, beta, d_act: &mut d_act,
         n_pairs, d_model,
-    }).expect("sync_backward_scatter dispatch");
+    })).expect("sync_backward_scatter dispatch");
     d_act
 }
 
@@ -2739,12 +2739,12 @@ impl AdamWBuf {
     }
 
     fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
-        use modgrad_device::backend::{registry, Op};
-        registry().dispatch(&mut Op::AdamW {
+        use modgrad_device::backend::{registry, AdamWArgs, Op};
+        registry().dispatch(&mut Op::AdamW(AdamWArgs {
             w: weights, g: grads, m: &mut self.m, v: &mut self.v,
             lr, beta1: b1, beta2: b2, eps, weight_decay: wd,
             bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
-        }).expect("adamw dispatch");
+        })).expect("adamw dispatch");
     }
 }
 

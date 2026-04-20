@@ -988,12 +988,12 @@ fn adamw_apply(
     // AdamW at this shape; size-gated KFD paths are honored inside
     // supports(). Callers don't branch on hardware.
     let g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
-    use modgrad_device::backend::{registry, Op};
-    registry().dispatch(&mut Op::AdamW {
+    use modgrad_device::backend::{registry, AdamWArgs, Op};
+    registry().dispatch(&mut Op::AdamW(AdamWArgs {
         w: weights, g: &g_scaled, m, v,
         lr, beta1, beta2, eps, weight_decay: wd,
         bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
-    }).expect("adamw dispatch");
+    })).expect("adamw dispatch");
 }
 
 // ═══════════════════════════════════════════════════════════════

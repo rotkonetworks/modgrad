@@ -105,7 +105,7 @@ impl Backend for KfdBackend {
             // non-wavefront-aligned sizes. Gate conservatively to
             // multiples of 32 (RDNA3 wavefront) of reasonable size;
             // non-aligned cases fall through to CPU.
-            Op::AdamW { w, .. }   if w.len() >= 32 && w.len() % 32 == 0 => true,
+            Op::AdamW(args) if args.w.len() >= 32 && args.w.len() % 32 == 0 => true,
             Op::SiluFwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
             Op::SiluBwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
             // GluFwd: input has length 2*half; gate on that.
@@ -168,19 +168,16 @@ impl Backend for KfdBackend {
                 )
             }
 
-            Op::AdamW {
-                w, g, m, v,
-                lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv,
-            } => {
+            Op::AdamW(args) => {
                 // try_adamw requires mutable grads (FFI shape); our Op
                 // keeps them immutable semantically. Local copy per
                 // step is O(params) and negligible.
-                let mut grads_copy = g.to_vec();
+                let mut grads_copy = args.g.to_vec();
                 try_result(
                     accel::try_adamw(
-                        w, &mut grads_copy, m, v,
-                        *lr, *beta1, *beta2, *eps, *weight_decay,
-                        *bc1_inv, *bc2_inv,
+                        args.w, &mut grads_copy, args.m, args.v,
+                        args.lr, args.beta1, args.beta2, args.eps, args.weight_decay,
+                        args.bc1_inv, args.bc2_inv,
                     ),
                     "adamw",
                 )

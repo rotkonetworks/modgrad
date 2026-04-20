@@ -28,6 +28,50 @@ pub enum QuantKind {
     Q4K,
 }
 
+/// Arguments to [`Op::AdamW`]. Pulled out of the enum variant so callers
+/// get labeled-field ergonomics and future additions (new moment, new
+/// hyperparameter) don't break every match arm — struct fields are
+/// additive, variant fields are not.
+///
+/// Semantics match the original `AdamW` variant: `m`/`v` are the
+/// optimizer moments (mutated in place); bias-correction terms are
+/// pre-computed by the caller as `bc{1,2}_inv = 1/(1-beta^t)` so they
+/// can be reused across many parameter groups per step.
+#[derive(Debug)]
+pub struct AdamWArgs<'a> {
+    pub w: &'a mut [f32],
+    pub g: &'a [f32],
+    pub m: &'a mut [f32],
+    pub v: &'a mut [f32],
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub weight_decay: f32,
+    pub bc1_inv: f32,
+    pub bc2_inv: f32,
+}
+
+/// Arguments to [`Op::SyncBackwardScatter`]. Pulled out of the enum
+/// variant for the same reason as [`AdamWArgs`] — 14 positional fields
+/// at every call site was the actual pain point.
+///
+/// Semantics match the original `SyncBackwardScatter` variant:
+///
+///   d_act[left[i]]  += d_sync[i] * activated[right[i]] / sqrt(beta[i])
+///   d_act[right[i]] += d_sync[i] * activated[left[i]]  / sqrt(beta[i])
+#[derive(Debug)]
+pub struct SyncBackwardScatterArgs<'a> {
+    pub d_sync: &'a [f32],
+    pub pairs_left: &'a [u32],
+    pub pairs_right: &'a [u32],
+    pub activated: &'a [f32],
+    pub beta: &'a [f32],
+    pub d_act: &'a mut [f32],
+    pub n_pairs: usize,
+    pub d_model: usize,
+}
+
 /// Finite operation set. See module docs for granularity policy.
 ///
 /// Lifetime `'a` borrows every slice from the caller; the op lives no
@@ -203,24 +247,8 @@ pub enum Op<'a> {
         lr: f32,
     },
 
-    /// AdamW update. `m` and `v` are the optimizer moments (mutated in
-    /// place). Bias-correction terms are passed pre-computed as
-    /// `bc1_inv = 1/(1-beta1^t)` and `bc2_inv = 1/(1-beta2^t)` so the
-    /// caller can reuse them across many parameter groups without
-    /// re-computing `powi` per group.
-    AdamW {
-        w: &'a mut [f32],
-        g: &'a [f32],
-        m: &'a mut [f32],
-        v: &'a mut [f32],
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        weight_decay: f32,
-        bc1_inv: f32,
-        bc2_inv: f32,
-    },
+    /// AdamW update. See [`AdamWArgs`] for field semantics.
+    AdamW(AdamWArgs<'a>),
 
     // ─── CTM-specific (no library equivalent) ────────────────
 
@@ -278,22 +306,8 @@ pub enum Op<'a> {
 
     /// CTM synchronization backward — scatters d_sync onto the
     /// contributing neurons with per-pair decay-based normalisation.
-    ///
-    ///   d_act[left[i]]  += d_sync[i] * activated[right[i]] / sqrt(beta[i])
-    ///   d_act[right[i]] += d_sync[i] * activated[left[i]]  / sqrt(beta[i])
-    ///
-    /// `beta` is the accumulated decay per pair (same vector used in
-    /// the forward). `pairs_{left,right}` index into `activated`/`d_act`.
-    SyncBackwardScatter {
-        d_sync: &'a [f32],
-        pairs_left: &'a [u32],
-        pairs_right: &'a [u32],
-        activated: &'a [f32],
-        beta: &'a [f32],
-        d_act: &'a mut [f32],
-        n_pairs: usize,
-        d_model: usize,
-    },
+    /// See [`SyncBackwardScatterArgs`] for field semantics.
+    SyncBackwardScatter(SyncBackwardScatterArgs<'a>),
 
     /// Rotate trace memory: shift column-wise by one and write `new_val`
     /// into the most-recent column. In-place on `trace`.
@@ -325,12 +339,12 @@ impl<'a> Op<'a> {
             Op::PerNeuronGluBwd { .. } => "per_neuron_glu_bwd",
             Op::ReduceL2Sq { .. } => "reduce_l2_sq",
             Op::SgdUpdate { .. } => "sgd_update",
-            Op::AdamW { .. } => "adamw",
+            Op::AdamW(_) => "adamw",
             Op::SuperLinearFwd { .. } => "superlinear_fwd",
             Op::SuperLinearBwdDw { .. } => "superlinear_bwd_dw",
             Op::SuperLinearBwdDx { .. } => "superlinear_bwd_dx",
             Op::SyncUpdateFwd { .. } => "sync_update_fwd",
-            Op::SyncBackwardScatter { .. } => "sync_backward_scatter",
+            Op::SyncBackwardScatter(_) => "sync_backward_scatter",
             Op::TraceShiftFwd { .. } => "trace_shift_fwd",
         }
     }

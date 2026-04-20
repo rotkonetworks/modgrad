@@ -11,7 +11,7 @@
 //! catching layout/bounds bugs, not stress-testing precision.
 
 use modgrad_device::backend::{
-    Backend, CpuBackend, KfdBackend, Op, QuantKind, RocmBackend,
+    AdamWArgs, Backend, CpuBackend, KfdBackend, Op, QuantKind, RocmBackend,
 };
 use proptest::prelude::*;
 
@@ -332,11 +332,11 @@ proptest! {
             let mut v = v0.clone();
             let bc1_inv = 1.0 / (1.0 - 0.9_f32.powi(step as i32));
             let bc2_inv = 1.0 / (1.0 - 0.999_f32.powi(step as i32));
-            let mut op = Op::AdamW {
+            let mut op = Op::AdamW(AdamWArgs {
                 w: &mut w, g: &g, m: &mut m, v: &mut v,
                 lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 1e-8,
                 weight_decay: 0.0, bc1_inv, bc2_inv,
-            };
+            });
             if !backend.supports(&op) { continue; }
             backend.dispatch(&mut op).map_err(|e|
                 TestCaseError::fail(format!("adamw on '{}' errored: {e}", backend.name())))?;

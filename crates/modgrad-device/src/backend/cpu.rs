@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 
-use super::{Backend, BackendError, DeviceInfo, DeviceKind, Op, QuantKind};
+use super::{AdamWArgs, Backend, BackendError, DeviceInfo, DeviceKind, Op, QuantKind, SyncBackwardScatterArgs};
 
 /// Always-available fallback. Handles every op via pure Rust / rayon.
 pub struct CpuBackend {
@@ -114,8 +114,8 @@ impl Backend for CpuBackend {
                 for (w, g) in w.iter_mut().zip(g.iter()) { *w -= lr * *g; }
                 Ok(())
             }
-            Op::AdamW { w, g, m, v, lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv } => {
-                adamw(w, g, m, v, *lr, *beta1, *beta2, *eps, *weight_decay, *bc1_inv, *bc2_inv);
+            Op::AdamW(args) => {
+                adamw(args);
                 Ok(())
             }
 
@@ -136,14 +136,8 @@ impl Backend for CpuBackend {
                 sync_update_fwd(h, pairs_left, pairs_right, decay, sync_state, sync_out, *n_pairs);
                 Ok(())
             }
-            Op::SyncBackwardScatter {
-                d_sync, pairs_left, pairs_right,
-                activated, beta, d_act, n_pairs, d_model,
-            } => {
-                sync_backward_scatter(
-                    d_sync, pairs_left, pairs_right,
-                    activated, beta, d_act, *n_pairs, *d_model,
-                );
+            Op::SyncBackwardScatter(args) => {
+                sync_backward_scatter(args);
                 Ok(())
             }
             Op::TraceShiftFwd { trace, new_val, d_model, memory_length } => {
@@ -328,11 +322,13 @@ fn per_neuron_glu_bwd(d_out: &[f32], x: &[f32], d_x: &mut [f32], n_neurons: usiz
     }
 }
 
-fn adamw(
-    w: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32],
-    lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
-    bc1_inv: f32, bc2_inv: f32,
-) {
+fn adamw(args: &mut AdamWArgs<'_>) {
+    let AdamWArgs {
+        w, g, m, v,
+        lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv,
+    } = args;
+    let (lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv) =
+        (*lr, *beta1, *beta2, *eps, *weight_decay, *bc1_inv, *bc2_inv);
     for i in 0..w.len() {
         m[i] = beta1 * m[i] + (1.0 - beta1) * g[i];
         v[i] = beta2 * v[i] + (1.0 - beta2) * g[i] * g[i];
@@ -416,11 +412,12 @@ fn sync_update_fwd(
     }
 }
 
-fn sync_backward_scatter(
-    d_sync: &[f32], pairs_left: &[u32], pairs_right: &[u32],
-    activated: &[f32], beta: &[f32],
-    d_act: &mut [f32], n_pairs: usize, d_model: usize,
-) {
+fn sync_backward_scatter(args: &mut SyncBackwardScatterArgs<'_>) {
+    let SyncBackwardScatterArgs {
+        d_sync, pairs_left, pairs_right,
+        activated, beta, d_act, n_pairs, d_model,
+    } = args;
+    let (n_pairs, d_model) = (*n_pairs, *d_model);
     for p in 0..n_pairs {
         let l = pairs_left[p] as usize;
         let r = pairs_right[p] as usize;
@@ -500,13 +497,13 @@ mod tests {
         let g = [0.5f32, 0.5, 0.5];
         let mut m = [0.0f32; 3];
         let mut v = [0.0f32; 3];
-        let mut op = Op::AdamW {
+        let mut op = Op::AdamW(crate::backend::AdamWArgs {
             w: &mut w, g: &g, m: &mut m, v: &mut v,
             lr: 0.1, beta1: 0.9, beta2: 0.999, eps: 1e-8,
             weight_decay: 0.0,
             bc1_inv: 1.0 / (1.0 - 0.9_f32.powi(1)),
             bc2_inv: 1.0 / (1.0 - 0.999_f32.powi(1)),
-        };
+        });
         be.dispatch(&mut op).unwrap();
         // With positive gradients and lr=0.1, weights should decrease by ~lr.
         for wi in &w { assert!(*wi < 3.01); assert!(*wi > 0.0); }

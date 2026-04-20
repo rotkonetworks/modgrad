@@ -409,15 +409,15 @@ fn sync_backward(
 ) -> Vec<f32> {
     let n_pairs = left.len();
     // GPU path: convert usize indices to u32, dispatch scatter kernel
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::{registry, Op, SyncBackwardScatterArgs};
     let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
     let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
     let mut d_act = vec![0.0f32; d_model];
-    registry().dispatch(&mut Op::SyncBackwardScatter {
+    registry().dispatch(&mut Op::SyncBackwardScatter(SyncBackwardScatterArgs {
         d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
         activated, beta, d_act: &mut d_act,
         n_pairs, d_model,
-    }).expect("sync_backward_scatter dispatch");
+    })).expect("sync_backward_scatter dispatch");
     d_act
 }
 
