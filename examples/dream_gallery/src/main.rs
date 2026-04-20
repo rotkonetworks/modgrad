@@ -105,18 +105,69 @@ fn stats(pixels: &[f32]) -> DreamStats {
 // distribution to shape from, not to reproduce the maze benchmark.
 // ────────────────────────────────────────────────────────────────
 
-fn synthetic_maze_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
-    (0..n).map(|i| {
-        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64);
-        let mut pixels = vec![0.0f32; 3 * size * size];
-        for y in 0..size {
-            for x in 0..size {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let u = (rng >> 32) as f32 / u32::MAX as f32;
-                // Biased toward 0 or 1 to mimic wall/path binary structure.
-                let pv = if u < 0.35 { 0.0 } else if u > 0.65 { 1.0 } else { u };
-                for c in 0..3 { pixels[c * size * size + y * size + x] = pv; }
+// Deterministic LCG used by the maze generator and the top-K seeder.
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self { Self(seed.wrapping_add(1)) }
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 32) as u32
+    }
+    fn range(&mut self, n: usize) -> usize { (self.next_u32() as usize) % n.max(1) }
+    fn shuffle<T>(&mut self, v: &mut [T]) {
+        for i in (1..v.len()).rev() { v.swap(i, self.range(i + 1)); }
+    }
+}
+
+/// Recursive-backtracker maze on an odd-side grid. Returns the cell
+/// bitmap (row-major, `true` = path, `false` = wall).
+fn generate_maze_cells(size: usize, seed: u64) -> Vec<bool> {
+    assert!(size % 2 == 1 && size >= 5);
+    let mut cells = vec![false; size * size];
+    let mut rng = Rng::new(seed);
+    let mut stack = vec![(1usize, 1usize)];
+    cells[size + 1] = true;
+    while let Some(&(y, x)) = stack.last() {
+        let mut dirs = [(0isize, -2isize), (0, 2), (-2, 0), (2, 0)];
+        rng.shuffle(&mut dirs);
+        let mut carved = false;
+        for &(dy, dx) in &dirs {
+            let ny = y as isize + dy;
+            let nx = x as isize + dx;
+            if ny < 1 || nx < 1 || ny >= (size - 1) as isize || nx >= (size - 1) as isize { continue; }
+            let (ny, nx) = (ny as usize, nx as usize);
+            if !cells[ny * size + nx] {
+                cells[ny * size + nx] = true;
+                let my = (y as isize + dy / 2) as usize;
+                let mx = (x as isize + dx / 2) as usize;
+                cells[my * size + mx] = true;
+                stack.push((ny, nx));
+                carved = true;
+                break;
             }
+        }
+        if !carved { stack.pop(); }
+    }
+    cells
+}
+
+/// Build a bank of real mazes as [3 × size × size] pixel tensors
+/// (wall = 0.1, path = 0.9). This replaces the old synthetic-noise
+/// bank — prior versions trained the cortex on pixels biased to 0/1
+/// but otherwise random, which shaped V2/V4 on non-maze statistics.
+/// Now the bank is actual recursive-backtracker mazes, so any
+/// Hebbian/LSD result is grounded in maze-structure learning.
+fn maze_pixel_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
+    (0..n).map(|i| {
+        let s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(0xBED_CAFE)
+            .wrapping_add(i as u64);
+        let cells = generate_maze_cells(size, s);
+        let mut pixels = vec![0.0f32; 3 * size * size];
+        for idx in 0..cells.len() {
+            let v = if cells[idx] { 0.9 } else { 0.1 };
+            for c in 0..3 { pixels[c * size * size + idx] = v; }
         }
         pixels
     }).collect()
@@ -252,12 +303,12 @@ from identical args (deterministic RNG + serialized retina weights).
 
     // ── Condition 2: LSD-pretrained cortex ──
     let mut trained = VisualRetina::maze(size, size);
-    let bank = synthetic_maze_bank(pretrain_samples, size, seed);
+    let bank = maze_pixel_bank(pretrain_samples, size, seed);
     let bank_refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
-    // First shape the cortex on real-ish pixels (Hebbian prior), then
+    // First shape the cortex on real mazes (Hebbian prior), then
     // apply one LSD trip at the validated integration. This is the
     // "refinement" mode from the train_hebbian / lsd docs.
-    eprintln!("[lsd] Hebbian prior on {pretrain_samples} synthetic mazes...");
+    eprintln!("[lsd] Hebbian prior on {pretrain_samples} real mazes...");
     trained.train_hebbian(&bank_refs, pretrain_epochs, pretrain_lr);
     eprintln!("[lsd] trip: integration={integration}, duration={pretrain_samples}");
     let report = trained.lsd(LsdConfig {

@@ -226,22 +226,22 @@ fn retina_forward(retina: &VisualRetina, pixels: &[f32]) -> (LayerOut, LayerOut,
 }
 
 // ────────────────────────────────────────────────────────────────
-// Pretraining helpers (same synthetic bank as dream_gallery).
+// Pretraining helpers.
 // ────────────────────────────────────────────────────────────────
 
-fn synthetic_maze_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
+/// Bank of real recursive-backtracker mazes as [3 × size × size]
+/// pixel tensors. Replaces the earlier `maze_pixel_bank` that
+/// fed 0/1-biased random noise — now Hebbian/LSD actually shape
+/// V2/V4 on maze statistics, so layer activations downstream can be
+/// trusted as evidence of maze-structure learning.
+fn maze_pixel_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
     (0..n).map(|i| {
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64);
-        let mut pixels = vec![0.0f32; 3 * size * size];
-        for y in 0..size {
-            for x in 0..size {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let u = (s >> 32) as f32 / u32::MAX as f32;
-                let pv = if u < 0.35 { 0.1 } else if u > 0.65 { 0.9 } else { u };
-                for c in 0..3 { pixels[c * size * size + y * size + x] = pv; }
-            }
-        }
-        pixels
+        let s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(0xBED_CAFE)
+            .wrapping_add(i as u64);
+        let cells = generate_maze(size, s);
+        maze_pixels(&cells, size)
     }).collect()
 }
 
@@ -352,7 +352,7 @@ Flat or pure noise tiles = broken layer.
 
     // Hebbian.
     let mut hebbian = VisualRetina::maze(size, size);
-    let bank = synthetic_maze_bank(pretrain_samples, size, seed);
+    let bank = maze_pixel_bank(pretrain_samples, size, seed);
     let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
     eprintln!("[hebbian] train_hebbian on {pretrain_samples} synthetic mazes");
     hebbian.train_hebbian(&refs, pretrain_epochs, 2e-4);
