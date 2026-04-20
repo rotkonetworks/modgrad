@@ -197,9 +197,16 @@ impl Drop for HipBuffer {
 
 /// AMD ROCm backend. Holds a hipblas handle across ops; dropped cleanly
 /// via `Drop`.
+///
+/// The handle is wrapped in a `Mutex` because hipBLAS handles are **not**
+/// thread-safe per the ROCm 6.x docs — each host thread dispatching
+/// concurrently needs its own handle. Serialising through one mutex
+/// bounds multi-thread dispatch throughput but keeps correctness honest
+/// until a handle pool lands. Today's caller (`BackendRegistry::dispatch`)
+/// is sequential, so this is not a visible cost.
 #[cfg(feature = "rocm")]
 pub struct RocmBackend {
-    handle: ffi::hipblasHandle_t,
+    handle: std::sync::Mutex<ffi::hipblasHandle_t>,
 }
 
 #[cfg(not(feature = "rocm"))]
@@ -218,7 +225,7 @@ impl RocmBackend {
             let mut handle: ffi::hipblasHandle_t = std::ptr::null_mut();
             let status = unsafe { ffi::hipblasCreate(&mut handle) };
             if status != 0 { return None; }
-            Some(Self { handle })
+            Some(Self { handle: std::sync::Mutex::new(handle) })
         }
         #[cfg(not(feature = "rocm"))]
         {
@@ -230,19 +237,32 @@ impl RocmBackend {
 #[cfg(feature = "rocm")]
 impl Drop for RocmBackend {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { ffi::hipblasDestroy(self.handle) };
+        if let Ok(handle) = self.handle.lock() {
+            if !handle.is_null() {
+                unsafe { ffi::hipblasDestroy(*handle) };
+            }
         }
     }
 }
 
-// SAFETY: hipblas handle can be moved across threads once we're past
-// initialization; mutation is serialized by the handle's internal
-// locking. No mutable state in `Self` beyond the opaque handle.
+// SAFETY: `hipblasHandle_t` is a raw `*mut c_void`, so not Send/Sync by
+// default. We wrap it in a `Mutex` above; every access locks first, and
+// hipBLAS requires one thread at a time per handle anyway. The Mutex is
+// the sync primitive; the unsafe impls just tell Rust we've done the work.
 #[cfg(feature = "rocm")]
 unsafe impl Send for RocmBackend {}
 #[cfg(feature = "rocm")]
 unsafe impl Sync for RocmBackend {}
+
+/// Bounds-check a `usize` dimension for the hipBLAS `int` FFI. Returns
+/// a loud `Runtime` error rather than silently truncating — matters for
+/// anyone who one day routes a 3B-param weight through here.
+#[cfg(feature = "rocm")]
+fn as_i32(dim: usize, name: &'static str) -> Result<i32, BackendError> {
+    i32::try_from(dim).map_err(|_| {
+        BackendError::Runtime(format!("rocm: {name}={dim} exceeds i32::MAX"))
+    })
+}
 
 impl Backend for RocmBackend {
     fn name(&self) -> &'static str { "rocm" }
@@ -335,6 +355,14 @@ impl RocmBackend {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<(), BackendError> {
+        debug_assert_eq!(bias.len(), out_dim, "rocm matvec: bias len must equal out_dim");
+        debug_assert_eq!(weight.len(), out_dim * in_dim, "rocm matvec: weight len mismatch");
+        debug_assert!(x.len() >= in_dim, "rocm matvec: x shorter than in_dim");
+        debug_assert!(out.len() >= out_dim, "rocm matvec: out shorter than out_dim");
+
+        let in_dim_i32 = as_i32(in_dim, "in_dim")?;
+        let out_dim_i32 = as_i32(out_dim, "out_dim")?;
+
         let d_w = HipBuffer::alloc(weight.len() * 4)?;
         let d_x = HipBuffer::alloc(x.len() * 4)?;
         let d_y = HipBuffer::alloc(out_dim * 4)?;
@@ -348,15 +376,17 @@ impl RocmBackend {
         // W_col^T @ x = our row-major W @ x.
         let alpha: f32 = 1.0;
         let beta: f32 = 1.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
         let status = unsafe {
             ffi::hipblasSgemv(
-                self.handle,
+                *handle,
                 ffi::HIPBLAS_OP_T,
-                in_dim as i32,
-                out_dim as i32,
+                in_dim_i32,
+                out_dim_i32,
                 &alpha,
                 d_w.as_f32_ptr(),
-                in_dim as i32,
+                in_dim_i32,
                 d_x.as_f32_ptr(),
                 1,
                 &beta,
@@ -364,6 +394,7 @@ impl RocmBackend {
                 1,
             )
         };
+        drop(handle);
         if status != 0 {
             return Err(BackendError::Runtime(format!("hipblasSgemv: status {status}")));
         }
@@ -396,6 +427,14 @@ impl RocmBackend {
         k: usize,
         n: usize,
     ) -> Result<(), BackendError> {
+        debug_assert_eq!(a.len(), m * k, "rocm matmul: a len mismatch");
+        debug_assert_eq!(b.len(), k * n, "rocm matmul: b len mismatch");
+        debug_assert!(out.len() >= m * n, "rocm matmul: out too small");
+
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
         let d_a = HipBuffer::alloc(m * k * 4)?;
         let d_b = HipBuffer::alloc(k * n * 4)?;
         let d_c = HipBuffer::alloc(m * n * 4)?;
@@ -405,18 +444,21 @@ impl RocmBackend {
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
         let status = unsafe {
             ffi::hipblasSgemm(
-                self.handle,
+                *handle,
                 ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_N,
-                n as i32, m as i32, k as i32,
+                n_i32, m_i32, k_i32,
                 &alpha,
-                d_b.as_f32_ptr(), n as i32,
-                d_a.as_f32_ptr(), k as i32,
+                d_b.as_f32_ptr(), n_i32,
+                d_a.as_f32_ptr(), k_i32,
                 &beta,
-                d_c.as_f32_ptr(), n as i32,
+                d_c.as_f32_ptr(), n_i32,
             )
         };
+        drop(handle);
         if status != 0 {
             return Err(BackendError::Runtime(format!("hipblasSgemm: status {status}")));
         }
