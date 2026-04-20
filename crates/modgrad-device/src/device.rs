@@ -87,10 +87,16 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
 fn enumerate_cuda() -> Option<Vec<DeviceInfo>> {
     use cudarc::driver::CudaContext;
 
-    // Gate on /dev/nvidia0 BEFORE touching cudarc. Its OnceLock-init panic
-    // path doesn't reliably round-trip through catch_unwind in release
-    // builds; better to never call into it on a non-NVIDIA host.
-    if !std::path::Path::new("/dev/nvidia0").exists() { return None; }
+    // Gate on /dev/nvidia0 BEFORE touching cudarc on Linux. Its
+    // OnceLock-init panic path doesn't reliably round-trip through
+    // catch_unwind in release builds; better to never call into it
+    // on a non-NVIDIA host. Linux-only check — non-Linux platforms
+    // don't use this device-node convention; fall through to
+    // catch_unwind there.
+    #[cfg(target_os = "linux")]
+    {
+        if !std::path::Path::new("/dev/nvidia0").exists() { return None; }
+    }
 
     let n = std::panic::catch_unwind(|| CudaContext::device_count())
         .ok()

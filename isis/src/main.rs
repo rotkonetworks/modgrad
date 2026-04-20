@@ -1659,7 +1659,7 @@ fn learn(
             }
 
             opt.step(w, grads);
-            modgrad_device::kfd::accel::invalidate_cache();
+            modgrad_device::backend::registry().invalidate_caches();
 
             // Dream phase: replay a random position every 20 steps.
             if step_idx > 0 && step_idx % 20 == 0 && tokens_ref.len() > 10 {
