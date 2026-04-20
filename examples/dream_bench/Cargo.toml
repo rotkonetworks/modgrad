@@ -1,0 +1,9 @@
+[package]
+name = "dream_bench"
+version = "0.1.0"
+edition = "2024"
+description = "Reproducible harness for the Hoel/LSD dream-pretraining experiments on mazes"
+
+[[bin]]
+name = "dream_bench"
+path = "src/main.rs"
