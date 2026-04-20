@@ -22,6 +22,7 @@ members = [
     "examples/dream_gallery",
     "examples/maze_viz",
     "examples/retina_viz",
+    "examples/filter_viz",
     "examples/hebbian_sanity",
     "debugger",
     "extra/remu",

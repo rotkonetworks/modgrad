@@ -1,0 +1,12 @@
+[package]
+name = "filter_viz"
+version = "0.1.0"
+edition = "2024"
+description = "Render Conv2d filter weights as tiles — the canonical Olshausen/Field cortex-weights plot."
+
+[[bin]]
+name = "filter_viz"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
