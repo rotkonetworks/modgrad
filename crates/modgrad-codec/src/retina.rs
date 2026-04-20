@@ -734,29 +734,17 @@ impl VisualRetina {
     /// update on those synthesized images as `train_hebbian` does on
     /// real ones. No real task data is shown.
     ///
-    /// This is the "dreams regularize the cortex" mechanism the paper
-    /// argues evolved to combat overfitting to daily input statistics.
-    /// Use in two modes:
+    /// # Deprecated — permanent integration
     ///
-    ///   - Pure dream pretrain: initial call before any real-data
-    ///     training. Cortex learns priors from self-generated
-    ///     hallucinations. Bootstrap is legitimate because Hoel's
-    ///     argument is that sparsity + top-down stochasticity do the
-    ///     regularization even without a well-formed cortex prior.
-    ///
-    ///   - Dream refinement: call *after* `train_hebbian` has given
-    ///     V2/V4 a real-data prior. Dreams are then statistically
-    ///     coherent with the learned cortex and act as out-of-
-    ///     distribution augmentation (the closest analogue to the
-    ///     biological picture).
-    ///
-    /// `sparsity_k` controls how many V4 channels are active per
-    /// spatial cell when seeding (Hoel's dropout/sparsity factor).
-    /// `seed` is the RNG seed — same seed reproduces the same dream
-    /// set and therefore the same training trajectory.
-    ///
-    /// Returns the per-epoch energy summary vector, mirroring
-    /// `train_hebbian`'s return type.
+    /// This is the legacy permanent-dream path. Empirically it
+    /// collapses OOD accuracy on the mazes benchmark (OOD first-step
+    /// 2.5%, per-step 11.4% vs ~50%/~30% for the wear-off variant).
+    /// New callers should use [`VisualRetina::lsd`] with
+    /// `integration ≈ 0.7`, which is the cliff-side of the validated
+    /// band and gave the best ID/OOD numbers in the sweep.
+    /// `train_dream(...)` is equivalent to `lsd(integration = 1.0,
+    /// plasticity_boost = 1.0)` and kept only for reproducibility of
+    /// prior published experiments.
     pub fn train_dream(
         &mut self,
         n_samples: usize,
@@ -809,8 +797,40 @@ impl VisualRetina {
     /// caller can verify the trip actually changed something (non-zero
     /// pre-integration delta) and that wear-off actually wore off
     /// (scaled post-integration delta).
+    ///
+    /// # Validated configurations
+    ///
+    /// As of the cliff sweep in examples/mazes (size=11, ood=21):
+    ///
+    ///   - `integration ∈ [0.1, 0.7]`: regularises cleanly — OOD
+    ///     first-step 47–50%, per-step 30–39%, gap near zero. Best
+    ///     observed: `integration=0.7` at OOD per-step 39.2% /
+    ///     ID per-step 40.7% (gap 1.5pp).
+    ///   - `integration >= ~0.95`: catastrophic OOD collapse — V2/V4
+    ///     weights drift toward the dream's synthetic attractor far
+    ///     enough that real-maze input produces near-zero activation.
+    ///     Measured at integration=1.0: OOD first-step 2.5%, per-step
+    ///     11.4%, gap +20pp. Callers hit this path will receive a
+    ///     `log::warn!` at runtime.
+    ///   - `integration` in `(0.7, 0.95)` not yet mapped empirically;
+    ///     the cliff is somewhere in that range.
     pub fn lsd(&mut self, cfg: LsdConfig) -> TripReport {
         let integration = cfg.integration.clamp(0.0, 1.0);
+
+        // Warn on the known-pathological regime. We leave it callable
+        // for research reproducibility (someone reading the earlier
+        // commit history may want to reproduce the collapse), but
+        // silent acceptance would let naive callers foot-gun themselves.
+        if integration >= 0.95 {
+            tracing::warn!(
+                integration = integration,
+                "VisualRetina::lsd called with integration ≥ 0.95 — \
+                 this is a known-broken regime (V2/V4 drift to the dream's \
+                 synthetic attractor, OOD accuracy collapses). Recommended: \
+                 integration ≈ 0.7 for maze-scale. See docstring for the \
+                 empirical sweep."
+            );
+        }
 
         // Consume receptors — desensitises for future trips.
         // `dose` is top-K channels out of 128; we normalise into a
@@ -900,16 +920,19 @@ pub struct LsdConfig {
 }
 
 impl Default for LsdConfig {
-    /// Conservative default: moderate dose, short duration, single
-    /// epoch, normal plasticity, low integration (mostly a probe).
+    /// Validated default: `integration = 0.7`, the best point in
+    /// the empirical sweep (OOD per-step 39.2%, ID per-step 40.7%,
+    /// gap 1.5pp on maze-scale). Dose and duration match the
+    /// configuration of the sweep so `VisualRetina::lsd(cfg)` with
+    /// `LsdConfig::default()` reproduces the validated regime.
     fn default() -> Self {
         Self {
             dose: 8,
-            duration: 200,
-            epochs: 1,
+            duration: 500,
+            epochs: 2,
             lr: 2e-4,
             plasticity_boost: 1.0,
-            integration: 0.2,
+            integration: 0.7,
             seed: 0,
         }
     }
