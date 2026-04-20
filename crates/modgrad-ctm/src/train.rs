@@ -1182,7 +1182,15 @@ pub fn train_step(
     // d_activated is now gradient w.r.t. initial activated state
     for i in 0..d { grads.d_start_activated[i] += d_activated[i]; }
 
-    // Reset VRAM arena — all temporary GPU buffers freed
+    // Reset VRAM arena — all temporary GPU buffers freed.
+    //
+    // TODO(compute-device-unify Stage 5e/6): migrate to
+    // `ComputeCtx::<KfdBackend>::arena_reset()` when the training loop
+    // threads the ctx. Today `be` is the legacy `ComputeBackend` trait
+    // object; forcing a parallel ComputeCtx<KfdBackend> construction
+    // here just to call `arena_reset` would re-leak a new backend
+    // singleton per call. Stage 6 dissolves the `ComputeBackend` trait
+    // entirely, and this line moves onto ComputeCtx at that point.
     be.arena_reset();
 
     TrainResult { loss, prediction: pred_class }

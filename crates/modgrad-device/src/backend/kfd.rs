@@ -323,6 +323,28 @@ pub struct KfdBuffer {
 unsafe impl Send for KfdBuffer {}
 unsafe impl Sync for KfdBuffer {}
 
+impl KfdBuffer {
+    /// Destructively unwrap the underlying `GpuBuffer`. Returns `None`
+    /// only if `alloc_buffer` returned a buffer with no backing GPU
+    /// allocation (an invariant violation — kept here defensively).
+    ///
+    /// Escape hatch for Stage 5 of the compute-device unification
+    /// chain: `modgrad_compute::tensor_device::VramTensor` holds a raw
+    /// `GpuBuffer` + reaches into `cpu_ptr` / `va_addr` directly for
+    /// zero-copy BAR access and kernel dispatch. Rather than pollute
+    /// the public [`DeviceBuffer`] trait with those accessors, the
+    /// tensor type keeps using its historical `GpuBuffer` view after
+    /// unwrapping a freshly-allocated `KfdBuffer`. Stage 6 dissolves
+    /// this when `VramTensor` either moves behind the `DeviceBuffer`
+    /// contract itself or grows dedicated tensor-shape accessors.
+    ///
+    /// `#[doc(hidden)]` — this is an internal seam, not a stable API.
+    #[doc(hidden)]
+    pub fn into_inner(self) -> Option<crate::kfd::memory::GpuBuffer> {
+        self.inner
+    }
+}
+
 impl DeviceBuffer for KfdBuffer {
     fn backend_name(&self) -> &'static str { "kfd" }
 

@@ -17,6 +17,7 @@
 
 pub mod op;
 pub mod ops;
+pub mod optim;
 pub mod buffer;
 pub mod cpu;
 pub mod kfd;
@@ -25,6 +26,11 @@ pub mod vulkan;
 pub mod rocm;
 
 pub use buffer::{DeviceBuffer, HostBuffer};
+// Batched optimisers — CPU fallback always available, KFD variant
+// feature-gated. Re-exported here so callers write
+//   `use modgrad_device::backend::{BatchedOptimizer, CpuBatchedOptimizer};`
+// without reaching into the sub-module.
+pub use optim::{BatchedOptimizer, CpuBatchedOptimizer, KfdBatchedOptimizer};
 // `BufferBackend` + `ComputeCtx` are defined below in this file.
 // Re-export them explicitly so call sites can write
 //   `use modgrad_device::backend::{ComputeCtx, BufferBackend};`

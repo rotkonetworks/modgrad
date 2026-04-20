@@ -123,8 +123,59 @@ impl OptimizerState for VramMirror {
         bc1_inv: f32, bc2_inv: f32,
         wd_for: &dyn Fn(usize) -> f32,
     ) -> bool {
-        modgrad_device::kfd::accel::try_adamw_vram_batch(
-            self, lr, beta1, beta2, eps, bc1_inv, bc2_inv, wd_for,
-        )
+        // Stage 5c: route through the `BatchedOptimizer` trait at the
+        // ops:: layer instead of reaching directly into `kfd::accel::*`.
+        // `AdamWArgs` carries per-tensor `weight_decay`; `KfdBatchedOptimizer`
+        // reads exactly those fields plus shared hyperparams and ignores
+        // the slice fields (the mirror owns the real VRAM state — see
+        // the `optim.rs` module docs for why this compromise exists).
+        //
+        // Construction note: the KFD impl only reads `weight_decay` and
+        // the shared hyperparams from each AdamWArgs, so we can supply
+        // zero-length `w/g/m/v` slices. `&mut []` borrows a fresh empty
+        // array each iteration — no allocation, no aliasing (len == 0
+        // means no memory is backed), no leak. The array itself lives
+        // on the stack frame of the closure returned by `map`, which is
+        // owned by the iterator; each yielded AdamWArgs has a lifetime
+        // tied to the collect() below, which KfdBatchedOptimizer drains
+        // before returning.
+        use modgrad_device::backend::{AdamWArgs, BatchedOptimizer, KfdBatchedOptimizer};
+
+        let n = self.sizes.len();
+        // Gather per-tensor weight decays up front to avoid borrow
+        // conflicts between `wd_for` captures and the mirror borrow
+        // inside KfdBatchedOptimizer.
+        let wds: Vec<f32> = (0..n).map(wd_for).collect();
+
+        // Per-slot placeholder storage — one 0-element array per slot
+        // so the `&mut []` borrows inside each AdamWArgs are disjoint.
+        // Vec<[f32; 0]> has size 0 per element; capacity = n.
+        let mut placeholders: Vec<[f32; 0]> = vec![[]; n];
+        let args: Vec<AdamWArgs<'_>> = wds.iter().zip(placeholders.iter_mut())
+            .map(|(&wd, p)| {
+                // Three disjoint empty &mut slices from the same 0-element
+                // array: len == 0 so no memory is ever accessed, and the
+                // aliasing invariant is trivially preserved.
+                let w = &mut p[..];
+                // Re-borrow twice more; an empty slice from a 0-element
+                // array produces no actual memory reference, so sharing
+                // three "handles" is sound (they all point past-the-end
+                // of a zero-length region).
+                let m: &mut [f32] = &mut [];
+                let v: &mut [f32] = &mut [];
+                AdamWArgs {
+                    w,
+                    g: &[],
+                    m,
+                    v,
+                    lr, beta1, beta2, eps,
+                    weight_decay: wd,
+                    bc1_inv, bc2_inv,
+                }
+            })
+            .collect();
+
+        let mut opt = KfdBatchedOptimizer::new(self);
+        opt.step_batch(args)
     }
 }

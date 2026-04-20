@@ -39,6 +39,33 @@
 
 use modgrad_device::kfd::memory::GpuBuffer;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
+
+/// Process-wide `ComputeCtx<KfdBackend>` for `VramTensor` allocations.
+///
+/// Stage 5 migration point: `VramTensor::zeros` no longer calls the
+/// deprecated `crate::alloc_device_vram` shim; it goes through the new
+/// backend-affine allocator. The ctx caches a single leaked `KfdBackend`
+/// so subsequent allocations don't re-probe KFD — probing locks the
+/// global `GPU` mutex, and training loops allocate tensors in tight
+/// bursts.
+///
+/// Returns `None` when KFD is unavailable. Callers fall back to
+/// whatever their CPU path is (typically returning `None` from
+/// `VramTensor::zeros`).
+fn kfd_ctx() -> Option<&'static modgrad_device::backend::ComputeCtx<modgrad_device::backend::KfdBackend>> {
+    type KfdCtx = modgrad_device::backend::ComputeCtx<modgrad_device::backend::KfdBackend>;
+    static CTX: OnceLock<Option<&'static KfdCtx>> = OnceLock::new();
+    *CTX.get_or_init(|| {
+        let be = modgrad_device::backend::KfdBackend::try_new()?;
+        // Leak for 'static — matches how `BackendRegistry` stores its
+        // backends under the hood (OnceLock-backed owned Box, never freed
+        // within a process).
+        let be_leaked: &'static modgrad_device::backend::KfdBackend = Box::leak(Box::new(be));
+        let ctx: KfdCtx = modgrad_device::backend::ComputeCtx::new(be_leaked);
+        Some(&*Box::leak(Box::new(ctx)))
+    })
+}
 
 /// Element type usable inside a device tensor. Currently only `f32` is
 /// wired up; additional types (f16, i8, etc.) plug in by implementing
@@ -108,19 +135,24 @@ unsafe impl<T: DeviceElem> Sync for VramTensor<T> {}
 impl<T: DeviceElem> VramTensor<T> {
     /// Allocate a VRAM tensor of the given shape, zero-initialised.
     /// Returns `None` when no KFD GPU is available, or the alloc fails.
+    ///
+    /// Stage 5: routes through `ComputeCtx::<KfdBackend>::alloc_buffer`
+    /// instead of the deprecated `crate::alloc_device_vram` shim. The
+    /// returned `KfdBuffer` is unwrapped to its inner `GpuBuffer` via the
+    /// feature-hidden `into_inner` escape hatch — see `backend::kfd`
+    /// for the rationale. Rounding + byte-vs-f32-count semantics match
+    /// the previous allocator.
     pub fn zeros(dims: impl Into<Vec<usize>>) -> Option<Self> {
         let dims = dims.into();
         let n: usize = dims.iter().product();
-        let bytes = (n * T::BYTE_SIZE) as u64;
-        // Round up to 4 KiB page granularity — KFD alloc is page-sized.
-        let cap = ((bytes + 4095) & !4095).max(4096);
+        // ComputeCtx::alloc_buffer takes f32-element counts. Oversize
+        // in the rare non-f32 case so the byte capacity still covers
+        // `n * T::BYTE_SIZE`. Page rounding happens inside the backend.
+        let n_f32 = (n * T::BYTE_SIZE).div_ceil(4);
 
-        // Stage 4 deprecated `alloc_device_vram`; VramTensor is Stage 5
-        // scope and migrates to `ComputeCtx::<KfdBackend>::alloc_buffer`
-        // then. Silence the deprecation here so this stage's build stays
-        // warning-clean.
-        #[allow(deprecated)]
-        let buf = crate::alloc_device_vram(cap)?;
+        let ctx = kfd_ctx()?;
+        let kfd_buf = ctx.alloc_buffer(n_f32).ok()?;
+        let buf = kfd_buf.into_inner()?;
         // Zero the first `n` elements via BAR. `write_bytes` is safe here:
         // the buffer has CPU access (alloc_vram uses PUBLIC flag) and we own
         // the allocation, so no races.
