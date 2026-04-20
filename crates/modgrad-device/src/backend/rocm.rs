@@ -207,6 +207,29 @@ impl Drop for HipBuffer {
 #[cfg(feature = "rocm")]
 pub struct RocmBackend {
     handle: std::sync::Mutex<ffi::hipblasHandle_t>,
+    /// Weight VRAM cache — mirrors the KFD `GpuQueue::weight_cache`
+    /// pattern (see `kfd/dispatch_queue.rs`). Eliminates the per-dispatch
+    /// `hipMalloc + hipMemcpy H2D + hipFree` triple that otherwise runs
+    /// every forward pass for weights that never change within a step.
+    ///
+    /// SAFETY invariants (pointer-identity caching):
+    /// - Key is `(weight.as_ptr() as usize, weight.len())`. This is
+    ///   stable across training steps because weights live inside their
+    ///   owning struct (e.g. `CtmWeights`) and are never reallocated.
+    /// - The cache ASSUMES the host buffer behind `ptr` is not mutated
+    ///   in place while the cache entry is live. modgrad-device's AdamW
+    ///   DOES mutate weights in place, so the isis training loop calls
+    ///   `registry().invalidate_caches()` after every optimizer step
+    ///   (see commit feea041). As long as that invariant holds, a cache
+    ///   hit returns the same bytes the caller intended to upload.
+    /// - Dropping a `HipBuffer` runs `hipFree`, so clearing the HashMap
+    ///   automatically releases VRAM — no manual cleanup needed on
+    ///   invalidation or backend drop.
+    /// - Wrapped in the same `Mutex` style as the hipBLAS handle; every
+    ///   access locks first. The lock is held only during the
+    ///   lookup/insert; dispatches do not hold it across the hipBLAS
+    ///   call.
+    cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), HipBuffer>>,
 }
 
 #[cfg(not(feature = "rocm"))]
@@ -225,7 +248,10 @@ impl RocmBackend {
             let mut handle: ffi::hipblasHandle_t = std::ptr::null_mut();
             let status = unsafe { ffi::hipblasCreate(&mut handle) };
             if status != 0 { return None; }
-            Some(Self { handle: std::sync::Mutex::new(handle) })
+            Some(Self {
+                handle: std::sync::Mutex::new(handle),
+                cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
         }
         #[cfg(not(feature = "rocm"))]
         {
@@ -299,6 +325,21 @@ impl Backend for RocmBackend {
         }
     }
 
+    fn invalidate_cache(&self) {
+        // Drop every cached weight buffer. Each `HipBuffer::drop` calls
+        // `hipFree`, so VRAM is released here rather than leaking to the
+        // end of the process. Called by isis after every optimizer step
+        // because AdamW mutates weights in place — see the cache field's
+        // SAFETY note for the full invariant. When the rocm feature is
+        // off the struct has no cache field and this is a no-op.
+        #[cfg(feature = "rocm")]
+        {
+            if let Ok(mut c) = self.cache.lock() {
+                c.clear();
+            }
+        }
+    }
+
     fn dispatch(&self, op: &mut Op) -> Result<(), BackendError> {
         #[cfg(not(feature = "rocm"))]
         {
@@ -340,12 +381,35 @@ impl Backend for RocmBackend {
 
 #[cfg(feature = "rocm")]
 impl RocmBackend {
+    /// Look up the weight VRAM mirror, or upload it if missing. Returns
+    /// the cached device pointer.
+    ///
+    /// The pointer remains valid after the lock is released because the
+    /// cache only ever drops entries wholesale via `invalidate_cache`,
+    /// which callers schedule between dispatches (post-optimizer step),
+    /// never concurrent with one. See the `cache` field's SAFETY note.
+    fn cached_weight_ptr(&self, weight: &[f32]) -> Result<*mut f32, BackendError> {
+        let key = (weight.as_ptr() as usize, weight.len());
+        let mut cache = self.cache.lock()
+            .map_err(|_| BackendError::Runtime("rocm: cache mutex poisoned".into()))?;
+        if let Some(buf) = cache.get(&key) {
+            return Ok(buf.as_f32_ptr());
+        }
+        let buf = HipBuffer::alloc(weight.len() * 4)?;
+        buf.upload_f32(weight)?;
+        let ptr = buf.as_f32_ptr();
+        cache.insert(key, buf);
+        Ok(ptr)
+    }
+
     /// y = W @ x + bias, f32, via hipblasSgemv.
     /// W is row-major [out_dim × in_dim]; hipBLAS is column-major so we
     /// compute W^T @ x with hipblas + seed y with bias.
     ///
     /// HipBuffer handles are dropped automatically on error via RAII,
     /// so the `?` operator is safe here — no manual cleanup needed.
+    /// Weight buffers live in the VRAM cache and persist until
+    /// `invalidate_cache` clears them.
     fn matvec_f32(
         &self,
         x: &[f32],
@@ -363,11 +427,12 @@ impl RocmBackend {
         let in_dim_i32 = as_i32(in_dim, "in_dim")?;
         let out_dim_i32 = as_i32(out_dim, "out_dim")?;
 
-        let d_w = HipBuffer::alloc(weight.len() * 4)?;
+        // Weight reuses the VRAM cache — keyed on pointer identity so
+        // hot training loops amortise the upload cost across steps.
+        let d_w_ptr = self.cached_weight_ptr(weight)?;
         let d_x = HipBuffer::alloc(x.len() * 4)?;
         let d_y = HipBuffer::alloc(out_dim * 4)?;
 
-        d_w.upload_f32(weight)?;
         d_x.upload_f32(x)?;
         d_y.upload_f32(bias)?; // seed y with bias; SGEMV adds into it.
 
@@ -385,7 +450,7 @@ impl RocmBackend {
                 in_dim_i32,
                 out_dim_i32,
                 &alpha,
-                d_w.as_f32_ptr(),
+                d_w_ptr,
                 in_dim_i32,
                 d_x.as_f32_ptr(),
                 1,
@@ -435,11 +500,14 @@ impl RocmBackend {
         let k_i32 = as_i32(k, "k")?;
         let n_i32 = as_i32(n, "n")?;
 
-        let d_a = HipBuffer::alloc(m * k * 4)?;
+        // `a` is the weight-shaped operand in training dispatch — reuse
+        // the VRAM cache. `b` is typically the freshly-materialised input
+        // activation, which wouldn't cache-hit, so we keep it on the
+        // per-dispatch alloc/upload/free path.
+        let d_a_ptr = self.cached_weight_ptr(a)?;
         let d_b = HipBuffer::alloc(k * n * 4)?;
         let d_c = HipBuffer::alloc(m * n * 4)?;
 
-        d_a.upload_f32(a)?;
         d_b.upload_f32(b)?;
 
         let alpha: f32 = 1.0;
@@ -453,7 +521,7 @@ impl RocmBackend {
                 n_i32, m_i32, k_i32,
                 &alpha,
                 d_b.as_f32_ptr(), n_i32,
-                d_a.as_f32_ptr(), k_i32,
+                d_a_ptr, k_i32,
                 &beta,
                 d_c.as_f32_ptr(), n_i32,
             )

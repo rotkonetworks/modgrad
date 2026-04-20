@@ -377,3 +377,61 @@ fn env_override_cpu_only() {
     assert_eq!(chose, "cpu", "Phase 1: CPU is the only registered backend");
     assert_eq!(out[0], 4.0);
 }
+
+/// Exercise the ROCm weight-VRAM cache path end-to-end: run the same
+/// matvec twice against the same weight pointer and assert both calls
+/// produce identical output. The second call should hit the cache (no
+/// re-upload), but the observable contract is just that results match.
+///
+/// Dormant when ROCm isn't available on this host — `try_new()` returns
+/// `None` and the test short-circuits. Also a no-op when compiled
+/// without the `rocm` feature for the same reason.
+#[test]
+fn rocm_weight_cache_hit_matches_first_dispatch() {
+    let Some(rocm) = RocmBackend::try_new() else {
+        eprintln!("rocm backend unavailable — skipping cache parity check");
+        return;
+    };
+
+    // 64×64 clears RocmBackend::supports() (which gates on dim ≥ 64).
+    let out_dim = 64usize;
+    let in_dim = 64usize;
+    let weight: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i as f32) * 0.001).sin()).collect();
+    let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.01).collect();
+    let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.02 - 0.5).collect();
+
+    // First dispatch: cold cache, triggers alloc + upload + insert.
+    let mut out1 = vec![0.0f32; out_dim];
+    let mut op1 = Op::Matvec {
+        x: &x, weight: &weight, bias: &bias, out: &mut out1,
+        out_dim, in_dim, quant: QuantKind::F32,
+    };
+    assert!(rocm.supports(&op1), "64×64 matvec should hit rocm supports() gate");
+    rocm.dispatch(&mut op1).expect("first rocm matvec dispatch");
+
+    // Second dispatch: same weight pointer → cache HIT. Output must
+    // match bit-for-bit because the cached VRAM hasn't changed.
+    let mut out2 = vec![0.0f32; out_dim];
+    let mut op2 = Op::Matvec {
+        x: &x, weight: &weight, bias: &bias, out: &mut out2,
+        out_dim, in_dim, quant: QuantKind::F32,
+    };
+    rocm.dispatch(&mut op2).expect("second rocm matvec dispatch (cache hit)");
+    eprintln!("rocm cache-hit dispatch completed (weight ptr {:p})", weight.as_ptr());
+
+    assert_eq!(out1, out2,
+        "cache-hit dispatch must produce the same output as the cold dispatch");
+
+    // Invalidating the cache must not break correctness — the next
+    // dispatch re-uploads and should still match.
+    rocm.invalidate_cache();
+    let mut out3 = vec![0.0f32; out_dim];
+    let mut op3 = Op::Matvec {
+        x: &x, weight: &weight, bias: &bias, out: &mut out3,
+        out_dim, in_dim, quant: QuantKind::F32,
+    };
+    rocm.dispatch(&mut op3).expect("post-invalidate matvec dispatch");
+    assert_eq!(out1, out3,
+        "post-invalidate dispatch must match the original output");
+}
