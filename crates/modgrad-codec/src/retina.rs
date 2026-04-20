@@ -656,6 +656,58 @@ impl VisualRetina {
 
         errors
     }
+
+    /// Dream pretraining (Hoel 2021, "The Overfitted Brain").
+    ///
+    /// Synthesizes `n_samples` pseudo-images by seeding V4 with sparse
+    /// noise and projecting top-down through the cortex adjoint
+    /// (V4^T→V2^T→V1^T), then runs the same Hebbian sparse-coding
+    /// update on those synthesized images as `train_hebbian` does on
+    /// real ones. No real task data is shown.
+    ///
+    /// This is the "dreams regularize the cortex" mechanism the paper
+    /// argues evolved to combat overfitting to daily input statistics.
+    /// Use in two modes:
+    ///
+    ///   - Pure dream pretrain: initial call before any real-data
+    ///     training. Cortex learns priors from self-generated
+    ///     hallucinations. Bootstrap is legitimate because Hoel's
+    ///     argument is that sparsity + top-down stochasticity do the
+    ///     regularization even without a well-formed cortex prior.
+    ///
+    ///   - Dream refinement: call *after* `train_hebbian` has given
+    ///     V2/V4 a real-data prior. Dreams are then statistically
+    ///     coherent with the learned cortex and act as out-of-
+    ///     distribution augmentation (the closest analogue to the
+    ///     biological picture).
+    ///
+    /// `sparsity_k` controls how many V4 channels are active per
+    /// spatial cell when seeding (Hoel's dropout/sparsity factor).
+    /// `seed` is the RNG seed — same seed reproduces the same dream
+    /// set and therefore the same training trajectory.
+    ///
+    /// Returns the per-epoch energy summary vector, mirroring
+    /// `train_hebbian`'s return type.
+    pub fn train_dream(
+        &mut self,
+        n_samples: usize,
+        epochs: usize,
+        lr: f32,
+        sparsity_k: usize,
+        seed: u64,
+    ) -> Vec<f32> {
+        let bank: Vec<Vec<f32>> = (0..n_samples)
+            .map(|i| {
+                let s = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(0xD5EA_D5EA)
+                    .wrapping_add(i as u64);
+                self.dream_pixel(s, sparsity_k)
+            })
+            .collect();
+        let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
+        self.train_hebbian(&refs, epochs, lr)
+    }
 }
 
 impl VisualRetina {
@@ -1322,6 +1374,21 @@ mod tests {
         let rhs = dot(&x, &ty);
         let rel = (lhs - rhs).abs() / lhs.abs().max(rhs.abs()).max(1e-6);
         assert!(rel < 1e-5, "adjoint identity failed: <Ax,y>={lhs} <x,A*y>={rhs} rel={rel}");
+    }
+
+    #[test]
+    fn train_dream_runs_and_modifies_cortex() {
+        let mut retina = VisualRetina::maze(11, 11);
+        // Snapshot V4 weights (V2/V4 = learned, V1 fixed).
+        let v4_before: Vec<f32> = retina.v4.weight.clone();
+        let energies = retina.train_dream(50, 1, 1e-4, 8, 42);
+        assert_eq!(energies.len(), 1);
+        // Cortex must have moved. If V4 is unchanged the dream loop
+        // isn't actually training anything.
+        let diff: f32 = retina.v4.weight.iter().zip(&v4_before)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-6, "train_dream left V4 unchanged (diff={diff})");
     }
 
     #[test]

@@ -148,32 +148,16 @@ fn main() {
     }
 
     // ── Optional dream pretraining (Hoel 2021) ──
-    // Synthesizes top-down pixels via V4^T→V2^T→V1^T (sparse noise at V4,
-    // adjoint down through the cortex). Runs the same Hebbian update on
-    // these dream-pixels as on real mazes, but since the source is the
-    // cortex itself the training data is out-of-distribution relative
-    // to the task — the overfitted-brain hypothesis's proposed
-    // regularization mechanism.
-    //
-    // Bootstrap note: when V2/V4 are random, dreams are near-random too.
-    // That's fine under Hoel — the sparsity + top-down stochasticity do
-    // the regularization work even without a well-formed cortex prior.
-    // Combining with --hebbian-epochs gives the cortex a real prior
-    // first, then dream refinement.
+    // Delegates to VisualRetina::train_dream: synthesize N pseudo-images
+    // via V4→V2→V1 adjoint projection, then Hebbian-train V2/V4 on those.
+    // Combine with --hebbian-epochs to first seed with a real-data prior
+    // then refine with dream augmentation.
     if dream_epochs > 0 {
         let t0 = std::time::Instant::now();
-        let mut bank: Vec<Vec<f32>> = Vec::with_capacity(hebbian_samples);
-        for i in 0..hebbian_samples {
-            let dseed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(0xD5EA_D5EA)
-                .wrapping_add(i as u64);
-            bank.push(encoder.dream_pixel(dseed, dream_sparsity_k));
-        }
-        let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
         eprintln!("Dream pretraining: {hebbian_samples} synthesized × {dream_epochs} epochs \
                    (lr={hebbian_lr}, sparsity_k={dream_sparsity_k})");
-        encoder.train_hebbian(&refs, dream_epochs, hebbian_lr);
+        encoder.train_dream(hebbian_samples, dream_epochs, hebbian_lr,
+                            dream_sparsity_k, seed);
         eprintln!("Dream pretraining done in {:.1}s", t0.elapsed().as_secs_f32());
     }
 
