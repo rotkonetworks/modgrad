@@ -82,7 +82,7 @@ impl Linear {
             x, &self.weight, &self.bias, y,
             self.out_dim, self.in_dim,
             modgrad_device::backend::QuantKind::F32,
-        );
+        ).expect("matvec dispatch");
     }
 
     /// Allocating forward (backward compat). Prefer forward_into.
@@ -160,7 +160,7 @@ impl SuperLinear {
         modgrad_device::backend::ops::super_linear_fwd(
             trace, &self.weights, &self.biases, out, None,
             self.n_neurons, self.in_per, self.out_per,
-        );
+        ).expect("super_linear_fwd dispatch");
     }
 
     /// CPU-only forward (used by backends internally).

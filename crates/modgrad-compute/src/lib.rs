@@ -40,7 +40,8 @@ pub fn grad_norm(slices: &[&[f32]]) -> f32 {
     let mut buf = Vec::with_capacity(total_len);
     for s in slices { buf.extend_from_slice(s); }
     let mut out = [0.0f32];
-    modgrad_device::backend::ops::reduce_l2_sq(&buf, &mut out);
+    modgrad_device::backend::ops::reduce_l2_sq(&buf, &mut out)
+        .expect("reduce_l2_sq dispatch");
     out[0].sqrt()
 }
 

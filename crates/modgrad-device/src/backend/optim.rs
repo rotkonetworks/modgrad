@@ -83,7 +83,12 @@ impl BatchedOptimizer for CpuBatchedOptimizer {
             // We return `true` unconditionally because an op-level panic
             // is a programmer error (bad shapes / no backend supports
             // scalar AdamW), not a "fall back to CPU" condition.
-            super::ops::adamw(args);
+            //
+            // `.expect` lives *here* (caller frame), not inside
+            // `ops::adamw`, so an unwind can't cross a live hipBLAS/FFI
+            // frame — by the time we're in this loop the dispatch has
+            // returned and the foreign stack is unwound already.
+            super::ops::adamw(args).expect("adamw dispatch");
         }
         true
     }
@@ -212,7 +217,7 @@ mod tests {
             lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8,
             weight_decay: 0.0, bc1_inv: 1.0, bc2_inv: 1.0,
         };
-        super::super::ops::adamw(args_a);
+        super::super::ops::adamw(args_a).expect("adamw dispatch");
 
         let args_b = AdamWArgs {
             w: &mut w_b, g: &g, m: &mut m_b, v: &mut v_b,

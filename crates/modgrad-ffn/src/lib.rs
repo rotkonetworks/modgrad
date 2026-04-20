@@ -283,7 +283,8 @@ fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
     // CPU which handles all kinds. KFD support for NT is a follow-up
     // (kernel needs T-variant).
     use modgrad_device::backend::ops;
-    ops::matmul_nt(a, weight, y, Some(bias), n, k, m);
+    ops::matmul_nt(a, weight, y, Some(bias), n, k, m)
+        .expect("matmul_nt dispatch");
 }
 
 /// Transposed matmul: dA[n×k] += dY[n×m] @ W[m×k] (ACCUMULATES).
@@ -297,7 +298,8 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
     // Compute into `tmp` (overwrite) then accumulate into `da`.
     use modgrad_device::backend::ops;
     let mut tmp = vec![0.0f32; n * k];
-    ops::matmul_nn(dy, weight, &mut tmp, None, n, m, k);
+    ops::matmul_nn(dy, weight, &mut tmp, None, n, m, k)
+        .expect("matmul_nn dispatch");
     da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
@@ -313,7 +315,8 @@ fn matmul_grad_rayon(dy: &[f32], a: &[f32], dw: &mut [f32],
     // transposed" matches this layout: out[m×k] = dy^T @ a.
     use modgrad_device::backend::ops;
     let mut tmp = vec![0.0f32; m * k];
-    ops::matmul_tn(dy, a, &mut tmp, None, m, n, k);
+    ops::matmul_tn(dy, a, &mut tmp, None, m, n, k)
+        .expect("matmul_tn dispatch");
     dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
@@ -980,7 +983,7 @@ fn adamw_apply(
         w: weights, g: &g_scaled, m, v,
         lr, beta1, beta2, eps, weight_decay: wd,
         bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
-    });
+    }).expect("adamw dispatch");
 }
 
 // ═══════════════════════════════════════════════════════════════

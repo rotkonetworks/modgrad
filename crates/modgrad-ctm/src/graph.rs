@@ -1196,7 +1196,7 @@ fn global_sync_backward(
         d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
         activated, beta, d_act: &mut d_act,
         n_pairs, d_model,
-    });
+    }).expect("sync_backward_scatter dispatch");
     d_act
 }
 
@@ -2965,7 +2965,7 @@ impl AdamWBuf {
             w: weights, g: grads, m: &mut self.m, v: &mut self.v,
             lr, beta1: b1, beta2: b2, eps, weight_decay: wd,
             bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
-        });
+        }).expect("adamw dispatch");
     }
 }
 

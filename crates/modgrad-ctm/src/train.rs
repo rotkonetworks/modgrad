@@ -54,11 +54,13 @@ pub(crate) fn linear_backward(
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
 
     // d_weight[i,j] += d_out[i] * input[j]
-    ops::outer_product_acc(d_out, &cache.input, d_weight, out_dim, in_dim);
+    ops::outer_product_acc(d_out, &cache.input, d_weight, out_dim, in_dim)
+        .expect("outer_product_acc dispatch");
 
     // d_input = W^T @ d_out (overwrites)
     for v in d_input.iter_mut() { *v = 0.0; }
-    ops::matvec_t(d_out, &linear.weight, d_input, out_dim, in_dim);
+    ops::matvec_t(d_out, &linear.weight, d_input, out_dim, in_dim)
+        .expect("matvec_t dispatch");
 }
 
 // ─── Affine LayerNorm ──────────────────────────────────────
@@ -119,7 +121,7 @@ fn silu_forward_cached(x: &mut [f32]) -> Vec<f32> {
 fn silu_backward(d_out: &[f32], pre: &[f32]) -> Vec<f32> {
     use modgrad_device::backend::ops;
     let mut d_input = vec![0.0f32; d_out.len()];
-    ops::silu_bwd(d_out, pre, &mut d_input);
+    ops::silu_bwd(d_out, pre, &mut d_input).expect("silu_bwd dispatch");
     d_input
 }
 
@@ -146,7 +148,8 @@ fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
     use modgrad_device::backend::ops;
     let total_in = cache.n_neurons * cache.out_per;
     let mut d_input = vec![0.0f32; total_in];
-    ops::per_neuron_glu_bwd(d_out, &cache.x, &mut d_input, cache.n_neurons, half);
+    ops::per_neuron_glu_bwd(d_out, &cache.x, &mut d_input, cache.n_neurons, half)
+        .expect("per_neuron_glu_bwd dispatch");
     d_input
 }
 
@@ -180,7 +183,8 @@ impl BlockGrads {
         // Weight update via registry dispatch. Grad-zeroing is the
         // caller's responsibility (preserved in the outer training loop);
         // sgd_update now does ONLY the `w -= lr*g` step.
-        ops::sgd_update(&mut block.linear.weight, &self.d_weight, lr);
+        ops::sgd_update(&mut block.linear.weight, &self.d_weight, lr)
+            .expect("sgd_update dispatch");
         // Small epilogue updates stay inline — they're O(vec_len) serial
         // loops on tiny vectors; an Op dispatch would cost more than the work.
         for (b, g) in block.linear.bias.iter_mut().zip(&self.d_bias) { *b -= lr * g; }
@@ -377,8 +381,10 @@ fn superlinear_backward(
     // call-site benefits automatically.
     use modgrad_device::backend::ops;
     let mut d_input = vec![0.0f32; n * ip];
-    ops::super_linear_bwd_dw(d_out, &cache.input, d_weights, n, ip, op);
-    ops::super_linear_bwd_dx(d_out, &sl.weights, &mut d_input, n, ip, op);
+    ops::super_linear_bwd_dw(d_out, &cache.input, d_weights, n, ip, op)
+        .expect("super_linear_bwd_dw dispatch");
+    ops::super_linear_bwd_dx(d_out, &sl.weights, &mut d_input, n, ip, op)
+        .expect("super_linear_bwd_dx dispatch");
     d_input
 }
 
@@ -404,7 +410,7 @@ fn sync_backward(
         d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
         activated, beta, d_act: &mut d_act,
         n_pairs, d_model,
-    });
+    }).expect("sync_backward_scatter dispatch");
     d_act
 }
 
@@ -568,12 +574,14 @@ fn linear_slice_backward(
     // GPU operates on the contiguous slice d_weight[row_start*in_dim..row_end*in_dim]
     let w_offset = row_start * in_dim;
     let w_slice = &mut d_weight[w_offset..w_offset + slice_dim * in_dim];
-    ops::outer_product_acc(d_out, x, w_slice, slice_dim, in_dim);
+    ops::outer_product_acc(d_out, x, w_slice, slice_dim, in_dim)
+        .expect("outer_product_acc dispatch");
 
     // d_input = W_slice^T @ d_out
     let wt_slice = &linear.weight[w_offset..w_offset + slice_dim * in_dim];
     let mut d_input = vec![0.0f32; in_dim];
-    ops::matvec_t(d_out, wt_slice, &mut d_input, slice_dim, in_dim);
+    ops::matvec_t(d_out, wt_slice, &mut d_input, slice_dim, in_dim)
+        .expect("matvec_t dispatch");
     d_input
 }
 
@@ -779,8 +787,13 @@ impl CtmGradients {
 
         self.unet.apply(&mut w.synapse, lr);
         use modgrad_device::backend::ops;
+        // Closure over `ops::sgd_update` — the closure can't `?` into
+        // `apply`'s `()` return, and this is a training-loop call site,
+        // so `.expect` here keeps the panic off the FFI boundary inside
+        // `ops::sgd_update` itself. Every invocation below goes through
+        // this one `.expect` site.
         let sgd = |w: &mut [f32], g: &mut [f32]| {
-            ops::sgd_update(w, g, lr);
+            ops::sgd_update(w, g, lr).expect("sgd_update dispatch");
         };
         sgd(&mut w.nlm_stage1.weights, &mut self.nlm_s1_w);
         sgd(&mut w.nlm_stage1.biases, &mut self.nlm_s1_b);
