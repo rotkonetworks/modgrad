@@ -1149,21 +1149,34 @@ impl StreamGpuBackend {
 const GPU_MIN_FLOPS: usize = 32;
 
 impl ComputeBackend for StreamGpuBackend {
-    // Fail-fast contract — same as the FFN path in modgrad-ffn. GPU
-    // failures panic with shape info rather than silently routing to
-    // CPU. The cpu field is still used for the sub-GPU_MIN_FLOPS path
-    // below on matvec/superlinear, where dispatching to GPU isn't
-    // worth the overhead at all; that's a size gate, not a fallback.
+    // Stage 3 facade: every dispatch method below delegates to
+    // `modgrad_device::backend::ops::*`, which routes through the
+    // `BackendRegistry` — KFD when available and `supports()` accepts the
+    // shape, CPU otherwise. StreamGpuBackend sits strictly ABOVE the
+    // registry; it is NOT a registered `Backend` itself (layering rule
+    // from tasks/compute-device-unify.md).
+    //
+    // Behavior shift vs. pre-Stage-3 code: previously each method called
+    // `kfd::accel::try_*` directly and panicked if the KFD runtime was
+    // absent. After the rewrite, ops::* will transparently run on
+    // whichever registered backend is available — notably, on a host
+    // with ROCm but no KFD, matvec will now succeed on ROCm instead of
+    // panicking. That's the intended convergence; the fail-fast panics
+    // only remain where the ops:: façade itself panics on dispatch
+    // failure (e.g. no backend supports the op at the given shape).
+    //
+    // The sub-GPU_MIN_FLOPS CPU gate on matvec/superlinear is preserved
+    // — it's a size gate (dispatch overhead isn't worth amortizing at
+    // <32 FLOPs), not a fallback. `self.cpu` stays for that.
 
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
               y: &mut [f32], out_dim: usize, in_dim: usize) {
         if out_dim * in_dim >= GPU_MIN_FLOPS {
-            if !modgrad_device::kfd::accel::try_matvec(
-                x, weight, bias, y, out_dim as u32, in_dim as u32,
-            ) {
-                panic!("GPU matvec failed: out_dim={out_dim} in_dim={in_dim}. \
-                        --gpu requires a working GPU dispatch path.");
-            }
+            // Arg order: ops::matvec takes x first, weight second.
+            modgrad_device::backend::ops::matvec(
+                x, weight, bias, y, out_dim, in_dim,
+                modgrad_device::backend::QuantKind::F32,
+            );
             return;
         }
         // Too small for GPU to amortize dispatch overhead — CPU is the
@@ -1174,60 +1187,51 @@ impl ComputeBackend for StreamGpuBackend {
     fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                    output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
         if n_neurons * in_per * out_per >= GPU_MIN_FLOPS {
-            if !modgrad_device::kfd::accel::try_superlinear(
-                trace, weights, biases, output,
-                n_neurons as u32, in_per as u32, out_per as u32,
-            ) {
-                panic!("GPU superlinear failed: n_neurons={n_neurons} \
-                        in_per={in_per} out_per={out_per}. --gpu requires \
-                        a working GPU dispatch path.");
-            }
+            // Forward-only fused path — cache=None. Name mapping:
+            // ComputeBackend's (n_neurons, in_per) are SuperLinearFwd's
+            // (d_model, memory_length); see Op::SuperLinearFwd.
+            modgrad_device::backend::ops::super_linear_fwd(
+                trace, weights, biases, output, None,
+                n_neurons, in_per, out_per,
+            );
             return;
         }
         self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
     }
 
     fn glu(&self, input: &[f32], output: &mut [f32]) {
-        let n = input.len() / 2;
-        if !modgrad_device::kfd::accel::try_glu(input, output, n as u32) {
-            panic!("GPU glu failed: n={n}. --gpu requires a working GPU dispatch path.");
-        }
+        modgrad_device::backend::ops::glu_fwd(input, output);
     }
 
     fn silu_inplace(&self, x: &mut [f32]) {
-        if !modgrad_device::kfd::accel::try_silu_inplace(x) {
-            panic!("GPU silu_inplace failed: len={}. --gpu requires a working GPU \
-                    dispatch path.", x.len());
-        }
+        modgrad_device::backend::ops::silu_fwd_inplace(x);
     }
 
     fn layer_norm_inplace(&self, x: &mut [f32]) {
-        if !modgrad_device::kfd::accel::try_layer_norm_inplace(x) {
-            panic!("GPU layer_norm_inplace failed: len={}. --gpu requires a \
-                    working GPU dispatch path.", x.len());
-        }
+        // ComputeBackend's LN is single-row; the Op-layer signature
+        // carries explicit shape. n_rows=1 preserves the old semantics.
+        let n_cols = x.len();
+        modgrad_device::backend::ops::layer_norm_inplace(x, 1, n_cols);
     }
 
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
-                       output: &mut [f32], scratch: &mut [f32],
+                       output: &mut [f32], _scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
-        if !modgrad_device::kfd::accel::try_synapse_forward(
-            x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
-        ) {
-            panic!("GPU synapse_forward failed: out_dim={out_dim} in_dim={in_dim}. \
-                    --gpu requires a working GPU dispatch path.");
-        }
+        // Stage 1 deliberately dropped `scratch` from the Op boundary —
+        // the CPU impl allocates its own Vec, the KFD impl uses its own
+        // preallocated kernel slot. The caller's `scratch` is silently
+        // ignored here; it's part of the old API that Stage 6 will
+        // finish removing.
+        modgrad_device::backend::ops::synapse_forward(
+            weight, bias, x, output, out_dim, in_dim,
+        );
     }
 
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
-        if !modgrad_device::kfd::accel::try_trace_shift(
-            traces, new_activations, n_neurons as u32, memory_length as u32,
-        ) {
-            panic!("GPU trace_shift failed: n_neurons={n_neurons} \
-                    memory_length={memory_length}. --gpu requires a working \
-                    GPU dispatch path.");
-        }
+        modgrad_device::backend::ops::trace_rotate_inplace(
+            traces, new_activations, n_neurons, memory_length,
+        );
     }
 
     fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
@@ -1236,6 +1240,14 @@ impl ComputeBackend for StreamGpuBackend {
                    decay: &[f32], decay_shift: &[f32],
                    dopamine: f32, n_pairs: usize, initialized: bool,
                    sync_out: &mut [f32]) {
+        // TODO: migrate once Op::SyncUpdateFwd signature aligns.
+        // The Op-layer variant takes (h, pairs_left, pairs_right, decay,
+        // sync_state, sync_out, n_pairs) — a different kernel contract
+        // than the KFD alpha/beta/phases/dopamine stateful accumulator
+        // this ComputeBackend method exposes. Forcing a map would lose
+        // semantics; keep the direct kfd::accel call until the Op enum
+        // grows a matching variant (tracked in compute-device-unify
+        // plan Stage 5/6).
         if !modgrad_device::kfd::accel::try_sync_update(
             alpha, beta, activations_left, activations_right,
             phases_left, phases_right, decay, decay_shift,
