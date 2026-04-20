@@ -281,11 +281,8 @@ fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
     // claims NN-only in its gate today; for NT-kind we fall through to
     // CPU which handles all kinds. KFD support for NT is a follow-up
     // (kernel needs T-variant).
-    use modgrad_device::backend::{registry, Op};
-    registry().dispatch(&mut Op::MatmulNT {
-        a, b: weight, out: y, bias: Some(bias),
-        m: n, k, n: m,
-    }).expect("matmul dispatch");
+    use modgrad_device::backend::ops;
+    ops::matmul_nt(a, weight, y, Some(bias), n, k, m);
 }
 
 /// Transposed matmul: dA[n×k] += dY[n×m] @ W[m×k] (ACCUMULATES).
@@ -297,12 +294,9 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
     // Backward-input path: da[n×k] += dy[n×m] @ weight
     // Weight is stored row-major [m×k], so this is a plain NN matmul.
     // Compute into `tmp` (overwrite) then accumulate into `da`.
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
     let mut tmp = vec![0.0f32; n * k];
-    registry().dispatch(&mut Op::MatmulNN {
-        a: dy, b: weight, out: &mut tmp, bias: None,
-        m: n, k: m, n: k,
-    }).expect("matmul_t dispatch");
+    ops::matmul_nn(dy, weight, &mut tmp, None, n, m, k);
     da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
@@ -316,12 +310,9 @@ fn matmul_grad_rayon(dy: &[f32], a: &[f32], dw: &mut [f32],
     // dy stored [n×m] row-major; a stored [n×k] row-major; both as
     // provided by the caller. Using kind=TN for "first matrix
     // transposed" matches this layout: out[m×k] = dy^T @ a.
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
     let mut tmp = vec![0.0f32; m * k];
-    registry().dispatch(&mut Op::MatmulTN {
-        a: dy, b: a, out: &mut tmp, bias: None,
-        m, k: n, n: k,
-    }).expect("matmul_grad dispatch");
+    ops::matmul_tn(dy, a, &mut tmp, None, m, n, k);
     dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
@@ -983,12 +974,12 @@ fn adamw_apply(
     // supports(). Grads are read-only for the optimizer; caller owns
     // zero-after-step if needed.
     let g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
-    use modgrad_device::backend::{registry, AdamWArgs, Op};
-    registry().dispatch(&mut Op::AdamW(AdamWArgs {
+    use modgrad_device::backend::{ops, AdamWArgs};
+    ops::adamw(AdamWArgs {
         w: weights, g: &g_scaled, m, v,
         lr, beta1, beta2, eps, weight_decay: wd,
         bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
-    })).expect("adamw dispatch");
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════

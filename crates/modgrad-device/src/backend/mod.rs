@@ -16,6 +16,7 @@
 //! coordinated change, reviewed as a unit.
 
 pub mod op;
+pub mod ops;
 pub mod cpu;
 pub mod kfd;
 pub mod cuda_be;

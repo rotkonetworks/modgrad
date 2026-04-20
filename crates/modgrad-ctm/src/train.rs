@@ -37,7 +37,7 @@ pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
 
     let in_dim = linear.in_dim;
     let out_dim = linear.out_dim;
@@ -46,20 +46,11 @@ pub(crate) fn linear_backward(
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
 
     // d_weight[i,j] += d_out[i] * input[j]
-    registry().dispatch(&mut Op::OuterProductAcc {
-        a: d_out,
-        b: &cache.input,
-        accum: d_weight,
-        m: out_dim,
-        n: in_dim,
-    }).expect("outer_product dispatch");
+    ops::outer_product_acc(d_out, &cache.input, d_weight, out_dim, in_dim);
 
     // d_input = W^T @ d_out
     let mut d_input = vec![0.0f32; in_dim];
-    registry().dispatch(&mut Op::MatvecT {
-        d_out, weight: &linear.weight, d_input: &mut d_input,
-        out_dim, in_dim,
-    }).expect("matvec_t dispatch");
+    ops::matvec_t(d_out, &linear.weight, &mut d_input, out_dim, in_dim);
     d_input
 }
 
@@ -119,11 +110,9 @@ fn silu_forward_cached(x: &mut [f32]) -> Vec<f32> {
 }
 
 fn silu_backward(d_out: &[f32], pre: &[f32]) -> Vec<f32> {
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
     let mut d_input = vec![0.0f32; d_out.len()];
-    registry().dispatch(&mut Op::SiluBwd {
-        d_out, x: pre, d_x: &mut d_input,
-    }).expect("silu_bwd dispatch");
+    ops::silu_bwd(d_out, pre, &mut d_input);
     d_input
 }
 
@@ -147,14 +136,10 @@ fn per_neuron_glu_cached(x: &[f32], n_neurons: usize, out_per: usize) -> (Vec<f3
 
 fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
     let half = cache.out_per / 2;
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
     let total_in = cache.n_neurons * cache.out_per;
     let mut d_input = vec![0.0f32; total_in];
-    registry().dispatch(&mut Op::PerNeuronGluBwd {
-        d_out, x: &cache.x, d_x: &mut d_input,
-        n_neurons: cache.n_neurons,
-        feat_per_neuron: half,
-    }).expect("per_neuron_glu_bwd dispatch");
+    ops::per_neuron_glu_bwd(d_out, &cache.x, &mut d_input, cache.n_neurons, half);
     d_input
 }
 
@@ -184,13 +169,11 @@ impl BlockGrads {
     }
 
     fn apply(&mut self, block: &mut SynapseBlock, lr: f32) {
-        use modgrad_device::backend::{registry, Op};
+        use modgrad_device::backend::ops;
         // Weight update via registry dispatch. Grad-zeroing is the
         // caller's responsibility (preserved in the outer training loop);
         // sgd_update now does ONLY the `w -= lr*g` step.
-        registry().dispatch(&mut Op::SgdUpdate {
-            w: &mut block.linear.weight, g: &self.d_weight, lr,
-        }).expect("sgd_update dispatch");
+        ops::sgd_update(&mut block.linear.weight, &self.d_weight, lr);
         // Small epilogue updates stay inline — they're O(vec_len) serial
         // loops on tiny vectors; an Op dispatch would cost more than the work.
         for (b, g) in block.linear.bias.iter_mut().zip(&self.d_bias) { *b -= lr * g; }
@@ -382,16 +365,10 @@ fn superlinear_backward(
     // registry, CPU runs them as two passes. When a kernel-matched
     // fused variant lands, supports() can claim it and this same
     // call-site benefits automatically.
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
     let mut d_input = vec![0.0f32; n * ip];
-    registry().dispatch(&mut Op::SuperLinearBwdDw {
-        d_out, trace: &cache.input, d_weights,
-        d_model: n, memory_length: ip, out_per: op,
-    }).expect("superlinear_bwd_dw dispatch");
-    registry().dispatch(&mut Op::SuperLinearBwdDx {
-        d_out, weights: &sl.weights, d_trace: &mut d_input,
-        d_model: n, memory_length: ip, out_per: op,
-    }).expect("superlinear_bwd_dx dispatch");
+    ops::super_linear_bwd_dw(d_out, &cache.input, d_weights, n, ip, op);
+    ops::super_linear_bwd_dx(d_out, &sl.weights, &mut d_input, n, ip, op);
     d_input
 }
 
@@ -409,15 +386,15 @@ fn sync_backward(
 ) -> Vec<f32> {
     let n_pairs = left.len();
     // GPU path: convert usize indices to u32, dispatch scatter kernel
-    use modgrad_device::backend::{registry, Op, SyncBackwardScatterArgs};
+    use modgrad_device::backend::{ops, SyncBackwardScatterArgs};
     let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
     let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
     let mut d_act = vec![0.0f32; d_model];
-    registry().dispatch(&mut Op::SyncBackwardScatter(SyncBackwardScatterArgs {
+    ops::sync_backward_scatter(SyncBackwardScatterArgs {
         d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
         activated, beta, d_act: &mut d_act,
         n_pairs, d_model,
-    })).expect("sync_backward_scatter dispatch");
+    });
     d_act
 }
 
@@ -575,22 +552,17 @@ fn linear_slice_backward(
     }
 
     // d_weight (outer product): d_weight[r*in_dim+j] += d_out[ri] * x[j]
-    use modgrad_device::backend::{registry, Op};
+    use modgrad_device::backend::ops;
 
     // GPU operates on the contiguous slice d_weight[row_start*in_dim..row_end*in_dim]
     let w_offset = row_start * in_dim;
     let w_slice = &mut d_weight[w_offset..w_offset + slice_dim * in_dim];
-    registry().dispatch(&mut Op::OuterProductAcc {
-        a: d_out, b: x, accum: w_slice, m: slice_dim, n: in_dim,
-    }).expect("outer_product dispatch");
+    ops::outer_product_acc(d_out, x, w_slice, slice_dim, in_dim);
 
     // d_input = W_slice^T @ d_out
     let wt_slice = &linear.weight[w_offset..w_offset + slice_dim * in_dim];
     let mut d_input = vec![0.0f32; in_dim];
-    registry().dispatch(&mut Op::MatvecT {
-        d_out, weight: wt_slice, d_input: &mut d_input,
-        out_dim: slice_dim, in_dim,
-    }).expect("matvec_t dispatch");
+    ops::matvec_t(d_out, wt_slice, &mut d_input, slice_dim, in_dim);
     d_input
 }
 
@@ -772,10 +744,9 @@ impl CtmGradients {
         let lr = lr * scale;
 
         self.unet.apply(&mut w.synapse, lr);
-        use modgrad_device::backend::{registry, Op};
+        use modgrad_device::backend::ops;
         let sgd = |w: &mut [f32], g: &mut [f32]| {
-            registry().dispatch(&mut Op::SgdUpdate { w, g, lr })
-                .expect("sgd_update dispatch");
+            ops::sgd_update(w, g, lr);
         };
         sgd(&mut w.nlm_stage1.weights, &mut self.nlm_s1_w);
         sgd(&mut w.nlm_stage1.biases, &mut self.nlm_s1_b);
