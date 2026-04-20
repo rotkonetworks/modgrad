@@ -242,6 +242,40 @@ proptest! {
         }
     }
 
+    // ─── SiluFwdInplace ──────────────────────────────────────
+    // Mirrors `prop_silu_fwd_parity` but exercises the in-place
+    // variant. The whole point is verifying that KFD's
+    // copy-avoidance path still produces bit-for-bit compatible
+    // output with the (out-of-place) CPU reference.
+    #[test]
+    fn prop_silu_fwd_inplace_parity(
+        len in 1usize..=256,
+        seed in 0u64..u64::MAX,
+    ) {
+        let rng = |i: usize| -> f32 {
+            let h = (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as u32;
+            ((h as f32) / (u32::MAX as f32)) * 8.0 - 4.0
+        };
+        let x0: Vec<f32> = (0..len).map(rng).collect();
+
+        let bs = backends();
+        let mut reference: Option<Vec<f32>> = None;
+
+        for backend in &bs {
+            let mut x = x0.clone();
+            let mut op = Op::SiluFwdInplace { x: &mut x };
+            if !backend.supports(&op) { continue; }
+            backend.dispatch(&mut op).map_err(|e|
+                TestCaseError::fail(format!("silu_fwd_inplace on '{}' errored: {e}", backend.name())))?;
+
+            if let Some(ref r) = reference {
+                assert_close(&x, r, &format!("silu_fwd_inplace on '{}'", backend.name()))?;
+            } else {
+                reference = Some(x);
+            }
+        }
+    }
+
     // ─── SiluBwd ─────────────────────────────────────────────
     #[test]
     fn prop_silu_bwd_parity(

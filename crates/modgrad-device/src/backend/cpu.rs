@@ -97,6 +97,7 @@ impl Backend for CpuBackend {
                 Ok(())
             }
             Op::SiluFwd { x, out } => { silu_fwd(x, out); Ok(()) }
+            Op::SiluFwdInplace { x } => { silu_fwd_inplace(x); Ok(()) }
             Op::SiluBwd { d_out, x, d_x } => { silu_bwd(d_out, x, d_x); Ok(()) }
             Op::GluFwd { x, out } => { glu_fwd(x, out); Ok(()) }
             Op::GluBwd { d_out, x, d_x } => { glu_bwd(d_out, x, d_x); Ok(()) }
@@ -285,6 +286,13 @@ fn ln_silu_fwd(
 
 fn silu_fwd(x: &[f32], out: &mut [f32]) {
     for (o, &v) in out.iter_mut().zip(x.iter()) { *o = v * sigmoid(v); }
+}
+
+fn silu_fwd_inplace(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        let s = sigmoid(*v);
+        *v *= s;
+    }
 }
 
 fn silu_bwd(d_out: &[f32], x: &[f32], d_x: &mut [f32]) {

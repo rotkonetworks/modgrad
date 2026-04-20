@@ -107,6 +107,7 @@ impl Backend for KfdBackend {
             // non-aligned cases fall through to CPU.
             Op::AdamW(args) if args.w.len() >= 32 && args.w.len() % 32 == 0 => true,
             Op::SiluFwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
+            Op::SiluFwdInplace { x } if x.len() >= 32 && x.len() % 32 == 0 => true,
             Op::SiluBwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
             // GluFwd: input has length 2*half; gate on that.
             Op::GluFwd { x, .. }  if x.len() >= 64 && x.len() % 64 == 0 => true,
@@ -187,8 +188,16 @@ impl Backend for KfdBackend {
                 // KFD kernel is in-place; copy input over first, then
                 // dispatch on the output buffer. One memcpy of size
                 // `x.len()` — negligible compared to GPU dispatch cost.
+                // Callers that don't need the pre-activation preserved
+                // should prefer `Op::SiluFwdInplace` to skip this copy.
                 out.copy_from_slice(x);
                 try_result(accel::try_silu_inplace(out), "silu")
+            }
+
+            Op::SiluFwdInplace { x } => {
+                // Native in-place path — the whole point of this variant.
+                // No copy_from_slice: the kernel mutates `x` directly.
+                try_result(accel::try_silu_inplace(x), "silu_inplace")
             }
 
             Op::SiluBwd { d_out, x, d_x } => try_result(

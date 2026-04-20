@@ -212,6 +212,18 @@ pub enum Op<'a> {
         out: &'a mut [f32],
     },
 
+    /// SiLU forward, in-place: x = x * sigmoid(x).
+    ///
+    /// Use when the caller does NOT need the pre-activation preserved
+    /// (e.g. inference paths). Backwards training paths must use
+    /// `SiluFwd` because `SiluBwd` requires the original `x`. This
+    /// variant lets backends whose native kernel is in-place (KFD)
+    /// skip the redundant host-side memcpy that `SiluFwd` would
+    /// otherwise force.
+    SiluFwdInplace {
+        x: &'a mut [f32],
+    },
+
     /// SiLU backward: d_x = d_out * dSiLU/dx(x).
     SiluBwd {
         d_out: &'a [f32],
@@ -343,6 +355,7 @@ impl<'a> Op<'a> {
             Op::LayerNormBwd { .. } => "layer_norm_bwd",
             Op::LnSiluFwd { .. } => "ln_silu_fwd",
             Op::SiluFwd { .. } => "silu_fwd",
+            Op::SiluFwdInplace { .. } => "silu_fwd_inplace",
             Op::SiluBwd { .. } => "silu_bwd",
             Op::GluFwd { .. } => "glu_fwd",
             Op::GluBwd { .. } => "glu_bwd",
@@ -371,7 +384,8 @@ impl<'a> Op<'a> {
 //   LayerNormFwd           → layer_norm_fwd
 //   LayerNormBwd           → ln_bwd
 //   LnSiluFwd              → ln_silu_fwd
-//   SiluFwd                → silu_fwd
+//   SiluFwd                → silu_fwd (with host-side copy_from_slice)
+//   SiluFwdInplace         → silu_fwd (native in-place, no copy)
 //   SiluBwd                → silu_bwd
 //   GluFwd                 → glu_fwd
 //   GluBwd                 → glu_bwd
