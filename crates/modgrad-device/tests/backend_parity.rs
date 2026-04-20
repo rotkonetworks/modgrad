@@ -242,7 +242,7 @@ fn parity_layernorm_fwd() {
     let beta = [0.0, 0.0, 0.0];
     let mut op = Op::LayerNormFwd {
         x: &x, gamma: &gamma, beta: &beta,
-        out: &mut out_buf, cache: &mut cache,
+        out: &mut out_buf, cache: Some(&mut cache),
         n_rows: 2, n_cols: 3,
     };
     let be = CpuBackend::new();

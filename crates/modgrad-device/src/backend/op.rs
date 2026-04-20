@@ -158,14 +158,19 @@ pub enum Op<'a> {
     // ─── normalization and activations ───────────────────────
 
     /// LayerNorm forward: normalizes `x` then scales by `gamma` + shifts
-    /// by `beta`. Output written into `out`. `cache` stores intermediate
-    /// mean/rstd for backward (length = 2 * n_rows).
+    /// by `beta`. Output written into `out`.
+    ///
+    /// `cache` is optional: if `Some`, intermediate mean/rstd
+    /// (length = 2 * n_rows) are written for use by a subsequent
+    /// `LayerNormBwd`. Inference paths pass `None` and skip the
+    /// scratch allocation. Backends that can't compute cache must
+    /// return `false` from `supports()` when `cache.is_some()`.
     LayerNormFwd {
         x: &'a [f32],
         gamma: &'a [f32],
         beta: &'a [f32],
         out: &'a mut [f32],
-        cache: &'a mut [f32],
+        cache: Option<&'a mut [f32]>,
         n_rows: usize,
         n_cols: usize,
     },
@@ -185,13 +190,18 @@ pub enum Op<'a> {
     },
 
     /// Fused LayerNorm + SiLU forward. Common CTM path (layer_norm followed
-    /// by silu activation). Cache retains mean/rstd for a matched backward.
+    /// by silu activation).
+    ///
+    /// `cache` is optional: if `Some`, mean/rstd (length = 2 * n_rows) are
+    /// retained for a matched backward. Inference paths pass `None` and
+    /// skip the scratch allocation. Backends that can't compute cache
+    /// must return `false` from `supports()` when `cache.is_some()`.
     LnSiluFwd {
         x: &'a [f32],
         gamma: &'a [f32],
         beta: &'a [f32],
         out: &'a mut [f32],
-        cache: &'a mut [f32],
+        cache: Option<&'a mut [f32]>,
         n_rows: usize,
         n_cols: usize,
     },

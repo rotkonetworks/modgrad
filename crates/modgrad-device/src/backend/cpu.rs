@@ -85,7 +85,7 @@ impl Backend for CpuBackend {
             }
 
             Op::LayerNormFwd { x, gamma, beta, out, cache, n_rows, n_cols } => {
-                layer_norm_fwd(x, gamma, beta, out, cache, *n_rows, *n_cols);
+                layer_norm_fwd(x, gamma, beta, out, cache.as_deref_mut(), *n_rows, *n_cols);
                 Ok(())
             }
             Op::LayerNormBwd { d_out, x, gamma, cache, d_x, d_gamma, d_beta, n_rows, n_cols } => {
@@ -93,7 +93,7 @@ impl Backend for CpuBackend {
                 Ok(())
             }
             Op::LnSiluFwd { x, gamma, beta, out, cache, n_rows, n_cols } => {
-                ln_silu_fwd(x, gamma, beta, out, cache, *n_rows, *n_cols);
+                ln_silu_fwd(x, gamma, beta, out, cache.as_deref_mut(), *n_rows, *n_cols);
                 Ok(())
             }
             Op::SiluFwd { x, out } => { silu_fwd(x, out); Ok(()) }
@@ -216,15 +216,20 @@ fn outer_product_acc(a: &[f32], b: &[f32], accum: &mut [f32], m: usize, n: usize
 
 fn layer_norm_fwd(
     x: &[f32], gamma: &[f32], beta: &[f32], out: &mut [f32],
-    cache: &mut [f32], n_rows: usize, n_cols: usize,
+    mut cache: Option<&mut [f32]>, n_rows: usize, n_cols: usize,
 ) {
+    // `cache` mirrors the `SuperLinearFwd` pattern: when `Some`, we
+    // persist mean/rstd for a subsequent backward; when `None`, we
+    // still compute them (they feed the output) but drop them.
     for r in 0..n_rows {
         let row = &x[r * n_cols..(r + 1) * n_cols];
         let mean: f32 = row.iter().sum::<f32>() / n_cols as f32;
         let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n_cols as f32;
         let rstd = 1.0 / (var + 1e-5).sqrt();
-        cache[r * 2] = mean;
-        cache[r * 2 + 1] = rstd;
+        if let Some(ref mut c) = cache {
+            c[r * 2] = mean;
+            c[r * 2 + 1] = rstd;
+        }
         let out_row = &mut out[r * n_cols..(r + 1) * n_cols];
         for c in 0..n_cols {
             out_row[c] = (row[c] - mean) * rstd * gamma[c] + beta[c];
@@ -268,7 +273,7 @@ fn layer_norm_bwd(
 
 fn ln_silu_fwd(
     x: &[f32], gamma: &[f32], beta: &[f32], out: &mut [f32],
-    cache: &mut [f32], n_rows: usize, n_cols: usize,
+    cache: Option<&mut [f32]>, n_rows: usize, n_cols: usize,
 ) {
     // Compose: out = silu(layer_norm(x) * gamma + beta)
     layer_norm_fwd(x, gamma, beta, out, cache, n_rows, n_cols);

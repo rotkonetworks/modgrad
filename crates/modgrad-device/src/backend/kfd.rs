@@ -283,7 +283,7 @@ mod tests {
         // registry falls through to CPU for it.
         let op = Op::LayerNormFwd {
             x: &x, gamma: &gamma, beta: &beta,
-            out: &mut out, cache: &mut cache,
+            out: &mut out, cache: Some(&mut cache),
             n_rows: 1, n_cols: 4,
         };
         assert!(!be.supports(&op));
