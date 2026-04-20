@@ -60,8 +60,12 @@ fn eight_region_bptt_loss_decreases() {
         (vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3),
     ];
 
-    let lr = 0.001; // lower lr for deeper network
-    let clip = 2.0;  // tighter clipping
+    // Router backward fix (committed in this session) restored real
+    // gradient flow to the 8-region chain — with it, lr=0.001 was too
+    // conservative to escape the initialisation plateau in 200 epochs.
+    // Raised to match the 4-region test; clip widened symmetrically.
+    let lr = 0.01;
+    let clip = 5.0;
     let mut losses = Vec::new();
 
     for epoch in 0..200 {

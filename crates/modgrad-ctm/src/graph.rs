@@ -228,6 +228,14 @@ pub struct RouterCache {
     pub selected: Vec<Vec<usize>>,
     /// Per-source projected outputs: [n_regions][d_route].
     pub projected_sources: Vec<Vec<f32>>,
+    /// Per-destination pre-from_route routed activation (weighted sum of
+    /// projected sources). Shape: [n_regions][d_route]. Needed to compute
+    /// `from_route[j]` weight gradients in backward.
+    pub routed: Vec<Vec<f32>>,
+    /// Per-source region outputs observed at forward time (the input to
+    /// `to_route[i]`). Shape: [n_regions][d_model_i]. Needed to compute
+    /// `to_route[i]` weight gradients in backward.
+    pub region_outputs: Vec<Vec<f32>>,
 }
 
 /// Gradients for the router.
@@ -313,6 +321,7 @@ impl RegionalRouter {
         let mut weights = vec![0.0f32; n * n];
         let mut selected = Vec::with_capacity(n);
         let mut routed_inputs = Vec::with_capacity(n);
+        let mut routed_cache: Vec<Vec<f32>> = Vec::with_capacity(n);
 
         let mut rng = if training {
             Some(SimpleRng::new(tick as u64 ^ 0xCAFE))
@@ -362,11 +371,18 @@ impl RegionalRouter {
             // Project to destination input dimension
             let dest_input = self.from_route[j].forward(&routed);
             selected.push(sel);
+            routed_cache.push(routed);
             routed_inputs.push(dest_input);
         }
 
+        // Cache per-source inputs for backward (to_route weight grads).
+        let region_outputs_cache: Vec<Vec<f32>> =
+            region_outputs.iter().map(|v| v.clone()).collect();
+
         let cache = RouterCache {
             proj_input, logits, weights, selected, projected_sources,
+            routed: routed_cache,
+            region_outputs: region_outputs_cache,
         };
         (routed_inputs, cache)
     }
@@ -1458,6 +1474,36 @@ impl RegionalGradients {
         if let Some(s) = &mut self.cereb_blend_scale_grad { *s = 0.0; }
     }
 
+    /// Diagnostic: L2 norm of the weight-gradient payload for each region.
+    /// Used for vanishing-gradient diagnostics; not on the hot path.
+    pub fn region_norms(&self) -> Vec<f32> {
+        self.region_grads.iter().map(|rg| rg.l2_norm()).collect()
+    }
+
+    /// Diagnostic: L2 norm of each inter-region connection synapse's dW.
+    pub fn connection_norms(&self) -> Vec<f32> {
+        self.connection_dw.iter().map(|dw| {
+            let sumsq: f64 = dw.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            (sumsq as f32).sqrt()
+        }).collect()
+    }
+
+    /// Diagnostic: L2 norm of each router sub-weight's gradient.
+    /// Returns (to_route_norms, from_route_norms, route_proj_norm, tick_embed_norm).
+    /// All zeros when router isn't enabled.
+    pub fn router_norms(&self) -> (Vec<f32>, Vec<f32>, f32, f32) {
+        let Some(rg) = &self.router_grads else {
+            return (vec![], vec![], 0.0, 0.0);
+        };
+        let n = |v: &[f32]| -> f32 {
+            let s: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            (s as f32).sqrt()
+        };
+        let to_route: Vec<f32> = rg.to_route_dw.iter().map(|v| n(v)).collect();
+        let from_route: Vec<f32> = rg.from_route_dw.iter().map(|v| n(v)).collect();
+        (to_route, from_route, n(&rg.route_proj_dw), n(&rg.tick_embed_grad))
+    }
+
     /// Apply gradients with SGD + gradient clipping (for tests / simple usage).
     pub fn apply(&mut self, w: &mut RegionalWeights, lr: f32, clip_norm: f32) {
         // Compute gradient norm for clipping (GPU-accelerated with CPU fallback)
@@ -2010,6 +2056,15 @@ pub fn regional_train_step(
         for (d, s) in d.iter_mut().zip(s) { *d += s; }
     };
 
+    // Router source-feedback carry: the router at tick t reads the PREVIOUS
+    // tick's region_outputs, so the backward gradient into those sources
+    // must land on tick t-1's d_region_activated (we iterate ticks in
+    // reverse, so t-1 fires AFTER tick t in this loop). Seeded to zeros;
+    // consumed-and-zeroed at each iteration.
+    let mut d_region_activated_carry: Vec<Vec<f32>> = (0..n_regions)
+        .map(|r| vec![0.0f32; w.regions[r].config.d_model])
+        .collect();
+
     for (t, mut tc) in tick_caches.into_iter().enumerate().rev() {
         let d_logits = &d_per_tick[t];
 
@@ -2032,13 +2087,24 @@ pub fn regional_train_step(
             &w.global_sync_left, &w.global_sync_right, total_act_dim,
         );
 
-        // Scatter to per-region
+        // Scatter to per-region, adding the router source-feedback carry
+        // from the NEXT tick (which wrote into this tick's region_outputs).
         let mut offset = 0;
         let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
         for r in 0..n_regions {
             let dim = w.regions[r].config.d_model;
-            d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
+            let mut row = d_all_activations[offset..offset + dim].to_vec();
+            let carry = &d_region_activated_carry[r];
+            for k in 0..dim.min(carry.len()) {
+                row[k] += carry[k];
+            }
+            d_region_activated.push(row);
             offset += dim;
+        }
+        // Reset the carry; the router-backward below will repopulate it
+        // for this tick's sources (feeding tick t-1 on the next iteration).
+        for r in 0..n_regions {
+            for v in d_region_activated_carry[r].iter_mut() { *v = 0.0; }
         }
 
         // Per-region inner-tick BPTT → get d_observation for each region
@@ -2082,15 +2148,18 @@ pub fn regional_train_step(
             let d = router.config.d_route;
 
             // Per-destination: backprop through from_route Linear
+            // Bug 1 fix: use cached `rc.routed[j]` as the Linear input for dW.
             let mut d_routed = vec![vec![0.0f32; d]; n]; // d_routed[j][d_route]
             for j in 0..n {
                 let d_obs = &d_region_obs[j];
+                if d_obs.is_empty() { continue; }
                 let fr = &router.from_route[j];
+                let routed_j = &rc.routed[j];
                 // from_route backward: d_obs → dW, db, d_input
                 for i in 0..fr.out_dim.min(d_obs.len()) {
                     rg.from_route_db[j][i] += d_obs[i];
-                    for k in 0..fr.in_dim {
-                        rg.from_route_dw[j][i * fr.in_dim + k] += d_obs[i] * 0.0; // need cached input
+                    for k in 0..fr.in_dim.min(routed_j.len()) {
+                        rg.from_route_dw[j][i * fr.in_dim + k] += d_obs[i] * routed_j[k];
                     }
                 }
                 // d_routed = W^T @ d_obs
@@ -2120,21 +2189,27 @@ pub fn regional_train_step(
                 }
             }
 
-            // Backprop through to_route: d_projected → d_region_activated (source feedback)
+            // Backprop through to_route: d_projected → dW, db, and source feedback.
+            // Bug 2 fix: compute to_route weight gradients using cached region_outputs[i].
+            // Bug 3 fix: route the source-feedback into d_region_activated_carry so
+            // it lands on the PREVIOUS tick (which supplied these region outputs).
             for i in 0..n {
                 let tr = &router.to_route[i];
-                // to_route backward: d_projected[i] → dW, db
-                // Need cached input = region_outputs[i] from the tick
-                // We can reconstruct from tc.region_activated of PREVIOUS tick
-                // Actually tc stores current tick's activated, we need prev_outputs
-                // For now, accumulate weight grads using the projected_sources as proxy
+                let src_in = &rc.region_outputs[i];
                 for oi in 0..tr.out_dim.min(d) {
                     rg.to_route_db[i][oi] += d_projected[i][oi];
+                    for k in 0..tr.in_dim.min(src_in.len()) {
+                        rg.to_route_dw[i][oi * tr.in_dim + k] +=
+                            d_projected[i][oi] * src_in[k];
+                    }
                 }
-                // d_region_activated[i] += to_route[i].W^T @ d_projected[i]
-                for k in 0..tr.in_dim {
+                // Source-feedback gradient: contributes to tick t-1's
+                // region activated (the router at tick t read region_outputs
+                // updated by tick t-1's region forward).
+                let carry = &mut d_region_activated_carry[i];
+                for k in 0..tr.in_dim.min(carry.len()) {
                     for oi in 0..tr.out_dim.min(d) {
-                        d_region_activated[i][k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                        carry[k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
                     }
                 }
             }
@@ -2162,6 +2237,29 @@ pub fn regional_train_step(
                     rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
                 }
             }
+
+            // Bug 4 fix: propagate d_logits back through route_proj's input
+            // (W^T @ d_logits). Split the d_input into [d_global_sync, d_tick_embed]
+            // and accumulate the tick-embedding tail into `tick_embed_grad`.
+            // The global-sync half is not wired further here (sync pairs are
+            // index-based; a backward path through them is a separate commit).
+            let mut d_proj_input = vec![0.0f32; rp.in_dim];
+            for j in 0..rp.in_dim {
+                for i in 0..n_sq.min(rp.out_dim) {
+                    d_proj_input[j] += d_logits[i] * rp.weight[i * rp.in_dim + j];
+                }
+            }
+            let t_idx = t.min(router.max_ticks - 1);
+            let t_dim = router.config.tick_embed_dim;
+            let n_sync_grad = rp.in_dim.saturating_sub(t_dim);
+            for k in 0..t_dim {
+                let idx = n_sync_grad + k;
+                if idx < d_proj_input.len() {
+                    rg.tick_embed_grad[t_idx * t_dim + k] += d_proj_input[idx];
+                }
+            }
+            // TODO(future): d_proj_input[..n_sync_grad] is d_global_sync — add
+            // a backward path through the global-sync pairs.
         } else {
             // Fixed connection synapse backward
             for (ci, conn) in cfg.connections.iter().enumerate().rev() {
@@ -2502,6 +2600,13 @@ fn regional_train_step_inner(
 
     let mut d_observation = vec![0.0f32; obs_dim];
 
+    // Router source-feedback carry (see matching comment in the loss-less
+    // variant). Feeds tick t's router source-backward gradient into the
+    // previous tick's region activated gradient on the next iteration.
+    let mut d_region_activated_carry: Vec<Vec<f32>> = (0..n_regions)
+        .map(|r| vec![0.0f32; w.regions[r].config.d_model])
+        .collect();
+
     for (t, mut tc) in tick_caches.into_iter().enumerate().rev() {
         let d_logits = &d_per_tick[t];
 
@@ -2526,8 +2631,16 @@ fn regional_train_step_inner(
         let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
         for r in 0..n_regions {
             let dim = w.regions[r].config.d_model;
-            d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
+            let mut row = d_all_activations[offset..offset + dim].to_vec();
+            let carry = &d_region_activated_carry[r];
+            for k in 0..dim.min(carry.len()) {
+                row[k] += carry[k];
+            }
+            d_region_activated.push(row);
             offset += dim;
+        }
+        for r in 0..n_regions {
+            for v in d_region_activated_carry[r].iter_mut() { *v = 0.0; }
         }
 
         // Accumulate cerebellum projection gradients from d_region_activated[cereb_idx].
@@ -2595,12 +2708,18 @@ fn regional_train_step_inner(
             let n = router.n_regions;
             let d = router.config.d_route;
 
+            // Bug 1: from_route weight grad now uses cached rc.routed[j].
             let mut d_routed = vec![vec![0.0f32; d]; n];
             for j in 0..n {
                 let d_obs = &d_region_obs[j];
+                if d_obs.is_empty() { continue; }
                 let fr = &router.from_route[j];
+                let routed_j = &rc.routed[j];
                 for i in 0..fr.out_dim.min(d_obs.len()) {
                     rg.from_route_db[j][i] += d_obs[i];
+                    for k in 0..fr.in_dim.min(routed_j.len()) {
+                        rg.from_route_dw[j][i * fr.in_dim + k] += d_obs[i] * routed_j[k];
+                    }
                 }
                 for k in 0..d {
                     for i in 0..fr.out_dim.min(d_obs.len()) {
@@ -2625,14 +2744,23 @@ fn regional_train_step_inner(
                 }
             }
 
+            // Bug 2 + Bug 3: to_route weight grad uses cached region_outputs[i];
+            // source feedback routes into d_region_activated_carry for the
+            // previous tick.
             for i in 0..n {
                 let tr = &router.to_route[i];
+                let src_in = &rc.region_outputs[i];
                 for oi in 0..tr.out_dim.min(d) {
                     rg.to_route_db[i][oi] += d_projected[i][oi];
+                    for k in 0..tr.in_dim.min(src_in.len()) {
+                        rg.to_route_dw[i][oi * tr.in_dim + k] +=
+                            d_projected[i][oi] * src_in[k];
+                    }
                 }
-                for k in 0..tr.in_dim {
+                let carry = &mut d_region_activated_carry[i];
+                for k in 0..tr.in_dim.min(carry.len()) {
                     for oi in 0..tr.out_dim.min(d) {
-                        d_region_activated[i][k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
+                        carry[k] += d_projected[i][oi] * tr.weight[oi * tr.in_dim + k];
                     }
                 }
             }
@@ -2655,6 +2783,24 @@ fn regional_train_step_inner(
                 rg.route_proj_db[i] += d_logits[i];
                 for j in 0..rp.in_dim.min(rc.proj_input.len()) {
                     rg.route_proj_dw[i * rp.in_dim + j] += d_logits[i] * rc.proj_input[j];
+                }
+            }
+
+            // Bug 4: propagate d_logits back through route_proj input; tail
+            // of the input is the tick embedding slice → tick_embed_grad.
+            let mut d_proj_input = vec![0.0f32; rp.in_dim];
+            for j in 0..rp.in_dim {
+                for i in 0..n_sq.min(rp.out_dim) {
+                    d_proj_input[j] += d_logits[i] * rp.weight[i * rp.in_dim + j];
+                }
+            }
+            let t_idx = t.min(router.max_ticks - 1);
+            let t_dim = router.config.tick_embed_dim;
+            let n_sync_grad = rp.in_dim.saturating_sub(t_dim);
+            for k in 0..t_dim {
+                let idx = n_sync_grad + k;
+                if idx < d_proj_input.len() {
+                    rg.tick_embed_grad[t_idx * t_dim + k] += d_proj_input[idx];
                 }
             }
         } else {

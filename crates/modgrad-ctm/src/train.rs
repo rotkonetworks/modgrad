@@ -729,6 +729,29 @@ impl CtmGradients {
         if let Some(b) = &mut self.exit_gate_b { b.fill(0.0); }
     }
 
+    /// Diagnostic: L2 norm across all public weight gradient fields of this region.
+    /// Used for vanishing-gradient diagnostics; not on the hot path.
+    pub fn l2_norm(&self) -> f32 {
+        let mut sumsq: f64 = 0.0;
+        let mut acc = |s: &[f32]| {
+            for &x in s { sumsq += (x as f64) * (x as f64); }
+        };
+        acc(&self.nlm_s1_w); acc(&self.nlm_s1_b);
+        if let Some(w) = &self.nlm_s2_w { acc(w); }
+        if let Some(b) = &self.nlm_s2_b { acc(b); }
+        acc(&self.d_start_activated); acc(&self.d_start_trace);
+        acc(&self.kv_proj_w); acc(&self.kv_proj_b);
+        acc(&self.kv_ln_d_gamma); acc(&self.kv_ln_d_beta);
+        acc(&self.q_proj_w); acc(&self.q_proj_b);
+        acc(&self.mha_in_w); acc(&self.mha_in_b);
+        acc(&self.mha_out_w); acc(&self.mha_out_b);
+        acc(&self.d_decay_out); acc(&self.d_decay_action);
+        acc(&self.out_proj_w); acc(&self.out_proj_b);
+        if let Some(w) = &self.exit_gate_w { acc(w); }
+        if let Some(b) = &self.exit_gate_b { acc(b); }
+        (sumsq as f32).sqrt()
+    }
+
     /// SGD update: w -= lr * grad. Clips gradients by norm.
     /// GPU-accelerated for large parameter arrays.
     pub fn apply(&mut self, w: &mut CtmWeights, lr: f32, clip_norm: f32) {
