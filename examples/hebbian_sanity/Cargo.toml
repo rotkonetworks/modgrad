@@ -1,0 +1,12 @@
+[package]
+name = "hebbian_sanity"
+version = "0.1.0"
+edition = "2024"
+description = "Empirical check: does modgrad's Hebbian rule produce Gabor-like V1 filters from natural images?"
+
+[[bin]]
+name = "hebbian_sanity"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
