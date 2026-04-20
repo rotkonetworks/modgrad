@@ -211,6 +211,74 @@ pub fn set_render_mode_sdf(on: bool) {
     RENDER_SDF.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide toggle for retina bypass. Same atomic-static pattern
+/// as `RENDER_SDF`. When set, the training loop replaces
+/// `encoder.encode(&pixels)` with `bypass_tokens(...)` — raw pixel
+/// average-pool in place of the VisualRetina conv stack. Answers "is
+/// vision net-positive vs neutral vs net-negative" on the maze task.
+static RETINA_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_retina_bypass(on: bool) {
+    RETINA_BYPASS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn retina_bypass_enabled() -> bool {
+    RETINA_BYPASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Average-pool raw [3 × in_h × in_w] pixels into an
+/// [out_h × out_w × 3] grid, then broadcast each RGB triple into a
+/// `token_dim`-dim vector (first 3 dims are the colour, rest zero).
+/// Produces a TokenInput-shaped `Vec<f32>` of length
+/// `out_h * out_w * token_dim`.
+///
+/// This is the deliberately-minimal "no learning" encoder: the brain
+/// sees the exact pixel colours at the spatial resolution the retina
+/// would have produced, but with no filters, no non-linearities, no
+/// Hebbian shaping. Any performance it achieves is credit to the
+/// CTM, not the encoder.
+pub fn bypass_tokens(
+    pixels: &[f32],
+    in_h: usize, in_w: usize,
+    out_h: usize, out_w: usize,
+    token_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(pixels.len(), 3 * in_h * in_w,
+        "bypass_tokens: pixel buffer size mismatch");
+    assert!(token_dim >= 3, "token_dim must hold at least RGB");
+    let n_tokens = out_h * out_w;
+    let mut out = vec![0.0f32; n_tokens * token_dim];
+    // Integer-div pool: each output cell averages the `stride_h × stride_w`
+    // block of input pixels that maps to it. For in=21,out=11: mostly
+    // 2×2 blocks with edge handling. Exact weighting doesn't matter —
+    // this is a *probe* encoder, not a production one.
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            // Map output cell (oy, ox) to input rectangle.
+            let y0 = (oy * in_h) / out_h;
+            let y1 = ((oy + 1) * in_h) / out_h;
+            let x0 = (ox * in_w) / out_w;
+            let x1 = ((ox + 1) * in_w) / out_w;
+            let n = ((y1 - y0) * (x1 - x0)).max(1) as f32;
+            let mut rgb = [0.0f32; 3];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    for c in 0..3 {
+                        rgb[c] += pixels[c * in_h * in_w + y * in_w + x];
+                    }
+                }
+            }
+            let tok_off = (oy * out_w + ox) * token_dim;
+            for c in 0..3 {
+                out[tok_off + c] = rgb[c] / n;
+            }
+            // remainder of token_dim stays zero
+        }
+    }
+    out
+}
+
 pub fn render_input(maze: &Maze) -> Vec<f32> {
     if RENDER_SDF.load(std::sync::atomic::Ordering::Relaxed) {
         render_maze_sdf(maze)

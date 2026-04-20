@@ -20,7 +20,29 @@ use modgrad_ctm::graph::{
     RegionalAdamW, RegionalBrain, regional_forward,
 };
 use modgrad_codec::retina::{LsdConfig, VisualRetina};
-use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination};
+use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination, TokenInput};
+
+/// Dispatch between the full retina encode and the --no-retina
+/// bypass. Called from every training/eval step; flag is read once
+/// from the global AtomicBool so no parameter plumbing.
+fn encode_maybe_bypass(
+    encoder: &VisualRetina,
+    pixels: &[f32],
+    in_h: usize,
+    in_w: usize,
+) -> TokenInput {
+    if retina_bypass_enabled() {
+        let (_, _, _, _, h_tok, w_tok) = encoder.stage_dims();
+        let token_dim = encoder.token_dim();
+        TokenInput {
+            tokens: bypass_tokens(pixels, in_h, in_w, h_tok, w_tok, token_dim),
+            n_tokens: h_tok * w_tok,
+            token_dim,
+        }
+    } else {
+        encoder.encode(pixels)
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -65,6 +87,10 @@ fn main() {
     // changes. A/B this against baseline to see if the retina was
     // information-bottlenecked by the binary wall/path encoding.
     let mut use_sdf = false;
+    // --no-retina: skip the VisualRetina conv stack, feed avg-pooled
+    // raw pixels into the brain. Binary A/B on whether the retina is
+    // net-positive vs neutral vs net-negative on the task.
+    let mut no_retina = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -99,6 +125,7 @@ fn main() {
             "--live-viz" => { live_viz_dir = Some(args[i+1].clone()); i += 2; }
             "--live-every" => { live_every = args[i+1].parse().unwrap(); i += 2; }
             "--sdf" => { use_sdf = true; i += 1; }
+            "--no-retina" => { no_retina = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -117,8 +144,12 @@ fn main() {
     // helper `render_input(&maze)` dispatches to `render_maze_sdf` if
     // this flag is on, otherwise the standard `render_maze`.
     set_render_mode_sdf(use_sdf);
+    set_retina_bypass(no_retina);
     if use_sdf {
         eprintln!("Input encoding: SDF (wall-distance normalised into luminance)");
+    }
+    if no_retina {
+        eprintln!("Encoder: BYPASSED (avg-pool raw pixels → brain; no conv stack)");
     }
 
     // Optionally load external maze banks (e.g., Sakana PNGs exported via the
@@ -150,6 +181,11 @@ fn main() {
     // ── Encoder: visual retina → spatial tokens ──
     let mut encoder = VisualRetina::maze(maze_size, maze_size);
     let token_dim = encoder.token_dim();
+
+    // Freeze the (h_tok, w_tok) grid the retina produces so the bypass
+    // path can emit the same shape. stage_dims returns all three layer
+    // grids; we only need the last (V4).
+    let (_, _, _, _, h_tok, w_tok) = encoder.stage_dims();
 
     // Probe token count with dummy image
     let dummy = vec![0.0f32; 3 * maze_size * maze_size];
@@ -294,9 +330,9 @@ fn main() {
             let maze = generate_maze(maze_size, &mut rng);
             if maze.path_length < 3 { continue; }
 
-            // Encode: pixels → TokenInput
+            // Encode: pixels → TokenInput (bypasses retina if --no-retina)
             let pixels = render_input(&maze);
-            let input = encoder.encode(&pixels);
+            let input = encode_maybe_bypass(&encoder, &pixels, maze_size, maze_size);
 
             // Truncate/pad route
             let mut route = maze.route.clone();
@@ -572,7 +608,7 @@ fn eval(
         if maze.path_length < 3 { continue; }
 
         let pixels = render_input(&maze);
-        let input = encoder.encode(&pixels);
+        let input = encode_maybe_bypass(encoder, &pixels, maze_size, maze_size);
 
         let mut route = maze.route.clone();
         route.truncate(route_len);
