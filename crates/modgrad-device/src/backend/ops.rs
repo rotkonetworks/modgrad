@@ -265,3 +265,24 @@ pub fn trace_rotate_inplace(
     let mut op = Op::TraceRotateInplace { trace, new_val, d_model, memory_length };
     super::registry().dispatch(&mut op).expect("trace_rotate_inplace dispatch");
 }
+
+// ─── fused (Stage 1) ──────────────────────────────────────
+
+/// Fused synapse forward (matvec → GLU → SiLU → LayerNorm).
+/// See [`Op::SynapseForward`](super::Op::SynapseForward).
+#[inline]
+pub fn synapse_forward(
+    weight: &[f32], bias: &[f32], x: &[f32], out: &mut [f32],
+    out_dim: usize, in_dim: usize,
+) {
+    let mut op = Op::SynapseForward { weight, bias, x, out, out_dim, in_dim };
+    super::registry().dispatch(&mut op).expect("synapse_forward dispatch");
+}
+
+/// In-place row-wise LayerNorm (no affine).
+/// See [`Op::LayerNormInplace`](super::Op::LayerNormInplace).
+#[inline]
+pub fn layer_norm_inplace(x: &mut [f32], n_rows: usize, n_cols: usize) {
+    let mut op = Op::LayerNormInplace { x, n_rows, n_cols };
+    super::registry().dispatch(&mut op).expect("layer_norm_inplace dispatch");
+}

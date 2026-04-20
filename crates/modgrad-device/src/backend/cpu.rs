@@ -145,6 +145,15 @@ impl Backend for CpuBackend {
                 trace_rotate_inplace(trace, new_val, *d_model, *memory_length);
                 Ok(())
             }
+
+            Op::SynapseForward { weight, bias, x, out, out_dim, in_dim } => {
+                synapse_forward(weight, bias, x, out, *out_dim, *in_dim);
+                Ok(())
+            }
+            Op::LayerNormInplace { x, n_rows, n_cols } => {
+                layer_norm_inplace(x, *n_rows, *n_cols);
+                Ok(())
+            }
         }
     }
 }
@@ -439,6 +448,51 @@ fn sync_backward_scatter(args: &mut SyncBackwardScatterArgs<'_>) {
             d_act[l] += d_sync[p] * activated[r] * inv_sqrt_beta;
             d_act[r] += d_sync[p] * activated[l] * inv_sqrt_beta;
         }
+    }
+}
+
+/// Fused synapse forward — CPU composition.
+///
+/// Pipeline: matvec (2*out_dim) → GLU (halves to out_dim) → SiLU inplace →
+/// LayerNorm inplace (single row, n_cols = out_dim). Matches the KFD
+/// `synapse_forward` kernel chain in `stream.rs`. Scratch is allocated
+/// locally (one f32 Vec of size 2*out_dim) and dropped on return — not
+/// exposed through the Op boundary by design.
+fn synapse_forward(
+    weight: &[f32], bias: &[f32], x: &[f32], out: &mut [f32],
+    out_dim: usize, in_dim: usize,
+) {
+    let matvec_out = out_dim * 2;
+    let mut scratch = vec![0.0f32; matvec_out];
+    // matvec: weight is [2*out_dim × in_dim], bias is [2*out_dim].
+    matvec(x, weight, bias, &mut scratch, matvec_out, in_dim);
+    // GLU halves: out[i] = scratch[i] * sigmoid(scratch[out_dim + i])
+    glu_fwd(&scratch, out);
+    // SiLU inplace on the halved buffer.
+    silu_fwd_inplace(out);
+    // LayerNorm inplace, single row, n_cols = out_dim.
+    layer_norm_inplace(out, 1, out_dim);
+}
+
+/// Row-wise in-place LayerNorm with no affine.
+///
+/// For each of `n_rows` rows of length `n_cols`, subtracts the row mean
+/// then divides by √(var + 1e-5). No gamma/beta — the affine step is
+/// handled by upstream ops (e.g. the synapse pipeline's preceding
+/// matvec+GLU already realised the scaling). Matches the KFD
+/// `layer_norm_fwd` kernel which the `try_layer_norm_inplace` entry
+/// point dispatches.
+fn layer_norm_inplace(x: &mut [f32], n_rows: usize, n_cols: usize) {
+    debug_assert_eq!(
+        n_rows * n_cols, x.len(),
+        "layer_norm_inplace: n_rows * n_cols must equal x.len()",
+    );
+    for r in 0..n_rows {
+        let row = &mut x[r * n_cols..(r + 1) * n_cols];
+        let mean: f32 = row.iter().sum::<f32>() / n_cols as f32;
+        let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n_cols as f32;
+        let rstd = 1.0 / (var + 1e-5).sqrt();
+        for v in row.iter_mut() { *v = (*v - mean) * rstd; }
     }
 }
 

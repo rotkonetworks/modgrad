@@ -339,6 +339,38 @@ pub enum Op<'a> {
         d_model: usize,
         memory_length: usize,
     },
+
+    // ─── fused (Stage 1) ──────────────────────────────────────
+
+    /// Fused synapse forward: matvec → GLU → SiLU → LayerNorm.
+    /// `weight` has shape [2*out_dim × in_dim] (GLU halves the channel
+    /// dim), `bias` has length `2*out_dim`, `x` has length `in_dim`,
+    /// and `out` has length `out_dim`.
+    ///
+    /// Intentionally exposes no scratch buffer — the matvec/GLU
+    /// intermediate is a backend-private implementation detail. CPU
+    /// composes and allocates its own Vec; KFD dispatches the fused
+    /// kernel against its preallocated VRAM slot.
+    SynapseForward {
+        weight: &'a [f32],
+        bias: &'a [f32],
+        x: &'a [f32],
+        out: &'a mut [f32],
+        out_dim: usize,
+        in_dim: usize,
+    },
+
+    /// LayerNorm forward, in-place, row-wise. Writes normalized values
+    /// back into `x`. No gamma/beta — pure mean/rstd normalization (the
+    /// affine step is absorbed into the caller, e.g. the synapse-forward
+    /// pipeline where weight/bias already handled scaling).
+    ///
+    /// `n_rows * n_cols` must equal `x.len()`.
+    LayerNormInplace {
+        x: &'a mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    },
 }
 
 impl<'a> Op<'a> {
@@ -369,6 +401,8 @@ impl<'a> Op<'a> {
             Op::SyncUpdateFwd { .. } => "sync_update_fwd",
             Op::SyncBackwardScatter(_) => "sync_backward_scatter",
             Op::TraceRotateInplace { .. } => "trace_rotate_inplace",
+            Op::SynapseForward { .. } => "synapse_forward",
+            Op::LayerNormInplace { .. } => "layer_norm_inplace",
         }
     }
 }
@@ -399,6 +433,9 @@ impl<'a> Op<'a> {
 //   SyncUpdateFwd          → sync_update_fwd
 //   SyncBackwardScatter    → sync_backward_scatter
 //   TraceRotateInplace     → trace_shift_fwd
+//   SynapseForward         → synapse_forward (fused: matvec→glu→silu→layer_norm)
+//   LayerNormInplace       → layer_norm_fwd (single WG, inplace; same kernel
+//                             the KFD synapse pipeline invokes at the end)
 //
 // Debug/test kernels (test_store, addr_dump, coop_test, lds_test,
 // matmul_dbg) are intentionally NOT exposed — they're dispatch

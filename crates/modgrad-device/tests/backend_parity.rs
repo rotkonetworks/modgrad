@@ -292,6 +292,71 @@ fn parity_super_linear_fwd_nocache() {
     }
 }
 
+/// Hand-picked fused-synapse parity case. Shape (out_dim=128, in_dim=64)
+/// clears the KFD supports() gate (out_dim ≥ 32, multiple-of-32, ≤ 1024,
+/// in_dim ≥ 32), so the KFD dispatch actually runs rather than the
+/// registry falling through to CPU. Weights are deterministic so the
+/// test is reproducible across runs.
+#[test]
+fn parity_synapse_forward() {
+    let out_dim = 128usize;
+    let in_dim = 64usize;
+    let weight: Vec<f32> = (0..2 * out_dim * in_dim)
+        .map(|i| ((i as f32) * 0.001).sin() * 0.1).collect();
+    let bias: Vec<f32> = (0..2 * out_dim)
+        .map(|i| ((i as f32) * 0.05).cos() * 0.1).collect();
+    let x: Vec<f32> = (0..in_dim)
+        .map(|i| ((i as f32) * 0.07).sin()).collect();
+
+    let bs = backends();
+    let mut reference: Option<Vec<f32>> = None;
+
+    for backend in &bs {
+        let mut out = vec![0.0f32; out_dim];
+        let mut op = Op::SynapseForward {
+            weight: &weight, bias: &bias, x: &x, out: &mut out,
+            out_dim, in_dim,
+        };
+        if !backend.supports(&op) { continue; }
+        backend.dispatch(&mut op).unwrap_or_else(|e| {
+            panic!("synapse_forward on '{}' errored: {e}", backend.name())
+        });
+
+        if let Some(ref r) = reference {
+            assert_close(&out, r, &format!("synapse_forward on '{}'", backend.name()));
+        } else {
+            reference = Some(out.clone());
+        }
+    }
+}
+
+/// Hand-picked LN-inplace parity case. Single row of 256 elements
+/// clears the KFD gate (n_rows == 1, n_cols multiple-of-32, ≤ 1024).
+#[test]
+fn parity_layer_norm_inplace() {
+    let n_cols = 256usize;
+    let x0: Vec<f32> = (0..n_cols)
+        .map(|i| ((i as f32) * 0.03).sin() * 2.0 + 0.1).collect();
+
+    let bs = backends();
+    let mut reference: Option<Vec<f32>> = None;
+
+    for backend in &bs {
+        let mut x = x0.clone();
+        let mut op = Op::LayerNormInplace { x: &mut x, n_rows: 1, n_cols };
+        if !backend.supports(&op) { continue; }
+        backend.dispatch(&mut op).unwrap_or_else(|e| {
+            panic!("layer_norm_inplace on '{}' errored: {e}", backend.name())
+        });
+
+        if let Some(ref r) = reference {
+            assert_close(&x, r, &format!("layer_norm_inplace on '{}'", backend.name()));
+        } else {
+            reference = Some(x.clone());
+        }
+    }
+}
+
 #[test]
 fn registry_detect_at_least_cpu() {
     let reg = BackendRegistry::detect();

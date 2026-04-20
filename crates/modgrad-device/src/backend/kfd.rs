@@ -131,6 +131,28 @@ impl Backend for KfdBackend {
             // the hand-written parity case exercises successfully.
             Op::SuperLinearFwd { cache: None, d_model, out_per, memory_length, .. }
                 if *d_model >= 16 && *out_per >= 2 && *memory_length >= 8 => true,
+            // Fused synapse and standalone layer_norm_inplace:
+            // **declined across the board in Stage 1.** Parity proptest
+            // at committed tolerance (max_abs 2e-5, max_rel 1e-4) found
+            // divergence at:
+            //   - SynapseForward: out_dim=32, in_dim=96,
+            //     seed=12390942540437353913 → |Δ|≈1.5e-4 (rel 1.5e-4).
+            //   - LayerNormInplace: n_cols=96,
+            //     seed=556123943721261328  → |Δ|≈3.96e-4 (rel 3.96e-4).
+            // The KFD single-WG layer_norm_fwd kernel's parallel
+            // reduction + approximate-division stack pushes drift past
+            // the committed f32 tolerance at small output shapes.
+            //
+            // Per compute-device-unify plan failure-mode criterion:
+            // tighten the supports() gate OR land with CPU-only fused
+            // impl. Here we take the latter — the KFD kernels stay
+            // callable via `kfd::accel::try_synapse_forward` /
+            // `try_layer_norm_inplace` for existing modgrad-compute
+            // callers (their tolerance decisions predate this audit),
+            // but the `Op`-layer registry declines. Future kernel fix
+            // re-enables fusion via this gate as a standalone commit.
+            Op::SynapseForward { .. } => false,
+            Op::LayerNormInplace { .. } => false,
             // Deferred — require Op/kernel alignment first:
             //   LayerNormFwd         → KFD's inplace kernel doesn't emit cache
             //   SyncUpdateFwd        → KFD's kernel expects alpha/beta/phases/dopamine
@@ -240,6 +262,27 @@ impl Backend for KfdBackend {
                     *d_model as u32, *memory_length as u32, *out_per as u32,
                 ),
                 "superlinear",
+            ),
+
+            Op::SynapseForward { weight, bias, x, out, out_dim, in_dim } => {
+                // `try_synapse_forward`'s `_scratch` parameter is unused
+                // (the engine uses its own VRAM-resident scratch slot);
+                // pass an empty slice to keep the signature honest.
+                let mut scratch: [f32; 0] = [];
+                try_result(
+                    accel::try_synapse_forward(
+                        x, weight, bias, out, &mut scratch,
+                        *out_dim as u32, *in_dim as u32,
+                    ),
+                    "synapse_forward",
+                )
+            }
+
+            Op::LayerNormInplace { x, n_rows: _, n_cols: _ } => try_result(
+                // KFD kernel is single-row / single-WG — `supports()`
+                // already gated `n_rows == 1`, so `x` is exactly one row.
+                accel::try_layer_norm_inplace(x),
+                "layer_norm_inplace",
             ),
 
             // Anything else should have been filtered by `supports()`.

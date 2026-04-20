@@ -12,8 +12,28 @@
 
 use modgrad_device::backend::{
     AdamWArgs, Backend, CpuBackend, KfdBackend, Op, QuantKind, RocmBackend,
+    registry,
 };
 use proptest::prelude::*;
+
+/// True if the KFD backend is live in the process-wide registry. The
+/// parity tests gate on this so CI without gfx1102 emits a visible
+/// `[test] SKIP` line rather than passing silently while never
+/// actually exercising the fused-kernel path.
+fn kfd_registered() -> bool {
+    registry().iter().any(|b| b.name() == "kfd")
+}
+
+/// Ask the registered KFD backend (if any) whether it would claim the
+/// supplied fused op. Returns `false` when the backend isn't registered
+/// OR when it's registered but `supports()` declines the shape. Stage
+/// 1's KFD declines fused variants across the board, so callers use
+/// this to emit a visible SKIP banner rather than silently degrading
+/// to a CPU-vs-CPU parity check.
+fn kfd_supports(op: &Op<'_>) -> bool {
+    registry().iter().find(|b| b.name() == "kfd")
+        .map(|b| b.supports(op)).unwrap_or(false)
+}
 
 // Slightly looser than `backend_parity.rs` — random shapes hit more
 // accumulation paths and f32 rounding diverges more at scale.
@@ -452,6 +472,135 @@ proptest! {
                 assert_close(&trace, r, &format!("trace_shift on '{}'", backend.name()))?;
             } else {
                 reference = Some(trace);
+            }
+        }
+    }
+
+    // ─── SynapseForward (fused matvec→GLU→SiLU→LN) ───────────
+    // Stage 1 parity: CPU composed vs KFD fused. Tighter tolerance
+    // (committed plan numbers) than the default because we want real
+    // bit-level confidence in the fused path, not just "roughly
+    // similar". Shape gated to the KFD supports() predicate so we
+    // never proptest shapes KFD would decline.
+    //
+    // As of Stage 1, KFD declines the fused variant across the board
+    // (see `kfd.rs` supports()) — the proptest thus degrades to
+    // CPU-vs-CPU. Visible SKIP line emitted so the log still reflects
+    // the routing decision when there's no KFD comparison happening.
+    #[test]
+    fn prop_synapse_forward_parity(
+        out_dim_q in 1usize..=16, // × 32 → [32, 512]
+        in_dim_q  in 1usize..=16, // × 32 → [32, 512]
+        seed in 0u64..u64::MAX,
+    ) {
+        if !kfd_registered() {
+            eprintln!("[test] SKIP — no gfx1102 detected");
+            return Ok(());
+        }
+        // Even when KFD is live, Stage 1 declines the fused variant —
+        // emit the SKIP line so the log doesn't look like a silent
+        // KFD-vs-CPU pass when it's really CPU-vs-CPU.
+        let mut probe_out = vec![0.0f32; 128];
+        let probe_op = Op::SynapseForward {
+            weight: &[], bias: &[], x: &[],
+            out: &mut probe_out, out_dim: 128, in_dim: 64,
+        };
+        if !kfd_supports(&probe_op) {
+            eprintln!("[test] SKIP — KFD declines SynapseForward (Stage 1)");
+            return Ok(());
+        }
+        let out_dim = out_dim_q * 32;
+        let in_dim = in_dim_q * 32;
+        let rng = |i: usize| -> f32 {
+            let h = (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as u32;
+            ((h as f32) / (u32::MAX as f32)) * 2.0 - 1.0
+        };
+        // weight: [2*out_dim × in_dim]; bias: [2*out_dim]; x: [in_dim].
+        let weight: Vec<f32> = (0..2 * out_dim * in_dim).map(|i| rng(i + 1000) * 0.1).collect();
+        let bias:   Vec<f32> = (0..2 * out_dim).map(|i| rng(i + 2000) * 0.1).collect();
+        let x:      Vec<f32> = (0..in_dim).map(rng).collect();
+
+        let bs = backends();
+        let mut reference: Option<Vec<f32>> = None;
+
+        for backend in &bs {
+            let mut out = vec![0.0f32; out_dim];
+            let mut op = Op::SynapseForward {
+                weight: &weight, bias: &bias, x: &x, out: &mut out,
+                out_dim, in_dim,
+            };
+            if !backend.supports(&op) { continue; }
+            backend.dispatch(&mut op).map_err(|e|
+                TestCaseError::fail(format!("synapse_forward on '{}' errored: {e}", backend.name())))?;
+
+            if let Some(ref r) = reference {
+                // Tolerances per compute-device-unify plan:
+                //   max_abs_err ≤ 2e-5, max_rel_err ≤ 1e-4.
+                for (i, (av, bv)) in out.iter().zip(r.iter()).enumerate() {
+                    let diff = (av - bv).abs();
+                    let scale = av.abs().max(bv.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 2e-5 || diff / scale <= 1e-4,
+                        "synapse_forward on '{}'[{}]: {} vs {} (|Δ|={}, rel={})",
+                        backend.name(), i, av, bv, diff, diff / scale,
+                    );
+                }
+            } else {
+                reference = Some(out);
+            }
+        }
+    }
+
+    // ─── LayerNormInplace (single-row fused LN) ──────────────
+    // Matches the KFD standalone `layer_norm_fwd` kernel — single
+    // workgroup, single row. Multi-row variants fall through to CPU
+    // (supports() gate on n_rows==1).
+    #[test]
+    fn prop_layer_norm_inplace_parity(
+        n_cols_q in 1usize..=32, // × 32 → [32, 1024]
+        seed in 0u64..u64::MAX,
+    ) {
+        if !kfd_registered() {
+            eprintln!("[test] SKIP — no gfx1102 detected");
+            return Ok(());
+        }
+        let mut probe_x = vec![0.0f32; 256];
+        let probe_op = Op::LayerNormInplace {
+            x: &mut probe_x, n_rows: 1, n_cols: 256,
+        };
+        if !kfd_supports(&probe_op) {
+            eprintln!("[test] SKIP — KFD declines LayerNormInplace (Stage 1)");
+            return Ok(());
+        }
+        let n_cols = n_cols_q * 32;
+        let rng = |i: usize| -> f32 {
+            let h = (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as u32;
+            ((h as f32) / (u32::MAX as f32)) * 4.0 - 2.0
+        };
+        let x0: Vec<f32> = (0..n_cols).map(rng).collect();
+
+        let bs = backends();
+        let mut reference: Option<Vec<f32>> = None;
+
+        for backend in &bs {
+            let mut x = x0.clone();
+            let mut op = Op::LayerNormInplace { x: &mut x, n_rows: 1, n_cols };
+            if !backend.supports(&op) { continue; }
+            backend.dispatch(&mut op).map_err(|e|
+                TestCaseError::fail(format!("layer_norm_inplace on '{}' errored: {e}", backend.name())))?;
+
+            if let Some(ref r) = reference {
+                for (i, (av, bv)) in x.iter().zip(r.iter()).enumerate() {
+                    let diff = (av - bv).abs();
+                    let scale = av.abs().max(bv.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 2e-5 || diff / scale <= 1e-4,
+                        "layer_norm_inplace on '{}'[{}]: {} vs {} (|Δ|={}, rel={})",
+                        backend.name(), i, av, bv, diff, diff / scale,
+                    );
+                }
+            } else {
+                reference = Some(x);
             }
         }
     }
