@@ -17,12 +17,18 @@
 
 pub mod op;
 pub mod ops;
+pub mod buffer;
 pub mod cpu;
 pub mod kfd;
 pub mod cuda_be;
 pub mod vulkan;
 pub mod rocm;
 
+pub use buffer::{DeviceBuffer, HostBuffer};
+// `BufferBackend` + `ComputeCtx` are defined below in this file.
+// Re-export them explicitly so call sites can write
+//   `use modgrad_device::backend::{ComputeCtx, BufferBackend};`
+// without digging into the module layout.
 pub use cpu::CpuBackend;
 pub use kfd::KfdBackend;
 pub use cuda_be::CudaBackend;
@@ -105,6 +111,11 @@ impl std::error::Error for BackendError {}
 /// so a shared registry can be wrapped in `Arc` and dispatched from any
 /// thread. Ops are dispatched one-at-a-time; higher-level batching
 /// (kernel fusion, graph capture) is a follow-up concern.
+///
+/// `Backend` is deliberately dyn-compatible so the registry can stash
+/// `Box<dyn Backend>`. Device-resident buffer allocation lives on the
+/// sibling trait [`BufferBackend`] instead — adding an associated type
+/// there doesn't compromise this trait's dyn usage.
 pub trait Backend: Send + Sync + 'static {
     /// Short human-readable name (e.g. "kfd", "rocm", "cuda", "cpu").
     /// Used in telemetry, test names, and error messages.
@@ -134,6 +145,116 @@ pub trait Backend: Send + Sync + 'static {
     /// forward dispatches re-upload fresh weights. Default: no-op.
     fn invalidate_cache(&self) {}
 }
+
+/// A backend that can also allocate device-resident buffers.
+///
+/// This sibling of [`Backend`] carries the associated [`Buffer`] type
+/// used by [`ComputeCtx`]. Splitting the allocation surface into its
+/// own trait keeps `Backend` dyn-compatible (no associated type at the
+/// dispatch layer) while still letting us enforce backend-affine
+/// buffers at compile time through `ComputeCtx<B: BufferBackend>`.
+///
+/// Every concrete backend in this crate implements `BufferBackend`.
+/// CPU / CUDA / Vulkan use [`HostBuffer`]; KFD and ROCm define their
+/// own device-resident Buffer types.
+///
+/// [`Buffer`]: BufferBackend::Buffer
+pub trait BufferBackend: Backend {
+    /// Opaque buffer handle this backend owns. Enforces backend-affine
+    /// memory: a `KfdBackend::Buffer` cannot be handed to a
+    /// `ComputeCtx<RocmBackend>`, by construction of the type system.
+    ///
+    /// Associated type defaults are still unstable in Rust, so every
+    /// `impl BufferBackend` must declare `type Buffer` explicitly. Most
+    /// pick `HostBuffer`; KFD and ROCm define their own.
+    type Buffer: DeviceBuffer;
+
+    /// Allocate a buffer of `n_f32` elements on this backend's device.
+    ///
+    /// The returned handle is backend-affine: only this backend (or a
+    /// `ComputeCtx<Self>` wrapping it) can dispatch against it.
+    /// `HostBuffer`-using backends hit a plain `Vec<f32>` allocation;
+    /// KFD + ROCm hit their device allocators.
+    fn alloc_buffer(&self, n_f32: usize) -> Result<Self::Buffer, BackendError>;
+}
+
+/// Stateful handle around a single backend.
+///
+/// `ComputeCtx<B>` is the entry point for workflows that need device-
+/// resident buffers (vs. the stateless slice-based `registry::dispatch`).
+/// It exposes lifecycle methods — `alloc_buffer`, `arena_reset`,
+/// `flush` — that don't belong on the `Backend` trait itself because
+/// they're not universally meaningful.
+///
+/// **Monomorphic by design**: `ComputeCtx<KfdBackend>` and
+/// `ComputeCtx<RocmBackend>` are distinct types. Cross-backend mixing
+/// cannot silently happen — the type system refuses to compile it.
+///
+/// The default `arena_reset` / `flush` are no-ops; backends that have
+/// meaningful implementations override via an inherent impl on
+/// `ComputeCtx<SpecificBackend>` (see the KFD override in `kfd.rs`).
+///
+/// # Compile-time enforcement of backend affinity
+///
+/// The associated `BufferBackend::Buffer` type is what prevents cross-
+/// backend mixing. The KFD feature gate is intentional — without it,
+/// `KfdBuffer` is still the type KFD's `alloc_buffer` returns, but the
+/// backend is never constructible so the scenario is moot. The doctest
+/// below runs under `--features kfd`.
+///
+/// ```compile_fail
+/// # #[cfg(feature = "kfd")]
+/// # fn _demo() {
+/// use modgrad_device::backend::{ComputeCtx, CpuBackend, KfdBackend};
+/// let cpu: &'static CpuBackend = Box::leak(Box::new(CpuBackend::new()));
+/// let cpu_ctx: ComputeCtx<CpuBackend> = ComputeCtx::new(cpu);
+/// // This binding asks for a KFD buffer from a CPU context — the
+/// // compiler must refuse, because `CpuBackend::Buffer == HostBuffer`,
+/// // not `KfdBuffer`.
+/// let _buf: <KfdBackend as modgrad_device::backend::BufferBackend>::Buffer
+///     = cpu_ctx.alloc_buffer(8).unwrap();
+/// # }
+/// ```
+pub struct ComputeCtx<B: BufferBackend + 'static> {
+    backend: &'static B,
+}
+
+impl<B: BufferBackend + 'static> ComputeCtx<B> {
+    /// Wrap a long-lived backend reference. The `'static` bound matches
+    /// how backends are actually stored (`OnceLock` singletons, leaked
+    /// `Box` for tests, or `&'static` from a `Box::leak` in the registry).
+    pub fn new(backend: &'static B) -> Self {
+        Self { backend }
+    }
+
+    /// Borrow the underlying backend — useful when the caller still needs
+    /// to run a slice-based `Op` through the trait's `dispatch` hook.
+    pub fn backend(&self) -> &'static B { self.backend }
+
+    /// Short-circuit to the backend's `name()`. Primarily for diagnostics.
+    pub fn backend_name(&self) -> &'static str { self.backend.name() }
+
+    /// Allocate a buffer of `n_f32` elements. The return type is
+    /// `B::Buffer`, enforcing backend affinity: the compiler refuses to
+    /// let a `ComputeCtx<CpuBackend>::alloc_buffer` return a `KfdBuffer`.
+    pub fn alloc_buffer(&self, n_f32: usize) -> Result<B::Buffer, BackendError> {
+        self.backend.alloc_buffer(n_f32)
+    }
+}
+
+// Arena and flush hooks live on per-backend inherent impls rather than
+// the generic `impl<B: BufferBackend> ComputeCtx<B>` block above.
+// Reason: Rust doesn't let an inherent impl on `ComputeCtx<KfdBackend>`
+// shadow a same-named method on the generic impl. The cleanest way to
+// keep `ctx.arena_reset()` valid for every backend is to provide the
+// method on each concrete context.
+//
+// Cost: each backend's module must spell out a no-op `arena_reset` +
+// `flush` if it doesn't have real ones. The upside is that when a
+// backend grows a real arena or an async submit path, only one file
+// changes — no risk of accidentally inheriting a stale default. See
+// `cpu.rs`, `kfd.rs`, `rocm.rs`, `cuda_be.rs`, `vulkan.rs` for the
+// per-backend impls.
 
 /// Preference-ordered set of backends. First whose `supports()` returns
 /// true wins. `detect()` instantiates whatever's available on this host.
@@ -299,6 +420,12 @@ mod tests {
             Err(BackendError::Unsupported { op: "n/a", backend: "null" })
         }
     }
+    impl BufferBackend for NullBackend {
+        type Buffer = HostBuffer;
+        fn alloc_buffer(&self, n: usize) -> Result<HostBuffer, BackendError> {
+            Ok(HostBuffer::new(n))
+        }
+    }
 
     #[test]
     fn empty_registry_returns_unsupported() {
@@ -338,6 +465,25 @@ mod tests {
         assert_eq!(a, b);
         // Non-empty because CPU backend always registers.
         assert!(!super::registry().is_empty());
+    }
+
+    #[test]
+    fn compute_ctx_alloc_roundtrip() {
+        // Leak a CpuBackend for 'static — matches how registry-owned
+        // backends actually live. ComputeCtx::alloc_buffer must return a
+        // HostBuffer whose copy_* round-trips.
+        let be: &'static CpuBackend = Box::leak(Box::new(CpuBackend::new()));
+        let ctx: ComputeCtx<CpuBackend> = ComputeCtx::new(be);
+        assert_eq!(ctx.backend_name(), "cpu");
+        let mut buf = ctx.alloc_buffer(4).unwrap();
+        buf.copy_from_host(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut out = vec![0.0f32; 4];
+        buf.copy_to_host(&mut out).unwrap();
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+        // Default arena_reset / flush are no-ops — just asserting they
+        // compile + are callable on a CpuBackend context.
+        ctx.arena_reset();
+        ctx.flush();
     }
 
     #[test]

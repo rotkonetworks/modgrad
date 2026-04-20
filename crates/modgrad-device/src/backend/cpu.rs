@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 
-use super::{AdamWArgs, Backend, BackendError, DeviceInfo, DeviceKind, Op, QuantKind, SyncBackwardScatterArgs};
+use super::{AdamWArgs, Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, HostBuffer, Op, QuantKind, SyncBackwardScatterArgs};
 
 /// Always-available fallback. Handles every op via pure Rust / rayon.
 pub struct CpuBackend {
@@ -156,6 +156,31 @@ impl Backend for CpuBackend {
             }
         }
     }
+}
+
+/// CPU backend's device-resident "Buffer" is just host memory — a
+/// `HostBuffer` (a `Vec<f32>` newtype). Explicit impl is kept simple:
+/// zero-allocate and hand back. Not strictly required (the default
+/// `HostBuffer` is what every non-GPU backend uses) but making it
+/// explicit documents intent at the module level.
+impl BufferBackend for CpuBackend {
+    type Buffer = HostBuffer;
+
+    fn alloc_buffer(&self, n: usize) -> Result<HostBuffer, BackendError> {
+        Ok(HostBuffer::new(n))
+    }
+}
+
+/// CPU has nothing resembling a device arena or an async submit queue,
+/// so both lifecycle hooks are genuine no-ops here. They exist to let
+/// generic call sites write `ctx.arena_reset()` / `ctx.flush()` without
+/// peeking at the concrete backend.
+impl ComputeCtx<CpuBackend> {
+    /// No-op on CPU — no arena to reset.
+    pub fn arena_reset(&self) {}
+
+    /// No-op on CPU — dispatch is synchronous, nothing to flush.
+    pub fn flush(&self) {}
 }
 
 // ─── Free-function implementations ───────────────────────────

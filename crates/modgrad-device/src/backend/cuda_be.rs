@@ -5,7 +5,7 @@
 //! Everything else falls through to CPU (or KFD on gfx1102). Further
 //! ops land as we port them — same pattern as `KfdBackend`.
 
-use super::{Backend, BackendError, DeviceInfo, DeviceKind, Op};
+use super::{Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, HostBuffer, Op};
 #[cfg(feature = "cuda")]
 use super::QuantKind;
 
@@ -101,6 +101,31 @@ impl Backend for CudaBackend {
             }
         }
     }
+}
+
+/// CUDA backend doesn't have VRAM allocation plumbed into this crate
+/// yet — device-resident buffers will land when `crate::cuda` grows an
+/// explicit alloc surface. Until then we default to `HostBuffer`, the
+/// same as CPU. Dispatches still run on GPU (via `crate::cuda`); only
+/// the `ComputeCtx::alloc_buffer` path is host-backed.
+impl BufferBackend for CudaBackend {
+    type Buffer = HostBuffer;
+
+    fn alloc_buffer(&self, n: usize) -> Result<HostBuffer, BackendError> {
+        Ok(HostBuffer::new(n))
+    }
+}
+
+/// CUDA ComputeCtx hooks are no-ops until we wire a real device-arena
+/// and an async stream in a follow-up. Having them present keeps
+/// `ComputeCtx<CudaBackend>` a drop-in replacement for future lifecycle-
+/// aware call sites.
+impl ComputeCtx<CudaBackend> {
+    /// No-op — no CUDA arena plumbed yet.
+    pub fn arena_reset(&self) {}
+
+    /// No-op — dispatch is still synchronous through `crate::cuda`.
+    pub fn flush(&self) {}
 }
 
 #[cfg(test)]

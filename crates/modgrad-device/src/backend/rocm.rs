@@ -14,9 +14,11 @@
 //! ROCm covers every other AMD arch supported by the ROCm runtime,
 //! plus falls through to KFD-uncovered ops on gfx1102 itself.
 
-use super::{Backend, BackendError, DeviceInfo, DeviceKind, Op};
+use super::{Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, Op};
 #[cfg(feature = "rocm")]
-use super::QuantKind;
+use super::{DeviceBuffer, QuantKind};
+#[cfg(not(feature = "rocm"))]
+use super::HostBuffer;
 
 #[cfg(feature = "rocm")]
 mod ffi {
@@ -418,6 +420,92 @@ impl RocmBackend {
 
         d_c.download_f32(out)
     }
+}
+
+/// ROCm device-resident buffer — a `DeviceBuffer`-shaped wrapper around
+/// a `hipMalloc`'d allocation. Dropped via `HipBuffer`'s own `Drop`,
+/// which runs `hipFree` automatically; `?`-propagated errors in the
+/// dispatcher already rely on that, so re-using it here is no new
+/// discipline.
+#[cfg(feature = "rocm")]
+pub struct RocmBuffer {
+    inner: HipBuffer,
+    len_f32: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl DeviceBuffer for RocmBuffer {
+    fn backend_name(&self) -> &'static str { "rocm" }
+
+    fn len(&self) -> usize { self.len_f32 }
+
+    fn copy_from_host(&mut self, src: &[f32]) -> Result<(), BackendError> {
+        if src.len() > self.len_f32 {
+            return Err(BackendError::Runtime(format!(
+                "RocmBuffer::copy_from_host: src.len()={} > buffer.len()={}",
+                src.len(), self.len_f32,
+            )));
+        }
+        self.inner.upload_f32(src)
+    }
+
+    fn copy_to_host(&self, dst: &mut [f32]) -> Result<(), BackendError> {
+        if dst.len() > self.len_f32 {
+            return Err(BackendError::Runtime(format!(
+                "RocmBuffer::copy_to_host: dst.len()={} > buffer.len()={}",
+                dst.len(), self.len_f32,
+            )));
+        }
+        self.inner.download_f32(dst)
+    }
+}
+
+// SAFETY: HipBuffer holds only an opaque device pointer + byte size.
+// Neither is mutated across threads; the hipMemcpy / hipFree calls are
+// thread-safe per the HIP runtime.
+#[cfg(feature = "rocm")]
+unsafe impl Send for RocmBuffer {}
+#[cfg(feature = "rocm")]
+unsafe impl Sync for RocmBuffer {}
+
+#[cfg(feature = "rocm")]
+impl BufferBackend for RocmBackend {
+    type Buffer = RocmBuffer;
+
+    fn alloc_buffer(&self, n_f32: usize) -> Result<RocmBuffer, BackendError> {
+        let bytes = n_f32.checked_mul(4).ok_or_else(|| {
+            BackendError::Runtime(format!("rocm alloc_buffer: size overflow (n={n_f32})"))
+        })?;
+        let inner = HipBuffer::alloc(bytes)?;
+        Ok(RocmBuffer { inner, len_f32: n_f32 })
+    }
+}
+
+/// When the `rocm` feature is off, `RocmBackend` is a zero-size stub
+/// that never appears in the registry (`try_new` returns `None`). Still
+/// needs a `BufferBackend` impl so `ComputeCtx<RocmBackend>` is
+/// nameable as a type — default to `HostBuffer`, same pattern as CUDA
+/// and Vulkan.
+#[cfg(not(feature = "rocm"))]
+impl BufferBackend for RocmBackend {
+    type Buffer = HostBuffer;
+
+    fn alloc_buffer(&self, n: usize) -> Result<HostBuffer, BackendError> {
+        Ok(HostBuffer::new(n))
+    }
+}
+
+/// ROCm lifecycle hooks — the HIP runtime synchronises per-call in our
+/// dispatcher (each matvec ends with `hipDeviceSynchronize`), so the
+/// flush hook is a no-op at Stage 2. Arena doesn't exist yet: we do
+/// allocate/free per dispatch today, which is exactly the waste Stage 4
+/// will address by letting callers hold `RocmBuffer` across ops.
+impl ComputeCtx<RocmBackend> {
+    /// No-op — ROCm has no managed arena yet.
+    pub fn arena_reset(&self) {}
+
+    /// No-op — dispatcher already syncs on every op.
+    pub fn flush(&self) {}
 }
 
 #[cfg(test)]

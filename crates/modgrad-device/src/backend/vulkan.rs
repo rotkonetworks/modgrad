@@ -9,7 +9,7 @@
 //! (no t_bias, no cache) doesn't cleanly align with `Op::SuperLinearFwd`;
 //! deferred until the shader is extended or the Op trimmed.
 
-use super::{Backend, BackendError, DeviceInfo, DeviceKind, Op};
+use super::{Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, HostBuffer, Op};
 #[cfg(feature = "gpu")]
 use super::QuantKind;
 
@@ -96,6 +96,28 @@ impl Backend for VulkanBackend {
             }
         }
     }
+}
+
+/// Vulkan hasn't plumbed VRAM allocation through `crate::gpu` yet —
+/// defaults to `HostBuffer` the same way CUDA does. Replace with a
+/// `VulkanBuffer` (ash-backed) when the Vulkan VRAM lifecycle lands.
+impl BufferBackend for VulkanBackend {
+    type Buffer = HostBuffer;
+
+    fn alloc_buffer(&self, n: usize) -> Result<HostBuffer, BackendError> {
+        Ok(HostBuffer::new(n))
+    }
+}
+
+/// Vulkan lifecycle hooks — no-ops at Stage 2. Replace with the real
+/// ash-based submit-queue flush when the Vulkan compute path grows an
+/// explicit queue lifecycle.
+impl ComputeCtx<VulkanBackend> {
+    /// No-op — no Vulkan arena yet.
+    pub fn arena_reset(&self) {}
+
+    /// No-op — dispatch still blocking through `crate::gpu`.
+    pub fn flush(&self) {}
 }
 
 #[cfg(test)]

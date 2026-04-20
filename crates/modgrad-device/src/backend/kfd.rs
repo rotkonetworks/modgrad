@@ -14,7 +14,7 @@
 
 use crate::kfd::accel;
 
-use super::{Backend, BackendError, DeviceInfo, DeviceKind, Op, QuantKind};
+use super::{Backend, BackendError, BufferBackend, ComputeCtx, DeviceBuffer, DeviceInfo, DeviceKind, Op, QuantKind};
 
 /// RDNA3 gfx1102 hand-written kernel backend. Available only when the
 /// global KFD GPU state has successfully initialised (`accel::available`).
@@ -292,6 +292,123 @@ impl Backend for KfdBackend {
             }),
         }
     }
+}
+
+/// KFD device-resident buffer: a thin `DeviceBuffer`-flavoured wrapper
+/// around the existing `kfd::memory::GpuBuffer`. Allocates VRAM via
+/// `accel::alloc_vram`, which rounds to 4 KiB pages internally.
+///
+/// The `GpuBuffer` lives as long as the `KfdBuffer` does — drop runs
+/// the ioctl cleanup (unmap + free) automatically. `write_f32` and
+/// `read_f32` are the underlying host-side copy operations; both go
+/// through the BAR mapping (CPU-visible through resizable BAR on
+/// gfx1102), so there's no explicit DMA submit.
+///
+/// `len` reports the **logical** f32 count requested at alloc time,
+/// not the rounded-up page-aligned capacity of the underlying
+/// `GpuBuffer`. Callers reason about their own sizing.
+pub struct KfdBuffer {
+    /// `None` only when the GPU was unavailable at alloc time — kept
+    /// as an invariant to let `copy_*_host` return a clear runtime
+    /// error rather than panic. In practice `alloc_buffer` refuses to
+    /// construct a `KfdBuffer` without a live `GpuBuffer`, so this is
+    /// belt-and-suspenders.
+    inner: Option<crate::kfd::memory::GpuBuffer>,
+    /// Logical element count, in f32s, as requested by the caller.
+    len_f32: usize,
+}
+
+// SAFETY: GpuBuffer itself implements Send + Sync (see memory.rs); the
+// Option wrapper doesn't change that, and `len_f32` is trivially safe.
+unsafe impl Send for KfdBuffer {}
+unsafe impl Sync for KfdBuffer {}
+
+impl DeviceBuffer for KfdBuffer {
+    fn backend_name(&self) -> &'static str { "kfd" }
+
+    fn len(&self) -> usize { self.len_f32 }
+
+    fn copy_from_host(&mut self, src: &[f32]) -> Result<(), BackendError> {
+        if src.len() > self.len_f32 {
+            return Err(BackendError::Runtime(format!(
+                "KfdBuffer::copy_from_host: src.len()={} > buffer.len()={}",
+                src.len(), self.len_f32,
+            )));
+        }
+        let buf = self.inner.as_ref().ok_or_else(|| {
+            BackendError::Runtime("KfdBuffer::copy_from_host: no backing GpuBuffer".into())
+        })?;
+        // write_f32 takes a byte offset; we always write from the start.
+        buf.write_f32(0, src);
+        Ok(())
+    }
+
+    fn copy_to_host(&self, dst: &mut [f32]) -> Result<(), BackendError> {
+        if dst.len() > self.len_f32 {
+            return Err(BackendError::Runtime(format!(
+                "KfdBuffer::copy_to_host: dst.len()={} > buffer.len()={}",
+                dst.len(), self.len_f32,
+            )));
+        }
+        let buf = self.inner.as_ref().ok_or_else(|| {
+            BackendError::Runtime("KfdBuffer::copy_to_host: no backing GpuBuffer".into())
+        })?;
+        // read_f32 allocates a fresh Vec; copy into the caller's slice
+        // afterwards. Acceptable for Stage 2 — the hot path for KFD
+        // still goes through zero-copy arena slices, not this API.
+        let v = buf.read_f32(0, dst.len());
+        dst.copy_from_slice(&v);
+        Ok(())
+    }
+}
+
+/// Wire KFD's VRAM allocator into the `BufferBackend` trait.
+///
+/// `accel::alloc_vram` takes bytes, returns `Option<GpuBuffer>`
+/// (None when the GPU isn't available — matches our compile-time
+/// invariant that the backend is only alive when `available = true`,
+/// but we keep the None path reachable so a race with device loss
+/// surfaces as a clean Runtime error).
+impl BufferBackend for KfdBackend {
+    type Buffer = KfdBuffer;
+
+    fn alloc_buffer(&self, n_f32: usize) -> Result<KfdBuffer, BackendError> {
+        let bytes = (n_f32 as u64).saturating_mul(4);
+        let buf = accel::alloc_vram(bytes)
+            .ok_or_else(|| BackendError::Runtime(
+                "kfd alloc_buffer: accel::alloc_vram returned None".into()
+            ))?;
+        Ok(KfdBuffer { inner: Some(buf), len_f32: n_f32 })
+    }
+}
+
+/// KFD-specific overrides for [`ComputeCtx`].
+///
+/// `arena_reset` is the entire point of this block: it scopes what used
+/// to be a process-global `accel::arena_reset()` call to a
+/// `ComputeCtx<KfdBackend>`. Callers that hold a context against a
+/// specific backend now reset just that context's arena — matching the
+/// "Committed stance: global mutable state stays" invariant while
+/// beginning to move call sites away from the bare global fn.
+///
+/// `flush` is a no-op today (KFD submits synchronously in
+/// `accel::try_*`). It exists here so that future changes migrating to
+/// an async submit model land as one inherent-impl patch on
+/// `ComputeCtx<KfdBackend>` rather than touching every caller.
+impl ComputeCtx<KfdBackend> {
+    /// Reset the KFD VRAM arena — forwards to `accel::arena_reset()`.
+    ///
+    /// See `tasks/compute-device-unify.md` under "Committed stance:
+    /// global mutable state stays" for why this still goes through the
+    /// global fn. Stage 3+ threads a real per-context arena through.
+    pub fn arena_reset(&self) {
+        accel::arena_reset();
+    }
+
+    /// No-op on KFD today — `accel::try_*` dispatch is already
+    /// synchronous. Kept as an inherent override so migrations to an
+    /// async dispatch path land here without touching callers.
+    pub fn flush(&self) {}
 }
 
 #[cfg(test)]
