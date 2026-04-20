@@ -10,11 +10,18 @@ name = "isis"
 path = "src/main.rs"
 
 [features]
-default = []
+# The isis binary is the end-user entry point, so the runtime defaults
+# live here: ROCm + CUDA enabled by default, KFD opt-in. Opt out with
+# `--no-default-features` for a CPU-only build.
+default = ["rocm", "cuda"]
 onnx = ["isis-runtime/onnx", "modgrad-io/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 sdp  = ["isis-runtime/sdp"]
-cuda = ["modgrad/cuda"]
+cuda = ["modgrad/cuda", "isis-runtime/cuda"]
+cuda-kernels = ["cuda", "modgrad/cuda-kernels"]
+rocm = ["modgrad/rocm", "isis-runtime/rocm"]
+kfd  = ["modgrad/kfd",  "isis-runtime/kfd"]
+gpu  = ["modgrad/gpu",  "isis-runtime/gpu"]
 
 [dependencies]
 # Top-level modgrad library — prelude + init() + re-exports.

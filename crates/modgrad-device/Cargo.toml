@@ -6,9 +6,29 @@ description = "GPU/hardware backends for the modgrad ML SDK"
 license = "MIT"
 
 [features]
+# As a library crate, modgrad-device ships with zero backends beyond the
+# always-available CPU fallback. Downstream *runtime* crates (e.g.
+# `modgrad`, `isis`, `isis-runtime`) decide which backends are active for
+# an end-user binary. This keeps library consumers from inheriting link-
+# time requirements (libamdhip64, libcuda, …) they didn't ask for.
+default = []
+
+# Enable every backend we can link. Same link-time requirements as each
+# individual feature, collected for convenience (dev/CI only).
+full = ["cuda", "gpu", "rocm", "kfd"]
+
 cuda = ["dep:cudarc"]
-# Legacy Vulkan path. Not wired in default build (requires `ash` dep to compile).
+# Vulkan compute fallback (cross-vendor). Works on any GPU with Vulkan 1.3.
 gpu = []
+# AMD ROCm backend via hand-rolled FFI to libamdhip64 + libhipblas.
+# Requires ROCm 6.x or 7.x at /opt/rocm (or LD_LIBRARY_PATH).
+rocm = []
+# KFD "flash" backend — hand-written RDNA3 assembly for gfx1102.
+# Registered in BackendRegistry only when enabled. The `kfd` Rust
+# module stays compiled either way (modgrad-compute depends on its
+# types); this flag controls whether the backend is ACTIVE in the
+# dispatch registry.
+kfd = []
 
 [dependencies]
 libc = "0.2"
@@ -19,3 +39,10 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "std", "driver", "cublas", "nvrtc",
     "fallback-dynamic-loading", "cuda-12060",
 ] }
+
+[dev-dependencies]
+# Property-based testing — generates random op shapes/data and asserts
+# every registered backend produces results within tolerance of CPU
+# reference. Catches shape-specific bugs the hand-written parity cases
+# can't cover.
+proptest = "1"

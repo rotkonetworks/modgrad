@@ -258,10 +258,6 @@ pub fn ffn_forward(w: &FfnWeights, tokens: &[usize]) -> (Vec<Vec<f32>>, FfnCache
     (logits, cache)
 }
 
-/// How many rows of the batch dimension each rayon thread processes.
-/// At N=128 and 32 cores, a chunk size of 4 gives full core coverage.
-const GEMM_N_CHUNK: usize = 4;
-
 /// Forward matmul: Y[n×m] = A[n×k] @ W^T[k×m] + bias[m].
 /// GPU-accelerated via `accel::try_matmul` (uses matmul_blocked kernel).
 /// CPU path (rayon + matrixmultiply sgemm) runs when GPU is disabled.
@@ -278,36 +274,18 @@ const GEMM_N_CHUNK: usize = 4;
 #[inline]
 fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
                 n: usize, k: usize, m: usize) {
-    if modgrad_compute::neuron::gpu_enabled() {
-        if !modgrad_device::kfd::accel::try_matmul(
-            a, weight, bias, y, n as u32, k as u32, m as u32)
-        {
-            panic!("GPU matmul failed: n={n} k={k} m={m}. \
-                    --gpu requires a working GPU dispatch path; either \
-                    fix the kernel or run without --gpu for CPU training.");
-        }
-        return;
-    }
-
-    // CPU path (no --gpu): rayon-parallel matrixmultiply sgemm.
-    y.par_chunks_mut(GEMM_N_CHUNK * m)
-        .zip(a.par_chunks(GEMM_N_CHUNK * k))
-        .for_each(|(y_chunk, a_chunk)| {
-            let rows = y_chunk.len() / m;
-            // Stamp bias into this chunk (broadcast).
-            for r in 0..rows {
-                y_chunk[r * m..(r + 1) * m].copy_from_slice(bias);
-            }
-            // Y += A @ W^T   with A:[rows×k], W:[m×k] → W^T:[k×m], Y:[rows×m]
-            unsafe {
-                matrixmultiply::sgemm(
-                    rows, k, m,
-                    1.0, a_chunk.as_ptr(), k as isize, 1,
-                    weight.as_ptr(), 1, k as isize,
-                    1.0, y_chunk.as_mut_ptr(), m as isize, 1,
-                );
-            }
-        });
+    // y[n×m] = a[n×k] @ weight^T + bias[m]  (weight stored as [m×k]
+    // row-major, so we use kind=NT to compute A @ B^T).
+    //
+    // Registry dispatches: KFD's try_matmul expects this layout and
+    // claims NN-only in its gate today; for NT-kind we fall through to
+    // CPU which handles all kinds. KFD support for NT is a follow-up
+    // (kernel needs T-variant).
+    use modgrad_device::backend::{registry, Op};
+    registry().dispatch(&mut Op::MatmulNT {
+        a, b: weight, out: y, bias: Some(bias),
+        m: n, k, n: m,
+    }).expect("matmul dispatch");
 }
 
 /// Transposed matmul: dA[n×k] += dY[n×m] @ W[m×k] (ACCUMULATES).
@@ -316,35 +294,16 @@ fn matmul_rayon(a: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32],
 #[inline]
 fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
                   n: usize, k: usize, m: usize) {
-    if modgrad_compute::neuron::gpu_enabled() {
-        // GPU path assigns — so compute into tmp and add. For the common
-        // case where `da` was pre-zeroed, the add collapses to a copy, but
-        // we keep the pattern uniform for safety.
-        let mut tmp = vec![0.0f32; n * k];
-        if !modgrad_device::kfd::accel::try_matmul_t(
-            dy, weight, &mut tmp, n as u32, k as u32, m as u32)
-        {
-            panic!("GPU matmul_t failed: n={n} k={k} m={m}. \
-                    --gpu requires a working GPU dispatch path.");
-        }
-        da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
-        return;
-    }
-
-    // CPU path (no --gpu): rayon-split batch + sgemm (beta=1.0 accumulates).
-    da.par_chunks_mut(GEMM_N_CHUNK * k)
-        .zip(dy.par_chunks(GEMM_N_CHUNK * m))
-        .for_each(|(da_chunk, dy_chunk)| {
-            let rows = da_chunk.len() / k;
-            unsafe {
-                matrixmultiply::sgemm(
-                    rows, m, k,
-                    1.0, dy_chunk.as_ptr(), m as isize, 1,
-                    weight.as_ptr(), k as isize, 1,
-                    1.0, da_chunk.as_mut_ptr(), k as isize, 1,
-                );
-            }
-        });
+    // Backward-input path: da[n×k] += dy[n×m] @ weight
+    // Weight is stored row-major [m×k], so this is a plain NN matmul.
+    // Compute into `tmp` (overwrite) then accumulate into `da`.
+    use modgrad_device::backend::{registry, Op};
+    let mut tmp = vec![0.0f32; n * k];
+    registry().dispatch(&mut Op::MatmulNN {
+        a: dy, b: weight, out: &mut tmp, bias: None,
+        m: n, k: m, n: k,
+    }).expect("matmul_t dispatch");
+    da.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
 /// Weight-gradient matmul: dW[m×k] += dY^T[m×n] @ A[n×k] (ACCUMULATES).
@@ -353,33 +312,17 @@ fn matmul_t_rayon(dy: &[f32], weight: &[f32], da: &mut [f32],
 #[inline]
 fn matmul_grad_rayon(dy: &[f32], a: &[f32], dw: &mut [f32],
                      n: usize, k: usize, m: usize) {
-    if modgrad_compute::neuron::gpu_enabled() {
-        let mut tmp = vec![0.0f32; m * k];
-        if !modgrad_device::kfd::accel::try_matmul_grad(
-            dy, a, &mut tmp, n as u32, k as u32, m as u32)
-        {
-            panic!("GPU matmul_grad failed: n={n} k={k} m={m}. \
-                    --gpu requires a working GPU dispatch path.");
-        }
-        dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
-        return;
-    }
-
-    // CPU path (no --gpu). Chunk size chosen for ~32 chunks on an m=5120 matmul.
-    let m_chunk = (m / 32).max(32);
-    dw.par_chunks_mut(m_chunk * k).enumerate().for_each(|(chunk_idx, dw_chunk)| {
-        let rows = dw_chunk.len() / k;
-        let m_start = chunk_idx * m_chunk;
-        let dy_sub = &dy[m_start..];
-        unsafe {
-            matrixmultiply::sgemm(
-                rows, n, k,
-                1.0, dy_sub.as_ptr(), 1, m as isize,
-                a.as_ptr(), k as isize, 1,
-                1.0, dw_chunk.as_mut_ptr(), k as isize, 1,
-            );
-        }
-    });
+    // Weight-gradient: dw[m×k] += dy^T[m×n] @ a[n×k]
+    // dy stored [n×m] row-major; a stored [n×k] row-major; both as
+    // provided by the caller. Using kind=TN for "first matrix
+    // transposed" matches this layout: out[m×k] = dy^T @ a.
+    use modgrad_device::backend::{registry, Op};
+    let mut tmp = vec![0.0f32; m * k];
+    registry().dispatch(&mut Op::MatmulTN {
+        a: dy, b: a, out: &mut tmp, bias: None,
+        m, k: n, n: k,
+    }).expect("matmul_grad dispatch");
+    dw.par_iter_mut().zip(tmp.par_iter()).for_each(|(d, &t)| *d += t);
 }
 
 /// Batched row-wise layer norm. Returns (normed, means, inv_stds).
@@ -1040,30 +983,17 @@ fn adamw_apply(
     // For now use CPU — the GPU kernel signature doesn't match cleanly (mutates grads).
     // TODO: add try_adamw_noclear variant or clone grads.
 
-    if modgrad_compute::neuron::gpu_enabled() && weights.len() >= 1024 {
-        // Pre-scale grads on CPU (small op), then dispatch GPU AdamW.
-        let mut g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
-        let bc1_inv = 1.0 / bc1;
-        let bc2_inv = 1.0 / bc2;
-        if !modgrad_device::kfd::accel::try_adamw(
-            weights, &mut g_scaled, m, v,
-            lr, beta1, beta2, eps, wd, bc1_inv, bc2_inv,
-        ) {
-            panic!("GPU AdamW failed: n={}. --gpu requires a working \
-                    GPU dispatch path.", weights.len());
-        }
-        return;
-    }
-
-    // CPU path (no --gpu, or tensor too small for GPU launch overhead).
-    for i in 0..weights.len() {
-        let g = grads[i] * clip_scale;
-        m[i] = beta1 * m[i] + (1.0 - beta1) * g;
-        v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
-        let m_hat = m[i] / bc1;
-        let v_hat = v[i] / bc2;
-        weights[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * weights[i]);
-    }
+    // Pre-scale grads once on CPU; then dispatch via the backend
+    // registry. The registry picks the fastest backend that supports
+    // AdamW at this shape; size-gated KFD paths are honored inside
+    // supports(). Callers don't branch on hardware.
+    let g_scaled: Vec<f32> = grads.iter().map(|&g| g * clip_scale).collect();
+    use modgrad_device::backend::{registry, Op};
+    registry().dispatch(&mut Op::AdamW {
+        w: weights, g: &g_scaled, m, v,
+        lr, beta1, beta2, eps, weight_decay: wd,
+        bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
+    }).expect("adamw dispatch");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1110,8 +1040,8 @@ pub fn ffn_train_step(
 
     // Weights were updated in place — the GPU's VRAM-cached copies are now
     // stale. Drop them so the next forward re-uploads the current values.
-    // No-op when GPU is unavailable or in stream mode.
-    modgrad_device::kfd::accel::invalidate_cache();
+    // No-op for backends that don't maintain weight caches.
+    modgrad_device::backend::registry().invalidate_caches();
 
     (loss, acc)
 }

@@ -53,7 +53,8 @@ pub struct DeviceInfo {
 
 /// Discover all available compute devices.
 pub fn enumerate_devices() -> Vec<DeviceInfo> {
-    let devices = vec![DeviceInfo {
+    #[allow(unused_mut)]
+    let mut devices = vec![DeviceInfo {
         id: DeviceId::Cpu,
         name: format!("CPU ({} threads)", rayon::current_num_threads()),
         memory_bytes: 0,
@@ -86,21 +87,27 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
 fn enumerate_cuda() -> Option<Vec<DeviceInfo>> {
     use cudarc::driver::CudaContext;
 
-    let n = CudaContext::device_count().ok()? as usize;
+    // cudarc panics (not just Err) when libcuda.so isn't findable.
+    // catch_unwind so non-NVIDIA hosts don't crash during enumeration.
+    let n = std::panic::catch_unwind(|| CudaContext::device_count())
+        .ok()
+        .and_then(|r| r.ok())? as usize;
     if n == 0 { return None; }
 
     let mut infos = Vec::new();
     for i in 0..n {
-        if let Ok(ctx) = CudaContext::new(i) {
-            let name = ctx.name().unwrap_or_else(|_| format!("CUDA device {i}"));
-            let mem = ctx.total_mem().unwrap_or(0) as u64;
-            infos.push(DeviceInfo {
-                id: DeviceId::Gpu(i),
-                name,
-                memory_bytes: mem,
-                tflops: 0.0,
-            });
-        }
+        let ctx = match std::panic::catch_unwind(|| CudaContext::new(i)) {
+            Ok(Ok(c)) => c,
+            _ => continue,
+        };
+        let name = ctx.name().unwrap_or_else(|_| format!("CUDA device {i}"));
+        let mem = ctx.total_mem().unwrap_or(0) as u64;
+        infos.push(DeviceInfo {
+            id: DeviceId::Gpu(i),
+            name,
+            memory_bytes: mem,
+            tflops: 0.0,
+        });
     }
     if infos.is_empty() { None } else { Some(infos) }
 }

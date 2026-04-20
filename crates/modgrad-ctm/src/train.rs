@@ -24,52 +24,42 @@ pub(crate) fn linear_forward_cached(linear: &Linear, x: &[f32]) -> (Vec<f32>, Li
 }
 
 /// Returns d_input. Accumulates into d_weight, d_bias.
-/// GPU-accelerated dx via stateless stream dispatch.
+///
+/// d_weight (outer product) and d_input (matvec_t) dispatch through the
+/// `Backend` registry: each op routes to the fastest registered backend
+/// that supports the shape, falling through to `CpuBackend` when no GPU
+/// claim matches. Caller doesn't branch on hardware — the registry's
+/// the abstraction that hides that.
+///
+/// Kill-switch: `MODGRAD_BACKEND=cpu` before process start forces the
+/// registry to contain only CPU.
 pub(crate) fn linear_backward(
     linear: &Linear, d_out: &[f32], cache: &LinearCache,
     d_weight: &mut [f32], d_bias: &mut [f32],
 ) -> Vec<f32> {
+    use modgrad_device::backend::{registry, Op};
+
     let in_dim = linear.in_dim;
     let out_dim = linear.out_dim;
-    // d_bias
+
+    // d_bias: a trivial accumulation, not worth an Op variant.
     for i in 0..out_dim { d_bias[i] += d_out[i]; }
-    // d_weight (outer product) — GPU when large enough
-    if modgrad_compute::neuron::gpu_enabled()
-        && modgrad_device::kfd::accel::try_outer_product(
-            d_weight, d_out, &cache.input, out_dim as u32, in_dim as u32,
-        )
-    {
-        // GPU path succeeded
-    } else {
-        for i in 0..out_dim {
-            let d = d_out[i];
-            if d.abs() < 1e-12 { continue; }
-            let row = i * in_dim;
-            for j in 0..in_dim {
-                d_weight[row + j] += d * cache.input[j];
-            }
-        }
-    }
-    // d_input = W^T @ d_out — GPU dispatch for backward pass
-    if modgrad_compute::neuron::gpu_enabled() {
-        let mut d_input = vec![0.0f32; in_dim];
-        if modgrad_device::kfd::accel::try_matvec_t(
-            d_out, &linear.weight, &mut d_input,
-            out_dim as u32, in_dim as u32,
-        ) {
-            return d_input;
-        }
-    }
-    // CPU fallback
+
+    // d_weight[i,j] += d_out[i] * input[j]
+    registry().dispatch(&mut Op::OuterProductAcc {
+        a: d_out,
+        b: &cache.input,
+        accum: d_weight,
+        m: out_dim,
+        n: in_dim,
+    }).expect("outer_product dispatch");
+
+    // d_input = W^T @ d_out
     let mut d_input = vec![0.0f32; in_dim];
-    for i in 0..out_dim {
-        let d = d_out[i];
-        if d.abs() < 1e-12 { continue; }
-        let row = i * in_dim;
-        for j in 0..in_dim {
-            d_input[j] += d * linear.weight[row + j];
-        }
-    }
+    registry().dispatch(&mut Op::MatvecT {
+        d_out, weight: &linear.weight, d_input: &mut d_input,
+        out_dim, in_dim,
+    }).expect("matvec_t dispatch");
     d_input
 }
 
@@ -96,18 +86,13 @@ fn affine_ln_backward(
     d_out: &[f32], cache: &LnCache, gamma: &[f32],
     d_gamma: &mut [f32], d_beta: &mut [f32],
 ) -> Vec<f32> {
+    // This path uses a normalized+inv_std cache, which doesn't line up
+    // with `Op::LayerNormBwd`'s mean/rstd cache shape. Until the Op is
+    // unified (follow-up), the math stays inline here. It's CPU-only:
+    // the old KFD fast-path went through a backend-specific import,
+    // which would layer-violate modgrad-ctm against `modgrad_device::kfd`.
+    // Worth measuring before re-introducing a fast path.
     let n = d_out.len();
-    // GPU path (single-WG kernel, n <= 256)
-    if modgrad_compute::neuron::gpu_enabled() && n <= 256 {
-        let mut d_input = vec![0.0f32; n];
-        if modgrad_device::kfd::accel::try_ln_backward(
-            d_out, &cache.normalized, gamma,
-            d_gamma, d_beta, &mut d_input, cache.inv_std,
-        ) {
-            return d_input;
-        }
-    }
-    // CPU fallback
     let nf = n as f32;
     for i in 0..n {
         d_gamma[i] += d_out[i] * cache.normalized[i];
@@ -134,16 +119,11 @@ fn silu_forward_cached(x: &mut [f32]) -> Vec<f32> {
 }
 
 fn silu_backward(d_out: &[f32], pre: &[f32]) -> Vec<f32> {
+    use modgrad_device::backend::{registry, Op};
     let mut d_input = vec![0.0f32; d_out.len()];
-    if modgrad_compute::neuron::gpu_enabled()
-        && modgrad_device::kfd::accel::try_silu_backward(d_out, pre, &mut d_input)
-    {
-        return d_input;
-    }
-    d_out.iter().zip(pre).enumerate().for_each(|(i, (&d, &x))| {
-        let s = 1.0 / (1.0 + (-x).exp());
-        d_input[i] = d * (s + x * s * (1.0 - s));
-    });
+    registry().dispatch(&mut Op::SiluBwd {
+        d_out, x: pre, d_x: &mut d_input,
+    }).expect("silu_bwd dispatch");
     d_input
 }
 
@@ -167,32 +147,14 @@ fn per_neuron_glu_cached(x: &[f32], n_neurons: usize, out_per: usize) -> (Vec<f3
 
 fn per_neuron_glu_backward(d_out: &[f32], cache: &GluCache) -> Vec<f32> {
     let half = cache.out_per / 2;
+    use modgrad_device::backend::{registry, Op};
     let total_in = cache.n_neurons * cache.out_per;
-
-    // GPU path
-    if modgrad_compute::neuron::gpu_enabled() {
-        let mut d_input = vec![0.0f32; total_in];
-        if modgrad_device::kfd::accel::try_per_neuron_glu_backward(
-            d_out, &cache.x, &mut d_input,
-            cache.n_neurons as u32, cache.out_per as u32,
-        ) {
-            return d_input;
-        }
-    }
-
     let mut d_input = vec![0.0f32; total_in];
-    for n in 0..cache.n_neurons {
-        let base_in = n * cache.out_per;
-        let base_out = n * half;
-        for j in 0..half {
-            let val = cache.x[base_in + j];
-            let gate_v = cache.x[base_in + half + j];
-            let gate = 1.0 / (1.0 + (-gate_v).exp());
-            let d = d_out[base_out + j];
-            d_input[base_in + j] = d * gate;
-            d_input[base_in + half + j] = d * val * gate * (1.0 - gate);
-        }
-    }
+    registry().dispatch(&mut Op::PerNeuronGluBwd {
+        d_out, x: &cache.x, d_x: &mut d_input,
+        n_neurons: cache.n_neurons,
+        feat_per_neuron: half,
+    }).expect("per_neuron_glu_bwd dispatch");
     d_input
 }
 
@@ -222,15 +184,15 @@ impl BlockGrads {
     }
 
     fn apply(&mut self, block: &mut SynapseBlock, lr: f32) {
-        if modgrad_compute::neuron::gpu_enabled()
-            && block.linear.weight.len() >= 1024
-            && modgrad_device::kfd::accel::try_sgd_update(
-                &mut block.linear.weight, &mut self.d_weight, lr)
-        {
-            // GPU handled weight update + zeroed d_weight
-        } else {
-            for (w, g) in block.linear.weight.iter_mut().zip(&self.d_weight) { *w -= lr * g; }
-        }
+        use modgrad_device::backend::{registry, Op};
+        // Weight update via registry dispatch. Grad-zeroing is the
+        // caller's responsibility (preserved in the outer training loop);
+        // sgd_update now does ONLY the `w -= lr*g` step.
+        registry().dispatch(&mut Op::SgdUpdate {
+            w: &mut block.linear.weight, g: &self.d_weight, lr,
+        }).expect("sgd_update dispatch");
+        // Small epilogue updates stay inline — they're O(vec_len) serial
+        // loops on tiny vectors; an Op dispatch would cost more than the work.
         for (b, g) in block.linear.bias.iter_mut().zip(&self.d_bias) { *b -= lr * g; }
         for (g, dg) in block.ln_gamma.iter_mut().zip(&self.d_gamma) { *g -= lr * dg; }
         for (b, db) in block.ln_beta.iter_mut().zip(&self.d_beta) { *b -= lr * db; }
@@ -248,42 +210,14 @@ fn block_forward_cached(block: &SynapseBlock, x: &[f32]) -> (Vec<f32>, BlockCach
 fn block_backward(
     block: &SynapseBlock, d_out: &[f32], cache: &BlockCache, grads: &mut BlockGrads,
 ) -> Vec<f32> {
-    let in_dim = block.linear.in_dim;
-    let out_dim = block.linear.out_dim;
-
-    // Fused GPU path: silu_bwd → ln_bwd → matvec_t in one submit_wait.
-    // Eliminates 2 GPU stalls between the 3 kernels.
-    if modgrad_compute::neuron::gpu_enabled() && out_dim <= 256 {
-        let mut d_input = vec![0.0f32; in_dim];
-        let mut d_ln = vec![0.0f32; out_dim];
-        if modgrad_device::kfd::accel::try_synapse_backward(
-            &block.linear.weight, d_out, &cache.pre_silu,
-            &cache.ln.normalized, &block.ln_gamma,
-            &mut grads.d_gamma, &mut grads.d_beta,
-            &mut d_input, &mut d_ln, cache.ln.inv_std,
-            out_dim as u32, in_dim as u32,
-        ) {
-            // d_bias from d_ln (the gradient at the linear output)
-            for i in 0..out_dim { grads.d_bias[i] += d_ln[i]; }
-            // d_weight (outer product) — GPU when large enough
-            if !modgrad_device::kfd::accel::try_outer_product(
-                &mut grads.d_weight, &d_ln, &cache.lin.input,
-                out_dim as u32, in_dim as u32,
-            ) {
-                for i in 0..out_dim {
-                    let d = d_ln[i];
-                    if d.abs() < 1e-12 { continue; }
-                    let row = i * in_dim;
-                    for j in 0..in_dim {
-                        grads.d_weight[row + j] += d * cache.lin.input[j];
-                    }
-                }
-            }
-            return d_input;
-        }
-    }
-
-    // CPU fallback: separate kernel dispatches
+    // Three-stage backward: silu → ln → linear. Each stage dispatches
+    // through the registry, which routes to KFD on gfx1102 and CPU
+    // otherwise. A fused GPU path existed before (one submit_wait for
+    // all three) — it traded ~2 dispatch-sync stalls for coupling
+    // modgrad-ctm to `modgrad_device::kfd`. Not worth the layer
+    // violation; if the perf matters, the fusion can come back inside
+    // `KfdBackend::dispatch` as a graph-level optimization without any
+    // caller changes.
     let d_silu = silu_backward(d_out, &cache.pre_silu);
     let d_ln = affine_ln_backward(&d_silu, &cache.ln, &block.ln_gamma,
         &mut grads.d_gamma, &mut grads.d_beta);
@@ -443,34 +377,21 @@ fn superlinear_backward(
         d_biases[i] += d_out[i];
     }
 
-    // GPU path for d_weight + d_input
-    if modgrad_compute::neuron::gpu_enabled() {
-        let mut d_input = vec![0.0f32; n * ip];
-        if modgrad_device::kfd::accel::try_superlinear_backward(
-            &sl.weights, d_out, &cache.input,
-            d_weights, &mut d_input,
-            n as u32, op as u32, ip as u32,
-        ) {
-            return d_input;
-        }
-    }
-
-    // CPU fallback
+    // Two-phase gradient: weight-grad accumulates, input-grad is fresh.
+    // The KFD kernel fuses both into one dispatch; routed through
+    // registry, CPU runs them as two passes. When a kernel-matched
+    // fused variant lands, supports() can claim it and this same
+    // call-site benefits automatically.
+    use modgrad_device::backend::{registry, Op};
     let mut d_input = vec![0.0f32; n * ip];
-    for neuron in 0..n {
-        let t = &cache.input[neuron * ip..(neuron + 1) * ip];
-        let w_base = neuron * op * ip;
-        let o_base = neuron * op;
-
-        for o in 0..op {
-            let d = d_out[o_base + o];
-            if d.abs() < 1e-12 { continue; }
-            for i in 0..ip {
-                d_weights[w_base + o * ip + i] += d * t[i];
-                d_input[neuron * ip + i] += d * sl.weights[w_base + o * ip + i];
-            }
-        }
-    }
+    registry().dispatch(&mut Op::SuperLinearBwdDw {
+        d_out, trace: &cache.input, d_weights,
+        d_model: n, memory_length: ip, out_per: op,
+    }).expect("superlinear_bwd_dw dispatch");
+    registry().dispatch(&mut Op::SuperLinearBwdDx {
+        d_out, weights: &sl.weights, d_trace: &mut d_input,
+        d_model: n, memory_length: ip, out_per: op,
+    }).expect("superlinear_bwd_dx dispatch");
     d_input
 }
 
@@ -488,26 +409,15 @@ fn sync_backward(
 ) -> Vec<f32> {
     let n_pairs = left.len();
     // GPU path: convert usize indices to u32, dispatch scatter kernel
-    if modgrad_compute::neuron::gpu_enabled() && n_pairs >= 16 {
-        let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
-        let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
-        let mut d_act = vec![0.0f32; d_model];
-        if modgrad_device::kfd::accel::try_sync_backward(
-            d_sync, activated, beta,
-            &left_u32, &right_u32,
-            n_pairs as u32, d_model as u32,
-            &mut d_act,
-        ) {
-            return d_act;
-        }
-    }
-    // CPU fallback
+    use modgrad_device::backend::{registry, Op};
+    let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
+    let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
     let mut d_act = vec![0.0f32; d_model];
-    for i in 0..n_pairs {
-        let scale = 1.0 / beta[i].sqrt().max(1e-8);
-        d_act[left[i]] += d_sync[i] * scale * activated[right[i]];
-        d_act[right[i]] += d_sync[i] * scale * activated[left[i]];
-    }
+    registry().dispatch(&mut Op::SyncBackwardScatter {
+        d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
+        activated, beta, d_act: &mut d_act,
+        n_pairs, d_model,
+    }).expect("sync_backward_scatter dispatch");
     d_act
 }
 
@@ -664,47 +574,23 @@ fn linear_slice_backward(
         d_bias[r] += d_out[ri];
     }
 
-    let use_gpu = modgrad_compute::neuron::gpu_enabled();
-
     // d_weight (outer product): d_weight[r*in_dim+j] += d_out[ri] * x[j]
+    use modgrad_device::backend::{registry, Op};
+
     // GPU operates on the contiguous slice d_weight[row_start*in_dim..row_end*in_dim]
     let w_offset = row_start * in_dim;
     let w_slice = &mut d_weight[w_offset..w_offset + slice_dim * in_dim];
-    if !(use_gpu && modgrad_device::kfd::accel::try_outer_product(
-        w_slice, d_out, x, slice_dim as u32, in_dim as u32,
-    )) {
-        // CPU fallback
-        for ri in 0..(row_end - row_start) {
-            let d = d_out[ri];
-            if d.abs() < 1e-12 { continue; }
-            let local_row = ri * in_dim;
-            for j in 0..in_dim {
-                w_slice[local_row + j] += d * x[j];
-            }
-        }
-    }
+    registry().dispatch(&mut Op::OuterProductAcc {
+        a: d_out, b: x, accum: w_slice, m: slice_dim, n: in_dim,
+    }).expect("outer_product dispatch");
 
     // d_input = W_slice^T @ d_out
     let wt_slice = &linear.weight[w_offset..w_offset + slice_dim * in_dim];
-    if use_gpu {
-        let mut d_input = vec![0.0f32; in_dim];
-        if modgrad_device::kfd::accel::try_matvec_t(
-            d_out, wt_slice, &mut d_input,
-            slice_dim as u32, in_dim as u32,
-        ) {
-            return d_input;
-        }
-    }
-    // CPU fallback
     let mut d_input = vec![0.0f32; in_dim];
-    for (ri, _r) in (row_start..row_end).enumerate() {
-        let d = d_out[ri];
-        if d.abs() < 1e-12 { continue; }
-        let local_row = ri * in_dim;
-        for j in 0..in_dim {
-            d_input[j] += d * wt_slice[local_row + j];
-        }
-    }
+    registry().dispatch(&mut Op::MatvecT {
+        d_out, weight: wt_slice, d_input: &mut d_input,
+        out_dim: slice_dim, in_dim,
+    }).expect("matvec_t dispatch");
     d_input
 }
 
@@ -886,12 +772,10 @@ impl CtmGradients {
         let lr = lr * scale;
 
         self.unet.apply(&mut w.synapse, lr);
-        let gpu = modgrad_compute::neuron::gpu_enabled();
+        use modgrad_device::backend::{registry, Op};
         let sgd = |w: &mut [f32], g: &mut [f32]| {
-            if gpu && w.len() >= 1024
-                && modgrad_device::kfd::accel::try_sgd_update(w, g, lr)
-            { return; }
-            for (w, g) in w.iter_mut().zip(g.iter()) { *w -= lr * g; }
+            registry().dispatch(&mut Op::SgdUpdate { w, g, lr })
+                .expect("sgd_update dispatch");
         };
         sgd(&mut w.nlm_stage1.weights, &mut self.nlm_s1_w);
         sgd(&mut w.nlm_stage1.biases, &mut self.nlm_s1_b);

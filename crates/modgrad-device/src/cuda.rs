@@ -219,7 +219,7 @@ pub fn init_global() {
 
 /// Try cuBLAS matvec on default device. Returns false if unavailable.
 pub fn try_matvec(
-    _x: &[f32], _weight: &[f32], _bias: &[f32], _out: &mut [f32],
+    x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
     _out_dim: u32, _in_dim: u32,
 ) -> bool {
     #[cfg(feature = "cuda")]
@@ -230,6 +230,8 @@ pub fn try_matvec(
             }
         }
     }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = (x, weight, bias, out); }
     false
 }
 
@@ -246,7 +248,7 @@ pub fn try_superlinear(
 /// Try matvec on a specific device.
 pub fn try_matvec_on(
     _device_ordinal: usize,
-    _x: &[f32], _weight: &[f32], _bias: &[f32], _out: &mut [f32],
+    x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
 ) -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -256,6 +258,8 @@ pub fn try_matvec_on(
             }
         }
     }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = (x, weight, bias, out); }
     false
 }
 

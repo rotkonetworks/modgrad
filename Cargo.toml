@@ -18,6 +18,7 @@ members = [
     "examples/minictm",
     "examples/parity",
     "examples/mazes",
+    "examples/hebbian_sanity",
     "debugger",
     "extra/remu",
 ]
@@ -67,10 +68,23 @@ path = "test_remu.rs"
 harness = false
 
 [features]
-default = []
+# Runtime defaults: ROCm (portable AMD) + CUDA (NVIDIA) cover the common
+# production hardware. End users get a binary that works on whatever GPU
+# is present; library-only consumers depending on modgrad-device directly
+# stay minimal. KFD (gfx1102 flash path) is opt-in via `--features kfd`.
+#
+# `cuda` here is the runtime-portable variant (cudarc w/ fallback dynamic
+# loading) — builds on any host. For the heavier compute-kernel variant
+# (candle-kernels PTX) that needs nvcc at build time, use
+# `--features cuda-kernels`.
+default = ["rocm", "cuda"]
 onnx = ["dep:ort", "modgrad-io/onnx"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
-cuda = ["dep:cudarc", "modgrad-compute/cuda"]
+cuda = ["dep:cudarc", "modgrad-device/cuda"]
+cuda-kernels = ["cuda", "modgrad-compute/cuda"]
+rocm = ["modgrad-device/rocm"]
+kfd  = ["modgrad-device/kfd"]
+gpu  = ["modgrad-device/gpu"]
 telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "modgrad-io/telemetry"]
 
 [dependencies]

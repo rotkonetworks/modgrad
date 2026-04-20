@@ -1145,32 +1145,16 @@ fn global_sync_backward(
     d_sync: &[f32], activated: &[f32], beta: &[f32],
     left: &[usize], right: &[usize], d_model: usize,
 ) -> Vec<f32> {
+    use modgrad_device::backend::{registry, Op};
     let n_pairs = left.len();
-    // GPU path
-    if modgrad_compute::neuron::gpu_enabled() && n_pairs >= 16 {
-        let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
-        let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
-        let mut d_act = vec![0.0f32; d_model];
-        if modgrad_device::kfd::accel::try_sync_backward(
-            d_sync, activated, beta,
-            &left_u32, &right_u32,
-            n_pairs as u32, d_model as u32,
-            &mut d_act,
-        ) {
-            return d_act;
-        }
-    }
-    // CPU fallback
+    let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
+    let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
     let mut d_act = vec![0.0f32; d_model];
-    for i in 0..n_pairs {
-        let l = left[i];
-        let r = right[i];
-        if l < d_model && r < d_model {
-            let inv_sqrt_beta = 1.0 / beta[i].sqrt().max(1e-8);
-            d_act[l] += d_sync[i] * activated[r] * inv_sqrt_beta;
-            d_act[r] += d_sync[i] * activated[l] * inv_sqrt_beta;
-        }
-    }
+    registry().dispatch(&mut Op::SyncBackwardScatter {
+        d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
+        activated, beta, d_act: &mut d_act,
+        n_pairs, d_model,
+    }).expect("sync_backward_scatter dispatch");
     d_act
 }
 
@@ -2755,26 +2739,12 @@ impl AdamWBuf {
     }
 
     fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
-        // Try GPU dispatch first — eliminates PCIe round-trip for optimizer
-        let bc1_inv = 1.0 / bc1;
-        let bc2_inv = 1.0 / bc2;
-        if weights.len() >= 256
-            && modgrad_device::kfd::accel::try_adamw(
-                weights, grads, &mut self.m, &mut self.v,
-                lr, b1, b2, eps, wd, bc1_inv, bc2_inv,
-            )
-        {
-            return;
-        }
-        // CPU fallback
-        for i in 0..weights.len() {
-            let g = grads[i];
-            self.m[i] = b1 * self.m[i] + (1.0 - b1) * g;
-            self.v[i] = b2 * self.v[i] + (1.0 - b2) * g * g;
-            let m_hat = self.m[i] * bc1_inv;
-            let v_hat = self.v[i] * bc2_inv;
-            weights[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * weights[i]);
-        }
+        use modgrad_device::backend::{registry, Op};
+        registry().dispatch(&mut Op::AdamW {
+            w: weights, g: grads, m: &mut self.m, v: &mut self.v,
+            lr, beta1: b1, beta2: b2, eps, weight_decay: wd,
+            bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
+        }).expect("adamw dispatch");
     }
 }
 
