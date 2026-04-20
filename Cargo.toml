@@ -20,6 +20,7 @@ members = [
     "examples/mazes",
     "examples/dream_bench",
     "examples/dream_gallery",
+    "examples/maze_viz",
     "examples/hebbian_sanity",
     "debugger",
     "extra/remu",

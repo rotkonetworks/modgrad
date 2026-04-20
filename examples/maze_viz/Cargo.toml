@@ -1,0 +1,9 @@
+[package]
+name = "maze_viz"
+version = "0.1.0"
+edition = "2024"
+description = "Render real mazes with route overlay — the structured counterpart to dream_gallery's noise."
+
+[[bin]]
+name = "maze_viz"
+path = "src/main.rs"
