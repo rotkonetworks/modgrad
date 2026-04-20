@@ -15,6 +15,10 @@ fn four_region_bptt_loss_decreases() {
         (vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3),
     ];
 
+    // Standard small-model BPTT defaults, chosen empirically: lr=0.01
+    // clears the init plateau in ~100 epochs on this toy 4-class set;
+    // clip=5.0 is loose enough to avoid capping on the healthy-gradient
+    // majority while still catching the occasional spike.
     let lr = 0.01;
     let clip = 5.0;
     let mut losses = Vec::new();

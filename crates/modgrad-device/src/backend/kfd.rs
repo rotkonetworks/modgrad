@@ -153,10 +153,22 @@ impl Backend for KfdBackend {
             // re-enables fusion via this gate as a standalone commit.
             Op::SynapseForward { .. } => false,
             Op::LayerNormInplace { .. } => false,
-            // Deferred — require Op/kernel alignment first:
-            //   LayerNormFwd         → KFD's inplace kernel doesn't emit cache
-            //   SyncUpdateFwd        → KFD's kernel expects alpha/beta/phases/dopamine
-            //   SuperLinearBwd{Dw,Dx}→ arg shape mismatch; TODO align
+            // Deferred — require Op/kernel alignment first. Tracked in
+            // `tasks/kfd-kernel-bugs.md` ("Deferred" section). Each marker
+            // below mirrors the SynapseForward precedent: inline reason,
+            // pointer to the tracker for seed/shape detail (N/A here —
+            // these fail the Op match before proptest reaches a dispatch).
+            // FIXME(kfd-layer-norm-fwd): KFD's inplace kernel doesn't emit
+            //   the `cache` tensor the Op variant expects; backward handoff
+            //   blocked on kernel surface change. See
+            //   tasks/kfd-kernel-bugs.md#deferred.
+            // FIXME(kfd-sync-update-fwd): KFD's kernel expects
+            //   alpha/beta/phases/dopamine args the Op struct doesn't
+            //   carry; blocked on Op enum extension. See
+            //   tasks/kfd-kernel-bugs.md#deferred.
+            // FIXME(kfd-super-linear-bwd): Dw/Dx arg-shape mismatch between
+            //   Op variants and KFD's existing dispatcher; blocked on
+            //   dispatcher rework. See tasks/kfd-kernel-bugs.md#deferred.
             _ => false,
         }
     }

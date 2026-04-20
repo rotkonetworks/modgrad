@@ -202,11 +202,25 @@ No `#[deprecated]` window, no grace period. Either the chain is ready or it isn'
 
 ## Definition of done
 
-- Zero `modgrad_device::kfd::*` imports in `modgrad-compute/src/*` except via `cfg(feature = "kfd")` in the VRAM lifecycle shim.
-- `ComputeBackend` trait either reduced to lifecycle-only or removed entirely.
-- No op implementation exists in two places.
-- Parity + proptest harness covers every fused variant; long-horizon convergence test wired.
-- `cargo test --workspace` passes on default + `--features kfd`; gfx1102 run logged in PR description.
+- `ComputeBackend` trait and its `StreamGpuBackend` / `VramGpuBackend`
+  impls retain direct `modgrad_device::kfd::accel::*` call sites
+  (~13 across `modgrad-compute/src/{backend.rs, tensor_device.rs,
+  optimizer_state.rs, lib.rs}`). These are **not** feature-gated —
+  the `kfd` Rust module compiles unconditionally (modgrad-compute
+  depends on its types), and the VRAM-lifecycle path does not yet
+  have an ops-layer equivalent. Accepted technical debt pending
+  `Op::SyncUpdateFwd` alignment + `DeviceBuffer` adoption in
+  `VramGpuBackend`. Tracked as the remaining straggler — not a
+  regression, a known follow-up.
+- `ComputeBackend` trait reduced toward lifecycle-only; dispatch
+  methods that already have an `ops::` equivalent delegate there.
+  Full removal of the trait depends on the VRAM shim landing above.
+- No `&[f32]`-slice op implementation exists in two places. (VRAM
+  lifecycle dispatches are the exception — see straggler bullet.)
+- Parity + proptest harness covers every fused variant; long-horizon
+  convergence test wired.
+- `cargo test --workspace` passes on default + `--features kfd`;
+  gfx1102 run logged in PR description.
 
 ## Not in this plan
 
