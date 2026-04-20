@@ -487,8 +487,8 @@ pub fn init_global() {
 
 /// Try to run SuperLinear on GPU. Returns false if unavailable (caller should fall back to CPU).
 pub fn try_superlinear(
-    _trace: &[f32], _weights: &[f32], _biases: &[f32], _out: &mut [f32],
-    _n_neurons: u32, _in_per: u32, _out_per: u32,
+    trace: &[f32], weights: &[f32], biases: &[f32], out: &mut [f32],
+    n_neurons: u32, in_per: u32, out_per: u32,
 ) -> bool {
     #[cfg(feature = "gpu")]
     {
@@ -496,13 +496,15 @@ pub fn try_superlinear(
             return gpu.superlinear(trace, weights, biases, out, n_neurons, in_per, out_per);
         }
     }
+    #[cfg(not(feature = "gpu"))]
+    { let _ = (trace, weights, biases, out, n_neurons, in_per, out_per); }
     false
 }
 
 /// Try to run matvec on GPU. Returns false if unavailable.
 pub fn try_matvec(
-    _x: &[f32], _weight: &[f32], _bias: &[f32], _out: &mut [f32],
-    _out_dim: u32, _in_dim: u32,
+    x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
+    out_dim: u32, in_dim: u32,
 ) -> bool {
     #[cfg(feature = "gpu")]
     {
@@ -510,6 +512,8 @@ pub fn try_matvec(
             return gpu.matvec(x, weight, bias, out, out_dim, in_dim);
         }
     }
+    #[cfg(not(feature = "gpu"))]
+    { let _ = (x, weight, bias, out, out_dim, in_dim); }
     false
 }
 
