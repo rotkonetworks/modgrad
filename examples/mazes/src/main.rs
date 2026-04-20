@@ -42,6 +42,8 @@ fn main() {
     let mut frozen_cereb = false;
     let mut autoresearch_summary = false;
     let mut budget_secs: Option<u64> = None;
+    let mut train_bank_path: Option<String> = None;
+    let mut test_bank_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -64,6 +66,8 @@ fn main() {
             "--frozen-cereb" => { frozen_cereb = true; i += 1; }
             "--autoresearch-summary" => { autoresearch_summary = true; i += 1; }
             "--budget" => { budget_secs = Some(args[i+1].parse().unwrap()); i += 2; }
+            "--load-mazes" => { train_bank_path = Some(args[i+1].clone()); i += 2; }
+            "--load-mazes-test" => { test_bank_path = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -77,8 +81,26 @@ fn main() {
 
     let maze_size = maze_size | 1;
 
+    // Optionally load external maze banks (e.g., Sakana PNGs exported via the
+    // /tmp/export_sakana_mazes.py script). When loaded, the training loop
+    // samples from the bank instead of generating fresh mazes.
+    let train_bank: Option<Vec<Maze>> = train_bank_path.as_deref().map(|p| {
+        let m = load_maze_bank(p).expect("failed to load train maze bank");
+        eprintln!("Loaded {} train mazes from {}", m.len(), p);
+        m
+    });
+    let test_bank: Option<Vec<Maze>> = test_bank_path.as_deref().map(|p| {
+        let m = load_maze_bank(p).expect("failed to load test maze bank");
+        eprintln!("Loaded {} test mazes from {}", m.len(), p);
+        m
+    });
+    // If a bank is loaded and matches a size, override --size so shapes line up.
+    let maze_size = if let Some(ref b) = train_bank {
+        b[0].grid_size
+    } else { maze_size };
+
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs, train_bank, test_bank);
         return;
     }
 
@@ -334,6 +356,7 @@ fn run_brain(
     lr: f32, seed: u64, batch_size: usize, imagination: bool, pain_mode: bool,
     plural_mode: bool, csv_mode: bool, cereb_size: usize, frozen_cereb: bool,
     autoresearch_summary: bool, budget_secs: Option<u64>,
+    train_bank: Option<Vec<Maze>>, test_bank: Option<Vec<Maze>>,
 ) {
     let t_train_start = std::time::Instant::now();
     let budget = budget_secs.map(std::time::Duration::from_secs);
@@ -481,7 +504,11 @@ fn run_brain(
         if pain_mode { org.begin_step(); }
 
         for _ in 0..batch_size {
-            let maze = generate_maze(maze_size, &mut rng);
+            let maze: Maze = if let Some(ref bank) = train_bank {
+                bank[rng.range(bank.len())].clone()
+            } else {
+                generate_maze(maze_size, &mut rng)
+            };
             if maze.path_length < 3 { continue; }
 
             let pixels = render_maze(&maze);
@@ -693,8 +720,17 @@ fn run_brain(
     let mut prefix_lengths = Vec::new();
     let mut n_valid = 0usize;
 
-    for _ in 0..200 {
-        let maze = generate_maze(maze_size, &mut eval_rng);
+    // Use held-out test bank if provided; otherwise sample the training
+    // bank (or generate fresh mazes). Keeping eval distinct from training
+    // data matters when a fixed bank replaces the online generator.
+    let eval_source: Option<&[Maze]> = test_bank.as_deref().or(train_bank.as_deref());
+
+    for eval_i in 0..200 {
+        let maze: Maze = if let Some(bank) = eval_source {
+            bank[eval_i % bank.len()].clone()
+        } else {
+            generate_maze(maze_size, &mut eval_rng)
+        };
         if maze.path_length < 3 { continue; }
 
         let pixels = render_maze(&maze);

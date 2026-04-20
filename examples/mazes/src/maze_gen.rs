@@ -14,6 +14,7 @@ pub const DIR_WAIT: usize = 4;
 pub const N_DIRECTIONS: usize = 5;
 
 /// A generated maze with its solution.
+#[derive(Clone)]
 pub struct Maze {
     /// Grid: true = wall, false = path. Size: grid_size × grid_size.
     pub grid: Vec<bool>,
@@ -39,7 +40,7 @@ impl MazeRng {
         self.0
     }
 
-    fn range(&mut self, max: usize) -> usize {
+    pub fn range(&mut self, max: usize) -> usize {
         (self.next() >> 33) as usize % max
     }
 
@@ -103,6 +104,47 @@ pub fn generate_maze(size: usize, rng: &mut MazeRng) -> Maze {
     let path_length = route.len();
 
     Maze { grid, grid_size: size, start, end, route, path_length }
+}
+
+/// Load a bank of mazes from the binary format written by
+/// `/tmp/export_sakana_mazes.py`. Each maze's route is recomputed
+/// via BFS (we don't trust any pre-drawn solution).
+pub fn load_maze_bank(path: &str) -> std::io::Result<Vec<Maze>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?.read_to_end(&mut buf)?;
+    if buf.len() < 12 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bank too short"));
+    }
+    let n = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let h = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let w = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    if h != w {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("non-square maze {}x{}", h, w)));
+    }
+    let size = h;
+    let wall_bytes = size * size;
+    let rec = wall_bytes + 16;
+    if buf.len() < 12 + n * rec {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bank truncated"));
+    }
+    let mut mazes = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = 12 + i * rec;
+        let walls = &buf[off..off + wall_bytes];
+        let grid: Vec<bool> = walls.iter().map(|&b| b != 0).collect();
+        let sy = u32::from_le_bytes(buf[off + wall_bytes..off + wall_bytes + 4].try_into().unwrap()) as usize;
+        let sx = u32::from_le_bytes(buf[off + wall_bytes + 4..off + wall_bytes + 8].try_into().unwrap()) as usize;
+        let ey = u32::from_le_bytes(buf[off + wall_bytes + 8..off + wall_bytes + 12].try_into().unwrap()) as usize;
+        let ex = u32::from_le_bytes(buf[off + wall_bytes + 12..off + wall_bytes + 16].try_into().unwrap()) as usize;
+        let start = (sy, sx);
+        let end = (ey, ex);
+        let route = bfs_path(&grid, size, start, end);
+        let path_length = route.len();
+        mazes.push(Maze { grid, grid_size: size, start, end, route, path_length });
+    }
+    Ok(mazes)
 }
 
 /// BFS shortest path, returns direction sequence.
