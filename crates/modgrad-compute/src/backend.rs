@@ -397,50 +397,29 @@ fn fast_sigmoid(v: f32) -> f32 {
 
 // ─── ComputeBackend trait ───────────────────────────────────
 
-/// Compute backend for CTM hot-path operations.
-/// Implementations: CpuBackend (rayon), future CudaBackend, VulkanBackend.
+/// Lifecycle surface for stateful compute contexts.
+///
+/// Stage 6 collapsed this trait to the two lifecycle knobs that
+/// `modgrad_device::backend::ops::*` does not cover:
+///   * `alloc_f32(n)` — return a `GpuVec`. On CPU that's a heap `Vec`;
+///     on `VramGpuBackend` that's a KFD arena sub-allocation (bump
+///     allocator, freed wholesale by `arena_reset`).
+///   * `arena_reset()` — reclaim every outstanding `alloc_f32` at once.
+///     No-op on CPU; drops the KFD arena's bump watermark to zero.
+///
+/// Every op dispatch method (matvec, glu, silu, layer_norm, superlinear,
+/// synapse_forward, trace_shift, sync_update) moved to
+/// `modgrad_device::backend::ops::*` in Stages 1-3. The op:: façade is
+/// the single entry point — callers that want a kernel call it directly
+/// instead of going through this trait.
+///
+/// This trait exists only because the VRAM *arena* contract
+/// (alloc_f32 → raw pointer into a bump allocator, invalidated en-masse
+/// by arena_reset) does not map onto `ComputeCtx<KfdBackend>::alloc_buffer`
+/// (ioctl-allocates a fresh `GpuBuffer` per call, drop-time freed). The
+/// unify plan's "global mutable state stays" stance keeps this arena;
+/// dissolving it fully is a follow-on effort.
 pub trait ComputeBackend: Send + Sync {
-    /// Dense matrix-vector multiply: y = W*x + b
-    /// W is [out_dim x in_dim] row-major, x is [in_dim], y is [out_dim]
-    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
-              y: &mut [f32], out_dim: usize, in_dim: usize);
-
-    /// Per-neuron batched MLP (SuperLinear):
-    /// For each neuron n: y[n] = W[n] * trace[n] + b[n]
-    /// weights: [n_neurons x out_per x in_per], trace: [n_neurons x in_per]
-    /// output: [n_neurons x out_per]
-    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
-                   output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize);
-
-    /// GLU activation: output[i] = input[i] * sigmoid(input[i + half])
-    /// input has 2*n elements, output has n elements
-    fn glu(&self, input: &[f32], output: &mut [f32]);
-
-    /// SiLU (swish) in-place: x[i] = x[i] * sigmoid(x[i])
-    fn silu_inplace(&self, x: &mut [f32]);
-
-    /// Layer normalization in-place
-    fn layer_norm_inplace(&self, x: &mut [f32]);
-
-    /// Fused synapse forward: matvec -> GLU -> SiLU -> layer_norm
-    /// Default implementation calls the individual methods.
-    /// `scratch` must have at least `out_dim * 2` elements (the raw matvec output).
-    /// `output` must have at least `out_dim` elements.
-    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
-                       output: &mut [f32], scratch: &mut [f32],
-                       out_dim: usize, in_dim: usize) {
-        // matvec into scratch (2*out_dim), GLU into output (out_dim), SiLU, layer_norm
-        self.matvec(weight, bias, x, scratch, out_dim * 2, in_dim);
-        self.glu(&scratch[..out_dim * 2], &mut output[..out_dim]);
-        self.silu_inplace(&mut output[..out_dim]);
-        self.layer_norm_inplace(&mut output[..out_dim]);
-    }
-
-    /// Flush any batched GPU dispatches. Call at tick/step boundaries.
-    /// No-op for CPU backends. GPU backends may buffer dispatches and
-    /// flush them in a single submit_wait for efficiency.
-    fn flush(&self) {}
-
     /// Allocate an f32 buffer. GPU backends return VRAM-backed memory
     /// so data stays in GPU memory between operations. CPU backends
     /// return a regular heap allocation.
@@ -452,27 +431,10 @@ pub trait ComputeBackend: Send + Sync {
     /// temporary VRAM buffers. No-op for CPU backends.
     fn arena_reset(&self) {}
 
-    /// Trace shift: for each neuron, shift trace left by 1, append new activation.
-    /// traces: [n_neurons x memory_length], new_activations: [n_neurons]
-    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
-                   n_neurons: usize, memory_length: usize);
-
-    /// Sync accumulator update.
-    ///
-    /// For each pair i in 0..n_pairs:
-    ///   pairwise = activations_left[i] * activations_right[i] * dopamine * temporal_proximity
-    ///   r = exp(-(decay[i] + decay_shift[i]).clamp(0, 15))
-    ///   alpha[i] = r * alpha[i] + pairwise   (or just pairwise if !initialized)
-    ///   beta[i]  = r * beta[i]  + dopamine    (or just dopamine if !initialized)
-    ///   sync_out[i] = alpha[i] / sqrt(beta[i]).max(1e-8)
-    ///
-    /// `phases_left`/`phases_right` may be empty (magnitude-only mode).
-    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
-                   activations_left: &[f32], activations_right: &[f32],
-                   phases_left: &[f32], phases_right: &[f32],
-                   decay: &[f32], decay_shift: &[f32],
-                   dopamine: f32, n_pairs: usize, initialized: bool,
-                   sync_out: &mut [f32]);
+    /// Flush any batched GPU dispatches. Call at tick/step boundaries.
+    /// No-op for CPU backends. GPU backends may buffer dispatches and
+    /// flush them in a single submit_wait for efficiency.
+    fn flush(&self) {}
 }
 
 // ─── CpuBackend ─────────────────────────────────────────────
@@ -505,8 +467,14 @@ impl CpuBackend {
     }
 }
 
-impl ComputeBackend for CpuBackend {
-    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
+// CpuBackend satisfies the lifecycle trait with the default (heap alloc,
+// no-op arena_reset, no-op flush). The SIMD / cache-tiled compute methods
+// below are inherent — bench code and unit tests poke them directly;
+// production callers go through `modgrad_device::backend::ops::*`.
+impl ComputeBackend for CpuBackend {}
+
+impl CpuBackend {
+    pub fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
               y: &mut [f32], out_dim: usize, in_dim: usize) {
         debug_assert_eq!(weight.len(), out_dim * in_dim);
         debug_assert_eq!(bias.len(), out_dim);
@@ -538,7 +506,7 @@ impl ComputeBackend for CpuBackend {
 
     /// Fused synapse: matvec → GLU → SiLU → layernorm in minimal cache passes.
     /// Overrides the default 4-pass implementation.
-    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
+    pub fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
                        output: &mut [f32], _scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
         if !self.config.use_fused_synapse {
@@ -557,7 +525,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
+    pub fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                    output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
         debug_assert_eq!(weights.len(), n_neurons * out_per * in_per);
         debug_assert_eq!(biases.len(), n_neurons * out_per);
@@ -598,7 +566,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn glu(&self, input: &[f32], output: &mut [f32]) {
+    pub fn glu(&self, input: &[f32], output: &mut [f32]) {
         let half = input.len() / 2;
         debug_assert!(output.len() >= half);
 
@@ -621,7 +589,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn silu_inplace(&self, x: &mut [f32]) {
+    pub fn silu_inplace(&self, x: &mut [f32]) {
         if x.len() >= self.config.par_threshold {
             x.par_chunks_mut(64).for_each(|chunk| {
                 for v in chunk {
@@ -637,7 +605,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn layer_norm_inplace(&self, x: &mut [f32]) {
+    pub fn layer_norm_inplace(&self, x: &mut [f32]) {
         let n = x.len() as f32;
         if n < 1.0 { return; }
 
@@ -649,7 +617,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
+    pub fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
         debug_assert!(traces.len() >= n_neurons * memory_length);
         debug_assert!(new_activations.len() >= n_neurons);
@@ -671,7 +639,7 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
-    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
+    pub fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
                    activations_left: &[f32], activations_right: &[f32],
                    phases_left: &[f32], phases_right: &[f32],
                    decay: &[f32], decay_shift: &[f32],
@@ -832,170 +800,11 @@ mod tests {
         assert!(approx_eq(beta[1], 1.0, 1e-5));
     }
 
-    // ─── GPU vs CPU comparison tests ───────────────────────────
-    // Run with: cargo test -p modgrad-compute -- --ignored
-    // Requires AMD GPU hardware (KFD).
-
-    fn gpu_available() -> bool {
-        modgrad_device::kfd::accel::available()
-    }
-
-    fn init_gpu_backend() -> StreamGpuBackend {
-        modgrad_device::kfd::accel::enable_vram_mode();
-        StreamGpuBackend::new()
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_glu() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let n = 128;
-        let input: Vec<f32> = (0..2*n).map(|i| (i as f32 - n as f32) * 0.01).collect();
-        let mut cpu_out = vec![0.0f32; n];
-        let mut gpu_out = vec![0.0f32; n];
-
-        cpu.glu(&input, &mut cpu_out);
-        gpu.glu(&input, &mut gpu_out);
-
-        for i in 0..n {
-            assert!((cpu_out[i] - gpu_out[i]).abs() < 0.01,
-                "GLU mismatch at {}: cpu={} gpu={}", i, cpu_out[i], gpu_out[i]);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_silu() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let mut cpu_x: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.05).collect();
-        let mut gpu_x = cpu_x.clone();
-
-        cpu.silu_inplace(&mut cpu_x);
-        gpu.silu_inplace(&mut gpu_x);
-
-        for i in 0..256 {
-            assert!((cpu_x[i] - gpu_x[i]).abs() < 0.01,
-                "SiLU mismatch at {}: cpu={} gpu={}", i, cpu_x[i], gpu_x[i]);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_layer_norm() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let mut cpu_x: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 + 1.0).collect();
-        let mut gpu_x = cpu_x.clone();
-
-        cpu.layer_norm_inplace(&mut cpu_x);
-        gpu.layer_norm_inplace(&mut gpu_x);
-
-        for i in 0..256 {
-            assert!((cpu_x[i] - gpu_x[i]).abs() < 0.05,
-                "LayerNorm mismatch at {}: cpu={} gpu={}", i, cpu_x[i], gpu_x[i]);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_synapse_forward() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let out_dim = 128;
-        let in_dim = 64;
-        let matvec_dim = out_dim * 2; // pre-GLU
-
-        // Random-ish weights
-        let w: Vec<f32> = (0..matvec_dim * in_dim)
-            .map(|i| ((i * 7 + 3) % 100) as f32 * 0.001 - 0.05)
-            .collect();
-        let b: Vec<f32> = (0..matvec_dim)
-            .map(|i| ((i * 13 + 7) % 100) as f32 * 0.001)
-            .collect();
-        let x: Vec<f32> = (0..in_dim)
-            .map(|i| ((i * 11 + 5) % 100) as f32 * 0.01 - 0.5)
-            .collect();
-
-        let mut cpu_out = vec![0.0f32; out_dim];
-        let mut gpu_out = vec![0.0f32; out_dim];
-        let mut cpu_scratch = vec![0.0f32; matvec_dim];
-        let mut gpu_scratch = vec![0.0f32; matvec_dim];
-
-        cpu.synapse_forward(&w, &b, &x, &mut cpu_out, &mut cpu_scratch, out_dim, in_dim);
-        gpu.synapse_forward(&w, &b, &x, &mut gpu_out, &mut gpu_scratch, out_dim, in_dim);
-
-        for i in 0..out_dim {
-            assert!((cpu_out[i] - gpu_out[i]).abs() < 0.1,
-                "synapse_forward mismatch at {}: cpu={} gpu={}", i, cpu_out[i], gpu_out[i]);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_trace_shift() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let n_neurons = 64;
-        let mem_len = 8;
-        let mut cpu_traces: Vec<f32> = (0..n_neurons * mem_len)
-            .map(|i| i as f32)
-            .collect();
-        let mut gpu_traces = cpu_traces.clone();
-        let new_act: Vec<f32> = (0..n_neurons).map(|i| (i * 100) as f32).collect();
-
-        cpu.trace_shift(&mut cpu_traces, &new_act, n_neurons, mem_len);
-        gpu.trace_shift(&mut gpu_traces, &new_act, n_neurons, mem_len);
-
-        for i in 0..n_neurons * mem_len {
-            assert!((cpu_traces[i] - gpu_traces[i]).abs() < 1e-5,
-                "trace_shift mismatch at {}: cpu={} gpu={}", i, cpu_traces[i], gpu_traces[i]);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpu_sync_update() {
-        if !gpu_available() { return; }
-        let gpu = init_gpu_backend();
-        let cpu = CpuBackend::new();
-
-        let n = 32;
-        let mut cpu_alpha = vec![0.0f32; n];
-        let mut cpu_beta = vec![0.0f32; n];
-        let mut gpu_alpha = vec![0.0f32; n];
-        let mut gpu_beta = vec![0.0f32; n];
-        let mut cpu_sync = vec![0.0f32; n];
-        let mut gpu_sync = vec![0.0f32; n];
-
-        let act_l: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
-        let act_r: Vec<f32> = (0..n).map(|i| ((n - i) as f32) * 0.1).collect();
-        let decay: Vec<f32> = vec![0.5; n];
-        let decay_shift: Vec<f32> = vec![0.1; n];
-
-        cpu.sync_update(&mut cpu_alpha, &mut cpu_beta, &act_l, &act_r,
-            &[], &[], &decay, &decay_shift, 1.0, n, false, &mut cpu_sync);
-        gpu.sync_update(&mut gpu_alpha, &mut gpu_beta, &act_l, &act_r,
-            &[], &[], &decay, &decay_shift, 1.0, n, false, &mut gpu_sync);
-
-        for i in 0..n {
-            assert!((cpu_alpha[i] - gpu_alpha[i]).abs() < 0.01,
-                "sync alpha mismatch at {}: cpu={} gpu={}", i, cpu_alpha[i], gpu_alpha[i]);
-            assert!((cpu_sync[i] - gpu_sync[i]).abs() < 0.01,
-                "sync_out mismatch at {}: cpu={} gpu={}", i, cpu_sync[i], gpu_sync[i]);
-        }
-    }
+    // Stage 6 removed the CPU-vs-KFD parity tests (test_gpu_glu, etc.) that
+    // used to live here. Their coverage moved to
+    // `modgrad-device/tests/backend_proptest.rs` and related proptests,
+    // which exercise the same kernels through the Op/registry layer and
+    // run on every `cargo test --features kfd` invocation.
 
     #[test]
     fn test_superlinear() {
@@ -1129,144 +938,22 @@ pub fn set_backend(b: Box<dyn ComputeBackend>) -> Result<(), Box<dyn ComputeBack
     BACKEND.set(b)
 }
 
-/// Stream GPU backend: weights stream through BAR per-call; ops routed
-/// to GPU above `GPU_MIN_FLOPS`, CPU below (where dispatch overhead
-/// dominates). Named for the per-call streaming behaviour — pairs with
-/// `VramGpuBackend`, which keeps weights resident in a VRAM arena.
-///
-/// Not "hybrid": that said nothing about *how* it was hybrid.
-/// Not "fusion": that term is already overloaded for kernel fusion.
-pub struct StreamGpuBackend {
-    cpu: CpuBackend,
-}
-
-impl StreamGpuBackend {
-    pub fn new() -> Self {
-        Self { cpu: CpuBackend::new() }
-    }
-}
-
-const GPU_MIN_FLOPS: usize = 32;
-
-impl ComputeBackend for StreamGpuBackend {
-    // Stage 3 facade: every dispatch method below delegates to
-    // `modgrad_device::backend::ops::*`, which routes through the
-    // `BackendRegistry` — KFD when available and `supports()` accepts the
-    // shape, CPU otherwise. StreamGpuBackend sits strictly ABOVE the
-    // registry; it is NOT a registered `Backend` itself (layering rule
-    // from tasks/compute-device-unify.md).
-    //
-    // Behavior shift vs. pre-Stage-3 code: previously each method called
-    // `kfd::accel::try_*` directly and panicked if the KFD runtime was
-    // absent. After the rewrite, ops::* will transparently run on
-    // whichever registered backend is available — notably, on a host
-    // with ROCm but no KFD, matvec will now succeed on ROCm instead of
-    // panicking. That's the intended convergence; the fail-fast panics
-    // only remain where the ops:: façade itself panics on dispatch
-    // failure (e.g. no backend supports the op at the given shape).
-    //
-    // The sub-GPU_MIN_FLOPS CPU gate on matvec/superlinear is preserved
-    // — it's a size gate (dispatch overhead isn't worth amortizing at
-    // <32 FLOPs), not a fallback. `self.cpu` stays for that.
-
-    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
-              y: &mut [f32], out_dim: usize, in_dim: usize) {
-        if out_dim * in_dim >= GPU_MIN_FLOPS {
-            // Arg order: ops::matvec takes x first, weight second.
-            modgrad_device::backend::ops::matvec(
-                x, weight, bias, y, out_dim, in_dim,
-                modgrad_device::backend::QuantKind::F32,
-            );
-            return;
-        }
-        // Too small for GPU to amortize dispatch overhead — CPU is the
-        // intended path at this size, not a fallback.
-        self.cpu.matvec(weight, bias, x, y, out_dim, in_dim);
-    }
-
-    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
-                   output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
-        if n_neurons * in_per * out_per >= GPU_MIN_FLOPS {
-            // Forward-only fused path — cache=None. Name mapping:
-            // ComputeBackend's (n_neurons, in_per) are SuperLinearFwd's
-            // (d_model, memory_length); see Op::SuperLinearFwd.
-            modgrad_device::backend::ops::super_linear_fwd(
-                trace, weights, biases, output, None,
-                n_neurons, in_per, out_per,
-            );
-            return;
-        }
-        self.cpu.superlinear(weights, biases, trace, output, n_neurons, in_per, out_per);
-    }
-
-    fn glu(&self, input: &[f32], output: &mut [f32]) {
-        modgrad_device::backend::ops::glu_fwd(input, output);
-    }
-
-    fn silu_inplace(&self, x: &mut [f32]) {
-        modgrad_device::backend::ops::silu_fwd_inplace(x);
-    }
-
-    fn layer_norm_inplace(&self, x: &mut [f32]) {
-        // ComputeBackend's LN is single-row; the Op-layer signature
-        // carries explicit shape. n_rows=1 preserves the old semantics.
-        let n_cols = x.len();
-        modgrad_device::backend::ops::layer_norm_inplace(x, 1, n_cols);
-    }
-
-    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
-                       output: &mut [f32], _scratch: &mut [f32],
-                       out_dim: usize, in_dim: usize) {
-        // Stage 1 deliberately dropped `scratch` from the Op boundary —
-        // the CPU impl allocates its own Vec, the KFD impl uses its own
-        // preallocated kernel slot. The caller's `scratch` is silently
-        // ignored here; it's part of the old API that Stage 6 will
-        // finish removing.
-        modgrad_device::backend::ops::synapse_forward(
-            weight, bias, x, output, out_dim, in_dim,
-        );
-    }
-
-    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
-                   n_neurons: usize, memory_length: usize) {
-        modgrad_device::backend::ops::trace_rotate_inplace(
-            traces, new_activations, n_neurons, memory_length,
-        );
-    }
-
-    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
-                   activations_left: &[f32], activations_right: &[f32],
-                   phases_left: &[f32], phases_right: &[f32],
-                   decay: &[f32], decay_shift: &[f32],
-                   dopamine: f32, n_pairs: usize, initialized: bool,
-                   sync_out: &mut [f32]) {
-        // TODO: migrate once Op::SyncUpdateFwd signature aligns.
-        // The Op-layer variant takes (h, pairs_left, pairs_right, decay,
-        // sync_state, sync_out, n_pairs) — a different kernel contract
-        // than the KFD alpha/beta/phases/dopamine stateful accumulator
-        // this ComputeBackend method exposes. Forcing a map would lose
-        // semantics; keep the direct kfd::accel call until the Op enum
-        // grows a matching variant (tracked in compute-device-unify
-        // plan Stage 5/6).
-        if !modgrad_device::kfd::accel::try_sync_update(
-            alpha, beta, activations_left, activations_right,
-            phases_left, phases_right, decay, decay_shift,
-            dopamine, n_pairs as u32, initialized, sync_out,
-        ) {
-            panic!("GPU sync_update failed: n_pairs={n_pairs}. --gpu requires \
-                    a working GPU dispatch path.");
-        }
-    }
-}
-
-// ─── Full VRAM backend ────────────────────────────────────
+// ─── VRAM arena backend ────────────────────────────────────
 //
-// All activation buffers live in VRAM arena. Every op dispatches
-// zero-copy — no PCIe transfers in the inner loop. Weights are
-// cached in VRAM on first use (re-uploaded after optimizer step
-// via invalidate_cache).
+// The sole remaining `ComputeBackend` impl with non-default lifecycle
+// behavior. `alloc_f32` returns a pointer into a pre-initialised VRAM
+// arena (bump allocator); `arena_reset` wipes every outstanding alloc
+// in one shot. This is the knob that makes `--vram` mode work: training
+// buffers stay resident on the GPU across tick boundaries and the
+// dispatch path (routed through `modgrad_device::backend::ops::*`) gets
+// a zero-copy input whenever the underlying backend detects a VRAM-
+// resident slice.
 //
-// Use with `--vram`. Requires model to fit in GPU memory.
+// Stage 3 / 4 deleted the old StreamGpuBackend entirely — it was a pure
+// ops:: facade with no lifecycle state, and after the op methods moved
+// off the trait it collapsed to `CpuBackend::new()` semantically. The
+// `--gpu` flag in CLIs is now a no-op (the registry already picks KFD
+// when the kernel driver is reachable).
 
 pub struct VramGpuBackend {
     // No cpu fallback — VRAM mode is GPU-only by design. A silent CPU
@@ -1284,131 +971,24 @@ impl VramGpuBackend {
 }
 
 impl ComputeBackend for VramGpuBackend {
-    // Stage 4 facade: every dispatch method below delegates to
-    // `modgrad_device::backend::ops::*`, which routes through the
-    // `BackendRegistry`. Same treatment as Stage 3 gave StreamGpuBackend.
-    // VramGpuBackend sits strictly ABOVE the registry; it is NOT a
-    // registered `Backend` itself (layering rule from
-    // tasks/compute-device-unify.md).
-    //
-    // Behavior shift vs. pre-Stage-4 code: previously each method called
-    // `kfd::accel::try_*` directly and panicked if the KFD runtime was
-    // absent. After the rewrite, ops::* will transparently run on
-    // whichever registered backend is available. On a gfx1102 host with
-    // the `kfd` feature enabled, KFD still wins (that's where VRAM mode
-    // is used); on hosts without KFD, the registry will transparently
-    // route to ROCm/CPU — which defeats the "no PCIe in the inner loop"
-    // promise that VRAM mode is about, but the caller explicitly chose
-    // `--vram` so they get what the registry can provide. The loud
-    // fail-fast panics are now embedded inside the `ops::*` façade
-    // (every function `.expect`s dispatch to succeed).
-    //
-    // `alloc_f32` and `arena_reset` still touch `kfd::accel` directly —
-    // those are the arena suballocation path (bump-alloc from a VRAM
-    // arena initialised in `VramGpuBackend::new`). That API has no
-    // equivalent on the `ComputeCtx<KfdBackend>::alloc_buffer` path,
-    // which ioctl-allocates a fresh `GpuBuffer` per call. Migrating the
-    // arena to `DeviceBuffer` would force a semantic change (per-alloc
-    // ioctl cost, different VRAM lifetime), so it stays for Stage 5/6 to
-    // address as part of dissolving the arena entirely.
-
-    fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
-              y: &mut [f32], out_dim: usize, in_dim: usize) {
-        // Arg order: ops::matvec takes x first, weight second.
-        modgrad_device::backend::ops::matvec(
-            x, weight, bias, y, out_dim, in_dim,
-            modgrad_device::backend::QuantKind::F32,
-        );
-    }
-
-    fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
-                   output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
-        // Forward-only fused path — cache=None. Name mapping:
-        // ComputeBackend's (n_neurons, in_per) are SuperLinearFwd's
-        // (d_model, memory_length); see Op::SuperLinearFwd.
-        modgrad_device::backend::ops::super_linear_fwd(
-            trace, weights, biases, output, None,
-            n_neurons, in_per, out_per,
-        );
-    }
-
-    fn glu(&self, input: &[f32], output: &mut [f32]) {
-        modgrad_device::backend::ops::glu_fwd(input, output);
-    }
-
-    fn silu_inplace(&self, x: &mut [f32]) {
-        modgrad_device::backend::ops::silu_fwd_inplace(x);
-    }
-
-    fn layer_norm_inplace(&self, x: &mut [f32]) {
-        // ComputeBackend's LN is single-row; the Op-layer signature
-        // carries explicit shape. n_rows=1 preserves the old semantics.
-        let n_cols = x.len();
-        modgrad_device::backend::ops::layer_norm_inplace(x, 1, n_cols);
-    }
-
-    fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
-                       output: &mut [f32], _scratch: &mut [f32],
-                       out_dim: usize, in_dim: usize) {
-        // Stage 1 deliberately dropped `scratch` from the Op boundary —
-        // the CPU impl allocates its own Vec, the KFD impl uses its own
-        // preallocated kernel slot. The caller's `scratch` is silently
-        // ignored here; it's part of the old API that Stage 6 will
-        // finish removing.
-        modgrad_device::backend::ops::synapse_forward(
-            weight, bias, x, output, out_dim, in_dim,
-        );
-    }
-
-    fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
-                   n_neurons: usize, memory_length: usize) {
-        modgrad_device::backend::ops::trace_rotate_inplace(
-            traces, new_activations, n_neurons, memory_length,
-        );
-    }
-
-    fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
-                   activations_left: &[f32], activations_right: &[f32],
-                   phases_left: &[f32], phases_right: &[f32],
-                   decay: &[f32], decay_shift: &[f32],
-                   dopamine: f32, n_pairs: usize, initialized: bool,
-                   sync_out: &mut [f32]) {
-        // TODO: migrate once Op::SyncUpdateFwd signature aligns.
-        // The Op-layer variant takes (h, pairs_left, pairs_right, decay,
-        // sync_state, sync_out, n_pairs) — a different kernel contract
-        // than the KFD alpha/beta/phases/dopamine stateful accumulator
-        // this ComputeBackend method exposes. Forcing a map would lose
-        // semantics; keep the direct kfd::accel call until the Op enum
-        // grows a matching variant (tracked in compute-device-unify
-        // plan Stage 5/6).
-        if !modgrad_device::kfd::accel::try_sync_update(
-            alpha, beta, activations_left, activations_right,
-            phases_left, phases_right, decay, decay_shift,
-            dopamine, n_pairs as u32, initialized, sync_out,
-        ) {
-            panic!("VRAM sync_update failed: n_pairs={n_pairs}. --vram requires \
-                    a working GPU dispatch path.");
-        }
-    }
-
     fn alloc_f32(&self, n: usize) -> GpuVec {
         // Arena suballocation, not `ComputeCtx::alloc_buffer`.
         //
-        // VramGpuBackend initialises a VRAM arena in its constructor
-        // (`init_arena(arena_mb)`) and services every `alloc_f32` from
-        // that arena via `arena_alloc` (bump allocator). Each allocation
-        // is a raw pointer into the arena; `arena_reset()` invalidates
-        // every outstanding slice at once. The `ComputeCtx<KfdBackend>`
-        // path (Stage 2) instead ioctl-allocates a fresh `GpuBuffer` per
-        // call, with independent drop-time free — a different lifetime
-        // contract. Stage 4b per compute-device-unify.md explicitly
-        // stops at semantic-change friction; the arena dissolves in
-        // Stage 5/6 when VramMirror / VramTensor are reworked.
+        // `VramGpuBackend::new` initialises a VRAM arena via
+        // `init_arena(arena_mb)` and every `alloc_f32` bump-allocates
+        // from that arena. Each allocation is a raw pointer into the
+        // arena; `arena_reset()` invalidates all outstanding slices at
+        // once. The `ComputeCtx<KfdBackend>::alloc_buffer` path (Stage
+        // 2) instead ioctl-allocates a fresh `GpuBuffer` per call with
+        // drop-time free — a different lifetime contract that does not
+        // fit the tick-scoped "allocate dozens of temporaries, throw
+        // them away at tick boundary" usage pattern. Dissolving the
+        // arena entirely is outside the compute-device-unify scope (see
+        // plan's "Committed stance: global mutable state stays").
         GpuVec::try_vram(n)
     }
 
     fn arena_reset(&self) {
-        // Stage 5 dissolves this — see compute-device-unify.md.
         modgrad_device::kfd::accel::arena_reset();
     }
 }

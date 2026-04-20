@@ -29,6 +29,14 @@ impl CudaBackend {
     pub fn try_new() -> Option<Self> {
         #[cfg(feature = "cuda")]
         {
+            // Gate on device-node presence BEFORE calling cudarc. cudarc
+            // 0.19 panics from inside its internal OnceLock init closure
+            // when libcuda.so is missing, and that panic propagates past
+            // catch_unwind in release+test builds (likely an inlining /
+            // unwind-safety interaction). The /dev/nvidia0 pre-check
+            // sidesteps the problem — no cudarc call = no panic. Mirrors
+            // the /dev/kfd probe pattern in the top-level init path.
+            if !std::path::Path::new("/dev/nvidia0").exists() { return None; }
             std::panic::catch_unwind(|| crate::cuda::CudaDevice::new(0))
                 .ok()
                 .and_then(|r| r.ok())

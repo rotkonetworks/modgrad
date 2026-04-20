@@ -261,9 +261,19 @@ impl Backend for RocmBackend {
         { let _ = op; return false; }
         #[cfg(feature = "rocm")]
         {
+            // Gate on shape size: below ~64 elements per dim, hipBLAS
+            // dispatch overhead (3× hipMalloc + 3× hipMemcpy + sgemv +
+            // sync + 1× hipMemcpy back) dwarfs the actual compute, and
+            // some tiny-shape configurations surface as silent zero-output
+            // in practice (caught by isis-runtime's 8-region actor test
+            // at obs_proj shapes like out_dim=16, in_dim=32). Conservative
+            // size gate routes tiny matvecs to CPU; real training shapes
+            // (out_dim >= 64) clear this and get the GPU path.
             match op {
-                Op::Matvec { quant: QuantKind::F32, .. } => true,
-                Op::MatmulNN { .. } => true,
+                Op::Matvec { quant: QuantKind::F32, out_dim, in_dim, .. }
+                    if *out_dim >= 64 && *in_dim >= 64 => true,
+                Op::MatmulNN { m, k, n, .. }
+                    if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 _ => false,
             }
         }

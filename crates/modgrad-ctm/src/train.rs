@@ -1184,13 +1184,12 @@ pub fn train_step(
 
     // Reset VRAM arena — all temporary GPU buffers freed.
     //
-    // TODO(compute-device-unify Stage 5e/6): migrate to
-    // `ComputeCtx::<KfdBackend>::arena_reset()` when the training loop
-    // threads the ctx. Today `be` is the legacy `ComputeBackend` trait
-    // object; forcing a parallel ComputeCtx<KfdBackend> construction
-    // here just to call `arena_reset` would re-leak a new backend
-    // singleton per call. Stage 6 dissolves the `ComputeBackend` trait
-    // entirely, and this line moves onto ComputeCtx at that point.
+    // Stage 6 shrunk `ComputeBackend` to lifecycle-only (alloc_f32,
+    // arena_reset, flush); `arena_reset` is one of the remaining four
+    // trait methods, so this call survives unchanged. Migrating to
+    // `ComputeCtx::<KfdBackend>::arena_reset` would require threading
+    // the ctx through every caller of `train_step_frozen` — out of
+    // scope per the "global mutable state stays" stance in the plan.
     be.arena_reset();
 
     TrainResult { loss, prediction: pred_class }

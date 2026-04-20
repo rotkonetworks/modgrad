@@ -205,17 +205,16 @@ fn main() {
         Commands::Generate { checkpoint, prompt, max_tokens, temperature, frozen_cereb } => {
             run_generate(&checkpoint, &prompt, max_tokens, temperature, frozen_cereb.as_deref());
         }
-        Commands::Learn { checkpoint, data, context, vocab, gpu, vram, medium, large, billion, debug_port, frozen_cereb } => {
-            // Registry picks the backend automatically. `set_backend` still
-            // installs the ComputeBackend variant for VRAM vs Stream lifecycle —
-            // it gets removed in the compute-device-unify plan Stage 3.
+        Commands::Learn { checkpoint, data, context, vocab, gpu: _gpu, vram, medium, large, billion, debug_port, frozen_cereb } => {
+            // Stage 6 of compute-device-unify: `--gpu` is now a no-op —
+            // the `BackendRegistry` picks KFD / ROCm / CUDA automatically
+            // whenever any of them are reachable. Only `--vram` still
+            // needs to install a `ComputeBackend` impl, because the VRAM
+            // arena lifecycle (init_arena + alloc_f32 → bump allocator)
+            // has no registry equivalent yet.
             if vram {
                 let _ = modgrad_compute::backend::set_backend(
                     Box::new(modgrad_compute::backend::VramGpuBackend::new(512))
-                );
-            } else if gpu {
-                let _ = modgrad_compute::backend::set_backend(
-                    Box::new(modgrad_compute::backend::StreamGpuBackend::new())
                 );
             }
             learn(&checkpoint, &data, context, vocab, medium, large, billion, debug_port, frozen_cereb.as_deref());

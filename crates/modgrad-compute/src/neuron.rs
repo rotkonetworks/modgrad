@@ -74,11 +74,14 @@ impl Linear {
     }
 
     /// Forward into pre-allocated output buffer. Zero allocation.
-    /// Dispatches through the global ComputeBackend (CPU, GPU, etc).
+    /// Dispatches through `modgrad_device::backend::ops::matvec`, which
+    /// routes through the `BackendRegistry` (KFD > ROCm > CUDA > CPU,
+    /// shape-permitting).
     pub fn forward_into(&self, x: &[f32], y: &mut [f32]) {
-        super::backend::backend().matvec(
-            &self.weight, &self.bias, x, y,
+        modgrad_device::backend::ops::matvec(
+            x, &self.weight, &self.bias, y,
             self.out_dim, self.in_dim,
+            modgrad_device::backend::QuantKind::F32,
         );
     }
 
@@ -90,6 +93,9 @@ impl Linear {
     }
 
     /// Forward with VRAM-aware allocation. Output may be GPU-resident.
+    /// Allocation goes through the lifecycle `ComputeBackend::alloc_f32`
+    /// (heap on CPU, arena-backed VRAM on `VramGpuBackend`); the dispatch
+    /// itself still goes through `ops::matvec` via `forward_into`.
     pub fn forward_gpu(&self, x: &[f32]) -> super::backend::GpuVec {
         let mut y = super::backend::backend().alloc_f32(self.out_dim);
         self.forward_into(x, &mut y);
@@ -147,10 +153,12 @@ impl SuperLinear {
     }
 
     /// Forward into pre-allocated buffer. Zero allocation.
-    /// Dispatches through the global ComputeBackend.
+    /// Dispatches through `modgrad_device::backend::ops::super_linear_fwd`,
+    /// which routes via the `BackendRegistry`. Forward-only fused variant
+    /// (`cache=None`).
     pub fn forward_into(&self, trace: &[f32], out: &mut [f32]) {
-        super::backend::backend().superlinear(
-            &self.weights, &self.biases, trace, out,
+        modgrad_device::backend::ops::super_linear_fwd(
+            trace, &self.weights, &self.biases, out, None,
             self.n_neurons, self.in_per, self.out_per,
         );
     }

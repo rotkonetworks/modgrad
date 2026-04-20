@@ -43,12 +43,11 @@ use std::sync::OnceLock;
 
 /// Process-wide `ComputeCtx<KfdBackend>` for `VramTensor` allocations.
 ///
-/// Stage 5 migration point: `VramTensor::zeros` no longer calls the
-/// deprecated `crate::alloc_device_vram` shim; it goes through the new
-/// backend-affine allocator. The ctx caches a single leaked `KfdBackend`
-/// so subsequent allocations don't re-probe KFD — probing locks the
-/// global `GPU` mutex, and training loops allocate tensors in tight
-/// bursts.
+/// Routes `VramTensor::zeros` through the backend-affine allocator in
+/// `modgrad_device::backend` (Stage 2 of compute-device-unify). The ctx
+/// caches a single leaked `KfdBackend` so subsequent allocations don't
+/// re-probe KFD — probing locks the global `GPU` mutex, and training
+/// loops allocate tensors in tight bursts.
 ///
 /// Returns `None` when KFD is unavailable. Callers fall back to
 /// whatever their CPU path is (typically returning `None` from
@@ -136,12 +135,11 @@ impl<T: DeviceElem> VramTensor<T> {
     /// Allocate a VRAM tensor of the given shape, zero-initialised.
     /// Returns `None` when no KFD GPU is available, or the alloc fails.
     ///
-    /// Stage 5: routes through `ComputeCtx::<KfdBackend>::alloc_buffer`
-    /// instead of the deprecated `crate::alloc_device_vram` shim. The
+    /// Routes through `ComputeCtx::<KfdBackend>::alloc_buffer`. The
     /// returned `KfdBuffer` is unwrapped to its inner `GpuBuffer` via the
     /// feature-hidden `into_inner` escape hatch — see `backend::kfd`
     /// for the rationale. Rounding + byte-vs-f32-count semantics match
-    /// the previous allocator.
+    /// what the raw `alloc_vram` path did before Stage 5.
     pub fn zeros(dims: impl Into<Vec<usize>>) -> Option<Self> {
         let dims = dims.into();
         let n: usize = dims.iter().product();

@@ -22,21 +22,6 @@ pub fn make_optimizer_state(sizes: Vec<usize>) -> Option<Box<dyn optimizer_state
     Some(Box::new(mirror))
 }
 
-/// Allocate a VRAM `GpuBuffer` of `bytes` bytes via the device singleton.
-/// Returns `None` if GPU is unavailable. Exposed so `tensor_device::VramTensor`
-/// can allocate without taking a direct modgrad-device visibility leak.
-///
-/// Stage 4 of compute-device-unify marks this for removal — callers should
-/// migrate to `modgrad_device::backend::ComputeCtx::<KfdBackend>::alloc_buffer`
-/// which returns a backend-affine `KfdBuffer` with the same underlying
-/// `GpuBuffer` lifetime. The shim is kept alive through Stage 5 because
-/// `tensor_device::VramTensor` (Stage 5 scope) still uses it; Stage 6
-/// removes both in one atomic migration.
-#[doc(hidden)]
-#[deprecated(note = "use ComputeCtx<KfdBackend>::alloc_buffer — removed in Stage 6")]
-pub fn alloc_device_vram(bytes: u64) -> Option<modgrad_device::kfd::memory::GpuBuffer> {
-    modgrad_device::kfd::accel::alloc_vram(bytes)
-}
 /// Compute L2 gradient norm over multiple slices. Dispatches via the
 /// backend registry above `GPU_THRESHOLD` elements — whichever backend
 /// claims `ReduceL2Sq` for the shape runs (KFD/ROCm/CUDA/Vulkan/CPU).
