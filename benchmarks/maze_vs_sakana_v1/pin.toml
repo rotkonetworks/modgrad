@@ -1,0 +1,119 @@
+# Pinned Sakana CTM v1 baseline for the maze-vs-modgrad head-to-head.
+#
+# This file is the *authoritative* pin. Do not tweak any value here in
+# modgrad's favor. If a number here changes, that is a new experiment,
+# not the same one.
+
+[pin]
+upstream        = "https://github.com/SakanaAI/continuous-thought-machines"
+commit          = "4a6c9c3a7fb5dc4bca6381cc7883a3b9252c6466"
+commit_date     = "2025-12-29T12:52:22+09:00"
+# Last commit touching tasks/mazes/train.py on upstream main. Maze code
+# has been stable since 2025-05-30 (aecfb63a), so any upstream commit
+# after that date produces identical maze behavior.
+maze_code_last  = "aecfb63ac42db7a20903ee27489ff71671669474"
+maze_code_date  = "2025-05-30T11:52:47+09:00"
+
+# Model shape — lifted verbatim from tasks/mazes/train.py argparse
+# defaults in the pinned commit. These are the CTM (not LSTM/FF)
+# defaults for the `mazes-medium` dataset.
+[model]
+architecture              = "ContinuousThoughtMachine"
+d_model                   = 512
+d_input                   = 128
+heads                     = 8
+iterations                = 75
+synapse_depth             = 8
+n_synch_out               = 32
+n_synch_action            = 32
+neuron_select_type        = "random-pairing"
+n_random_pairing_self     = 0
+memory_length             = 25
+deep_memory               = true
+memory_hidden_dims        = 32
+dropout                   = 0.0
+dropout_nlm               = "match_dropout"   # None in argparse → falls back to --dropout
+do_normalisation          = false
+backbone_type             = "resnet34-2"
+positional_embedding_type = "none"
+
+[task]
+maze_route_length     = 100
+curriculum_lookahead  = 5
+dataset               = "mazes-medium"
+expand_range          = true   # inputs in [-1, 1]
+out_dims              = 500    # maze_route_length * 5 (one-hot over {N,S,E,W,stop})
+
+[training]
+batch_size            = 16
+batch_size_test       = 64
+lr                    = 1e-4
+training_iterations   = 100001
+warmup_steps          = 5000
+use_scheduler         = true
+scheduler_type        = "cosine"
+weight_decay          = 0.0
+gradient_clipping     = -1     # disabled
+num_workers_train     = 0
+use_amp               = false
+
+[reproducibility]
+seed                   = 412
+# Sakana's set_seed(seed, False) — the False means *non-deterministic*
+# cuDNN. We match this for the baseline run (honest comparison to
+# what their defaults produce). A separate deterministic run can be
+# added later as a control.
+deterministic_cudnn    = false
+
+[eval]
+# From tasks/mazes/train.py defaults — how Sakana measures during
+# training. We report the same metrics so numbers are directly
+# comparable.
+n_test_batches         = 20    # minibatches used for running eval
+# For the final reported comparison, we should run with n_test_batches
+# = -1 (full test set). This is a post-training pass, not the running
+# eval shown in logs.
+track_every            = 1000
+save_every             = 1000
+
+[metrics_we_report]
+# These are the columns of the head-to-head table. Any one of them
+# being a win is enough to make a narrow, defensible claim; winning
+# on all four is the full claim.
+accuracy_first_step       = "fraction of test mazes where step 1 is correct"
+accuracy_correct_prefix   = "mean length of correct prefix across test mazes"
+wall_clock_per_1k_iters   = "seconds, on a fixed hardware target"
+peak_vram_mb              = "peak GPU memory during training step"
+
+[hardware_target]
+# The head-to-head runs on identical hardware. If Python baseline
+# cannot run on RX 7600 via ROCm PyTorch, that is itself a reportable
+# result ("modgrad runs where Python does not"), but we still need a
+# comparison run somewhere — see fallback.
+primary          = "AMD RX 7600 (gfx1102), 16 GB VRAM"
+fallback_python  = "rented NVIDIA T4 or A10 if ROCm PyTorch is non-viable"
+# When using fallback hardware, we report raw wall-clock AND wall-clock
+# normalized by published fp32 TFLOPS so the comparison remains honest.
+
+[modgrad_config_for_fairness]
+# For the reference-compatible port run, modgrad uses single-region
+# mode with all auxiliary losses disabled. This isolates "Rust port of
+# CTM v1" from "CTM v1 + modgrad extensions", which are separate
+# experiments.
+mode                     = "single-region"
+auxiliary_losses         = []
+episodic_memory          = false
+dream_replay             = false
+# Weights/opt should start from the same init strategy. Where Sakana
+# relies on torch.nn defaults, modgrad matches them (Kaiming uniform
+# for Linear, etc.).
+
+[out_of_scope]
+# Things explicitly NOT measured in this experiment. Listed so
+# readers cannot accuse us of cherry-picking.
+items = [
+    "interpretability / neural-dynamics visualizations (Sakana's headline claim)",
+    "ImageNet, sort, parity, QEC tasks (separate experiments)",
+    "multi-region modgrad vs Python CTM (different experiment, different table)",
+    "training stability across many seeds (single-seed run; multi-seed is follow-up)",
+]
