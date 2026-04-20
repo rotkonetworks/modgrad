@@ -1284,72 +1284,87 @@ impl VramGpuBackend {
 }
 
 impl ComputeBackend for VramGpuBackend {
-    // Fail-fast contract. VRAM mode exists to avoid PCIe in the inner
-    // loop — silently falling back to CPU would defeat the purpose
-    // AND be indistinguishable from slow-success. Panic loudly.
+    // Stage 4 facade: every dispatch method below delegates to
+    // `modgrad_device::backend::ops::*`, which routes through the
+    // `BackendRegistry`. Same treatment as Stage 3 gave StreamGpuBackend.
+    // VramGpuBackend sits strictly ABOVE the registry; it is NOT a
+    // registered `Backend` itself (layering rule from
+    // tasks/compute-device-unify.md).
+    //
+    // Behavior shift vs. pre-Stage-4 code: previously each method called
+    // `kfd::accel::try_*` directly and panicked if the KFD runtime was
+    // absent. After the rewrite, ops::* will transparently run on
+    // whichever registered backend is available. On a gfx1102 host with
+    // the `kfd` feature enabled, KFD still wins (that's where VRAM mode
+    // is used); on hosts without KFD, the registry will transparently
+    // route to ROCm/CPU — which defeats the "no PCIe in the inner loop"
+    // promise that VRAM mode is about, but the caller explicitly chose
+    // `--vram` so they get what the registry can provide. The loud
+    // fail-fast panics are now embedded inside the `ops::*` façade
+    // (every function `.expect`s dispatch to succeed).
+    //
+    // `alloc_f32` and `arena_reset` still touch `kfd::accel` directly —
+    // those are the arena suballocation path (bump-alloc from a VRAM
+    // arena initialised in `VramGpuBackend::new`). That API has no
+    // equivalent on the `ComputeCtx<KfdBackend>::alloc_buffer` path,
+    // which ioctl-allocates a fresh `GpuBuffer` per call. Migrating the
+    // arena to `DeviceBuffer` would force a semantic change (per-alloc
+    // ioctl cost, different VRAM lifetime), so it stays for Stage 5/6 to
+    // address as part of dissolving the arena entirely.
 
     fn matvec(&self, weight: &[f32], bias: &[f32], x: &[f32],
               y: &mut [f32], out_dim: usize, in_dim: usize) {
-        if !modgrad_device::kfd::accel::try_matvec(
-            x, weight, bias, y, out_dim as u32, in_dim as u32,
-        ) {
-            panic!("VRAM matvec failed: out_dim={out_dim} in_dim={in_dim}. \
-                    --vram requires a working GPU dispatch path.");
-        }
+        // Arg order: ops::matvec takes x first, weight second.
+        modgrad_device::backend::ops::matvec(
+            x, weight, bias, y, out_dim, in_dim,
+            modgrad_device::backend::QuantKind::F32,
+        );
     }
 
     fn superlinear(&self, weights: &[f32], biases: &[f32], trace: &[f32],
                    output: &mut [f32], n_neurons: usize, in_per: usize, out_per: usize) {
-        if !modgrad_device::kfd::accel::try_superlinear(
-            trace, weights, biases, output,
-            n_neurons as u32, in_per as u32, out_per as u32,
-        ) {
-            panic!("VRAM superlinear failed: n_neurons={n_neurons} in_per={in_per} \
-                    out_per={out_per}. --vram requires a working GPU dispatch path.");
-        }
+        // Forward-only fused path — cache=None. Name mapping:
+        // ComputeBackend's (n_neurons, in_per) are SuperLinearFwd's
+        // (d_model, memory_length); see Op::SuperLinearFwd.
+        modgrad_device::backend::ops::super_linear_fwd(
+            trace, weights, biases, output, None,
+            n_neurons, in_per, out_per,
+        );
     }
 
     fn glu(&self, input: &[f32], output: &mut [f32]) {
-        let n = input.len() / 2;
-        if !modgrad_device::kfd::accel::try_glu(input, output, n as u32) {
-            panic!("VRAM glu failed: n={n}. --vram requires a working GPU dispatch path.");
-        }
+        modgrad_device::backend::ops::glu_fwd(input, output);
     }
 
     fn silu_inplace(&self, x: &mut [f32]) {
-        if !modgrad_device::kfd::accel::try_silu_inplace(x) {
-            panic!("VRAM silu_inplace failed: len={}. --vram requires a working \
-                    GPU dispatch path.", x.len());
-        }
+        modgrad_device::backend::ops::silu_fwd_inplace(x);
     }
 
     fn layer_norm_inplace(&self, x: &mut [f32]) {
-        if !modgrad_device::kfd::accel::try_layer_norm_inplace(x) {
-            panic!("VRAM layer_norm_inplace failed: len={}. --vram requires a \
-                    working GPU dispatch path.", x.len());
-        }
+        // ComputeBackend's LN is single-row; the Op-layer signature
+        // carries explicit shape. n_rows=1 preserves the old semantics.
+        let n_cols = x.len();
+        modgrad_device::backend::ops::layer_norm_inplace(x, 1, n_cols);
     }
 
     fn synapse_forward(&self, weight: &[f32], bias: &[f32], x: &[f32],
-                       output: &mut [f32], scratch: &mut [f32],
+                       output: &mut [f32], _scratch: &mut [f32],
                        out_dim: usize, in_dim: usize) {
-        if !modgrad_device::kfd::accel::try_synapse_forward(
-            x, weight, bias, output, scratch, out_dim as u32, in_dim as u32,
-        ) {
-            panic!("VRAM synapse_forward failed: out_dim={out_dim} in_dim={in_dim}. \
-                    --vram requires a working GPU dispatch path.");
-        }
+        // Stage 1 deliberately dropped `scratch` from the Op boundary —
+        // the CPU impl allocates its own Vec, the KFD impl uses its own
+        // preallocated kernel slot. The caller's `scratch` is silently
+        // ignored here; it's part of the old API that Stage 6 will
+        // finish removing.
+        modgrad_device::backend::ops::synapse_forward(
+            weight, bias, x, output, out_dim, in_dim,
+        );
     }
 
     fn trace_shift(&self, traces: &mut [f32], new_activations: &[f32],
                    n_neurons: usize, memory_length: usize) {
-        if !modgrad_device::kfd::accel::try_trace_shift(
-            traces, new_activations, n_neurons as u32, memory_length as u32,
-        ) {
-            panic!("VRAM trace_shift failed: n_neurons={n_neurons} \
-                    memory_length={memory_length}. --vram requires a working \
-                    GPU dispatch path.");
-        }
+        modgrad_device::backend::ops::trace_rotate_inplace(
+            traces, new_activations, n_neurons, memory_length,
+        );
     }
 
     fn sync_update(&self, alpha: &mut [f32], beta: &mut [f32],
@@ -1358,6 +1373,14 @@ impl ComputeBackend for VramGpuBackend {
                    decay: &[f32], decay_shift: &[f32],
                    dopamine: f32, n_pairs: usize, initialized: bool,
                    sync_out: &mut [f32]) {
+        // TODO: migrate once Op::SyncUpdateFwd signature aligns.
+        // The Op-layer variant takes (h, pairs_left, pairs_right, decay,
+        // sync_state, sync_out, n_pairs) — a different kernel contract
+        // than the KFD alpha/beta/phases/dopamine stateful accumulator
+        // this ComputeBackend method exposes. Forcing a map would lose
+        // semantics; keep the direct kfd::accel call until the Op enum
+        // grows a matching variant (tracked in compute-device-unify
+        // plan Stage 5/6).
         if !modgrad_device::kfd::accel::try_sync_update(
             alpha, beta, activations_left, activations_right,
             phases_left, phases_right, decay, decay_shift,
@@ -1369,10 +1392,23 @@ impl ComputeBackend for VramGpuBackend {
     }
 
     fn alloc_f32(&self, n: usize) -> GpuVec {
+        // Arena suballocation, not `ComputeCtx::alloc_buffer`.
+        //
+        // VramGpuBackend initialises a VRAM arena in its constructor
+        // (`init_arena(arena_mb)`) and services every `alloc_f32` from
+        // that arena via `arena_alloc` (bump allocator). Each allocation
+        // is a raw pointer into the arena; `arena_reset()` invalidates
+        // every outstanding slice at once. The `ComputeCtx<KfdBackend>`
+        // path (Stage 2) instead ioctl-allocates a fresh `GpuBuffer` per
+        // call, with independent drop-time free — a different lifetime
+        // contract. Stage 4b per compute-device-unify.md explicitly
+        // stops at semantic-change friction; the arena dissolves in
+        // Stage 5/6 when VramMirror / VramTensor are reworked.
         GpuVec::try_vram(n)
     }
 
     fn arena_reset(&self) {
+        // Stage 5 dissolves this — see compute-device-unify.md.
         modgrad_device::kfd::accel::arena_reset();
     }
 }

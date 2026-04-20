@@ -115,6 +115,11 @@ impl<T: DeviceElem> VramTensor<T> {
         // Round up to 4 KiB page granularity — KFD alloc is page-sized.
         let cap = ((bytes + 4095) & !4095).max(4096);
 
+        // Stage 4 deprecated `alloc_device_vram`; VramTensor is Stage 5
+        // scope and migrates to `ComputeCtx::<KfdBackend>::alloc_buffer`
+        // then. Silence the deprecation here so this stage's build stays
+        // warning-clean.
+        #[allow(deprecated)]
         let buf = crate::alloc_device_vram(cap)?;
         // Zero the first `n` elements via BAR. `write_bytes` is safe here:
         // the buffer has CPU access (alloc_vram uses PUBLIC flag) and we own

@@ -86,6 +86,59 @@ fn kfd_device_buffer_roundtrip() {
     eprintln!("[test] SKIP — kfd feature disabled at compile time");
 }
 
+/// Two independent KFD allocations must not share VRAM. Exercises the
+/// `alloc_buffer` lifetime contract that Stage 4's VramGpuBackend
+/// migration relies on: writes to one buffer must not leak into the
+/// other. Single round-trip roundtrip doesn't catch this — you need two
+/// live buffers simultaneously.
+#[cfg(feature = "kfd")]
+#[test]
+fn kfd_two_buffers_do_not_collide() {
+    use modgrad_device::backend::KfdBackend;
+
+    let Some(kfd) = KfdBackend::try_new() else {
+        eprintln!("[test] SKIP — no kfd backend detected (gfx1102 / /dev/kfd not available)");
+        return;
+    };
+    let be: &'static KfdBackend = Box::leak(Box::new(kfd));
+    let ctx: ComputeCtx<KfdBackend> = ComputeCtx::new(be);
+
+    let mut a = match ctx.alloc_buffer(8) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[test] SKIP — kfd alloc_buffer failed: {e}");
+            return;
+        }
+    };
+    let mut b = match ctx.alloc_buffer(8) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[test] SKIP — second kfd alloc_buffer failed: {e}");
+            return;
+        }
+    };
+
+    let pa: Vec<f32> = (0..8).map(|i| i as f32).collect();
+    let pb: Vec<f32> = (0..8).map(|i| -(i as f32) - 100.0).collect();
+    a.copy_from_host(&pa).expect("a copy_from_host");
+    b.copy_from_host(&pb).expect("b copy_from_host");
+
+    // Read in the opposite order to catch any "last write wins" bug.
+    let mut out_b = vec![0.0f32; 8];
+    let mut out_a = vec![0.0f32; 8];
+    b.copy_to_host(&mut out_b).expect("b copy_to_host");
+    a.copy_to_host(&mut out_a).expect("a copy_to_host");
+
+    assert_eq!(out_a, pa, "buffer a contents collided with b");
+    assert_eq!(out_b, pb, "buffer b contents collided with a");
+}
+
+#[cfg(not(feature = "kfd"))]
+#[test]
+fn kfd_two_buffers_do_not_collide() {
+    eprintln!("[test] SKIP — kfd feature disabled at compile time");
+}
+
 /// ROCm's `RocmBuffer` roundtrip. Skipped without the feature or a
 /// working libamdhip64.
 #[cfg(feature = "rocm")]
