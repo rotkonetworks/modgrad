@@ -1,0 +1,12 @@
+[package]
+name = "retina_viz"
+version = "0.1.0"
+edition = "2024"
+description = "Visualise the forward pass of VisualRetina on a real maze — the direct 'does it see' test."
+
+[[bin]]
+name = "retina_viz"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
