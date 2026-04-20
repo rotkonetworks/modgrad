@@ -54,6 +54,17 @@ fn main() {
     // pretraining through VisualRetina::lsd with this integration. 1.0
     // falls through to the legacy permanent train_dream path.
     let mut lsd_integration = 1.0f32;
+    // --live-viz DIR --live-every N: every N steps, forward-pass a
+    // fixed probe maze through the current retina and dump a combined
+    // input+V1+V2+V4 PPM panel so `feh --reload 1 DIR/combined.ppm`
+    // shows the cortex updating live.
+    let mut live_viz_dir: Option<String> = None;
+    let mut live_every = 25usize;
+    // --sdf: encode BFS wall-distance into pixel luminance instead of
+    // flat path=1.0. Same tensor shape; only the input distribution
+    // changes. A/B this against baseline to see if the retina was
+    // information-bottlenecked by the binary wall/path encoding.
+    let mut use_sdf = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -85,6 +96,9 @@ fn main() {
             "--dream-sparsity-k" => { dream_sparsity_k = args[i+1].parse().unwrap(); i += 2; }
             "--ood-size" => { ood_size = args[i+1].parse().unwrap(); i += 2; }
             "--lsd-integration" => { lsd_integration = args[i+1].parse().unwrap(); i += 2; }
+            "--live-viz" => { live_viz_dir = Some(args[i+1].clone()); i += 2; }
+            "--live-every" => { live_every = args[i+1].parse().unwrap(); i += 2; }
+            "--sdf" => { use_sdf = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -98,6 +112,14 @@ fn main() {
     }
 
     let maze_size = maze_size | 1;
+
+    // Pixel rendering mode is a one-time process-wide setting. The
+    // helper `render_input(&maze)` dispatches to `render_maze_sdf` if
+    // this flag is on, otherwise the standard `render_maze`.
+    set_render_mode_sdf(use_sdf);
+    if use_sdf {
+        eprintln!("Input encoding: SDF (wall-distance normalised into luminance)");
+    }
 
     // Optionally load external maze banks (e.g., Sakana PNGs exported via the
     // /tmp/export_sakana_mazes.py script). When loaded, the training loop
@@ -145,7 +167,7 @@ fn main() {
         while bank.len() < hebbian_samples {
             let m = generate_maze(maze_size, &mut pretrain_rng);
             if m.path_length < 3 { continue; }
-            bank.push(render_maze(&m));
+            bank.push(render_input(&m));
         }
         let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
         eprintln!("Hebbian pretraining: {hebbian_samples} mazes × {hebbian_epochs} epochs (lr={hebbian_lr})");
@@ -236,6 +258,23 @@ fn main() {
     let mut acc_history = Vec::new();
     let mut step = 0usize;
 
+    // Live-viz setup: freeze one probe maze, take its pixels, make a
+    // directory. At every --live-every step, we'll re-render the
+    // current retina's response to this fixed probe so `feh --reload 1`
+    // shows drift. Same probe across steps so visual change ↔ weight change.
+    let (live_probe_pixels, live_probe_h, live_probe_w, live_dir) = if let Some(dir) = &live_viz_dir {
+        std::fs::create_dir_all(dir).expect("live-viz out dir");
+        let mut probe_rng = MazeRng::new(seed ^ 0xC0FFEE);
+        let probe = loop {
+            let m = generate_maze(maze_size, &mut probe_rng);
+            if m.path_length >= 3 { break m; }
+        };
+        let px = render_input(&probe);
+        (Some(px), maze_size, maze_size, Some(dir.clone()))
+    } else {
+        (None, 0, 0, None)
+    };
+
     while step < steps {
         // Budget check — stops at the batch boundary, not mid-batch,
         // to keep the gradient update atomic.
@@ -256,7 +295,7 @@ fn main() {
             if maze.path_length < 3 { continue; }
 
             // Encode: pixels → TokenInput
-            let pixels = render_maze(&maze);
+            let pixels = render_input(&maze);
             let input = encoder.encode(&pixels);
 
             // Truncate/pad route
@@ -315,6 +354,19 @@ fn main() {
                     smooth_acc * 100.0);
             }
         }
+
+        // Live viz: forward the probe maze through current retina and
+        // dump combined input+V1+V2+V4 PPM. Fixed spatial probe, so any
+        // visual change is weight change. feh --reload 1 picks up the
+        // new file automatically.
+        if let (Some(dir), Some(px)) = (&live_dir, &live_probe_pixels) {
+            if step % live_every == 0 {
+                let path = format!("{}/combined.ppm", dir);
+                if let Err(e) = live_viz::dump_combined(&encoder, px, live_probe_h, live_probe_w, &path) {
+                    eprintln!("live_viz write failed: {e}");
+                }
+            }
+        }
     }
 
     // ── Evaluation ──
@@ -347,6 +399,149 @@ fn main() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Live visualisation: render retina forward-pass for one probe maze
+// as a single combined PPM so `feh --reload 1 /path/combined.ppm`
+// shows the cortex updating during training. Inline so mazes stays
+// standalone.
+// ═══════════════════════════════════════════════════════════════
+
+mod live_viz {
+    use modgrad_codec::retina::VisualRetina;
+    use std::io::Write;
+
+    fn leaky_relu(x: &mut [f32]) {
+        for v in x.iter_mut() { if *v < 0.0 { *v *= 0.1; } }
+    }
+
+    fn layer_norm_map(data: &[f32], channels: usize, h: usize, w: usize) -> Vec<f32> {
+        let mut m = vec![0.0f32; h * w];
+        for c in 0..channels {
+            for i in 0..h * w { m[i] += data[c * h * w + i].powi(2); }
+        }
+        for v in m.iter_mut() { *v = v.sqrt(); }
+        m
+    }
+
+    fn heatmap_rgb(vals: &[f32], h: usize, w: usize, us: usize) -> Vec<u8> {
+        let (mn, mx) = vals.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+            |(a, b), &v| (a.min(v), b.max(v)));
+        let span = (mx - mn).max(1e-6);
+        let oh = h * us;
+        let ow = w * us;
+        let mut out = vec![0u8; 3 * oh * ow];
+        for y in 0..h {
+            for x in 0..w {
+                let v = (vals[y * w + x] - mn) / span;
+                let r = (v * 255.0) as u8;
+                let b = ((1.0 - v) * 255.0) as u8;
+                let g = ((0.5 - (v - 0.5).abs()) * 200.0) as u8;
+                for dy in 0..us {
+                    for dx in 0..us {
+                        let off = ((y * us + dy) * ow + (x * us + dx)) * 3;
+                        out[off] = r;
+                        out[off + 1] = g;
+                        out[off + 2] = b;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn input_rgb(px: &[f32], h: usize, w: usize, us: usize) -> Vec<u8> {
+        let oh = h * us;
+        let ow = w * us;
+        let mut out = vec![0u8; 3 * oh * ow];
+        for y in 0..h {
+            for x in 0..w {
+                let r = (px[y * w + x] * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (px[h * w + y * w + x] * 255.0).clamp(0.0, 255.0) as u8;
+                let b = (px[2 * h * w + y * w + x] * 255.0).clamp(0.0, 255.0) as u8;
+                for dy in 0..us {
+                    for dx in 0..us {
+                        let off = ((y * us + dy) * ow + (x * us + dx)) * 3;
+                        out[off] = r;
+                        out[off + 1] = g;
+                        out[off + 2] = b;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn write_ppm_atomic(path: &str, rgb: &[u8], h: usize, w: usize) -> std::io::Result<()> {
+        // Write to .tmp then rename — feh never sees a half-written file.
+        let tmp = format!("{path}.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            writeln!(f, "P6\n{w} {h}\n255")?;
+            f.write_all(rgb)?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Forward `pixels` through `retina` and dump one combined panel to `path`.
+    pub fn dump_combined(
+        retina: &VisualRetina,
+        pixels: &[f32],
+        in_h: usize,
+        in_w: usize,
+        path: &str,
+    ) -> std::io::Result<()> {
+        let (mut v1, h1, w1) = retina.v1.forward(pixels, in_h, in_w);
+        leaky_relu(&mut v1);
+        let (mut v2, h2, w2) = retina.v2.forward(&v1, h1, w1);
+        leaky_relu(&mut v2);
+        let (mut v4, h4, w4) = retina.v4.forward(&v2, h2, w2);
+        leaky_relu(&mut v4);
+
+        let us_in = 16usize;
+        let panel_h = in_h * us_in;
+        let us1 = (panel_h / h1).max(1);
+        let us2 = (panel_h / h2).max(1);
+        let us4 = (panel_h / h4).max(1);
+
+        let input_px = input_rgb(pixels, in_h, in_w, us_in);
+        let v1_px = heatmap_rgb(&layer_norm_map(&v1, retina.v1.out_channels, h1, w1), h1, w1, us1);
+        let v2_px = heatmap_rgb(&layer_norm_map(&v2, retina.v2.out_channels, h2, w2), h2, w2, us2);
+        let v4_px = heatmap_rgb(&layer_norm_map(&v4, retina.v4.out_channels, h4, w4), h4, w4, us4);
+
+        let iw = in_w * us_in;
+        let w1p = w1 * us1;
+        let w2p = w2 * us2;
+        let w4p = w4 * us4;
+        let h1p = h1 * us1;
+        let h2p = h2 * us2;
+        let h4p = h4 * us4;
+        let border = 6usize;
+        let total_w = iw + w1p + w2p + w4p + 5 * border;
+        let total_h = panel_h + 2 * border;
+        let mut canvas = vec![40u8; 3 * total_h * total_w];
+
+        let blit = |canvas: &mut Vec<u8>, src: &[u8], sh: usize, sw: usize, ox: usize| {
+            for y in 0..sh {
+                for x in 0..sw {
+                    let s = (y * sw + x) * 3;
+                    let d = ((border + y) * total_w + (ox + x)) * 3;
+                    canvas[d] = src[s];
+                    canvas[d + 1] = src[s + 1];
+                    canvas[d + 2] = src[s + 2];
+                }
+            }
+        };
+
+        let mut ox = border;
+        blit(&mut canvas, &input_px, panel_h, iw, ox); ox += iw + border;
+        blit(&mut canvas, &v1_px,    h1p,    w1p, ox); ox += w1p + border;
+        blit(&mut canvas, &v2_px,    h2p,    w2p, ox); ox += w2p + border;
+        blit(&mut canvas, &v4_px,    h4p,    w4p, ox);
+
+        write_ppm_atomic(path, &canvas, total_h, total_w)
+    }
+}
+
 /// Eval summary returned by `eval` so callers can compute gaps between
 /// in-distribution and out-of-distribution runs (Hoel generalization test).
 #[derive(Debug, Clone, Copy)]
@@ -376,7 +571,7 @@ fn eval(
         let maze = generate_maze(maze_size, &mut rng);
         if maze.path_length < 3 { continue; }
 
-        let pixels = render_maze(&maze);
+        let pixels = render_input(&maze);
         let input = encoder.encode(&pixels);
 
         let mut route = maze.route.clone();
@@ -623,7 +818,7 @@ fn run_brain(
             };
             if maze.path_length < 3 { continue; }
 
-            let pixels = render_maze(&maze);
+            let pixels = render_input(&maze);
             let input = encoder.encode(&pixels);
 
             let mut route = maze.route.clone();
@@ -845,7 +1040,7 @@ fn run_brain(
         };
         if maze.path_length < 3 { continue; }
 
-        let pixels = render_maze(&maze);
+        let pixels = render_input(&maze);
         let input = encoder.encode(&pixels);
         let obs: Vec<f32> = input.tokens.clone();
 

@@ -198,6 +198,27 @@ fn bfs_path(grid: &[bool], size: usize, start: (usize, usize), end: (usize, usiz
 /// - Paths: white (1, 1, 1)
 /// - Start: red (1, 0, 0)
 /// - End: green (0, 1, 0)
+/// Process-wide toggle for SDF input encoding. Set once at startup
+/// from `main` via `set_render_mode_sdf(true)`; every call to
+/// `render_input(&maze)` then dispatches to the SDF variant without
+/// threading a bool through every function signature. Use-case is
+/// narrow (one flag, set once, never toggled), so a static Atomic is
+/// fine — not production architecture, just example wiring.
+static RENDER_SDF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_render_mode_sdf(on: bool) {
+    RENDER_SDF.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn render_input(maze: &Maze) -> Vec<f32> {
+    if RENDER_SDF.load(std::sync::atomic::Ordering::Relaxed) {
+        render_maze_sdf(maze)
+    } else {
+        render_maze(maze)
+    }
+}
+
 pub fn render_maze(maze: &Maze) -> Vec<f32> {
     let s = maze.grid_size;
     let mut pixels = vec![0.0f32; 3 * s * s];
@@ -225,6 +246,81 @@ pub fn render_maze(maze: &Maze) -> Vec<f32> {
     pixels[0 * s * s + er * s + ec] = 0.0; // R
     pixels[1 * s * s + er * s + ec] = 1.0; // G
     pixels[2 * s * s + er * s + ec] = 0.0; // B
+
+    pixels
+}
+
+/// Render maze with a signed-distance-field encoding instead of flat
+/// wall/path pixels. BFS wall-distance is computed for every cell;
+/// path cells carry their normalized distance as luminance, wall cells
+/// stay at 0. Start/end still painted red/green as single-channel markers
+/// so the brain can find goal locations. Shape is still [3 × H × W] —
+/// the retina is unchanged, only the pixel distribution changes.
+///
+/// Motivation: the standard renderer wastes V1's bio-filters by making
+/// all path cells identical. SDF gives every path cell a distinct value
+/// proportional to wall-gap, so center-surround filters in V1 extract
+/// navigational structure directly rather than leaving it entirely to
+/// the learned V2/V4 cortex.
+///
+/// Analog: peripheral-vision distance cues in biology — parasol cells,
+/// stereo disparity — the retina has evolved priors beyond simple RGB.
+/// The 3rd channel here is "wall-distance sense" painted into the same
+/// tensor shape so no retina surgery is required for an A/B test.
+pub fn render_maze_sdf(maze: &Maze) -> Vec<f32> {
+    let s = maze.grid_size;
+    let n = s * s;
+    let mut pixels = vec![0.0f32; 3 * n];
+
+    // BFS wall-distance: seed all walls at 0, expand outward.
+    let mut dist = vec![u32::MAX; n];
+    let mut q = std::collections::VecDeque::new();
+    for r in 0..s {
+        for c in 0..s {
+            if maze.grid[r * s + c] {
+                dist[r * s + c] = 0;
+                q.push_back((r, c));
+            }
+        }
+    }
+    while let Some((r, c)) = q.pop_front() {
+        let d = dist[r * s + c];
+        for (dr, dc) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+            let nr = r as isize + dr;
+            let nc = c as isize + dc;
+            if nr < 0 || nc < 0 || nr >= s as isize || nc >= s as isize { continue; }
+            let (nr, nc) = (nr as usize, nc as usize);
+            if dist[nr * s + nc] == u32::MAX {
+                dist[nr * s + nc] = d + 1;
+                q.push_back((nr, nc));
+            }
+        }
+    }
+    let max_d = dist.iter().filter(|&&d| d != u32::MAX).copied().max().unwrap_or(1).max(1);
+
+    for r in 0..s {
+        for c in 0..s {
+            let idx = r * s + c;
+            if !maze.grid[idx] {
+                // Path cell — normalized wall-distance as luminance.
+                // 0.1 floor so it never equals wall=0 and stays bio-plausible.
+                let v = 0.1 + 0.9 * (dist[idx] as f32 / max_d as f32);
+                for ch in 0..3 {
+                    pixels[ch * n + idx] = v;
+                }
+            }
+        }
+    }
+
+    let (sr, sc) = maze.start;
+    pixels[sr * s + sc] = 1.0; // R
+    pixels[n + sr * s + sc] = 0.0;
+    pixels[2 * n + sr * s + sc] = 0.0;
+
+    let (er, ec) = maze.end;
+    pixels[er * s + ec] = 0.0;
+    pixels[n + er * s + ec] = 1.0;
+    pixels[2 * n + er * s + ec] = 0.0;
 
     pixels
 }
