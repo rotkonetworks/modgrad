@@ -220,32 +220,64 @@ fn matmul(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize, k
     });
 }
 
+/// Rayon scheduling adds ~1-3μs of overhead per `par_iter`. For shapes
+/// where the whole compute takes <1μs (tiny matvecs inside a tick loop:
+/// d_model=8, d_route=32 etc.) that overhead dwarfs the work. Anything
+/// below this total-element threshold stays on the serial path.
+const PAR_THRESHOLD: usize = 4096;
+
 fn matvec(x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32], _out_dim: usize, in_dim: usize) {
     // out_dim is implicit in `out.len()` and `bias.len()`; parameter
     // kept for symmetry with GPU backends whose FFI wants it explicit.
-    out.par_iter_mut().enumerate().for_each(|(i, y)| {
-        let row = &weight[i * in_dim..(i + 1) * in_dim];
-        let mut acc = bias[i];
-        for j in 0..in_dim { acc += row[j] * x[j]; }
-        *y = acc;
-    });
+    let n_rows = out.len();
+    if n_rows * in_dim < PAR_THRESHOLD {
+        for i in 0..n_rows {
+            let row = &weight[i * in_dim..(i + 1) * in_dim];
+            let mut acc = bias[i];
+            for j in 0..in_dim { acc += row[j] * x[j]; }
+            out[i] = acc;
+        }
+    } else {
+        out.par_iter_mut().enumerate().for_each(|(i, y)| {
+            let row = &weight[i * in_dim..(i + 1) * in_dim];
+            let mut acc = bias[i];
+            for j in 0..in_dim { acc += row[j] * x[j]; }
+            *y = acc;
+        });
+    }
 }
 
 fn matvec_t(d_out: &[f32], weight: &[f32], d_input: &mut [f32], out_dim: usize, in_dim: usize) {
     // d_input[j] = sum_i weight[i, j] * d_out[i]
-    d_input.par_iter_mut().enumerate().for_each(|(j, dx)| {
-        let mut acc = 0.0f32;
-        for i in 0..out_dim { acc += weight[i * in_dim + j] * d_out[i]; }
-        *dx = acc;
-    });
+    if out_dim * in_dim < PAR_THRESHOLD {
+        for j in 0..in_dim {
+            let mut acc = 0.0f32;
+            for i in 0..out_dim { acc += weight[i * in_dim + j] * d_out[i]; }
+            d_input[j] = acc;
+        }
+    } else {
+        d_input.par_iter_mut().enumerate().for_each(|(j, dx)| {
+            let mut acc = 0.0f32;
+            for i in 0..out_dim { acc += weight[i * in_dim + j] * d_out[i]; }
+            *dx = acc;
+        });
+    }
 }
 
 fn outer_product_acc(a: &[f32], b: &[f32], accum: &mut [f32], m: usize, n: usize) {
     // accum[i, j] += a[i] * b[j]
-    accum.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-        let ai = a[i];
-        for j in 0..n { row[j] += ai * b[j]; }
-    });
+    if m * n < PAR_THRESHOLD {
+        for i in 0..m {
+            let ai = a[i];
+            let row = &mut accum[i * n..(i + 1) * n];
+            for j in 0..n { row[j] += ai * b[j]; }
+        }
+    } else {
+        accum.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+            let ai = a[i];
+            for j in 0..n { row[j] += ai * b[j]; }
+        });
+    }
     let _ = m;
 }
 
