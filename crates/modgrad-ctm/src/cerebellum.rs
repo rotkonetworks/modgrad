@@ -199,43 +199,77 @@ impl CerebProjection {
     }
 
     /// Project cortex activations → frozen model input space.
+    ///
+    /// Shape: out = proj_in_w @ cortex + proj_in_b, where cortex may
+    /// be shorter than `cortex_dim`. Zero-padding the tail makes the
+    /// math identical while letting us dispatch through `ops::matvec`
+    /// (which requires the full in_dim worth of input).
     pub fn project_in(&self, cortex: &[f32]) -> Vec<f32> {
         debug_assert!(cortex.len() <= self.cortex_dim,
             "project_in: input {} > cortex_dim {}", cortex.len(), self.cortex_dim);
-        let mut out = self.proj_in_b.clone();
-        for i in 0..self.frozen_input_dim {
-            let row_start = i * self.cortex_dim;
-            for j in 0..self.cortex_dim.min(cortex.len()) {
-                out[i] += self.proj_in_w[row_start + j] * cortex[j];
-            }
-        }
+        let in_dim = self.cortex_dim;
+        let padded: Vec<f32> = if cortex.len() == in_dim {
+            cortex.to_vec()
+        } else {
+            let mut v = vec![0.0f32; in_dim];
+            v[..cortex.len()].copy_from_slice(cortex);
+            v
+        };
+        let mut out = vec![0.0f32; self.frozen_input_dim];
+        modgrad_device::backend::ops::matvec(
+            &padded, &self.proj_in_w, &self.proj_in_b, &mut out,
+            self.frozen_input_dim, in_dim,
+            modgrad_device::backend::QuantKind::F32,
+        ).expect("project_in: matvec dispatch");
         out
     }
 
     /// Project frozen model output → cortex activation space.
+    /// See `project_in` for the zero-pad-then-dispatch rationale.
     pub fn project_out(&self, hidden: &[f32]) -> Vec<f32> {
-        let mut out = self.proj_out_b.clone();
-        for i in 0..self.cortex_dim {
-            let row_start = i * self.frozen_output_dim;
-            for j in 0..self.frozen_output_dim.min(hidden.len()) {
-                out[i] += self.proj_out_w[row_start + j] * hidden[j];
-            }
-        }
+        let in_dim = self.frozen_output_dim;
+        let padded: Vec<f32> = if hidden.len() == in_dim {
+            hidden.to_vec()
+        } else {
+            let mut v = vec![0.0f32; in_dim];
+            v[..hidden.len().min(in_dim)].copy_from_slice(&hidden[..hidden.len().min(in_dim)]);
+            v
+        };
+        let mut out = vec![0.0f32; self.cortex_dim];
+        modgrad_device::backend::ops::matvec(
+            &padded, &self.proj_out_w, &self.proj_out_b, &mut out,
+            self.cortex_dim, in_dim,
+            modgrad_device::backend::QuantKind::F32,
+        ).expect("project_out: matvec dispatch");
         out
     }
 
     /// Project frozen hidden state into a pre-allocated cortex buffer.
     pub fn project_out_into(&self, hidden: &[f32], out: &mut [f32]) {
-        out[..self.cortex_dim].copy_from_slice(&self.proj_out_b);
-        for i in 0..self.cortex_dim {
-            let row_start = i * self.frozen_output_dim;
-            for j in 0..self.frozen_output_dim.min(hidden.len()) {
-                out[i] += self.proj_out_w[row_start + j] * hidden[j];
-            }
-        }
+        let in_dim = self.frozen_output_dim;
+        let padded: Vec<f32> = if hidden.len() == in_dim {
+            hidden.to_vec()
+        } else {
+            let mut v = vec![0.0f32; in_dim];
+            v[..hidden.len().min(in_dim)].copy_from_slice(&hidden[..hidden.len().min(in_dim)]);
+            v
+        };
+        modgrad_device::backend::ops::matvec(
+            &padded, &self.proj_out_w, &self.proj_out_b,
+            &mut out[..self.cortex_dim],
+            self.cortex_dim, in_dim,
+            modgrad_device::backend::QuantKind::F32,
+        ).expect("project_out_into: matvec dispatch");
     }
 
     /// Backward pass for project_out.
+    ///
+    /// d_bias += d_cortex                         (elementwise add)
+    /// d_weight += d_cortex ⊗ hidden              (outer product accum)
+    ///
+    /// The outer-product accumulate dispatches through
+    /// `ops::outer_product_acc`. Same zero-pad trick as forward for
+    /// when hidden is shorter than frozen_output_dim.
     pub fn backward_out(
         &self,
         hidden: &[f32],
@@ -243,15 +277,18 @@ impl CerebProjection {
         d_w: &mut [f32],
         d_b: &mut [f32],
     ) {
-        for i in 0..self.cortex_dim {
-            d_b[i] += d_cortex[i];
-        }
-        for i in 0..self.cortex_dim {
-            let row_start = i * self.frozen_output_dim;
-            for j in 0..self.frozen_output_dim.min(hidden.len()) {
-                d_w[row_start + j] += d_cortex[i] * hidden[j];
-            }
-        }
+        let in_dim = self.frozen_output_dim;
+        for i in 0..self.cortex_dim { d_b[i] += d_cortex[i]; }
+        let padded: Vec<f32> = if hidden.len() == in_dim {
+            hidden.to_vec()
+        } else {
+            let mut v = vec![0.0f32; in_dim];
+            v[..hidden.len().min(in_dim)].copy_from_slice(&hidden[..hidden.len().min(in_dim)]);
+            v
+        };
+        modgrad_device::backend::ops::outer_product_acc(
+            d_cortex, &padded, d_w, self.cortex_dim, in_dim,
+        ).expect("backward_out: outer_product_acc dispatch");
     }
 
     /// Full forward: cortex → project_in → frozen → project_out → cortex.
@@ -357,15 +394,26 @@ impl FrozenCerebellum for RandomExpansion {
     fn hidden_dim(&self) -> usize { self.output_dim }
 
     fn forward(&mut self, input: &[f32]) -> Vec<f32> {
+        // Dispatch `out = W @ input`, then apply ReLU inline (no
+        // `ops::relu` variant in the registry yet — a trivial op worth
+        // adding later). Same zero-pad trick as the projection matvecs
+        // above when `input` is shorter than `input_dim`.
+        let in_dim = self.input_dim;
+        let padded: Vec<f32> = if input.len() == in_dim {
+            input.to_vec()
+        } else {
+            let mut v = vec![0.0f32; in_dim];
+            v[..input.len().min(in_dim)].copy_from_slice(&input[..input.len().min(in_dim)]);
+            v
+        };
+        let zero_bias = vec![0.0f32; self.output_dim];
         let mut out = vec![0.0f32; self.output_dim];
-        for i in 0..self.output_dim {
-            let row = i * self.input_dim;
-            let mut sum = 0.0f32;
-            for j in 0..self.input_dim.min(input.len()) {
-                sum += self.weights[row + j] * input[j];
-            }
-            out[i] = sum.max(0.0);
-        }
+        modgrad_device::backend::ops::matvec(
+            &padded, &self.weights, &zero_bias, &mut out,
+            self.output_dim, in_dim,
+            modgrad_device::backend::QuantKind::F32,
+        ).expect("RandomExpansion::forward matvec dispatch");
+        for v in out.iter_mut() { if *v < 0.0 { *v = 0.0; } }
         out
     }
 }
