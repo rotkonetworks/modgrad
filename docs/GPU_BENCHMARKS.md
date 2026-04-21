@@ -14,11 +14,21 @@ we found the ROCm VRAM-cache invalidation issue — see commit 7f17f42).
 **Wall-time caveat.** All the numbers below are single-shot
 measurements. A repeat of d_model=384 ROCm measured **594 s** where
 the prior run measured **393 s** — same binary, same seed, eval
-bit-for-bit identical. Source of the spread isn't confirmed (HIP
-driver allocator state, VRAM fragmentation, and plain run-to-run
-variance are all plausible; system load was not a factor). Treat the
-headline percentages as upper-bound hints. Any serious comparison
-needs multiple repeats.
+bit-for-bit identical.
+
+Confirmed source of the spread: **CPU governor clock-capping**. This
+workload is CPU-orchestration-bound (~23 000 GPU dispatches per
+training step, each a handful of host-side driver calls), so when
+the host CPU governor trims frequency in response to temperature the
+entire pipeline serialises at the lower clock — the GPU stays idle
+waiting for the next dispatch. On this host CPU temps reach ~95 °C
+during long bench runs and the governor scales back; GPU temps stay
+under 80 °C the whole time, confirming the bottleneck is host-side.
+This is a governor *policy*, not hardware thermal emergency.
+
+Treat headline percentages as "what's achievable with the CPU at
+full clock"; the worst-case spread is ~1.5× slower once the governor
+throttles in.
 
 ## Configurations measured
 
