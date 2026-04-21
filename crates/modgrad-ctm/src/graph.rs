@@ -2306,7 +2306,15 @@ pub fn regional_train_step(
             // TODO(future): scratch_d_proj_input[..n_sync_grad] is d_global_sync —
             // add a backward path through the global-sync pairs.
         } else {
-            // Fixed connection synapse backward
+            // Fixed connection synapse backward.
+            //
+            // Ports the fused inline linear-backward to two dispatched
+            // ops (outer_product_acc for dw, matvec_t for d_src). The
+            // `src_input` slice can be shorter than `syn.in_dim`; zero-
+            // padding preserves the original `.min(src_input.len())`
+            // semantics because any padded column contributes
+            // `d_syn_out[i] * 0 = 0` to the weight update — identical
+            // math, one dispatched op each.
             for (ci, conn) in cfg.connections.iter().enumerate().rev() {
                 let d_obs = &d_region_obs[conn.to];
                 let syn = &w.connection_synapses[ci];
@@ -2315,19 +2323,27 @@ pub fn regional_train_step(
                 let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
                     .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
 
-                for i in 0..syn.out_dim {
-                    grads.connection_db[ci][i] += d_syn_out[i];
-                    for j in 0..syn.in_dim.min(src_input.len()) {
-                        grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
-                    }
-                }
+                // Bias grad — elementwise, no Op variant worth it.
+                for i in 0..syn.out_dim { grads.connection_db[ci][i] += d_syn_out[i]; }
+
+                let padded_src: Vec<f32> = if src_input.len() >= syn.in_dim {
+                    src_input[..syn.in_dim].to_vec()
+                } else {
+                    let mut v = vec![0.0f32; syn.in_dim];
+                    v[..src_input.len()].copy_from_slice(src_input);
+                    v
+                };
+
+                modgrad_device::backend::ops::outer_product_acc(
+                    &d_syn_out, &padded_src, &mut grads.connection_dw[ci],
+                    syn.out_dim, syn.in_dim,
+                ).expect("connection_synapse backward: outer_product_acc dispatch");
 
                 let mut d_src = vec![0.0f32; syn.in_dim];
-                for j in 0..syn.in_dim {
-                    for i in 0..syn.out_dim {
-                        d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
-                    }
-                }
+                modgrad_device::backend::ops::matvec_t(
+                    &d_syn_out, &syn.weight, &mut d_src,
+                    syn.out_dim, syn.in_dim,
+                ).expect("connection_synapse backward: matvec_t dispatch");
 
                 let mut src_offset = 0;
                 for &from_idx in &conn.from {
@@ -2878,7 +2894,15 @@ fn regional_train_step_inner(
                 }
             }
         } else {
-            // Fixed connection synapse backward
+            // Fixed connection synapse backward.
+            //
+            // Ports the fused inline linear-backward to two dispatched
+            // ops (outer_product_acc for dw, matvec_t for d_src). The
+            // `src_input` slice can be shorter than `syn.in_dim`; zero-
+            // padding preserves the original `.min(src_input.len())`
+            // semantics because any padded column contributes
+            // `d_syn_out[i] * 0 = 0` to the weight update — identical
+            // math, one dispatched op each.
             for (ci, conn) in cfg.connections.iter().enumerate().rev() {
                 let d_obs = &d_region_obs[conn.to];
                 let syn = &w.connection_synapses[ci];
@@ -2887,19 +2911,27 @@ fn regional_train_step_inner(
                 let d_syn_out: Vec<f32> = d_obs.iter().take(syn.out_dim).copied()
                     .chain(std::iter::repeat(0.0)).take(syn.out_dim).collect();
 
-                for i in 0..syn.out_dim {
-                    grads.connection_db[ci][i] += d_syn_out[i];
-                    for j in 0..syn.in_dim.min(src_input.len()) {
-                        grads.connection_dw[ci][i * syn.in_dim + j] += d_syn_out[i] * src_input[j];
-                    }
-                }
+                // Bias grad — elementwise, no Op variant worth it.
+                for i in 0..syn.out_dim { grads.connection_db[ci][i] += d_syn_out[i]; }
+
+                let padded_src: Vec<f32> = if src_input.len() >= syn.in_dim {
+                    src_input[..syn.in_dim].to_vec()
+                } else {
+                    let mut v = vec![0.0f32; syn.in_dim];
+                    v[..src_input.len()].copy_from_slice(src_input);
+                    v
+                };
+
+                modgrad_device::backend::ops::outer_product_acc(
+                    &d_syn_out, &padded_src, &mut grads.connection_dw[ci],
+                    syn.out_dim, syn.in_dim,
+                ).expect("connection_synapse backward: outer_product_acc dispatch");
 
                 let mut d_src = vec![0.0f32; syn.in_dim];
-                for j in 0..syn.in_dim {
-                    for i in 0..syn.out_dim {
-                        d_src[j] += d_syn_out[i] * syn.weight[i * syn.in_dim + j];
-                    }
-                }
+                modgrad_device::backend::ops::matvec_t(
+                    &d_syn_out, &syn.weight, &mut d_src,
+                    syn.out_dim, syn.in_dim,
+                ).expect("connection_synapse backward: matvec_t dispatch");
 
                 let mut src_offset = 0;
                 for &from_idx in &conn.from {
