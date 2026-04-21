@@ -7,3 +7,4 @@ pub mod ngram_hash;
 pub mod retina;
 pub mod cifar;
 pub mod librispeech;
+pub mod edge_of_chaos;

@@ -423,6 +423,15 @@ fn dump_condition(
         writeln!(meta, "\n{name}: channels={}, {}×{} per channel", o.channels, o.h, o.w)?;
         writeln!(meta, "  mean={m:.4}, std={s:.4}, max={mx:.4}")?;
         writeln!(meta, "  nonzero={nz}/{n} ({:.1}%)", 100.0 * nz as f32 / n as f32)?;
+        // Edge-of-chaos diagnostic via argmax-over-channels winner map
+        // (Langton 1990 / Gell-Mann & Lloyd 1996). C_eff peaks when
+        // winner map is both varied (many unique winners) and locally
+        // redundant (runs of same winner). unique_winners exposes
+        // whether low C_eff is monoculture (1) vs noise (many).
+        let (c_argmax, uniq) = modgrad_codec::edge_of_chaos::effective_complexity_argmax_detail(
+            &o.data, o.channels, o.h, o.w,
+        );
+        writeln!(meta, "  C_eff(argmax)={c_argmax:.3}, unique_winners={uniq}/{}", o.channels)?;
     }
     Ok(())
 }
