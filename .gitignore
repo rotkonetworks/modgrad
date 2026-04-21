@@ -1,5 +1,9 @@
 /target
 
+# Claude session state — agent worktrees, scheduled-task locks, etc.
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
 # Models (large ONNX files)
 models/*.onnx
 models/*.onnx.data
