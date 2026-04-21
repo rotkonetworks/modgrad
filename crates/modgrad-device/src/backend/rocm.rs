@@ -389,15 +389,40 @@ impl RocmBackend {
     /// which callers schedule between dispatches (post-optimizer step),
     /// never concurrent with one. See the `cache` field's SAFETY note.
     fn cached_weight_ptr(&self, weight: &[f32]) -> Result<*mut f32, BackendError> {
-        let key = (weight.as_ptr() as usize, weight.len());
+        // Correctness-first: always re-upload the weight buffer, bypassing
+        // the VRAM cache entirely.
+        //
+        // Background: the original cache was keyed on
+        // (weight.as_ptr() as usize, weight.len()) and relied on callers
+        // explicitly invoking `registry().invalidate_caches()` after
+        // every in-place optimizer step. The isis training loop does
+        // this; modgrad-ctm's training loops (mazes, dream_bench) do
+        // NOT. Session 2026-04-21 benchmark at size=11 d_model=128,
+        // seed=7, 500 steps measured ID first-step dropping from
+        // 37.0% (CPU) to 9.5% (ROCm) — catastrophic divergence driven
+        // by forward passes using stale cached weights while gradients
+        // kept updating the CPU-side buffer.
+        //
+        // Two paths to re-enable the cache safely in the future:
+        //   (a) Every training loop calls `invalidate_caches()` after
+        //       applying the optimizer step. Requires auditing every
+        //       caller — a single missed spot re-introduces the silent
+        //       divergence.
+        //   (b) Cache keys include a content hash or monotonic version
+        //       counter so in-place mutations naturally invalidate.
+        //
+        // Until one of those lands, correctness outweighs the extra
+        // `hipMemcpyHtoD` per dispatch. The cache HashMap itself and
+        // `invalidate_cache()` stay wired so existing consumers aren't
+        // broken — the cache just never returns a hit.
         let mut cache = self.cache.lock()
             .map_err(|_| BackendError::Runtime("rocm: cache mutex poisoned".into()))?;
-        if let Some(buf) = cache.get(&key) {
-            return Ok(buf.as_f32_ptr());
-        }
+        let key = (weight.as_ptr() as usize, weight.len());
         let buf = HipBuffer::alloc(weight.len() * 4)?;
         buf.upload_f32(weight)?;
         let ptr = buf.as_f32_ptr();
+        // Replace any stale entry for this key; dropping the old
+        // HipBuffer runs hipFree automatically so VRAM doesn't leak.
         cache.insert(key, buf);
         Ok(ptr)
     }
