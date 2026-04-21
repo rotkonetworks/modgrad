@@ -1,7 +1,7 @@
 # GPU Benchmarks
 
 First measured numbers for the modgrad SDK's GPU backends on a single
-gfx1102 laptop iGPU (AMD Radeon RX 7600M XT, ROCm 7). All runs use the
+gfx1102 discrete mobile GPU (AMD Radeon RX 7600M XT, ROCm 7). All runs use the
 mazes example — `cargo run --release -p mazes --features rocm ...` —
 against a CPU baseline via `MODGRAD_BACKEND=cpu`.
 
@@ -11,14 +11,13 @@ correct. Any divergence indicates a silent numerical bug (this is how
 we found the ROCm VRAM-cache invalidation issue — see commit 7f17f42).
 
 **Wall-time caveat.** All the numbers below are single-shot
-measurements on a thermally-limited laptop iGPU. A repeat run of
-d_model=384 ROCm measured **594 s** where the prior run measured
-**393 s** — same binary, same seed, same eval bit-for-bit. The 50 %
-spread correlates with SoC thermal state after hours of back-to-back
-benching plus background load from other processes. Treat the headline
-percentages as upper-bound hints, not tight measurements. Meaningful
-comparisons need a controlled cooldown and concurrent-load control,
-neither of which this log has.
+measurements. A repeat of d_model=384 ROCm measured **594 s** where
+the prior run measured **393 s** — same binary, same seed, eval
+bit-for-bit identical. Source of the spread isn't confirmed (HIP
+driver allocator state, VRAM fragmentation, and plain run-to-run
+variance are all plausible; system load was not a factor). Treat the
+headline percentages as upper-bound hints. Any serious comparison
+needs multiple repeats.
 
 ## Configurations measured
 
