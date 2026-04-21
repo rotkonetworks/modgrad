@@ -2401,6 +2401,7 @@ dependencies = [
  "modgrad-ctm",
  "modgrad-device",
  "modgrad-persist",
+ "modgrad-substrate",
  "modgrad-training",
  "modgrad-traits",
 ]

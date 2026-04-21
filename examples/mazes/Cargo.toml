@@ -25,3 +25,4 @@ modgrad-persist = { path = "../../crates/modgrad-persist" }
 modgrad-codec = { path = "../../crates/modgrad-codec" }
 modgrad-traits = { path = "../../crates/modgrad-traits" }
 modgrad-device = { path = "../../crates/modgrad-device" }
+modgrad-substrate = { path = "../../crates/modgrad-substrate" }

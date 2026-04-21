@@ -101,6 +101,12 @@ fn main() {
     // raw pixels into the brain. Binary A/B on whether the retina is
     // net-positive vs neutral vs net-negative on the task.
     let mut no_retina = false;
+    // --substrate-log=PATH: every training step, append one CSV row
+    // with substrate observability (cpu freq ratio, max temp,
+    // throttle delta, governor, epp) alongside the step's loss/acc.
+    // Opt-in so mazes stays pure when this isn't wanted — the only
+    // cost when enabled is a handful of small sysfs reads per step.
+    let mut substrate_log: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -136,6 +142,7 @@ fn main() {
             "--live-every" => { live_every = args[i+1].parse().unwrap(); i += 2; }
             "--sdf" => { use_sdf = true; i += 1; }
             "--no-retina" => { no_retina = true; i += 1; }
+            "--substrate-log" => { substrate_log = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -299,6 +306,27 @@ fn main() {
     let mut acc_history = Vec::new();
     let mut step = 0usize;
 
+    // Substrate telemetry log: one CSV row per training step. Records
+    // (step, loss, acc, freq_ratio, freq_khz, temp_c, throttle_delta,
+    // governor, epp). Opt-in via --substrate-log=PATH. Dataset for a
+    // later learned clock controller — see crates/modgrad-substrate.
+    use std::io::Write as _;
+    let (mut substrate_writer, mut prev_throttle) = if let Some(path) = &substrate_log {
+        let mut f = std::fs::File::create(path)
+            .expect("--substrate-log: failed to open file");
+        writeln!(
+            f,
+            "step,loss,acc,freq_ratio,mean_freq_khz,max_temp_c,throttle_delta,governor,epp"
+        )
+        .expect("--substrate-log: write header");
+        let baseline = modgrad_substrate::Snapshot::take()
+            .map(|s| s.throttle_total())
+            .unwrap_or(0);
+        (Some(f), baseline)
+    } else {
+        (None, 0u64)
+    };
+
     // Live-viz setup: freeze one probe maze, take its pixels, make a
     // directory. At every --live-every step, we'll re-render the
     // current retina's response to this fixed probe so `feh --reload 1`
@@ -385,6 +413,36 @@ fn main() {
         }
 
         step += 1;
+
+        // Substrate telemetry — one row per step when --substrate-log
+        // is set. Kept close to the step boundary so throttle_delta
+        // attributes cleanly to what this step did. Errors reading
+        // sysfs degrade to NaN/0 fields rather than aborting training.
+        if let Some(ref mut f) = substrate_writer {
+            let loss = loss_history.last().copied().unwrap_or(f32::NAN);
+            let acc = acc_history.last().copied().unwrap_or(f32::NAN);
+            let (ratio, freq_khz, temp, throttle_delta, governor) =
+                if let Ok(s) = modgrad_substrate::Snapshot::take() {
+                    let t = s.throttle_total();
+                    let delta = t.saturating_sub(prev_throttle);
+                    prev_throttle = t;
+                    (
+                        s.mean_freq_ratio().unwrap_or(f32::NAN),
+                        s.mean_freq_khz().unwrap_or(0),
+                        s.max_temp_c().unwrap_or(f32::NAN),
+                        delta,
+                        s.governor.clone(),
+                    )
+                } else {
+                    (f32::NAN, 0, f32::NAN, 0, String::from("error"))
+                };
+            let epp = modgrad_substrate::cpu_energy_performance_preference(0)
+                .unwrap_or_else(|_| String::from("n/a"));
+            let _ = writeln!(
+                f,
+                "{step},{loss:.6},{acc:.6},{ratio:.3},{freq_khz},{temp:.1},{throttle_delta},{governor},{epp}"
+            );
+        }
 
         if step % 100 == 0 || step == steps {
             let window = 50.min(loss_history.len());
