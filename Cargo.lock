@@ -2665,6 +2665,10 @@ name = "modgrad-prompts"
 version = "0.1.0"
 
 [[package]]
+name = "modgrad-substrate"
+version = "0.1.0"
+
+[[package]]
 name = "modgrad-training"
 version = "0.1.0"
 dependencies = [

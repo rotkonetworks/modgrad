@@ -1,0 +1,8 @@
+[package]
+name = "modgrad-substrate"
+version = "0.1.0"
+edition = "2024"
+description = "Read-side observability for the host that modgrad runs on — CPU frequency, throttle counters, thermal sensors via Linux sysfs"
+license = "MIT"
+
+[dependencies]
