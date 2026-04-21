@@ -63,15 +63,21 @@ impl Column {
 }
 
 /// GLU + SiLU activation (same as ctm.rs Synapse::forward).
+///
+/// Dispatches through the `Backend` registry: `ops::glu_fwd` computes
+/// `out[i] = x[i] * sigmoid(x[half+i])`, then `ops::silu_fwd_inplace`
+/// applies SiLU element-wise. Two dispatched passes rather than one
+/// fused op (no `GluSiluFwd` variant yet in the enum); a future
+/// fused-op addition would trim the intermediate write without
+/// changing caller code here. Math is bit-identical to the prior
+/// inline implementation on the CpuBackend by construction.
 fn glu_silu(raw: &[f32]) -> Vec<f32> {
     let half = raw.len() / 2;
-    let mut out = Vec::with_capacity(half);
-    for i in 0..half {
-        let gate = 1.0 / (1.0 + (-raw[half + i]).exp());
-        let glu = raw[i] * gate;
-        let silu_sig = 1.0 / (1.0 + (-glu).exp());
-        out.push(glu * silu_sig);
-    }
+    let mut out = vec![0.0f32; half];
+    modgrad_device::backend::ops::glu_fwd(raw, &mut out)
+        .expect("glu_fwd dispatch");
+    modgrad_device::backend::ops::silu_fwd_inplace(&mut out)
+        .expect("silu_fwd_inplace dispatch");
     out
 }
 
