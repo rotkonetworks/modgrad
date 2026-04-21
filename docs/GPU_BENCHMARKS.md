@@ -37,34 +37,46 @@ numbers remain bit-identical to CPU — correctness preserved.
 
 | Backend | Wall time | Per-step acc | First-step acc | Notes |
 |---|---:|---:|---:|---|
-| CPU   | 465 s  | 25.8 % (OOD) | 45.0 % (OOD) | |
-| ROCm  | **413 s** (**+11 %**) | 25.8 % (OOD) | 45.0 % (OOD) | Forward matvec only; MatvecT reverted |
+| CPU                         | 465 s  | 25.8 % (OOD) | 45.0 % (OOD) | |
+| ROCm, no cache, no MatvecT  | 413 s (+11 %) | 25.8 % (OOD) | 45.0 % (OOD) | commit 012b923 |
+| ROCm, cache, no MatvecT     | **393 s** (**+15 %**) | 25.8 % (OOD) | 45.0 % (OOD) | commit 9923418 — current winner |
+| ROCm, no cache, + MatvecT   | 1091 s (−135 %) | 25.8 % (OOD) | 45.0 % (OOD) | commit b8c7a2b (reverted) — perf cliff |
+| ROCm, cache, + MatvecT      | 1048 s (−125 %) | 25.8 % (OOD) | 45.0 % (OOD) | cache saves only 43 s of 655 s MatvecT cost |
 
 Biggest win so far. Larger matmuls let hipBLAS compute dominate dispatch
-overhead, and eval stays bit-identical to CPU.
+overhead, and eval stays bit-identical to CPU across every row.
 
-This number came after a detour worth recording. A first pass added
-`MatvecT` (backward-pass `W^T @ x` via `hipblasSgemv` with `OP_N`) to
-the ROCm supports() gate, expecting another win. At d_model=384 the
-combined Matvec+MatvecT path measured **2.3× slower than CPU** (1091 s).
-Reverting MatvecT alone cut the time to 413 s — the win above.
+The table is the experimental arc. Two hypotheses tested:
 
-Why MatvecT hurt: the weight VRAM cache is currently disabled (see
-commit 7f17f42 for the correctness rationale), so every GPU matvec
-dispatch re-uploads its weight buffer via `hipMemcpyHtoD`. Adding
-MatvecT doubles the uploads per training step (forward Matvec +
-backward MatvecT), and at d_model=384 each upload moves 576 KB
-(vs 256 KB at d_model=256). The extra uploads ate the compute win.
-d_model=256 happened to sit on the favourable side of that break-even,
-which is why the earlier MatvecT benchmark passed without flagging it.
+1. **MatvecT on ROCm**: first pass routed backward `W^T @ d_out` via
+   `hipblasSgemv` with `OP_N` (same weight buffer as forward Matvec,
+   one transpose-free trick away). Expected a second win; measured
+   2.3× slower than CPU at d_model=384. Reverted in 012b923.
+2. **Weight cache would rescue MatvecT**: hypothesis was that the
+   weight re-upload per dispatch (disabled in 7f17f42 for correctness)
+   was MatvecT's bottleneck, and the fingerprint-keyed cache in
+   9923418 would let forward+backward share one upload. Re-ran with
+   cache+MatvecT: 1048 s. Cache saved 43 s; MatvecT still cost 655 s.
 
-Re-enabling the VRAM cache would flip this — both Matvec and MatvecT
-amortise their upload across many steps. Two paths, documented in
-`rocm.rs::cached_weight_ptr`:
-  - Version-counter cache keys (robust to in-place weight mutation)
-  - Every training loop calls `invalidate_caches()` after the optimizer
-    step (fragile but quick; isis already does this, modgrad-ctm
-    training loops do not)
+**Real bottleneck: per-dispatch overhead, not weight upload.** Each
+MatvecT dispatch does 3 × `hipMalloc` + 2 × `hipMemcpy` + 1 ×
+`hipblasSgemv` + 1 × `hipDeviceSynchronize` + 1 × `hipMemcpy` back +
+3 × `hipFree`. At ~20–40 MatvecT dispatches per training step × 200
+steps × several hundred µs per dispatch, the fixed cost dominates
+whether or not the weight buffer is cached.
+
+Paths that could actually land MatvecT on ROCm:
+  - Batch multiple backward matvecs into a single `hipblasSgemmStridedBatched`
+    call (one dispatch amortised across many layers).
+  - Keep activations resident on GPU across forward/backward — today
+    every matvec downloads to host immediately. A GPU-side activation
+    buffer ring would eliminate the ping-pong.
+  - Fuse Matvec + MatvecT + OuterProductAcc into one backward kernel
+    (the entire Linear backward becomes one dispatch).
+
+None of these are small; each is its own project. For now, forward
+Matvec on GPU + everything else on CPU is Pareto-optimal on this
+hardware/benchmark.
 
 ## What's registered
 
