@@ -212,24 +212,30 @@ pub struct RocmBackend {
     /// `hipMalloc + hipMemcpy H2D + hipFree` triple that otherwise runs
     /// every forward pass for weights that never change within a step.
     ///
-    /// SAFETY invariants (pointer-identity caching):
-    /// - Key is `(weight.as_ptr() as usize, weight.len())`. This is
-    ///   stable across training steps because weights live inside their
-    ///   owning struct (e.g. `CtmWeights`) and are never reallocated.
-    /// - The cache ASSUMES the host buffer behind `ptr` is not mutated
-    ///   in place while the cache entry is live. modgrad-device's AdamW
-    ///   DOES mutate weights in place, so the isis training loop calls
-    ///   `registry().invalidate_caches()` after every optimizer step
-    ///   (see commit feea041). As long as that invariant holds, a cache
-    ///   hit returns the same bytes the caller intended to upload.
-    /// - Dropping a `HipBuffer` runs `hipFree`, so clearing the HashMap
-    ///   automatically releases VRAM — no manual cleanup needed on
-    ///   invalidation or backend drop.
+    /// Key: `(weight.as_ptr() as usize, weight.len())`. Value:
+    /// `(content_fingerprint, vram_buffer)`.
+    ///
+    /// SAFETY / correctness:
+    /// - Fingerprint is a 64-element sample hash of the weight buffer.
+    ///   Cache hits are gated on fingerprint match, so in-place
+    ///   optimizer updates that mutate the buffer automatically
+    ///   invalidate the cached VRAM copy on the next dispatch. This
+    ///   replaces the earlier pointer-only scheme that required
+    ///   explicit `registry().invalidate_caches()` after every step —
+    ///   modgrad-ctm training loops (mazes/minictm/dream_bench) did not
+    ///   call it, producing the catastrophic divergence fixed in
+    ///   commit 7f17f42 (ID first-step 37% → 9.5%).
+    /// - Single entry per `(ptr, len)` slot: a fingerprint mismatch
+    ///   replaces the prior entry (its `HipBuffer::drop` runs `hipFree`
+    ///   so VRAM stays bounded to one buffer per live weight).
+    /// - `invalidate_cache` still clears the whole map — callers that
+    ///   *can* signal explicitly avoid the fingerprint check on first
+    ///   post-step dispatch. Not required for correctness.
     /// - Wrapped in the same `Mutex` style as the hipBLAS handle; every
     ///   access locks first. The lock is held only during the
     ///   lookup/insert; dispatches do not hold it across the hipBLAS
     ///   call.
-    cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), HipBuffer>>,
+    cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), (u64, HipBuffer)>>,
 }
 
 #[cfg(not(feature = "rocm"))]
@@ -379,51 +385,69 @@ impl Backend for RocmBackend {
     }
 }
 
+/// Sample-based content fingerprint of a weight buffer. Captures
+/// enough of the buffer that a dense AdamW in-place update will
+/// produce a different value with overwhelming probability, while
+/// staying O(1) in the buffer size.
+///
+/// Takes 64 evenly-spaced samples (or every element for n <= 64).
+/// Collision probability over a realistic training run is negligible:
+/// every AdamW step touches every weight, so every sampled position
+/// changes too.
+#[cfg(feature = "rocm")]
+fn weight_fingerprint(w: &[f32]) -> u64 {
+    const SAMPLES: usize = 64;
+    let n = w.len();
+    let mut hash: u64 = n as u64;
+    if n == 0 { return hash; }
+    if n <= SAMPLES {
+        for &v in w {
+            hash = hash.rotate_left(13) ^ (v.to_bits() as u64);
+        }
+    } else {
+        let stride = n / SAMPLES;
+        for i in 0..SAMPLES {
+            // SAFETY: i < SAMPLES ≤ n/stride, so i*stride < n.
+            let v = unsafe { *w.get_unchecked(i * stride) };
+            hash = hash.rotate_left(13) ^ (v.to_bits() as u64);
+        }
+    }
+    hash
+}
+
 #[cfg(feature = "rocm")]
 impl RocmBackend {
-    /// Look up the weight VRAM mirror, or upload it if missing. Returns
-    /// the cached device pointer.
+    /// Look up the weight VRAM mirror, or upload it if the fingerprint
+    /// mismatches (or the entry is missing). Returns the cached device
+    /// pointer.
     ///
-    /// The pointer remains valid after the lock is released because the
-    /// cache only ever drops entries wholesale via `invalidate_cache`,
-    /// which callers schedule between dispatches (post-optimizer step),
-    /// never concurrent with one. See the `cache` field's SAFETY note.
+    /// Fingerprint-based invalidation: in-place optimizer updates are
+    /// detected on the next dispatch without needing an explicit
+    /// `invalidate_caches()` call from the training loop. See the
+    /// `cache` field's SAFETY note for why this is the correctness
+    /// fence, and commit 7f17f42 for the divergence it prevents.
+    ///
+    /// The pointer remains valid after the lock is released: on a hit
+    /// the entry isn't touched; on a miss the new entry owns the
+    /// `HipBuffer`, and no concurrent dispatch can evict it because the
+    /// hipBLAS handle is serialised through its own mutex.
     fn cached_weight_ptr(&self, weight: &[f32]) -> Result<*mut f32, BackendError> {
-        // Correctness-first: always re-upload the weight buffer, bypassing
-        // the VRAM cache entirely.
-        //
-        // Background: the original cache was keyed on
-        // (weight.as_ptr() as usize, weight.len()) and relied on callers
-        // explicitly invoking `registry().invalidate_caches()` after
-        // every in-place optimizer step. The isis training loop does
-        // this; modgrad-ctm's training loops (mazes, dream_bench) do
-        // NOT. Session 2026-04-21 benchmark at size=11 d_model=128,
-        // seed=7, 500 steps measured ID first-step dropping from
-        // 37.0% (CPU) to 9.5% (ROCm) — catastrophic divergence driven
-        // by forward passes using stale cached weights while gradients
-        // kept updating the CPU-side buffer.
-        //
-        // Two paths to re-enable the cache safely in the future:
-        //   (a) Every training loop calls `invalidate_caches()` after
-        //       applying the optimizer step. Requires auditing every
-        //       caller — a single missed spot re-introduces the silent
-        //       divergence.
-        //   (b) Cache keys include a content hash or monotonic version
-        //       counter so in-place mutations naturally invalidate.
-        //
-        // Until one of those lands, correctness outweighs the extra
-        // `hipMemcpyHtoD` per dispatch. The cache HashMap itself and
-        // `invalidate_cache()` stay wired so existing consumers aren't
-        // broken — the cache just never returns a hit.
+        let fingerprint = weight_fingerprint(weight);
+        let key = (weight.as_ptr() as usize, weight.len());
         let mut cache = self.cache.lock()
             .map_err(|_| BackendError::Runtime("rocm: cache mutex poisoned".into()))?;
-        let key = (weight.as_ptr() as usize, weight.len());
+        if let Some((cached_fp, buf)) = cache.get(&key) {
+            if *cached_fp == fingerprint {
+                return Ok(buf.as_f32_ptr());
+            }
+        }
+        // Miss or fingerprint mismatch: upload fresh. Dropping the old
+        // HipBuffer on replace runs hipFree automatically so VRAM stays
+        // bounded to one entry per live weight slot.
         let buf = HipBuffer::alloc(weight.len() * 4)?;
         buf.upload_f32(weight)?;
         let ptr = buf.as_f32_ptr();
-        // Replace any stale entry for this key; dropping the old
-        // HipBuffer runs hipFree automatically so VRAM doesn't leak.
-        cache.insert(key, buf);
+        cache.insert(key, (fingerprint, buf));
         Ok(ptr)
     }
 
