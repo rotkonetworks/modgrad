@@ -85,16 +85,26 @@ impl Backend for KfdBackend {
     fn supports(&self, op: &Op) -> bool {
         if !self.available { return false; }
         match op {
-            // KFD matvec kernel proptest-found divergence at multiple
-            // shapes including (6, 9). Production use in modgrad-ctm
-            // runs at in_dim=64+ (kernel boot probes at 256x64, 1024x64,
-            // 4096x64, 8448x64 all pass). Gate conservatively to that
-            // regime; smaller shapes fall through to CPU. Needs kernel
-            // audit before we can safely widen.
+            // KFD matvec kernel:
+            //   - proptest-found divergence at multiple small shapes
+            //     including (6, 9).
+            //   - boot-probe shapes 256x64 (1 WG) pass; 1024x64 (4 WG),
+            //     4096x64 (16 WG), 8448x64 (33 WG) passed once per boot
+            //     but multi-WG wedged the compute ring during real
+            //     training (ring-buffer-full panic after ~4M dwords
+            //     enqueued with only 9 consumed — GPU not draining).
+            //   - Single-workgroup matvec (out_dim <= 256) has been
+            //     reliable across every observed run.
+            //
+            // Conservative gate: claim only out_dim in [32, 256] so
+            // multi-workgroup dispatches (which wedge the ring) fall
+            // through to CPU. Raises the "is this safe yet?" bar for
+            // any future widening — has to survive a full training
+            // step without ring stall, not just a one-off kernel probe.
             Op::Matvec { quant: QuantKind::F32, out_dim, in_dim, .. }
-                if *out_dim >= 32 && *in_dim >= 32 => true,
+                if *out_dim >= 32 && *out_dim <= 256 && *in_dim >= 32 => true,
             Op::MatvecT { out_dim, in_dim, .. }
-                if *out_dim >= 32 && *in_dim >= 32 => true,
+                if *out_dim >= 32 && *out_dim <= 256 && *in_dim >= 32 => true,
             // KFD's matmul kernel has hard alignment preconditions:
             //   n % 32 == 0, k % 8 == 0, m % 128 == 0
             // Fail `supports()` for non-conforming shapes so registry

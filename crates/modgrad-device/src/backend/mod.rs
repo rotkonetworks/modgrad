@@ -343,9 +343,18 @@ impl BackendRegistry {
 
     /// Try each backend in preference order; return the name of the
     /// backend that handled the op, or an error if none did.
+    ///
+    /// When `MODGRAD_TRACE_DISPATCH=1` is set, every dispatch logs
+    /// `<op_name> → <backend>` to stderr. Useful for narrowing
+    /// backend hangs (the last line before a wedge is the culprit op).
+    /// Env var is read once per process on first call — zero cost when
+    /// unset in production runs.
     pub fn dispatch(&self, op: &mut Op) -> Result<&'static str, BackendError> {
         for b in &self.backends {
             if b.supports(op) {
+                if trace_dispatch_enabled() {
+                    eprintln!("[dispatch] {} → {}", op.name(), b.name());
+                }
                 b.dispatch(op)?;
                 return Ok(b.name());
             }
@@ -398,6 +407,20 @@ impl Default for BackendRegistry {
 /// The registry is immutable once created; to override for debugging,
 /// set `MODGRAD_BACKEND=cpu` in the environment *before* the first
 /// call. Changing it at runtime is intentionally not supported.
+/// One-shot env probe. Cached in an AtomicBool via OnceLock so the
+/// dispatch hot loop reads one relaxed atomic instead of env var
+/// lookup per call.
+fn trace_dispatch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("MODGRAD_TRACE_DISPATCH").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
 pub fn registry() -> &'static BackendRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<BackendRegistry> = OnceLock::new();
