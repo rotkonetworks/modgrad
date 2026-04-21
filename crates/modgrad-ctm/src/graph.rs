@@ -2102,13 +2102,19 @@ pub fn regional_train_step(
         let out_dim = w.output_proj.out_dim;
         let in_dim = w.output_proj.in_dim;
         let mut d_global_sync = vec![0.0f32; in_dim];
-        for i in 0..out_dim {
-            grads.output_proj_db[i] += d_logits[i];
-            for j in 0..in_dim {
-                grads.output_proj_dw[i * in_dim + j] += d_logits[i] * tc.global_sync[j];
-                d_global_sync[j] += d_logits[i] * w.output_proj.weight[i * in_dim + j];
-            }
-        }
+        // Bias grad — trivial elementwise, no Op variant worth it.
+        for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+        // Weight grad (outer product accumulate) + input grad (matvec_t)
+        // through the Backend registry — output-projection backward now
+        // matches the dispatch pattern used in `linear_backward`.
+        modgrad_device::backend::ops::outer_product_acc(
+            d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+            out_dim, in_dim,
+        ).expect("output_proj backward: outer_product_acc dispatch");
+        modgrad_device::backend::ops::matvec_t(
+            d_logits, &w.output_proj.weight, &mut d_global_sync,
+            out_dim, in_dim,
+        ).expect("output_proj backward: matvec_t dispatch");
 
         // Global sync backward → d_all_activations (GPU-accelerated)
         let total_act_dim = tc.all_activations.len();
@@ -2667,13 +2673,19 @@ fn regional_train_step_inner(
         let out_dim = w.output_proj.out_dim;
         let in_dim = w.output_proj.in_dim;
         let mut d_global_sync = vec![0.0f32; in_dim];
-        for i in 0..out_dim {
-            grads.output_proj_db[i] += d_logits[i];
-            for j in 0..in_dim {
-                grads.output_proj_dw[i * in_dim + j] += d_logits[i] * tc.global_sync[j];
-                d_global_sync[j] += d_logits[i] * w.output_proj.weight[i * in_dim + j];
-            }
-        }
+        // Bias grad — trivial elementwise, no Op variant worth it.
+        for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+        // Weight grad (outer product accumulate) + input grad (matvec_t)
+        // through the Backend registry — output-projection backward now
+        // matches the dispatch pattern used in `linear_backward`.
+        modgrad_device::backend::ops::outer_product_acc(
+            d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+            out_dim, in_dim,
+        ).expect("output_proj backward: outer_product_acc dispatch");
+        modgrad_device::backend::ops::matvec_t(
+            d_logits, &w.output_proj.weight, &mut d_global_sync,
+            out_dim, in_dim,
+        ).expect("output_proj backward: matvec_t dispatch");
 
         let total_act_dim = tc.all_activations.len();
         let d_all_activations = global_sync_backward(
@@ -3905,13 +3917,15 @@ impl modgrad_traits::Brain for RegionalBrain {
             let out_dim = weights.output_proj.out_dim;
             let in_dim = weights.output_proj.in_dim;
             let mut d_global_sync = vec![0.0f32; in_dim];
-            for i in 0..out_dim {
-                grads.output_proj_db[i] += d_logits[i];
-                for j in 0..in_dim {
-                    grads.output_proj_dw[i * in_dim + j] += d_logits[i] * tc.global_sync[j];
-                    d_global_sync[j] += d_logits[i] * weights.output_proj.weight[i * in_dim + j];
-                }
-            }
+            for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+            modgrad_device::backend::ops::outer_product_acc(
+                d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+                out_dim, in_dim,
+            ).expect("output_proj backward: outer_product_acc dispatch");
+            modgrad_device::backend::ops::matvec_t(
+                d_logits, &weights.output_proj.weight, &mut d_global_sync,
+                out_dim, in_dim,
+            ).expect("output_proj backward: matvec_t dispatch");
 
             // global sync backward
             let total_act_dim = tc.all_activations.len();
