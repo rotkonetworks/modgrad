@@ -5,6 +5,15 @@ edition = "2024"
 description = "Continuous Thought Machine architecture for the modgrad ML SDK"
 license = "MIT"
 
+[features]
+# Plumb backend features through to modgrad-device so downstream
+# binaries can turn on GPU backends via a single feature on this crate.
+default = []
+kfd = ["modgrad-device/kfd"]
+rocm = ["modgrad-device/rocm"]
+cuda = ["modgrad-device/cuda"]
+gpu = ["modgrad-device/gpu"]
+
 [dependencies]
 modgrad-traits = { path = "../modgrad-traits" }
 modgrad-compute = { path = "../modgrad-compute" }

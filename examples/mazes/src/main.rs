@@ -45,6 +45,16 @@ fn encode_maybe_bypass(
 }
 
 fn main() {
+    // Print the backend registry's probe result at startup. With
+    // `--features kfd` on gfx1102, this should show `kfd` registered
+    // ahead of `cpu`. Without the feature, CPU only — lets users
+    // confirm a GPU build actually wired GPU dispatch.
+    {
+        let reg = modgrad_device::backend::registry();
+        let names: Vec<&'static str> = reg.iter().map(|b| b.name()).collect();
+        eprintln!("backends registered: [{}]", names.join(", "));
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let mut maze_size = 21usize;
     let mut ticks = 16usize;

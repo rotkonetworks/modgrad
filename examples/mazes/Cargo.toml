@@ -8,6 +8,15 @@ description = "Maze solving benchmark for CTM — visual reasoning with spatial 
 name = "mazes"
 path = "src/main.rs"
 
+[features]
+# Opt-in GPU backends. `kfd` turns on the hand-written gfx1102 fast
+# path; the registry then prefers it over ROCm / CUDA. Off by default
+# so `cargo build -p mazes --release` stays fast on any host.
+default = []
+kfd = ["modgrad-ctm/kfd", "modgrad-device/kfd"]
+rocm = ["modgrad-ctm/rocm", "modgrad-device/rocm"]
+cuda = ["modgrad-ctm/cuda", "modgrad-device/cuda"]
+
 [dependencies]
 modgrad-ctm = { path = "../../crates/modgrad-ctm" }
 modgrad-compute = { path = "../../crates/modgrad-compute" }
@@ -15,3 +24,4 @@ modgrad-training = { path = "../../crates/modgrad-training" }
 modgrad-persist = { path = "../../crates/modgrad-persist" }
 modgrad-codec = { path = "../../crates/modgrad-codec" }
 modgrad-traits = { path = "../../crates/modgrad-traits" }
+modgrad-device = { path = "../../crates/modgrad-device" }
