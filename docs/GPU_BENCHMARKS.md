@@ -30,6 +30,40 @@ Treat headline percentages as "what's achievable with the CPU at
 full clock"; the worst-case spread is ~1.5× slower once the governor
 throttles in.
 
+### Quantifying the boost-cap with `--substrate-log`
+
+A 200-step ROCm training run at d_model=384 with
+`--substrate-log=<path>` produced one telemetry row per training
+step. Aggregated:
+
+| Metric                  | value            |
+|-------------------------|------------------|
+| wall time               | 647 s            |
+| CPU freq ratio (mean)   | **0.518**        |
+| CPU freq ratio (min–max)| 0.445 – 0.631    |
+| max cpu temp            | 91.4 °C (mean)   |
+| `core_throttle_count`   | **0** events     |
+| governor / EPP          | performance / performance |
+
+The CPU spent the *entire* 200-step run pinned at roughly half its
+hardware boost ceiling — `scaling_governor=performance`,
+`EPP=performance`, and yet `cpuinfo_cur_freq` ≈ 0.52 × `cpuinfo_max_freq`.
+No classical thermal throttle events fire. This is **amd-pstate SMU
+boost suppression**: the silicon declines the requested P-state
+because of a package power (PPT) or current (TDC) limit it sees
+internally, and none of the kernel-exposed throttle counters
+increment. Only the freq-ratio reveals it.
+
+Corollary for the learned-controller direction: the PPT ceiling —
+not the governor, not cooling — is the actual physical cap this
+workload hits. A controller that cannot change PPT (via
+`ryzen_smu` or similar) can only optimise *within* the suppressed
+envelope; breaking past 0.52 ratio at d_model=384 requires either
+root-mediated PPT adjustment or reducing orchestration heat so the
+SMU lets the clock up on its own. Option B (GPU-resident
+activations, op fusion, batched dispatch) wins twice — less host
+work directly, plus less heat lets the SMU stop capping.
+
 ## Configurations measured
 
 ### Small: `--size 11 --ticks 8 --steps 500 --batch 4 --d-model 128 --route-len 10`
