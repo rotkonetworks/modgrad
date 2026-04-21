@@ -6,3 +6,10 @@ description = "Read-side observability for the host that modgrad runs on — CPU
 license = "MIT"
 
 [dependencies]
+
+[dev-dependencies]
+libc = "0.2"
+
+[[example]]
+name = "therm"
+required-features = []
