@@ -180,14 +180,19 @@ impl FrozenTransformer {
             // Post-attention norm
             let normed2 = rms_norm(&hidden, &layer.post_attn_norm_w, cfg.rms_norm_eps, seq_len, hd);
 
-            // SwiGLU MLP: gate = SiLU(gate_proj(x)), up = up_proj(x), out = down_proj(gate * up)
-            let gate = matvec_batch(&layer.gate_proj_w, &normed2, cfg.intermediate_dim, hd, seq_len);
+            // SwiGLU MLP: gate = SiLU(gate_proj(x)), up = up_proj(x),
+            //             out = down_proj(gate * up).
+            // SiLU dispatches through `ops::silu_fwd_inplace`; the
+            // elementwise `silu * up` stays as an inline scalar loop
+            // because the registry has no fused "multiply two tensors"
+            // op and adding one for a single call site would be
+            // premature (no other caller would share it).
+            let mut gate = matvec_batch(&layer.gate_proj_w, &normed2, cfg.intermediate_dim, hd, seq_len);
             let up = matvec_batch(&layer.up_proj_w, &normed2, cfg.intermediate_dim, hd, seq_len);
-            let mut gated = vec![0.0f32; seq_len * cfg.intermediate_dim];
-            for i in 0..gated.len() {
-                let silu = gate[i] / (1.0 + (-gate[i]).exp()); // SiLU = x * sigmoid(x)
-                gated[i] = silu * up[i];
-            }
+            modgrad_device::backend::ops::silu_fwd_inplace(&mut gate)
+                .expect("SwiGLU SiLU dispatch");
+            for i in 0..gate.len() { gate[i] *= up[i]; }
+            let gated = gate;
             let mlp_out = matvec_batch(&layer.down_proj_w, &gated, hd, cfg.intermediate_dim, seq_len);
 
             // Residual
@@ -254,31 +259,31 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32, seq_len: usize, dim: usize) -> Vec<f
     out
 }
 
+/// Batched linear: `out[t, :] = W @ x[t, :]` for each token t.
+///
+/// Equivalent to one GEMM: `out = X @ W^T` where X is [seq_len, in_dim],
+/// W is [out_dim, in_dim] (row-major), and out is [seq_len, out_dim].
+/// Dispatched through `ops::matmul_nt` so every Q/K/V/O/gate/up/down
+/// projection in the transformer stack hits the Backend registry as
+/// one op per layer per projection, not seq_len separate matvecs.
 fn matvec_batch(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize, seq_len: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; seq_len * out_dim];
-    for t in 0..seq_len {
-        let x_off = t * in_dim;
-        let o_off = t * out_dim;
-        for i in 0..out_dim {
-            let row = i * in_dim;
-            let mut sum = 0.0f32;
-            for j in 0..in_dim {
-                sum += w[row + j] * x[x_off + j];
-            }
-            out[o_off + i] = sum;
-        }
-    }
+    modgrad_device::backend::ops::matmul_nt(
+        x, w, &mut out, None,
+        seq_len, in_dim, out_dim,
+    ).expect("matvec_batch: matmul_nt dispatch");
     out
 }
 
+/// Same as `matvec_batch` but with an added bias per output unit,
+/// broadcast across tokens. `ops::matmul_nt` accepts an optional
+/// bias so we get a single dispatched op, no extra pass.
 fn matvec_bias_batch(w: &[f32], b: &[f32], x: &[f32], out_dim: usize, in_dim: usize, seq_len: usize) -> Vec<f32> {
-    let mut out = matvec_batch(w, x, out_dim, in_dim, seq_len);
-    for t in 0..seq_len {
-        let off = t * out_dim;
-        for i in 0..out_dim {
-            out[off + i] += b[i];
-        }
-    }
+    let mut out = vec![0.0f32; seq_len * out_dim];
+    modgrad_device::backend::ops::matmul_nt(
+        x, w, &mut out, Some(b),
+        seq_len, in_dim, out_dim,
+    ).expect("matvec_bias_batch: matmul_nt dispatch");
     out
 }
 
