@@ -513,13 +513,11 @@ impl RocmBackend {
             return Err(BackendError::Runtime(format!("hipblasSgemv: status {status}")));
         }
 
-        let err = unsafe { ffi::hipDeviceSynchronize() };
-        if err != 0 {
-            return Err(BackendError::Runtime(format!(
-                "deviceSync: {}", ffi::hip_err_str(err)
-            )));
-        }
-
+        // The following `hipMemcpy` D2H is synchronous (blocking), and
+        // it orders against prior default-stream work — so hipblasSgemv
+        // is guaranteed to complete before the copy reads from d_y.
+        // An explicit hipDeviceSynchronize() here would add another
+        // host↔driver round-trip for no safety gain.
         d_y.download_f32(out)
     }
 }
@@ -580,13 +578,11 @@ impl RocmBackend {
             return Err(BackendError::Runtime(format!("hipblasSgemm: status {status}")));
         }
 
-        let err = unsafe { ffi::hipDeviceSynchronize() };
-        if err != 0 {
-            return Err(BackendError::Runtime(format!(
-                "matmul sync: {}", ffi::hip_err_str(err)
-            )));
-        }
-
+        // `hipMemcpy` D2H is synchronous and orders against prior
+        // default-stream work; hipblasSgemm is guaranteed to complete
+        // before the copy runs.  Skipping the explicit
+        // `hipDeviceSynchronize` trims one host↔driver round-trip per
+        // dispatch with no correctness loss.
         d_c.download_f32(out)
     }
 }
@@ -664,16 +660,17 @@ impl BufferBackend for RocmBackend {
     }
 }
 
-/// ROCm lifecycle hooks — the HIP runtime synchronises per-call in our
-/// dispatcher (each matvec ends with `hipDeviceSynchronize`), so the
-/// flush hook is a no-op at Stage 2. Arena doesn't exist yet: we do
-/// allocate/free per dispatch today, which is exactly the waste Stage 4
-/// will address by letting callers hold `RocmBuffer` across ops.
+/// ROCm lifecycle hooks — each dispatch ends with a synchronous
+/// `hipMemcpy` D2H, so the caller's `out` slice is always up to date
+/// by the time `dispatch` returns. `flush` is therefore a no-op.
+/// Arena doesn't exist yet: we still allocate/free per dispatch today,
+/// which is exactly the waste Stage 4 will address by letting callers
+/// hold `RocmBuffer` across ops.
 impl ComputeCtx<RocmBackend> {
     /// No-op — ROCm has no managed arena yet.
     pub fn arena_reset(&self) {}
 
-    /// No-op — dispatcher already syncs on every op.
+    /// No-op — dispatcher already returns with `out` materialised on host.
     pub fn flush(&self) {}
 }
 
