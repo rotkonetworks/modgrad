@@ -105,42 +105,46 @@ impl Backend for KfdBackend {
                 if *out_dim >= 32 && *out_dim <= 256 && *in_dim >= 32 => true,
             Op::MatvecT { out_dim, in_dim, .. }
                 if *out_dim >= 32 && *out_dim <= 256 && *in_dim >= 32 => true,
-            // KFD's matmul kernel has hard alignment preconditions:
-            //   n % 32 == 0, k % 8 == 0, m % 128 == 0
-            // Fail `supports()` for non-conforming shapes so registry
-            // falls through to CPU (rather than claiming and erroring).
-            Op::MatmulNN { m, k, n, .. }
-                if *n % 32 == 0 && *k % 8 == 0 && *m % 128 == 0 => true,
-            // Elementwise ops: proptest found tail-handling issues at
-            // non-wavefront-aligned sizes. Gate conservatively to
-            // multiples of 32 (RDNA3 wavefront) of reasonable size;
-            // non-aligned cases fall through to CPU.
-            Op::AdamW(args) if args.w.len() >= 32 && args.w.len() % 32 == 0 => true,
-            Op::SiluFwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
-            Op::SiluFwdInplace { x } if x.len() >= 32 && x.len() % 32 == 0 => true,
-            Op::SiluBwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
-            // GluFwd: input has length 2*half; gate on that.
-            Op::GluFwd { x, .. }  if x.len() >= 64 && x.len() % 64 == 0 => true,
-            Op::SgdUpdate { w, .. } if w.len() >= 32 && w.len() % 32 == 0 => true,
-            // TraceRotateInplace: proptest found divergence at non-aligned
-            // (d_model, memory_length) e.g. (3, 27). Gate on total
-            // elements being a multiple of 32 (wavefront). Production
-            // shapes (d_model × memory_length in {32×8, 512×64}) clear this.
-            Op::TraceRotateInplace { d_model, memory_length, .. }
-                if d_model * memory_length >= 32
-                    && (d_model * memory_length) % 32 == 0 => true,
-            // KFD outer_product: proptest finds divergence at many
-            // mid-sized shapes (e.g. m=20, n=13). The float-div
-            // row/col approximation likely fails when K isn't a power
-            // of two. Gate to shapes where K is a clean power-of-two
-            // multiple — these are what production actually uses.
-            Op::OuterProductAcc { m, n, .. }
-                if *m >= 16 && n.is_power_of_two() && *n >= 32 => true,
-            // KFD try_superlinear: proptest found divergence at small
-            // d_model/out_per combinations. Gate on shape bounds that
-            // the hand-written parity case exercises successfully.
-            Op::SuperLinearFwd { cache: None, d_model, out_per, memory_length, .. }
-                if *d_model >= 16 && *out_per >= 2 && *memory_length >= 8 => true,
+            //
+            // ── All other ops temporarily disabled ──────────────────
+            //
+            // Debugging session 2026-04-21: at size=21 d_model=256 the
+            // compute ring wedges within one forward pass even with
+            // single-WG matvec gated. Something among MatmulNN /
+            // AdamW / SiluFwd{,Inplace} / SiluBwd / GluFwd /
+            // SgdUpdate / TraceRotateInplace / OuterProductAcc /
+            // SuperLinearFwd is either (a) a kernel bug the proptest
+            // shape-gate didn't catch, or (b) the ring-fill pattern
+            // from dispatching too many ops without GPU draining.
+            //
+            // Strategy: disable all of them for now so single-WG
+            // matvec is the only KFD claim. Training works end-to-end
+            // on CPU+KFD mix with no hang. Each op can be re-enabled
+            // individually once (i) parity proptest passes at its
+            // full claimed shape range AND (ii) a full training step
+            // at our benchmark config runs without wedging the ring.
+            // The second bar is new — kernel-parity is necessary but
+            // not sufficient.
+            //
+            // Previous gates are preserved below as comments so the
+            // existing shape analysis isn't lost. Re-enable one at a
+            // time, verify with mazes end-to-end, then commit.
+
+            // Op::MatmulNN { m, k, n, .. }
+            //     if *n % 32 == 0 && *k % 8 == 0 && *m % 128 == 0 => true,
+            // Op::AdamW(args) if args.w.len() >= 32 && args.w.len() % 32 == 0 => true,
+            // Op::SiluFwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
+            // Op::SiluFwdInplace { x } if x.len() >= 32 && x.len() % 32 == 0 => true,
+            // Op::SiluBwd { x, .. } if x.len() >= 32 && x.len() % 32 == 0 => true,
+            // Op::GluFwd { x, .. }  if x.len() >= 64 && x.len() % 64 == 0 => true,
+            // Op::SgdUpdate { w, .. } if w.len() >= 32 && w.len() % 32 == 0 => true,
+            // Op::TraceRotateInplace { d_model, memory_length, .. }
+            //     if d_model * memory_length >= 32
+            //         && (d_model * memory_length) % 32 == 0 => true,
+            // Op::OuterProductAcc { m, n, .. }
+            //     if *m >= 16 && n.is_power_of_two() && *n >= 32 => true,
+            // Op::SuperLinearFwd { cache: None, d_model, out_per, memory_length, .. }
+            //     if *d_model >= 16 && *out_per >= 2 && *memory_length >= 8 => true,
             // Fused synapse and standalone layer_norm_inplace:
             // **declined across the board in Stage 1.** Parity proptest
             // at committed tolerance (max_abs 2e-5, max_rel 1e-4) found
