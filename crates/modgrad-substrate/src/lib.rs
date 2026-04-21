@@ -200,10 +200,23 @@ fn cpu_attr_path(cpu: u32, tail: &str) -> PathBuf {
     PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/{tail}"))
 }
 
-/// Current clock of `cpu` in kHz. Source:
-/// `cpufreq/scaling_cur_freq`.
+/// Current clock of `cpu` in kHz.
+///
+/// Prefers `cpufreq/cpuinfo_cur_freq` (the actual hardware frequency
+/// reported by the silicon, per the kernel CPUFreq docs) and falls
+/// back to `cpufreq/scaling_cur_freq` (the frequency most recently
+/// *requested* by the scaling driver, which the hardware may or may
+/// not honour). The preference matters for any controller trying to
+/// learn "what did I actually get" vs "what did I ask for".
 pub fn cpu_cur_freq_khz(cpu: u32) -> Result<u64> {
-    read_u64(&cpu_attr_path(cpu, "cpufreq/scaling_cur_freq"))
+    let hw = cpu_attr_path(cpu, "cpufreq/cpuinfo_cur_freq");
+    match read_u64(&hw) {
+        Ok(v) => Ok(v),
+        Err(SubstrateError::Missing { .. }) => {
+            read_u64(&cpu_attr_path(cpu, "cpufreq/scaling_cur_freq"))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Policy ceiling for `cpu` in kHz. Source:
@@ -239,6 +252,76 @@ pub fn cpu_throttle_count(cpu: u32) -> Result<u64> {
 /// `"performance"`, `"schedutil"`).
 pub fn cpu_governor(cpu: u32) -> Result<String> {
     read_trimmed(&cpu_attr_path(cpu, "cpufreq/scaling_governor"))
+}
+
+/// Current energy-performance preference for `cpu`, when the scaling
+/// driver uses EPP (amd-pstate-epp, intel_pstate in active mode).
+///
+/// Typical values: `"performance"`, `"balance_performance"`,
+/// `"default"`, `"balance_power"`, `"power"`. Returns
+/// `Missing` on hosts where EPP isn't exposed.
+pub fn cpu_energy_performance_preference(cpu: u32) -> Result<String> {
+    read_trimmed(&cpu_attr_path(cpu, "cpufreq/energy_performance_preference"))
+}
+
+/// Scaling driver in use for `cpu` (e.g. `"amd-pstate-epp"`,
+/// `"intel_pstate"`, `"acpi-cpufreq"`).
+pub fn cpu_scaling_driver(cpu: u32) -> Result<String> {
+    read_trimmed(&cpu_attr_path(cpu, "cpufreq/scaling_driver"))
+}
+
+// ─────────────────────────────────────────────────────────────
+// hwmon temperature sensors — only the CPU-relevant drivers
+// ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
+// Global knobs — boost, amd-pstate mode
+// ─────────────────────────────────────────────────────────────
+
+const CPUFREQ_BOOST: &str = "/sys/devices/system/cpu/cpufreq/boost";
+const AMD_PSTATE_STATUS: &str = "/sys/devices/system/cpu/amd_pstate/status";
+
+/// Whether the CPU frequency boost mechanism (Intel Turbo Boost,
+/// AMD Core Performance Boost, etc.) is currently permitted by the
+/// kernel. `Some(true)` = boost allowed, `Some(false)` = disabled,
+/// `None` = the `boost` sysfs knob is not present on this host (for
+/// instance when `intel_pstate` provides a driver-specific interface
+/// instead). See the kernel CPUFreq docs §"The boost File in sysfs"
+/// for the rationale — notably its use for making benchmarks
+/// reproducible, which is exactly the variance source this crate
+/// exists to surface.
+pub fn boost_enabled() -> Result<Option<bool>> {
+    match read_trimmed(Path::new(CPUFREQ_BOOST)) {
+        Ok(s) => match s.as_str() {
+            "0" => Ok(Some(false)),
+            "1" => Ok(Some(true)),
+            other => Err(SubstrateError::Parse {
+                path: CPUFREQ_BOOST.into(),
+                raw: other.to_owned(),
+                reason: "expected `0` or `1`".to_owned(),
+            }),
+        },
+        Err(SubstrateError::Missing { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// amd-pstate driver mode: `"active"`, `"passive"`, `"guided"`, or
+/// `"disable"`. Returns `None` when the host is not running
+/// amd-pstate at all (e.g. Intel CPUs, pre-5.17 kernels).
+///
+/// Relevant because: in `active` mode the driver bypasses the
+/// generic governor and manages P-states itself via EPP hints — so
+/// `scaling_governor` shows stub names only and a userspace
+/// controller writing `scaling_setspeed` has no effect. To drive
+/// clocks from userspace (required for the learned-controller
+/// direction), switch to `passive`.
+pub fn amd_pstate_mode() -> Result<Option<String>> {
+    match read_trimmed(Path::new(AMD_PSTATE_STATUS)) {
+        Ok(s) => Ok(Some(s)),
+        Err(SubstrateError::Missing { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -461,6 +544,241 @@ impl Snapshot {
     #[must_use]
     pub fn throttle_total(&self) -> u64 {
         self.cpu_throttle_counts.iter().copied().sum()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Per-process observability via /proc
+//
+// Kept as a sub-module because the parsing concerns are distinct
+// from the sysfs-level sensors above. Everything here reads
+// /proc/[pid]/{comm,stat,status} and is Linux-only.
+// ─────────────────────────────────────────────────────────────
+
+pub mod process {
+    use super::{Result, SubstrateError, read_trimmed};
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// One sample of per-process state. Clock time fields are raw
+    /// jiffies from `/proc/[pid]/stat`; convert via
+    /// `sysconf(_SC_CLK_TCK)` if you need wallclock seconds.
+    /// Memory fields are kB from `/proc/[pid]/status` (the kernel's
+    /// own unit; not normalised further).
+    #[derive(Debug, Clone)]
+    pub struct ProcessInfo {
+        pub pid: u32,
+        pub comm: String,
+        /// `R` running, `S` sleeping, `D` disk-wait, `Z` zombie, etc.
+        /// A single byte as the kernel reports it.
+        pub state: char,
+        /// User-space CPU ticks since process start.
+        pub utime_ticks: u64,
+        /// Kernel-space CPU ticks since process start.
+        pub stime_ticks: u64,
+        pub vm_size_kb: u64,
+        pub vm_rss_kb: u64,
+        pub vm_peak_kb: u64,
+        pub vm_hwm_kb: u64,
+    }
+
+    fn proc_path(pid: u32, tail: &str) -> PathBuf {
+        PathBuf::from(format!("/proc/{pid}/{tail}"))
+    }
+
+    /// Parse `/proc/[pid]/stat`. The tricky field is `comm` (#2),
+    /// which is wrapped in parentheses and can contain spaces and
+    /// even close-parens inside it. The robust parse is: find the
+    /// *last* `)` and split around that. Everything after is
+    /// space-separated and indexable.
+    fn parse_stat(raw: &str, path: &Path) -> Result<(String, char, u64, u64)> {
+        let close = raw.rfind(')').ok_or_else(|| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: "no `)` found in /proc/[pid]/stat".to_owned(),
+        })?;
+        let open = raw[..close].find('(').ok_or_else(|| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: "no `(` found in /proc/[pid]/stat".to_owned(),
+        })?;
+        let comm = raw[open + 1..close].to_owned();
+        // Rest of the fields are space-delimited after the `) `.
+        let after = raw[close + 1..].trim_start();
+        let fields: Vec<&str> = after.split_ascii_whitespace().collect();
+        // Field layout (1-indexed in the kernel): state=3, utime=14, stime=15.
+        // After stripping pid+comm, we're at state=index 0, utime=11, stime=12.
+        let state = fields
+            .first()
+            .and_then(|s| s.chars().next())
+            .ok_or_else(|| SubstrateError::Parse {
+                path: path.to_owned(),
+                raw: raw.to_owned(),
+                reason: "missing state field".to_owned(),
+            })?;
+        let utime_ticks: u64 = fields.get(11).ok_or_else(|| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: "missing utime field".to_owned(),
+        })?.parse().map_err(|e| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: format!("utime: {e}"),
+        })?;
+        let stime_ticks: u64 = fields.get(12).ok_or_else(|| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: "missing stime field".to_owned(),
+        })?.parse().map_err(|e| SubstrateError::Parse {
+            path: path.to_owned(),
+            raw: raw.to_owned(),
+            reason: format!("stime: {e}"),
+        })?;
+        Ok((comm, state, utime_ticks, stime_ticks))
+    }
+
+    /// Parse one `Vm…: …. kB` line from `/proc/[pid]/status`.
+    /// Returns `0` if the field is not present — some process types
+    /// (kernel threads) legitimately don't report it.
+    fn kv_u64_kb(status: &str, key: &str) -> u64 {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                // rest looks like ":    1234 kB"
+                let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
+                if let Ok(v) = digits.parse::<u64>() {
+                    return v;
+                }
+            }
+        }
+        0
+    }
+
+    /// Read a single-process snapshot. `Missing` specifically when
+    /// the pid has exited between the caller's list and this call —
+    /// distinct from a partial/unparseable read, so callers watching
+    /// a dynamic set of processes can drop it and continue.
+    pub fn read(pid: u32) -> Result<ProcessInfo> {
+        #[cfg(not(target_os = "linux"))]
+        { let _ = pid; return Err(SubstrateError::Unsupported); }
+        #[cfg(target_os = "linux")]
+        {
+            let stat_path = proc_path(pid, "stat");
+            let raw_stat = read_trimmed(&stat_path)?;
+            let (comm, state, utime_ticks, stime_ticks) = parse_stat(&raw_stat, &stat_path)?;
+
+            let status_path = proc_path(pid, "status");
+            // A process may vanish between the stat and status reads;
+            // map NotFound → Missing so the caller can drop it.
+            let raw_status = match fs::read_to_string(&status_path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(SubstrateError::Missing { path: status_path });
+                }
+                Err(e) => return Err(SubstrateError::Io { path: status_path, source: e }),
+            };
+
+            let vm_size_kb = kv_u64_kb(&raw_status, "VmSize");
+            let vm_rss_kb = kv_u64_kb(&raw_status, "VmRSS");
+            let vm_peak_kb = kv_u64_kb(&raw_status, "VmPeak");
+            let vm_hwm_kb = kv_u64_kb(&raw_status, "VmHWM");
+
+            Ok(ProcessInfo {
+                pid, comm, state, utime_ticks, stime_ticks,
+                vm_size_kb, vm_rss_kb, vm_peak_kb, vm_hwm_kb,
+            })
+        }
+    }
+
+    /// Enumerate all PIDs by listing `/proc`. Non-digit entries are
+    /// skipped. Kernel threads (the ones with comm in square
+    /// brackets like `[kworker/u64:1]`) are included — callers who
+    /// want only user-space processes should filter on
+    /// `comm.starts_with('[') == false`.
+    pub fn list_pids() -> Result<Vec<u32>> {
+        #[cfg(not(target_os = "linux"))]
+        { return Err(SubstrateError::Unsupported); }
+        #[cfg(target_os = "linux")]
+        {
+            let root = Path::new("/proc");
+            let entries = fs::read_dir(root)
+                .map_err(|e| SubstrateError::Io { path: root.to_owned(), source: e })?;
+            let mut out = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else { continue; };
+                if let Ok(pid) = name_str.parse::<u32>() {
+                    out.push(pid);
+                }
+            }
+            out.sort_unstable();
+            Ok(out)
+        }
+    }
+
+    /// Return the pids whose `/proc/[pid]/cmdline` contains the
+    /// substring `needle`. Case-sensitive. Returns empty on no
+    /// matches — not an error.
+    pub fn find_by_cmdline(needle: &str) -> Result<Vec<u32>> {
+        #[cfg(not(target_os = "linux"))]
+        { let _ = needle; return Err(SubstrateError::Unsupported); }
+        #[cfg(target_os = "linux")]
+        {
+            let pids = list_pids()?;
+            let mut out = Vec::new();
+            for pid in pids {
+                let cmd_path = proc_path(pid, "cmdline");
+                // /proc/[pid]/cmdline uses NUL separators; join with
+                // spaces for substring matching.
+                let Ok(raw) = fs::read(&cmd_path) else { continue };
+                let joined: String = raw
+                    .iter()
+                    .map(|&b| if b == 0 { ' ' } else { b as char })
+                    .collect();
+                if joined.contains(needle) {
+                    out.push(pid);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_stat_simple_comm() {
+            // Minimal realistic line: pid comm state ppid pgrp session tty_nr
+            // tpgid flags minflt cminflt majflt cmajflt utime stime ...
+            // At minimum we need up to utime=field 14, stime=15.
+            let fake = "1234 (bash) S 1 1234 1234 0 -1 4096 10 20 30 40 500 700 ...";
+            let (comm, state, u, s) = parse_stat(fake, Path::new("/fake")).unwrap();
+            assert_eq!(comm, "bash");
+            assert_eq!(state, 'S');
+            assert_eq!(u, 500);
+            assert_eq!(s, 700);
+        }
+
+        #[test]
+        fn parse_stat_comm_with_spaces_and_parens() {
+            // comm can contain anything — see `proc(5)`. The robust
+            // parser finds the LAST `)`.
+            let fake = "99 (my (weird) name) R 1 99 99 0 -1 4096 0 0 0 0 111 222 ...";
+            let (comm, state, u, s) = parse_stat(fake, Path::new("/fake")).unwrap();
+            assert_eq!(comm, "my (weird) name");
+            assert_eq!(state, 'R');
+            assert_eq!(u, 111);
+            assert_eq!(s, 222);
+        }
+
+        #[test]
+        fn kv_u64_kb_extracts_values() {
+            let sample = "Name:\tbash\nVmSize:\t  12345 kB\nVmRSS:\t  678 kB\n";
+            assert_eq!(kv_u64_kb(sample, "VmSize"), 12345);
+            assert_eq!(kv_u64_kb(sample, "VmRSS"), 678);
+            assert_eq!(kv_u64_kb(sample, "VmPeak"), 0);
+        }
     }
 }
 
