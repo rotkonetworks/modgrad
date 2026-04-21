@@ -1,8 +1,8 @@
 # GPU Benchmarks
 
 First measured numbers for the modgrad SDK's GPU backends on a single
-gfx1102 discrete GPU (AMD Radeon RX 7600M XT on a water-cooled
-desktop host, ROCm 7). All runs use the
+gfx1102 discrete GPU (AMD Radeon RX 7600M XT on a well-cooled NUC
+host, ROCm 7). All runs use the
 mazes example — `cargo run --release -p mazes --features rocm ...` —
 against a CPU baseline via `MODGRAD_BACKEND=cpu`.
 
