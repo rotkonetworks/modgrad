@@ -95,19 +95,21 @@ impl TransformerNmcBridge {
         // hidden state after all layers + backout (before final norm).
         let features = cache.prev_embedding.clone();
 
-        // Step 2: Optionally project features to NMC input dim
+        // Step 2: Optionally project features to NMC input dim.
+        // Pure matvec `out = proj @ features`, no bias — routes through
+        // `ops::matvec` with an inline-constructed zero-bias so the
+        // dispatch path stays consistent with other matvec call sites.
         let nmc_input = match &self.projection {
             Some(proj) => {
                 let d_in = features.len();
                 let d_out = self.nmc_config.d_input;
+                let zero_bias = vec![0.0f32; d_out];
                 let mut out = vec![0.0f32; d_out];
-                for r in 0..d_out {
-                    let mut sum = 0.0f32;
-                    for c in 0..d_in {
-                        sum += proj[r * d_in + c] * features[c];
-                    }
-                    out[r] = sum;
-                }
+                modgrad_device::backend::ops::matvec(
+                    &features, proj, &zero_bias, &mut out,
+                    d_out, d_in,
+                    modgrad_device::backend::QuantKind::F32,
+                ).expect("bridge: matvec dispatch");
                 out
             }
             None => {
