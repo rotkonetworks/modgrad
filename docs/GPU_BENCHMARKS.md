@@ -94,9 +94,33 @@ ring has been observed to wedge on non-trivial training dispatches
 (`put=4194313 read=9`, exact same values every process). Root cause
 uninvestigated. See `crates/modgrad-device/src/backend/kfd.rs::try_new`.
 
+### XL: `--size 21 --ticks 16 --steps 200 --batch 4 --d-model 512 --route-len 20`
+
+| Backend | Wall time | Per-step acc | First-step acc | Notes |
+|---|---:|---:|---:|---|
+| CPU   | 696 s | 20.4 % (OOD) | 31.0 % (OOD) | |
+| ROCm  | 661 s (**+5 %**) | 20.4 % (OOD) | 31.0 % (OOD) | Cache, forward matvec only |
+
+The ROCm lead narrows to +5 % at d_model=512, **down from +15 % at
+d_model=384**. The GPU win peaks somewhere in the 384–512 range for
+this hardware/workload.
+
+Scaling per step d_model=384 → 512 (activations grow (512/384)² = 1.78×):
+- CPU wall time: 2.33 s → 3.48 s/step (1.50× — sub-compute-linear;
+  bigger matmuls amortise better over memory access patterns, or CPU
+  isn't actually compute-bound at d_model=384)
+- ROCm wall time: 1.97 s → 3.30 s/step (1.68× — slightly under the
+  1.78× pure-compute expectation; fixed dispatch cost doesn't scale,
+  so the GPU eats the fixed-cost tax relatively less at larger shapes)
+
+Both sides scale together, and the per-step cost ratio (ROCm / CPU)
+rises from 0.85 at d_model=384 to 0.95 at d_model=512. Compute-bound
+speedup (~3× naive, from 5 TFLOPS vs 1.5 TFLOPS) never materialises.
+The bottleneck remains orchestration, not hipBLAS.
+
 ## Next measurements we'd like
 
-- `--d-model 512` (probably bigger ROCm win)
+- Batch-size sweep at d_model=384 (more parallel work per dispatch)
 - Language-model-sized activations (10× bigger matmuls)
 - ROCm vs CUDA parity on an NVIDIA host (cudarc backend is plumbed
   but we haven't had access to validate)
@@ -121,4 +145,9 @@ time MODGRAD_BACKEND=cpu ./target/release/mazes --size 21 --ticks 16 \
     --steps 200 --batch 4 --d-model 384 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
 time ./target/release/mazes --size 21 --ticks 16 \
     --steps 200 --batch 4 --d-model 384 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
+# XL:
+time MODGRAD_BACKEND=cpu ./target/release/mazes --size 21 --ticks 16 \
+    --steps 200 --batch 4 --d-model 512 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
+time ./target/release/mazes --size 21 --ticks 16 \
+    --steps 200 --batch 4 --d-model 512 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
 ```
