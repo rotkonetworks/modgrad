@@ -1049,6 +1049,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "dream_bench"
+version = "0.1.0"
+
+[[package]]
+name = "dream_gallery"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
+]
+
+[[package]]
 name = "dyn-stack"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1345,6 +1356,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "filter_viz"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
 ]
 
 [[package]]
@@ -2371,12 +2389,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "maze_viz"
+version = "0.1.0"
+
+[[package]]
 name = "mazes"
 version = "0.1.0"
 dependencies = [
  "modgrad-codec",
  "modgrad-compute",
  "modgrad-ctm",
+ "modgrad-device",
  "modgrad-persist",
  "modgrad-training",
  "modgrad-traits",
@@ -2509,6 +2532,7 @@ dependencies = [
  "modgrad-traits",
  "rayon",
  "serde",
+ "tracing",
  "wincode",
  "wincode-derive",
 ]
@@ -2635,6 +2659,10 @@ dependencies = [
  "wincode",
  "wincode-derive",
 ]
+
+[[package]]
+name = "modgrad-prompts"
+version = "0.1.0"
 
 [[package]]
 name = "modgrad-training"
@@ -3850,6 +3878,13 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "retina_viz"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
+]
 
 [[package]]
 name = "ring"

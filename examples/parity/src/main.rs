@@ -11,7 +11,7 @@
 
 use modgrad_ctm::config::{CtmConfig, ExitStrategy};
 use modgrad_ctm::weights::CtmWeights;
-use modgrad_ctm::train::{train_step, CtmGradients, TrainResult};
+use modgrad_ctm::train::{train_step, CtmGradients};
 use modgrad_ctm::forward::ctm_forward;
 
 fn main() {

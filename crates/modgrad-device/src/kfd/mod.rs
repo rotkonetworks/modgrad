@@ -782,7 +782,10 @@ impl HsaDevice {
         };
         self.signal_value += 1;
 
-        // Record put position before dispatch for ring dump
+        // Record put position before dispatch for ring dump.
+        // cfg-gated to match its only use site below — keeps release
+        // builds warning-free without needing an `_put_before`.
+        #[cfg(debug_assertions)]
         let put_before = self.queue.put;
 
         self.queue.dispatch_lds(

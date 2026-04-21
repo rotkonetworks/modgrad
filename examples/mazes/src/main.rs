@@ -13,8 +13,8 @@ mod maze_gen;
 
 use maze_gen::*;
 use modgrad_ctm::config::{CtmConfig, ExitStrategy};
-use modgrad_ctm::weights::{CtmWeights, CtmState};
-use modgrad_ctm::train::{Ctm, CtmGradients, accumulate_gradients};
+use modgrad_ctm::weights::CtmWeights;
+use modgrad_ctm::train::{Ctm, accumulate_gradients};
 use modgrad_ctm::graph::{
     RegionalConfig, RegionalWeights, RegionalGradients, RegionalState,
     RegionalAdamW, RegionalBrain, regional_forward,
@@ -191,11 +191,6 @@ fn main() {
     // ── Encoder: visual retina → spatial tokens ──
     let mut encoder = VisualRetina::maze(maze_size, maze_size);
     let token_dim = encoder.token_dim();
-
-    // Freeze the (h_tok, w_tok) grid the retina produces so the bypass
-    // path can emit the same shape. stage_dims returns all three layer
-    // grids; we only need the last (V4).
-    let (_, _, _, _, h_tok, w_tok) = encoder.stage_dims();
 
     // Probe token count with dummy image
     let dummy = vec![0.0f32; 3 * maze_size * maze_size];

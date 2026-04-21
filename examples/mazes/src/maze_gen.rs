@@ -44,12 +44,6 @@ impl MazeRng {
         (self.next() >> 33) as usize % max
     }
 
-    fn shuffle<T>(&mut self, v: &mut [T]) {
-        for i in (1..v.len()).rev() {
-            let j = self.range(i + 1);
-            v.swap(i, j);
-        }
-    }
 }
 
 /// Generate a random solvable maze using randomized DFS (recursive backtracker).

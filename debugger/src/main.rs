@@ -101,6 +101,10 @@ struct App {
 
     // Controls
     paused: bool,
+    /// Reserved for an inject-text input widget; not yet wired to
+    /// the UI, but kept in the State struct so the egui panel build
+    /// path can reference it when the widget lands.
+    #[allow(dead_code)]
     inject_text: String,
     poll_interval: f32,
     last_poll: std::time::Instant,
@@ -244,7 +248,6 @@ impl App {
 
     fn build_neuron_positions(&mut self, d_models: &[usize]) {
         self.neuron_positions.clear();
-        let n = d_models.len();
         let mut rng = 42u64;
         let mut rand_f = || -> f32 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
