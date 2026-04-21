@@ -10,6 +10,16 @@ eval numbers are expected to match bit-for-bit when the GPU path is
 correct. Any divergence indicates a silent numerical bug (this is how
 we found the ROCm VRAM-cache invalidation issue — see commit 7f17f42).
 
+**Wall-time caveat.** All the numbers below are single-shot
+measurements on a thermally-limited laptop iGPU. A repeat run of
+d_model=384 ROCm measured **594 s** where the prior run measured
+**393 s** — same binary, same seed, same eval bit-for-bit. The 50 %
+spread correlates with SoC thermal state after hours of back-to-back
+benching plus background load from other processes. Treat the headline
+percentages as upper-bound hints, not tight measurements. Meaningful
+comparisons need a controlled cooldown and concurrent-load control,
+neither of which this log has.
+
 ## Configurations measured
 
 ### Small: `--size 11 --ticks 8 --steps 500 --batch 4 --d-model 128 --route-len 10`
