@@ -342,15 +342,24 @@ fn multihead_attention(
     out_proj.forward(&concat_heads)
 }
 
+/// Partial matvec: compute rows `[row_start, row_end)` of
+/// `out = linear.weight @ x + linear.bias`.
+///
+/// The slice `linear.weight[row_start * in_dim .. row_end * in_dim]`
+/// is contiguous (weight is row-major `[out_dim × in_dim]`), so the
+/// partial computation is itself a well-formed matvec on the weight
+/// sub-block — dispatched through `ops::matvec`.
 fn linear_slice(x: &[f32], linear: &Linear, row_start: usize, row_end: usize) -> Vec<f32> {
     let in_dim = linear.in_dim;
-    let mut out = Vec::with_capacity(row_end - row_start);
-    for r in row_start..row_end {
-        let w = &linear.weight[r * in_dim..(r + 1) * in_dim];
-        let mut sum = linear.bias[r];
-        for j in 0..in_dim { sum += w[j] * x[j]; }
-        out.push(sum);
-    }
+    let out_dim = row_end - row_start;
+    let w_slice = &linear.weight[row_start * in_dim..row_end * in_dim];
+    let b_slice = &linear.bias[row_start..row_end];
+    let mut out = vec![0.0f32; out_dim];
+    modgrad_device::backend::ops::matvec(
+        x, w_slice, b_slice, &mut out,
+        out_dim, in_dim,
+        modgrad_device::backend::QuantKind::F32,
+    ).expect("linear_slice: matvec dispatch");
     out
 }
 
