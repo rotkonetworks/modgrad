@@ -38,16 +38,33 @@ fn try_result(ok: bool, op_name: &'static str) -> Result<(), BackendError> {
 }
 
 impl KfdBackend {
-    /// Probe the KFD runtime. Returns `None` when:
-    ///   - The `kfd` Cargo feature is disabled (KFD is opt-in, not a
-    ///     default backend). Users running on gfx1102 who want the
-    ///     hand-written fast path enable it explicitly.
+    /// Probe the KFD runtime. Returns `None` when any of:
+    ///   - The `kfd` Cargo feature is disabled.
+    ///   - `MODGRAD_ENABLE_KFD` is not set (belt-and-suspenders guard
+    ///     while the ring-stall bug is being investigated — see the
+    ///     comment below).
     ///   - No supported GPU is present at runtime.
+    ///
+    /// Why the extra env-var gate: session 2026-04-21 found the KFD
+    /// compute ring reaches a wedged state (put=4194313, read=9 —
+    /// exact same values every process) after the boot-probe phase,
+    /// even when the training code is configured to only dispatch
+    /// single-workgroup matvecs to KFD. Ring state appears to
+    /// persist across processes or the self-test dispatches are
+    /// themselves filling the ring without the GPU draining.
+    /// Root cause not yet narrowed. Until then, default-enabling KFD
+    /// turns every `cargo build -p mazes --features kfd` binary into
+    /// one that panics on first forward pass. Safer to require
+    /// explicit opt-in: `MODGRAD_ENABLE_KFD=1 ./mazes ...`.
     pub fn try_new() -> Option<Self> {
         #[cfg(not(feature = "kfd"))]
         { return None; }
         #[cfg(feature = "kfd")]
         {
+            match std::env::var("MODGRAD_ENABLE_KFD").as_deref() {
+                Ok("1") | Ok("true") | Ok("yes") => {}
+                _ => return None,
+            }
             if accel::available() {
                 Some(Self { available: true })
             } else {
