@@ -318,13 +318,6 @@ impl Backend for RocmBackend {
             match op {
                 Op::Matvec { quant: QuantKind::F32, out_dim, in_dim, .. }
                     if *out_dim >= 64 && *in_dim >= 64 => true,
-                // MatvecT is the input-gradient leg of linear_backward:
-                //   d_input = W^T @ d_out
-                // Without this, half of every Linear backward stays on
-                // CPU while the outer-product-acc leg could also route
-                // to GPU (TODO). Same shape bound as matvec.
-                Op::MatvecT { out_dim, in_dim, .. }
-                    if *out_dim >= 64 && *in_dim >= 64 => true,
                 Op::MatmulNN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 _ => false,
@@ -361,10 +354,6 @@ impl Backend for RocmBackend {
                     out_dim, in_dim,
                     quant: QuantKind::F32,
                 } => self.matvec_f32(x, weight, bias, out, *out_dim, *in_dim),
-                Op::MatvecT {
-                    d_out, weight, d_input,
-                    out_dim, in_dim,
-                } => self.matvec_t_f32(d_out, weight, d_input, *out_dim, *in_dim),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
                 } => {
@@ -508,80 +497,6 @@ impl RocmBackend {
         }
 
         d_y.download_f32(out)
-    }
-
-    /// d_input = W^T @ d_out, f32, via hipblasSgemv.
-    ///
-    /// Shape: W is row-major [out_dim × in_dim]; d_out has length
-    /// out_dim; d_input has length in_dim (output). Overwrites
-    /// d_input — caller who wants accumulation zero-fills and
-    /// adds externally.
-    ///
-    /// hipBLAS is column-major. Our row-major W reads as col-major
-    /// [in_dim × out_dim]. With OP_N (no transpose), SGEMV computes
-    /// `y = A @ x` where A is col-major [m × n] = [in_dim × out_dim],
-    /// x = d_out (length out_dim), y = d_input (length in_dim).
-    /// That's exactly (row-major W)^T @ d_out. No actual transpose
-    /// instruction needed — it's just how the two memory layouts
-    /// relate.
-    fn matvec_t_f32(
-        &self,
-        d_out: &[f32],
-        weight: &[f32],
-        d_input: &mut [f32],
-        out_dim: usize,
-        in_dim: usize,
-    ) -> Result<(), BackendError> {
-        debug_assert_eq!(weight.len(), out_dim * in_dim, "rocm matvec_t: weight len mismatch");
-        debug_assert!(d_out.len() >= out_dim, "rocm matvec_t: d_out shorter than out_dim");
-        debug_assert!(d_input.len() >= in_dim, "rocm matvec_t: d_input shorter than in_dim");
-
-        let in_dim_i32 = as_i32(in_dim, "in_dim")?;
-        let out_dim_i32 = as_i32(out_dim, "out_dim")?;
-
-        // Weight shares the same cache bypass path as forward matvec.
-        let d_w_ptr = self.cached_weight_ptr(weight)?;
-        let d_x = HipBuffer::alloc(out_dim * 4)?;
-        let d_y = HipBuffer::alloc(in_dim * 4)?;
-
-        d_x.upload_f32(d_out)?;
-        // seed d_y with zeros — MatvecT overwrites, no bias term.
-        let zeros = vec![0.0f32; in_dim];
-        d_y.upload_f32(&zeros)?;
-
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let handle = self.handle.lock()
-            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
-        let status = unsafe {
-            ffi::hipblasSgemv(
-                *handle,
-                ffi::HIPBLAS_OP_N,  // key difference vs matvec_f32
-                in_dim_i32,
-                out_dim_i32,
-                &alpha,
-                d_w_ptr,
-                in_dim_i32,
-                d_x.as_f32_ptr(),
-                1,
-                &beta,
-                d_y.as_f32_ptr(),
-                1,
-            )
-        };
-        drop(handle);
-        if status != 0 {
-            return Err(BackendError::Runtime(format!("hipblasSgemv (T): status {status}")));
-        }
-
-        let err = unsafe { ffi::hipDeviceSynchronize() };
-        if err != 0 {
-            return Err(BackendError::Runtime(format!(
-                "deviceSync: {}", ffi::hip_err_str(err)
-            )));
-        }
-
-        d_y.download_f32(d_input)
     }
 }
 

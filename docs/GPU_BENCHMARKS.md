@@ -33,6 +33,39 @@ At this size, the crossover happens. `out_dim=256` matmuls are large
 enough that GPU compute dominates, and ROCm pulls ahead. Eval
 numbers remain bit-identical to CPU — correctness preserved.
 
+### Extra-large: `--size 21 --ticks 16 --steps 200 --batch 4 --d-model 384 --route-len 20`
+
+| Backend | Wall time | Per-step acc | First-step acc | Notes |
+|---|---:|---:|---:|---|
+| CPU   | 465 s  | 25.8 % (OOD) | 45.0 % (OOD) | |
+| ROCm  | **413 s** (**+11 %**) | 25.8 % (OOD) | 45.0 % (OOD) | Forward matvec only; MatvecT reverted |
+
+Biggest win so far. Larger matmuls let hipBLAS compute dominate dispatch
+overhead, and eval stays bit-identical to CPU.
+
+This number came after a detour worth recording. A first pass added
+`MatvecT` (backward-pass `W^T @ x` via `hipblasSgemv` with `OP_N`) to
+the ROCm supports() gate, expecting another win. At d_model=384 the
+combined Matvec+MatvecT path measured **2.3× slower than CPU** (1091 s).
+Reverting MatvecT alone cut the time to 413 s — the win above.
+
+Why MatvecT hurt: the weight VRAM cache is currently disabled (see
+commit 7f17f42 for the correctness rationale), so every GPU matvec
+dispatch re-uploads its weight buffer via `hipMemcpyHtoD`. Adding
+MatvecT doubles the uploads per training step (forward Matvec +
+backward MatvecT), and at d_model=384 each upload moves 576 KB
+(vs 256 KB at d_model=256). The extra uploads ate the compute win.
+d_model=256 happened to sit on the favourable side of that break-even,
+which is why the earlier MatvecT benchmark passed without flagging it.
+
+Re-enabling the VRAM cache would flip this — both Matvec and MatvecT
+amortise their upload across many steps. Two paths, documented in
+`rocm.rs::cached_weight_ptr`:
+  - Version-counter cache keys (robust to in-place weight mutation)
+  - Every training loop calls `invalidate_caches()` after the optimizer
+    step (fragile but quick; isis already does this, modgrad-ctm
+    training loops do not)
+
 ## What's registered
 
 `cargo build --features rocm` produces a binary where `hipBLAS`-backed
@@ -71,4 +104,9 @@ time MODGRAD_BACKEND=cpu ./target/release/mazes --size 21 --ticks 16 \
     --steps 300 --batch 4 --d-model 256 --route-len 20 --seed 42 --ood-size 31
 time ./target/release/mazes --size 21 --ticks 16 \
     --steps 300 --batch 4 --d-model 256 --route-len 20 --seed 42 --ood-size 31
+# Extra-large:
+time MODGRAD_BACKEND=cpu ./target/release/mazes --size 21 --ticks 16 \
+    --steps 200 --batch 4 --d-model 384 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
+time ./target/release/mazes --size 21 --ticks 16 \
+    --steps 200 --batch 4 --d-model 384 --route-len 20 --lr 3e-4 --seed 42 --ood-size 31
 ```
