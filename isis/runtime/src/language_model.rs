@@ -57,6 +57,8 @@ use modgrad_compute::backend::{GpuVec, ResidencyError};
 use modgrad_device::backend::HipBatch;
 #[cfg(feature = "rocm")]
 use modgrad_transformer::{GptModelResident, KvCacheResident};
+#[cfg(feature = "rocm")]
+use modgrad_transformer::resident::GptBackwardState;
 
 // ─── Trait ────────────────────────────────────────────────────
 
@@ -100,6 +102,61 @@ pub trait LanguageModel: Send {
     /// dispatches (Q4_K → fp32 unpack, future bf16 → fp32 promote)
     /// are not blocked by the trait shape.
     fn ensure_resident(&mut self, batch: &HipBatch) -> Result<(), ResidencyError>;
+
+    // ─── Backward chain ───────────────────────────────────────────
+    //
+    // Per-position backward — implementors that have a resident
+    // backward path expose it here. The trainer drives one call per
+    // position; per-call grads accumulate into the model's host master
+    // weights via `accumulate_host_grads_into` between calls.
+
+    /// Per-model backward state (activation scratch + GPU grad
+    /// buffers). Allocated once per training run via
+    /// `alloc_backward_state` and reused across `train_step` calls.
+    type BackwardState;
+
+    /// Pre-allocate per-position backward state. Sized to fit one
+    /// token's activations through every layer plus `[vocab × d_model]`
+    /// gradient buffers for embed and lm_head.
+    fn alloc_backward_state(
+        &self,
+        kv_cache: &KvCacheResident,
+    ) -> Result<Self::BackwardState, ResidencyError>;
+
+    /// Forward-with-cache for one token at `position`. Populates
+    /// `state.block_scratches` so `backward_position` can reverse the
+    /// chain. Writes logits for that position into `logits_out`
+    /// (`logits_out.len()` must equal `vocab_size()`).
+    ///
+    /// Caller is responsible for sequencing `forward_for_backward_position`
+    /// and `backward_position` per token: forward then backward, then
+    /// move to the next position. Skipping the matched forward will
+    /// read stale activations from the previous position's call.
+    fn forward_for_backward_position(
+        &mut self,
+        batch: &HipBatch,
+        token_id: i64,
+        position: usize,
+        kv_cache: &mut KvCacheResident,
+        state: &mut Self::BackwardState,
+        logits_out: &mut GpuVec,
+    ) -> Result<(), ResidencyError>;
+
+    /// Per-token backward. Call once per position, accumulating into
+    /// `state`. `d_logits` is `dL/d(logits)` for that position
+    /// (`vocab_size()`-sized). `state`'s per-`Linear` grad buffers are
+    /// **overwritten** by this call (one call ⇒ one position's grads);
+    /// the trainer is responsible for downloading and accumulating
+    /// across positions before the AdamW step.
+    fn backward_position(
+        &mut self,
+        batch: &HipBatch,
+        token_id: i64,
+        position: usize,
+        kv_cache: &mut KvCacheResident,
+        state: &mut Self::BackwardState,
+        d_logits: &GpuVec,
+    ) -> Result<(), ResidencyError>;
 }
 
 // ─── GptModelResident impl ────────────────────────────────────
@@ -149,5 +206,42 @@ impl LanguageModel for GptModelResident {
         // class models lands as a separate slice with
         // `LinearResidentStreaming`-flavored blocks.
         Ok(())
+    }
+
+    type BackwardState = GptBackwardState;
+
+    fn alloc_backward_state(
+        &self,
+        kv_cache: &KvCacheResident,
+    ) -> Result<Self::BackwardState, ResidencyError> {
+        GptModelResident::alloc_backward_state(self, kv_cache)
+    }
+
+    fn forward_for_backward_position(
+        &mut self,
+        batch: &HipBatch,
+        token_id: i64,
+        position: usize,
+        kv_cache: &mut KvCacheResident,
+        state: &mut Self::BackwardState,
+        logits_out: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        GptModelResident::forward_for_backward(
+            self, batch, token_id, position, kv_cache, state, logits_out,
+        )
+    }
+
+    fn backward_position(
+        &mut self,
+        batch: &HipBatch,
+        token_id: i64,
+        position: usize,
+        kv_cache: &mut KvCacheResident,
+        state: &mut Self::BackwardState,
+        d_logits: &GpuVec,
+    ) -> Result<(), ResidencyError> {
+        GptModelResident::backward(
+            self, batch, token_id, position, kv_cache, state, d_logits,
+        )
     }
 }
