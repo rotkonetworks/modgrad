@@ -203,49 +203,58 @@ impl SynapseUNet {
 //
 // Device-resident companion to `SynapseUNet`. Mirrors the host
 // U-Net structure (first_projection + down + up + skip LNs) as a
-// stack of `LinearResident`s with weights pinned in VRAM. Mirrors
-// the lifecycle of `LinearResident`/`RegionalResidentCache`: build
-// once via `from_synapse_unet`, refresh after optimizer steps via
-// `sync_weights_from`, dispatch through `forward` with a `&HipBatch`.
+// stack of `LinearResident`s with weights pinned in VRAM, plus
+// `HipBuffer` copies of every LayerNorm `gamma`/`beta` so the LN
+// + SiLU + skip-add chain stays fully device-resident. Build once
+// via `from_synapse_unet`, refresh after optimizer steps via
+// `sync_weights_from`, dispatch through `forward` with a
+// `&HipBatch`.
 //
-// Activation roundtrip: `modgrad_device::backend::ops` exposes
-// `MatvecResident` but no `LayerNormResident` or `LnSiluResident`.
-// Per the brief: path (b) — between matvec dispatches we
-// download into host scratch, apply `ln_silu_fwd` (and the affine
-// LN + skip-add on the up path) on the host, then re-upload. Each
-// matmul still runs on the GPU with weights resident in VRAM, but
-// every block pays a D2H + H2D for the activation. This is the
-// realistic floor until per-op resident kernels land. TODO: lift
-// the LN+SiLU and skip-add+LN passes into resident kernels — see
-// `memory/project_gpu_residency.md`.
+// Activation flow: every block runs `matvec_resident` →
+// `layer_norm_resident` → `activation_resident(Logistic)` into a
+// SiLU scratch buffer → `op_tensor_resident(Mul, x, scratch, x)`
+// to finish SiLU. The up path additionally does
+// `op_tensor_resident(Add, current, skip, current)` for the skip
+// connection followed by a second `layer_norm_resident` with the
+// per-level `skip_ln_*_dev` weights. No D2H or H2D bounces remain
+// inside the chain — every dispatch reads and writes hipMalloc'd
+// device pointers. The `&HipBatch` parameter flows into every new
+// dispatch via `note_dispatch` so the auto-sync cadence covers
+// the new ops just like it covers the matvecs.
+//
+// MIOpen's `miopenLayerNormForward` requires non-null `mean` and
+// `rstd` output pointers; the rocm backend honors that with two
+// hipMalloc/hipFree pairs per dispatch (sub-µs on this hardware).
+// We do not surface those scratch allocations here; they are
+// internal to the resident dispatch.
 
 #[cfg(feature = "rocm")]
 pub struct SynapseUNetResident {
     /// Layer widths (mirrors the host `SynapseUNet`). Used to
-    /// size scratch buffers per block.
+    /// size scratch buffers per block and validate the
+    /// `forward` input/output dims.
     pub widths: Vec<usize>,
 
     /// Initial projection: in_dims → widths[0]. The Linear weight
-    /// + bias live on-device; LN gamma/beta stay host-side because
-    /// the LN+SiLU pass is not yet a resident kernel.
+    /// + bias and the LN gamma/beta all live on-device.
     pub first_projection: modgrad_compute::neuron::LinearResident,
-    pub first_ln_gamma: Vec<f32>,
-    pub first_ln_beta: Vec<f32>,
+    pub first_ln_gamma_dev: modgrad_device::backend::HipBuffer,
+    pub first_ln_beta_dev: modgrad_device::backend::HipBuffer,
 
     /// Down blocks: widths[i] → widths[i+1].
     pub down_blocks: Vec<modgrad_compute::neuron::LinearResident>,
-    pub down_ln_gamma: Vec<Vec<f32>>,
-    pub down_ln_beta: Vec<Vec<f32>>,
+    pub down_ln_gamma_dev: Vec<modgrad_device::backend::HipBuffer>,
+    pub down_ln_beta_dev: Vec<modgrad_device::backend::HipBuffer>,
 
     /// Up blocks: widths[i+1] → widths[i] (stored in down-order,
     /// applied in reverse).
     pub up_blocks: Vec<modgrad_compute::neuron::LinearResident>,
-    pub up_ln_gamma: Vec<Vec<f32>>,
-    pub up_ln_beta: Vec<Vec<f32>>,
+    pub up_ln_gamma_dev: Vec<modgrad_device::backend::HipBuffer>,
+    pub up_ln_beta_dev: Vec<modgrad_device::backend::HipBuffer>,
 
     /// Skip-connection LayerNorm parameters (one per up level).
-    pub skip_ln_gamma: Vec<Vec<f32>>,
-    pub skip_ln_beta: Vec<Vec<f32>>,
+    pub skip_ln_gamma_dev: Vec<modgrad_device::backend::HipBuffer>,
+    pub skip_ln_beta_dev: Vec<modgrad_device::backend::HipBuffer>,
 
     /// Host-side dim cached for the input projection (= in_dim of
     /// `first_projection`). Used to validate `forward` arguments.
@@ -256,92 +265,155 @@ pub struct SynapseUNetResident {
 
 #[cfg(feature = "rocm")]
 impl SynapseUNetResident {
+    /// Allocate a `HipBuffer` sized for `host.len()` floats and
+    /// upload `host` into it. Used by `from_synapse_unet` and
+    /// `sync_weights_from` to stage LN gamma/beta arrays onto the
+    /// device. The caller is responsible for ensuring the buffer
+    /// outlives every dispatch that reads from it (which here
+    /// means: the buffer is owned by `Self`).
+    fn upload_param_dev(
+        host: &[f32],
+    ) -> Result<modgrad_device::backend::HipBuffer, modgrad_compute::backend::ResidencyError> {
+        let buf = modgrad_device::backend::HipBuffer::new(host.len() * 4)?;
+        buf.copy_from_host(host)?;
+        Ok(buf)
+    }
+
     /// Allocate device buffers and upload every Linear's weight +
-    /// bias. LN gamma/beta arrays are cloned to host-owned `Vec`s
-    /// because the LN+SiLU pass is not yet a resident kernel — see
-    /// the H2D/D2H roundtrip note in `forward`.
+    /// bias and every LN gamma/beta. After this returns, every
+    /// parameter the resident `forward` reads lives in VRAM and
+    /// stays there until `Self` is dropped.
     pub fn from_synapse_unet(
         unet: &SynapseUNet,
     ) -> Result<Self, modgrad_compute::backend::ResidencyError> {
         use modgrad_compute::neuron::LinearResident;
         let first_projection = LinearResident::from_linear(&unet.first_projection.linear)?;
+        let first_ln_gamma_dev = Self::upload_param_dev(&unet.first_projection.ln_gamma)?;
+        let first_ln_beta_dev = Self::upload_param_dev(&unet.first_projection.ln_beta)?;
+
         let down_blocks = unet.down_blocks.iter()
             .map(|b| LinearResident::from_linear(&b.linear))
             .collect::<Result<Vec<_>, _>>()?;
+        let down_ln_gamma_dev = unet.down_blocks.iter()
+            .map(|b| Self::upload_param_dev(&b.ln_gamma))
+            .collect::<Result<Vec<_>, _>>()?;
+        let down_ln_beta_dev = unet.down_blocks.iter()
+            .map(|b| Self::upload_param_dev(&b.ln_beta))
+            .collect::<Result<Vec<_>, _>>()?;
+
         let up_blocks = unet.up_blocks.iter()
             .map(|b| LinearResident::from_linear(&b.linear))
             .collect::<Result<Vec<_>, _>>()?;
-        let down_ln_gamma = unet.down_blocks.iter().map(|b| b.ln_gamma.clone()).collect();
-        let down_ln_beta = unet.down_blocks.iter().map(|b| b.ln_beta.clone()).collect();
-        let up_ln_gamma = unet.up_blocks.iter().map(|b| b.ln_gamma.clone()).collect();
-        let up_ln_beta = unet.up_blocks.iter().map(|b| b.ln_beta.clone()).collect();
+        let up_ln_gamma_dev = unet.up_blocks.iter()
+            .map(|b| Self::upload_param_dev(&b.ln_gamma))
+            .collect::<Result<Vec<_>, _>>()?;
+        let up_ln_beta_dev = unet.up_blocks.iter()
+            .map(|b| Self::upload_param_dev(&b.ln_beta))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let skip_ln_gamma_dev = unet.skip_ln_gamma.iter()
+            .map(|g| Self::upload_param_dev(g))
+            .collect::<Result<Vec<_>, _>>()?;
+        let skip_ln_beta_dev = unet.skip_ln_beta.iter()
+            .map(|g| Self::upload_param_dev(g))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             widths: unet.widths.clone(),
             first_projection,
-            first_ln_gamma: unet.first_projection.ln_gamma.clone(),
-            first_ln_beta: unet.first_projection.ln_beta.clone(),
+            first_ln_gamma_dev,
+            first_ln_beta_dev,
             down_blocks,
-            down_ln_gamma,
-            down_ln_beta,
+            down_ln_gamma_dev,
+            down_ln_beta_dev,
             up_blocks,
-            up_ln_gamma,
-            up_ln_beta,
-            skip_ln_gamma: unet.skip_ln_gamma.clone(),
-            skip_ln_beta: unet.skip_ln_beta.clone(),
+            up_ln_gamma_dev,
+            up_ln_beta_dev,
+            skip_ln_gamma_dev,
+            skip_ln_beta_dev,
             in_dim: unet.first_projection.linear.in_dim,
             out_dim: unet.widths[0],
         })
     }
 
-    /// Re-upload every Linear's weight + bias and refresh the
-    /// host-side LN parameter caches. Call after every optimizer
-    /// step that mutated the host `SynapseUNet`.
+    /// Re-upload every Linear's weight + bias and every LN
+    /// gamma/beta. Call after every optimizer step that mutated
+    /// the host `SynapseUNet`. Buffer sizes match the original
+    /// upload (the U-Net topology is fixed at
+    /// `from_synapse_unet`); we re-use the existing
+    /// `HipBuffer`s rather than reallocating.
     pub fn sync_weights_from(
         &mut self, unet: &SynapseUNet,
     ) -> Result<(), modgrad_compute::backend::ResidencyError> {
         debug_assert_eq!(self.down_blocks.len(), unet.down_blocks.len());
         debug_assert_eq!(self.up_blocks.len(), unet.up_blocks.len());
+
         self.first_projection.sync_weights_from(&unet.first_projection.linear)?;
-        self.first_ln_gamma.copy_from_slice(&unet.first_projection.ln_gamma);
-        self.first_ln_beta.copy_from_slice(&unet.first_projection.ln_beta);
+        self.first_ln_gamma_dev.copy_from_host(&unet.first_projection.ln_gamma)?;
+        self.first_ln_beta_dev.copy_from_host(&unet.first_projection.ln_beta)?;
+
         for (r, b) in self.down_blocks.iter_mut().zip(&unet.down_blocks) {
             r.sync_weights_from(&b.linear)?;
         }
-        for (g, b) in self.down_ln_gamma.iter_mut().zip(&unet.down_blocks) {
-            g.copy_from_slice(&b.ln_gamma);
+        for (g, b) in self.down_ln_gamma_dev.iter().zip(&unet.down_blocks) {
+            g.copy_from_host(&b.ln_gamma)?;
         }
-        for (g, b) in self.down_ln_beta.iter_mut().zip(&unet.down_blocks) {
-            g.copy_from_slice(&b.ln_beta);
+        for (g, b) in self.down_ln_beta_dev.iter().zip(&unet.down_blocks) {
+            g.copy_from_host(&b.ln_beta)?;
         }
+
         for (r, b) in self.up_blocks.iter_mut().zip(&unet.up_blocks) {
             r.sync_weights_from(&b.linear)?;
         }
-        for (g, b) in self.up_ln_gamma.iter_mut().zip(&unet.up_blocks) {
-            g.copy_from_slice(&b.ln_gamma);
+        for (g, b) in self.up_ln_gamma_dev.iter().zip(&unet.up_blocks) {
+            g.copy_from_host(&b.ln_gamma)?;
         }
-        for (g, b) in self.up_ln_beta.iter_mut().zip(&unet.up_blocks) {
-            g.copy_from_slice(&b.ln_beta);
+        for (g, b) in self.up_ln_beta_dev.iter().zip(&unet.up_blocks) {
+            g.copy_from_host(&b.ln_beta)?;
         }
-        for (g, src) in self.skip_ln_gamma.iter_mut().zip(&unet.skip_ln_gamma) {
-            g.copy_from_slice(src);
+
+        for (g, src) in self.skip_ln_gamma_dev.iter().zip(&unet.skip_ln_gamma) {
+            g.copy_from_host(src)?;
         }
-        for (g, src) in self.skip_ln_beta.iter_mut().zip(&unet.skip_ln_beta) {
-            g.copy_from_slice(src);
+        for (g, src) in self.skip_ln_beta_dev.iter().zip(&unet.skip_ln_beta) {
+            g.copy_from_host(src)?;
         }
         Ok(())
     }
 
     /// Resident U-Net forward. `x_dev` and `out_dev` are
-    /// `GpuVec::Hip`. Weights stay device-resident across the full
-    /// chain; activations roundtrip host-side once per block for
-    /// LN+SiLU (and skip-add+LN on the up path).
+    /// `GpuVec::Hip`. Every Linear, every LayerNorm, every SiLU,
+    /// and the up-path skip-add stay device-resident: zero D2H or
+    /// H2D bounces from `forward` itself. The only host work is
+    /// computing pointer offsets — every kernel reads and writes
+    /// hipMalloc'd buffers.
     ///
-    /// TODO(GPU residency follow-up): replace the per-block
-    /// `copy_to_host` / `ln_silu_fwd` / `copy_from` triple with a
-    /// resident `LnSiluResident` / `LayerNormResident` op. Same
-    /// for the up-path skip-add (`hipblasSaxpy` would do it on
-    /// device). Until those land, every block pays one D2H + one
-    /// H2D — measurable but not load-bearing for correctness.
+    /// Activation chain per block: `matvec_resident` →
+    /// `layer_norm_resident` (in-place) →
+    /// `activation_resident(Logistic)` into `silu_scratch_dev` →
+    /// `op_tensor_resident(Mul, x, silu_scratch_dev, x)`. The up
+    /// path additionally inserts an
+    /// `op_tensor_resident(Add, current, skip, current)` followed
+    /// by the affine `layer_norm_resident` with the level's
+    /// `skip_ln_*_dev` weights.
+    ///
+    /// The `silu_scratch_dev` buffer is allocated once at the
+    /// largest block size (`max(widths)`) and re-used across every
+    /// SiLU dispatch — the scratch buffer is only read inside the
+    /// immediately following `OpTensor(Mul)`, so over-sizing it is
+    /// safe and avoids per-block hipMalloc churn.
+    ///
+    /// `outs_down_dev` retains every down-path activation as a
+    /// device buffer because the up path reads them as skip
+    /// inputs. We pop the bottleneck out as the initial up-path
+    /// `current_dev`; the remaining entries are addressed by
+    /// `up_idx` during the up loop.
+    ///
+    /// Synchronisation: every resident dispatch counts toward the
+    /// `HipBatch::DEFAULT_SYNC_EVERY = 256` cadence via
+    /// `note_dispatch`, so the queue depth stays bounded for any
+    /// reasonable `n_blocks`. The caller is responsible for
+    /// flushing before reading `out_dev` back to host.
     pub fn forward(
         &self,
         batch: &modgrad_device::backend::HipBatch,
@@ -349,13 +421,15 @@ impl SynapseUNetResident {
         out_dev: &mut modgrad_compute::backend::GpuVec,
     ) -> Result<(), modgrad_compute::backend::ResidencyError> {
         use modgrad_compute::backend::{GpuVec, ResidencyError};
+        use modgrad_device::backend::BinaryOpKind;
         debug_assert_eq!(x_dev.len(), self.in_dim);
         debug_assert_eq!(out_dev.len(), self.out_dim);
 
-        // Boundary check: forward only consumes Hip-resident input.
-        // A Heap or Vram GpuVec slipping in is a caller bug; surface
-        // it as `WrongVariant` rather than panicking deeper inside
-        // `LinearResident::forward`.
+        // Boundary check: forward only consumes Hip-resident input
+        // and writes Hip-resident output. A Heap or Vram GpuVec
+        // slipping in is a caller bug; surface it as
+        // `WrongVariant` rather than panicking deeper inside the
+        // dispatch path.
         match x_dev {
             GpuVec::Hip(_) => {}
             other => return Err(ResidencyError::WrongVariant {
@@ -371,116 +445,285 @@ impl SynapseUNetResident {
 
         let n_blocks = self.down_blocks.len();
 
+        // LayerNorm epsilon. Matches the host CPU LN reference
+        // (`modgrad-device/backend/cpu.rs::layer_norm_fwd`) so
+        // numerical equivalence holds modulo MIOpen's sqrt/exp
+        // precision differences.
+        const LN_EPS: f32 = 1e-5;
+
+        // SiLU scratch buffer: sized to the widest block so it
+        // can be reused across every block's SiLU dispatch
+        // without reallocation. Reads/writes only the leading
+        // `widths[i]` floats per call; the trailing capacity is
+        // unused. Sub-µs hipMalloc cost is paid once per forward.
+        let max_width = *self.widths.iter().max().unwrap_or(&self.out_dim);
+        let silu_scratch_dev = modgrad_device::backend::HipBuffer::new(max_width * 4)?;
+        let silu_scratch_ptr = silu_scratch_dev.device_ptr() as *mut f32;
+
+        // Helper closure: run LN + SiLU in-place on a HipBuffer,
+        // using the supplied LN gamma/beta device pointers. This
+        // is the chain that replaces the previous D2H → host
+        // `ln_silu_fwd` → H2D triple.
+        //
+        // Inlined manually below (closures over &HipBuffer are
+        // ergonomic but obscure the dispatch sequence; explicit
+        // inlining keeps the resident chain easy to audit).
+
         // Stage 1: first_projection (in_dim → widths[0]).
         //
-        // We always need outs_down[0] held host-side (it's the
-        // shallowest skip target) and on-device (it's input to
-        // down_blocks[0] when n_blocks > 0, or it's the final
-        // output when n_blocks == 0). Stage activation on host
-        // for LN+SiLU + skip retention; re-upload to a fresh
-        // device buffer for the next dispatch.
+        // When `n_blocks == 0` (depth-1 case, no down/up path),
+        // the first projection IS the U-Net output — write
+        // directly into `out_dev`. Otherwise, allocate a fresh
+        // buffer, fill it via the projection, and stash it as
+        // `outs_down_dev[0]` for the down loop.
+        let mut outs_down_dev: Vec<GpuVec> = Vec::with_capacity(n_blocks + 1);
+
+        if n_blocks == 0 {
+            // Depth-1: first projection produces the final
+            // activation directly into `out_dev`.
+            self.first_projection.forward(batch, x_dev, out_dev)?;
+            self.layer_norm_silu_resident_inplace(
+                batch,
+                out_dev,
+                &self.first_ln_gamma_dev,
+                &self.first_ln_beta_dev,
+                self.widths[0],
+                silu_scratch_ptr,
+                LN_EPS,
+            )?;
+            return Ok(());
+        }
+
+        // n_blocks > 0: stage outs_down_dev[0] = first_act.
         let mut first_dev = GpuVec::try_hip(self.widths[0])?;
         self.first_projection.forward(batch, x_dev, &mut first_dev)?;
-        // D2H roundtrip — see TODO at fn-doc.
-        batch.flush()?;
-        let mut first_host = vec![0.0f32; self.widths[0]];
-        match &first_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut first_host)?,
-            _ => unreachable!("we just allocated Hip"),
-        }
-        // LN + SiLU on host (same dispatch path as
-        // `SynapseBlock::forward`).
-        let mut first_act = vec![0.0f32; self.widths[0]];
-        modgrad_device::backend::ops::ln_silu_fwd(
-            &first_host, &self.first_ln_gamma, &self.first_ln_beta,
-            &mut first_act, None, 1, self.widths[0],
+        self.layer_norm_silu_resident_inplace(
+            batch,
+            &mut first_dev,
+            &self.first_ln_gamma_dev,
+            &self.first_ln_beta_dev,
+            self.widths[0],
+            silu_scratch_ptr,
+            LN_EPS,
         )?;
+        outs_down_dev.push(first_dev);
 
-        // Down-path skip cache. outs_down[0] = first_act,
-        // outs_down[i+1] = down_blocks[i] applied to outs_down[i].
-        // Host-side because every level is read again on the up
-        // path for the skip-add.
-        let mut outs_down: Vec<Vec<f32>> = Vec::with_capacity(n_blocks + 1);
-        outs_down.push(first_act);
-
-        // Stage 2: down blocks. Re-upload the previous level's
-        // activation as the input to the next matvec, then
-        // download for LN+SiLU.
-        let mut current_dev = first_dev;
+        // Stage 2: down blocks. Each block reads
+        // outs_down_dev[i], writes a fresh buffer of size
+        // widths[i+1], runs LN + SiLU on it, and pushes the
+        // result onto outs_down_dev. We do NOT reuse buffers
+        // across levels because the up path needs every level's
+        // activation as a skip input.
         for i in 0..n_blocks {
-            // Upload outs_down[i] into current_dev (resize
-            // unnecessary — current_dev was widths[i] from the
-            // previous round, which matches outs_down[i].len()).
-            current_dev.copy_from(outs_down.last().unwrap());
-
-            // matvec_resident widths[i] → widths[i+1].
             let mut next_dev = GpuVec::try_hip(self.widths[i + 1])?;
-            self.down_blocks[i].forward(batch, &current_dev, &mut next_dev)?;
-            batch.flush()?;
-            let mut next_host = vec![0.0f32; self.widths[i + 1]];
-            match &next_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut next_host)?,
-                _ => unreachable!("Hip alloc"),
-            }
-            let mut next_act = vec![0.0f32; self.widths[i + 1]];
-            modgrad_device::backend::ops::ln_silu_fwd(
-                &next_host, &self.down_ln_gamma[i], &self.down_ln_beta[i],
-                &mut next_act, None, 1, self.widths[i + 1],
+            // borrow outs_down_dev[i] for matvec — split-borrow
+            // pattern: the `forward` call only reads its first
+            // arg and writes its second, and `next_dev` is a
+            // disjoint allocation, so no aliasing.
+            let prev_dev = outs_down_dev.last().expect("outs_down_dev[0] pushed above");
+            self.down_blocks[i].forward(batch, prev_dev, &mut next_dev)?;
+            self.layer_norm_silu_resident_inplace(
+                batch,
+                &mut next_dev,
+                &self.down_ln_gamma_dev[i],
+                &self.down_ln_beta_dev[i],
+                self.widths[i + 1],
+                silu_scratch_ptr,
+                LN_EPS,
             )?;
-            outs_down.push(next_act);
-            current_dev = next_dev;
+            outs_down_dev.push(next_dev);
         }
 
-        // Stage 3: up path. Start from the bottleneck
-        // (outs_down[n_blocks]); each iteration takes
-        // widths[up_idx+1] → widths[up_idx], adds the matching
-        // skip from outs_down[up_idx], affine-LNs the sum, then
-        // continues. The skip-add and LN are host-side for the
-        // same reason LN+SiLU is.
-        let mut current_host = outs_down[n_blocks].clone();
+        // Stage 3: up path. Pop the bottleneck out as the initial
+        // `current_dev`; the remaining outs_down_dev entries
+        // (indices 0..n_blocks) are still live as skip inputs.
+        let mut current_dev = outs_down_dev.pop()
+            .expect("bottleneck pushed in down loop");
+
         for i in 0..n_blocks {
             let up_idx = n_blocks - 1 - i;
-            // Upload current host activation onto a fresh device
-            // buffer of the right size.
-            let mut up_in_dev = GpuVec::try_hip(self.widths[up_idx + 1])?;
-            up_in_dev.copy_from(&current_host);
+            let is_last = i == n_blocks - 1;
+
+            // Allocate the up-path activation buffer for this
+            // level. matvec writes widths[up_idx+1] →
+            // widths[up_idx]. On the LAST iteration we still
+            // produce the activation in `up_out_dev`, then have
+            // the final skip-LN write directly into the caller's
+            // `out_dev`; on earlier iterations the skip-LN writes
+            // back into `up_out_dev` and we roll it into
+            // `current_dev`.
+            let mut up_out_dev = GpuVec::try_hip(self.widths[up_idx])?;
 
             // matvec_resident widths[up_idx+1] → widths[up_idx].
-            let mut up_out_dev = GpuVec::try_hip(self.widths[up_idx])?;
-            self.up_blocks[up_idx].forward(batch, &up_in_dev, &mut up_out_dev)?;
-            batch.flush()?;
-            let mut up_out_host = vec![0.0f32; self.widths[up_idx]];
-            match &up_out_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut up_out_host)?,
-                _ => unreachable!("Hip alloc"),
-            }
-            // LN + SiLU on the up output (matches
-            // `SynapseBlock::forward`).
-            let mut up_act = vec![0.0f32; self.widths[up_idx]];
-            modgrad_device::backend::ops::ln_silu_fwd(
-                &up_out_host, &self.up_ln_gamma[up_idx], &self.up_ln_beta[up_idx],
-                &mut up_act, None, 1, self.widths[up_idx],
+            self.up_blocks[up_idx].forward(batch, &current_dev, &mut up_out_dev)?;
+
+            // LN + SiLU in-place on up_out_dev (matches host
+            // `SynapseBlock::forward`: Linear → LN → SiLU).
+            self.layer_norm_silu_resident_inplace(
+                batch,
+                &mut up_out_dev,
+                &self.up_ln_gamma_dev[up_idx],
+                &self.up_ln_beta_dev[up_idx],
+                self.widths[up_idx],
+                silu_scratch_ptr,
+                LN_EPS,
             )?;
-            // Skip-add: up_act += outs_down[up_idx]. Host-side;
-            // see TODO at fn-doc.
-            let skip = &outs_down[up_idx];
-            debug_assert_eq!(up_act.len(), skip.len());
-            for j in 0..up_act.len() {
-                up_act[j] += skip[j];
+
+            // Skip-add: up_out_dev += outs_down_dev[up_idx].
+            // op_tensor_resident with alpha1=alpha2=1, beta=0:
+            //   c = 1*a + 1*b + 0*c = a + b.
+            // We aliase c=a (write back into up_out_dev). MIOpen
+            // permits read-then-write aliasing per element.
+            let skip_dev = &outs_down_dev[up_idx];
+            let skip_ptr = match skip_dev {
+                GpuVec::Hip(buf) => buf.device_ptr() as *const f32,
+                _ => unreachable!("outs_down_dev populated with try_hip"),
+            };
+            let up_out_ptr_const = match &up_out_dev {
+                GpuVec::Hip(buf) => buf.device_ptr() as *const f32,
+                _ => unreachable!("we just allocated try_hip"),
+            };
+            let up_out_ptr_mut = match &up_out_dev {
+                GpuVec::Hip(buf) => buf.device_ptr() as *mut f32,
+                _ => unreachable!("we just allocated try_hip"),
+            };
+            unsafe {
+                modgrad_device::backend::ops::op_tensor_resident(
+                    up_out_ptr_const,
+                    skip_ptr,
+                    up_out_ptr_mut,
+                    self.widths[up_idx],
+                    1.0, 1.0, 0.0,
+                    BinaryOpKind::Add,
+                )?;
             }
+            batch.note_dispatch()?;
+
             // Affine LN on the sum (matches host
-            // `affine_layer_norm`).
-            let mut after_ln = vec![0.0f32; self.widths[up_idx]];
-            modgrad_device::backend::ops::layer_norm_fwd(
-                &up_act, &self.skip_ln_gamma[up_idx], &self.skip_ln_beta[up_idx],
-                &mut after_ln, None, 1, self.widths[up_idx],
-            )?;
-            current_host = after_ln;
+            // `affine_layer_norm`). On the last up-iteration the
+            // LN writes directly into the caller's `out_dev`;
+            // otherwise it writes back into up_out_dev and we
+            // roll that into current_dev for the next iteration.
+            let gamma_ptr = self.skip_ln_gamma_dev[up_idx].device_ptr() as *const f32;
+            let beta_ptr = self.skip_ln_beta_dev[up_idx].device_ptr() as *const f32;
+            if is_last {
+                let out_ptr = match out_dev {
+                    GpuVec::Hip(buf) => buf.device_ptr() as *mut f32,
+                    _ => unreachable!("checked above"),
+                };
+                unsafe {
+                    modgrad_device::backend::ops::layer_norm_resident(
+                        up_out_ptr_const,
+                        gamma_ptr,
+                        beta_ptr,
+                        out_ptr,
+                        1, self.widths[up_idx], LN_EPS,
+                    )?;
+                }
+                batch.note_dispatch()?;
+                // current_dev is dropped at scope end — its
+                // allocation is reclaimed by hipFree.
+            } else {
+                // Run LN with up_out_dev as both input and
+                // output; the rocm dispatch path reads x then
+                // writes y, so element-wise self-aliasing is
+                // safe (the kernel completes one (mean,rstd)
+                // computation per row before writing the row).
+                unsafe {
+                    modgrad_device::backend::ops::layer_norm_resident(
+                        up_out_ptr_const,
+                        gamma_ptr,
+                        beta_ptr,
+                        up_out_ptr_mut,
+                        1, self.widths[up_idx], LN_EPS,
+                    )?;
+                }
+                batch.note_dispatch()?;
+                current_dev = up_out_dev;
+            }
         }
 
-        // Stage 4: stage the final activation back onto the
-        // caller-provided `out_dev` buffer.
-        out_dev.copy_from(&current_host);
+        Ok(())
+    }
+
+    /// Resident in-place LN + SiLU on a `GpuVec::Hip` buffer.
+    ///
+    /// Sequence:
+    ///   1. `layer_norm_resident(x_dev, gamma_dev, beta_dev → x_dev)`
+    ///   2. `activation_resident(Logistic, x_dev → silu_scratch_ptr)`
+    ///   3. `op_tensor_resident(Mul, x_dev, silu_scratch_ptr → x_dev)`
+    ///
+    /// Caller supplies the LN parameter buffers and a scratch
+    /// pointer of capacity ≥ `n` floats. Each dispatch is logged
+    /// to the batch via `note_dispatch` for the auto-sync cadence.
+    /// `n` is the number of floats to process (the buffer's
+    /// effective length for this call; the underlying allocation
+    /// may be larger if the scratch is shared across blocks).
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_silu_resident_inplace(
+        &self,
+        batch: &modgrad_device::backend::HipBatch,
+        x_dev: &mut modgrad_compute::backend::GpuVec,
+        gamma_dev: &modgrad_device::backend::HipBuffer,
+        beta_dev: &modgrad_device::backend::HipBuffer,
+        n: usize,
+        silu_scratch_ptr: *mut f32,
+        epsilon: f32,
+    ) -> Result<(), modgrad_compute::backend::ResidencyError> {
+        use modgrad_compute::backend::GpuVec;
+        use modgrad_device::backend::{ActivationMode, BinaryOpKind};
+
+        let x_ptr_const = match x_dev {
+            GpuVec::Hip(buf) => buf.device_ptr() as *const f32,
+            _ => unreachable!("checked at forward entry"),
+        };
+        let x_ptr_mut = match x_dev {
+            GpuVec::Hip(buf) => buf.device_ptr() as *mut f32,
+            _ => unreachable!("checked at forward entry"),
+        };
+
+        // Step 1: in-place LN. MIOpen reads x and writes y; with
+        // x == y the kernel completes per-row stats before
+        // writing the row, so self-aliasing is safe.
+        unsafe {
+            modgrad_device::backend::ops::layer_norm_resident(
+                x_ptr_const,
+                gamma_dev.device_ptr() as *const f32,
+                beta_dev.device_ptr() as *const f32,
+                x_ptr_mut,
+                1, n, epsilon,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Step 2: sigmoid(x) → silu_scratch. SiLU is
+        // sigmoid(x) * x; we compute the gate into scratch so
+        // the multiply step in step 3 still sees the original
+        // (post-LN) x untouched until after the read.
+        unsafe {
+            modgrad_device::backend::ops::activation_resident(
+                x_ptr_const,
+                silu_scratch_ptr,
+                n,
+                ActivationMode::Logistic,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Step 3: x = x * sigmoid(x). MIOpen permits self-aliased
+        // c = a in OpTensor (read-then-write per element).
+        unsafe {
+            modgrad_device::backend::ops::op_tensor_resident(
+                x_ptr_const,
+                silu_scratch_ptr as *const f32,
+                x_ptr_mut,
+                n,
+                1.0, 1.0, 0.0,
+                BinaryOpKind::Mul,
+            )?;
+        }
+        batch.note_dispatch()?;
+
         Ok(())
     }
 }
