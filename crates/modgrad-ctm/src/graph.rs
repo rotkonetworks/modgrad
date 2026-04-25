@@ -1189,6 +1189,21 @@ pub struct RegionalWeights {
     /// Learnable blend scale for frozen cerebellum contribution.
     #[serde(skip)]
     pub cereb_blend_logit: Option<f32>,
+
+    /// Monotonic mutation counter. Bumped by every weight-mutation
+    /// entry point (`RegionalAdamW::step`, `RegionalGradients::apply`,
+    /// `apply_aux_gradients`). Resident caches snapshot this value at
+    /// build/refresh time and refuse `forward` if it diverges from
+    /// `weights.generation()` — exposing the staleness window that
+    /// used to be a runtime contract as a typed error
+    /// (`CacheError::Stale`).
+    ///
+    /// `pub(crate)` to force callers through `bump_generation()`. Any
+    /// path that mutates a field directly (rare, mostly tests) must
+    /// call `bump_generation()` afterward or dependent caches will
+    /// not detect the staleness.
+    #[serde(default)]
+    pub(crate) generation: u64,
 }
 
 impl RegionalWeights {
@@ -1323,8 +1338,22 @@ impl RegionalWeights {
             router,
             cereb_projection: None,
             cereb_blend_logit: None,
+            generation: 0,
         }
     }
+
+    /// Snapshot of the mutation counter. Resident caches read this at
+    /// build time and on every dispatch; a divergence indicates a
+    /// stale cache that must be refreshed.
+    pub fn generation(&self) -> u64 { self.generation }
+
+    /// Increment the mutation counter. Called automatically by the
+    /// in-tree optimizer paths (`RegionalAdamW::step`,
+    /// `RegionalGradients::apply`, `apply_aux_gradients`). Custom
+    /// paths that mutate weight fields directly must call this; the
+    /// `pub(crate)` visibility on `generation` is what forces the
+    /// invariant.
+    pub fn bump_generation(&mut self) { self.generation = self.generation.wrapping_add(1); }
 
     /// Configure projection layers for a frozen cerebellum model.
     /// `n_layers` is how many transformer layers the model exposes.
@@ -1849,6 +1878,9 @@ impl RegionalGradients {
             sgd(&mut router.route_proj.weight, &rg.route_proj_dw, lr);
             sgd(&mut router.route_proj.bias, &rg.route_proj_db, lr);
         }
+
+        // Invalidate dependent resident caches.
+        w.bump_generation();
     }
 
 }
@@ -2172,6 +2204,11 @@ pub fn apply_aux_gradients(
     // Its gradients flow through the main backward pass (d_region_activations),
     // not through a separate head. To wire this properly, we'd need to inject
     // d_variance into the region's backward — left for future work.
+
+    // Aux heads (cereb_predict, bg_value) are part of `RegionalWeights`;
+    // mutating them must invalidate dependent resident caches even
+    // though the caches don't currently mirror these heads.
+    w.bump_generation();
 }
 
 /// One training step: forward all outer ticks, compute loss, backward.
@@ -3424,6 +3461,12 @@ impl RegionalAdamW {
             opt.step(&mut logit_slice, &mut grad_slice, lr, 0.0, b1, b2, eps, bc1, bc2);
             *logit = logit_slice[0];
         }
+
+        // Invalidate any device-resident snapshot of these weights. One
+        // bump covers every nested mutation above (per-region SGD,
+        // connection synapses, projections, aux heads). Resident caches
+        // detect this via `RegionalResidentCache::fresh(&w)`.
+        w.bump_generation();
     }
 
     /// Save optimizer state.

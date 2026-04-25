@@ -9,18 +9,27 @@
 //! call once the cache is built.
 //!
 //! **Lifecycle.** Construct from a `RegionalWeights` via
-//! `RegionalResidentCache::from_weights(&w)?`. After every AdamW
+//! `RegionalResidentCache::from_weights(&w)?`. After every optimizer
 //! step that mutated host weights, call `sync_from_weights(&w)?` to
 //! re-upload. The bench numbers
 //! (`memory/feedback_residency_proof.md`) show ~5× sustained per-call
 //! speedup on this hardware once the synapse + projection matvecs
 //! stop round-tripping through PCIe.
 //!
+//! **Freshness witness.** The cache snapshots `weights.generation()`
+//! at build/refresh time. Every dispatch goes through `cache.fresh(&w)`
+//! which compares snapshots — a divergence returns
+//! `Err(CacheError::Stale)` instead of silently dispatching against
+//! pre-step weights. The in-tree optimizer paths
+//! (`RegionalAdamW::step`, `RegionalGradients::apply`,
+//! `apply_aux_gradients`) all bump the counter. Custom paths that
+//! mutate weight fields directly must call `weights.bump_generation()`
+//! — `pub(crate)` visibility on the field is what enforces it.
+//!
 //! **Sync discipline.** Resident dispatches happen inside a
 //! `HipBatch` scope (see `memory/feedback_hip_queue_overflow.md`).
-//! The `forward_*_resident` helpers in this module take `&HipBatch`
-//! exactly so callers can't forget — the GPU hang that crashed Xorg
-//! is a compile error now.
+//! `LinearResident::forward` takes `&HipBatch` exactly so callers
+//! can't forget — the GPU hang that crashed Xorg is a compile error.
 //!
 //! **Out of scope (deferred).** Per-region `CtmWeights` Linears
 //! (NLM s1, MHA in/out, KV/Q projections) are not yet lifted into
@@ -36,30 +45,65 @@ use modgrad_compute::neuron::LinearResident;
 
 use crate::graph::RegionalWeights;
 
+/// Error returned when a resident cache dispatch detects staleness
+/// or when the underlying device runtime fails.
+///
+/// `Stale` carries the snapshot vs. current generation pair so the
+/// caller can log the gap; the typical recovery path is
+/// `cache.sync_from_weights(&w)` followed by retrying.
+#[derive(Debug)]
+pub enum CacheError {
+    /// `cache.snapshot_gen != weights.generation` — the host weights
+    /// have been mutated since this cache was built or last refreshed.
+    /// Caller must `sync_from_weights` before re-attempting.
+    Stale { snapshot: u64, current: u64 },
+    /// Underlying residency error: device OOM, queue overflow, etc.
+    Residency(ResidencyError),
+}
+
+impl From<ResidencyError> for CacheError {
+    fn from(e: ResidencyError) -> Self { Self::Residency(e) }
+}
+
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale { snapshot, current } =>
+                write!(f, "resident cache is stale: snapshot=gen{snapshot} current=gen{current}"),
+            Self::Residency(e) => write!(f, "residency error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CacheError {}
+
 /// Device-resident companion to `RegionalWeights`. One
 /// `LinearResident` per top-level Linear in the host weights. Built
-/// once via `from_weights`; synced (re-uploaded) after every AdamW
-/// step via `sync_from_weights`.
+/// once via `from_weights`; synced (re-uploaded) after every
+/// optimizer step via `sync_from_weights`.
 ///
 /// Per-region `CtmWeights` Linears are not in this cache yet — that
 /// is the next slice. See module-level docs.
+///
+/// Fields are `pub(crate)` to force callers through `fresh()`, which
+/// bundles the freshness check with the accessor view. Direct field
+/// access would defeat the freshness witness.
 pub struct RegionalResidentCache {
-    pub connection_synapses: Vec<LinearResident>,
-    pub obs_proj: LinearResident,
-    pub output_proj: LinearResident,
-    pub outer_exit_gate: Option<LinearResident>,
-    pub extra_heads: Vec<LinearResident>,
+    pub(crate) connection_synapses: Vec<LinearResident>,
+    pub(crate) obs_proj: LinearResident,
+    pub(crate) output_proj: LinearResident,
+    pub(crate) outer_exit_gate: Option<LinearResident>,
+    pub(crate) extra_heads: Vec<LinearResident>,
+    /// Generation counter snapshot from `weights.generation()` at
+    /// build/refresh time. Compared against `weights.generation()`
+    /// on every dispatch to detect staleness.
+    pub(crate) snapshot_gen: u64,
 }
 
 impl RegionalResidentCache {
     /// Allocate device buffers and upload all top-level Linears.
-    /// Returns `ResidencyError::Backend(_)` on hipMalloc / hipMemcpy
-    /// failure; the inner `BackendError` distinguishes
-    /// `OutOfMemory` (retry after eviction is sensible) from
-    /// `DeviceLost` (fail the run). Build site doesn't know which
-    /// Linear failed — that information is gone the moment we go
-    /// from String concatenation to typed errors. If diagnostics
-    /// matter the caller can `Err`-trace the call.
+    /// Snapshots `w.generation()` so subsequent dispatches detect
+    /// staleness via `fresh()` / `is_fresh()`.
     pub fn from_weights(w: &RegionalWeights) -> Result<Self, ResidencyError> {
         let connection_synapses = w.connection_synapses.iter()
             .map(LinearResident::from_linear)
@@ -76,16 +120,13 @@ impl RegionalResidentCache {
         Ok(Self {
             connection_synapses, obs_proj, output_proj,
             outer_exit_gate, extra_heads,
+            snapshot_gen: w.generation(),
         })
     }
 
-    /// Re-upload every Linear after an in-place optimizer step.
-    /// Caller is responsible for invoking this after AdamW; without
-    /// it, the resident path will run forwards against pre-step
-    /// weights while the host path uses post-step. Match the host
-    /// pattern of "step optimizer → invalidate caches" exactly.
-    /// (The PR-AB lift will turn this into a generation-counter
-    /// witness; today it is a runtime contract.)
+    /// Re-upload every Linear after an in-place optimizer step and
+    /// re-snapshot the generation counter. After this returns,
+    /// `is_fresh(&w)` is true.
     pub fn sync_from_weights(&mut self, w: &RegionalWeights) -> Result<(), ResidencyError> {
         debug_assert_eq!(self.connection_synapses.len(), w.connection_synapses.len());
         for (r, lin) in self.connection_synapses.iter_mut().zip(&w.connection_synapses) {
@@ -100,7 +141,38 @@ impl RegionalResidentCache {
         for (r, lin) in self.extra_heads.iter_mut().zip(&w.extra_heads) {
             r.sync_weights_from(lin)?;
         }
+        self.snapshot_gen = w.generation();
         Ok(())
+    }
+
+    /// Quick check: is the snapshot generation in sync with `w`'s
+    /// current generation? Cheap; doesn't cross the FFI boundary.
+    pub fn is_fresh(&self, w: &RegionalWeights) -> bool {
+        self.snapshot_gen == w.generation()
+    }
+
+    /// Last-snapshot generation. Useful for logging / telemetry.
+    pub fn snapshot_generation(&self) -> u64 { self.snapshot_gen }
+
+    /// Return a `FreshCache` view if and only if the cache is in sync
+    /// with `w`. Errors with `CacheError::Stale` otherwise; the
+    /// caller's recovery path is `sync_from_weights(&w)`.
+    ///
+    /// One freshness check, multiple uses: hold the returned
+    /// `FreshCache` to call several `LinearResident`s without
+    /// re-checking. The lifetime ties the view to both the cache and
+    /// `w`, so a `&mut RegionalWeights` borrow is impossible while
+    /// the view is alive — staleness can't open up under your feet.
+    pub fn fresh<'a>(
+        &'a self, w: &'a RegionalWeights,
+    ) -> Result<FreshCache<'a>, CacheError> {
+        if self.snapshot_gen != w.generation() {
+            return Err(CacheError::Stale {
+                snapshot: self.snapshot_gen,
+                current: w.generation(),
+            });
+        }
+        Ok(FreshCache { cache: self, _bind: std::marker::PhantomData })
     }
 
     /// Number of top-level Linears mirrored. Useful for debug logs
@@ -111,6 +183,31 @@ impl RegionalResidentCache {
             + self.outer_exit_gate.as_ref().map_or(0, |_| 1)
             + self.extra_heads.len()
     }
+}
+
+/// View on a `RegionalResidentCache` that has been freshness-checked
+/// against a specific `RegionalWeights`. Accessing a `LinearResident`
+/// through this view cannot dispatch against stale device weights
+/// because the freshness check happened on construction.
+///
+/// The lifetime ties this view to both the cache and the weights;
+/// you cannot `&mut weights` while a `FreshCache` is alive, so
+/// generation cannot diverge under your feet.
+pub struct FreshCache<'a> {
+    cache: &'a RegionalResidentCache,
+    _bind: std::marker::PhantomData<&'a RegionalWeights>,
+}
+
+impl<'a> FreshCache<'a> {
+    pub fn obs_proj(&self) -> &'a LinearResident { &self.cache.obs_proj }
+    pub fn output_proj(&self) -> &'a LinearResident { &self.cache.output_proj }
+    pub fn connection_synapses(&self) -> &'a [LinearResident] {
+        &self.cache.connection_synapses
+    }
+    pub fn outer_exit_gate(&self) -> Option<&'a LinearResident> {
+        self.cache.outer_exit_gate.as_ref()
+    }
+    pub fn extra_heads(&self) -> &'a [LinearResident] { &self.cache.extra_heads }
 }
 
 #[cfg(test)]
@@ -138,6 +235,7 @@ mod tests {
             weights.connection_synapses.len() + 2
                 + weights.outer_exit_gate.as_ref().map_or(0, |_| 1)
                 + weights.extra_heads.len());
+        assert!(cache.is_fresh(&weights), "build snapshot must match generation");
 
         // Synthetic input matching output_proj.in_dim.
         let in_dim = weights.output_proj.in_dim;
@@ -148,12 +246,13 @@ mod tests {
         let mut host_y = vec![0.0f32; out_dim];
         weights.output_proj.forward_into(&host_x, &mut host_y);
 
-        // Resident path
+        // Resident path — go through the freshness witness.
         let mut x_dev = GpuVec::try_hip(in_dim).expect("alloc x");
         x_dev.copy_from(&host_x);
         let mut out_dev = GpuVec::try_hip(out_dim).expect("alloc out");
         let batch = HipBatch::new();
-        cache.output_proj.forward(&batch, &x_dev, &mut out_dev)
+        let fresh = cache.fresh(&weights).expect("fresh on first build");
+        fresh.output_proj().forward(&batch, &x_dev, &mut out_dev)
             .expect("resident forward");
         batch.flush().expect("flush");
         let mut device_y = vec![0.0f32; out_dim];
@@ -166,10 +265,13 @@ mod tests {
             "output_proj host vs resident: max |Δ| = {max_diff}");
     }
 
-    /// AdamW-style mutation invalidates the cache; sync_from_weights
-    /// must re-upload so resident output reflects new weights.
+    /// Mutating weights directly (without going through the optimizer
+    /// path that bumps generation) leaves the cache stale; `fresh()`
+    /// must report `Err(Stale)`. Calling `bump_generation()`
+    /// explicitly trips the same detector. After `sync_from_weights`,
+    /// `fresh()` returns Ok and dispatch matches the host path.
     #[test]
-    fn cache_sync_after_weight_mutation() {
+    fn cache_stale_detection_and_recovery() {
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -179,12 +281,29 @@ mod tests {
         let mut cache = RegionalResidentCache::from_weights(&weights)
             .expect("cache build");
 
-        // Mutate output_proj weights (simulate AdamW step).
+        // Direct field mutation (simulating any path that bypasses the
+        // in-tree optimizer): the cache is now stale on-device. The
+        // generation counter is `pub(crate)` so external code MUST
+        // call `bump_generation()` to invalidate dependents.
         for w in weights.output_proj.weight.iter_mut() { *w *= 1.5; }
         for b in weights.output_proj.bias.iter_mut() { *b += 0.1; }
+        weights.bump_generation();
 
-        // Without sync, the resident path uses STALE weights — the
-        // contract of the cache. Verify the staleness is detectable.
+        // Freshness check refuses to hand out a view.
+        match cache.fresh(&weights) {
+            Err(CacheError::Stale { snapshot, current }) => {
+                assert_eq!(snapshot, 0, "snapshot should be the build-time gen");
+                assert_eq!(current, 1, "current should reflect bump_generation");
+            }
+            Err(CacheError::Residency(e)) => panic!("expected Stale, got Residency({e})"),
+            Ok(_) => panic!("expected Stale, fresh() returned Ok"),
+        }
+
+        // Recovery: sync_from_weights re-uploads + re-snapshots; the
+        // next `fresh()` returns Ok and dispatch matches host.
+        cache.sync_from_weights(&weights).expect("sync");
+        assert!(cache.is_fresh(&weights), "sync must restore freshness");
+
         let in_dim = weights.output_proj.in_dim;
         let out_dim = weights.output_proj.out_dim;
         let host_x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.01).collect();
@@ -195,30 +314,38 @@ mod tests {
         x_dev.copy_from(&host_x);
         let mut out_dev = GpuVec::try_hip(out_dim).expect("out");
         let batch = HipBatch::new();
-        cache.output_proj.forward(&batch, &x_dev, &mut out_dev).expect("forward");
+        let fresh = cache.fresh(&weights).expect("fresh after sync");
+        fresh.output_proj().forward(&batch, &x_dev, &mut out_dev).expect("forward");
         batch.flush().expect("flush");
-        let mut stale_y = vec![0.0f32; out_dim];
-        out_dev.copy_to_host(&mut stale_y);
-
-        let stale_diff = host_y.iter().zip(&stale_y)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(stale_diff > 1e-3,
-            "without sync, expected staleness; got max |Δ| = {stale_diff} (looks already-fresh)");
-
-        // After sync, output should match host.
-        cache.sync_from_weights(&weights).expect("sync");
-        let mut fresh_dev = GpuVec::try_hip(out_dim).expect("out2");
-        let batch2 = HipBatch::new();
-        cache.output_proj.forward(&batch2, &x_dev, &mut fresh_dev).expect("forward2");
-        batch2.flush().expect("flush2");
         let mut fresh_y = vec![0.0f32; out_dim];
-        fresh_dev.copy_to_host(&mut fresh_y);
+        out_dev.copy_to_host(&mut fresh_y);
 
         let fresh_diff = host_y.iter().zip(&fresh_y)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(fresh_diff < 1e-3,
             "after sync, expected match; got max |Δ| = {fresh_diff}");
+    }
+
+    /// The optimizer path bumps generation automatically. This is the
+    /// "happy path" — caller never has to remember to invalidate.
+    #[test]
+    fn optimizer_step_bumps_generation() {
+        let cfg = RegionalConfig::eight_region_small(64, 25, 3);
+        let mut weights = RegionalWeights::new(cfg);
+        let gen0 = weights.generation();
+
+        let mut grads = crate::graph::RegionalGradients::zeros(&weights);
+        // SGD path — RegionalGradients::apply must bump generation.
+        grads.apply(&mut weights, 1e-3, 1.0);
+        assert_eq!(weights.generation(), gen0 + 1,
+            "RegionalGradients::apply must bump generation");
+
+        // AdamW path — RegionalAdamW::step must bump generation.
+        let mut opt = crate::graph::RegionalAdamW::new(&weights);
+        let mut grads2 = crate::graph::RegionalGradients::zeros(&weights);
+        opt.step(&mut weights, &mut grads2);
+        assert_eq!(weights.generation(), gen0 + 2,
+            "RegionalAdamW::step must bump generation");
     }
 }
