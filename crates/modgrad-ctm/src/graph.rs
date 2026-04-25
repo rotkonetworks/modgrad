@@ -4032,6 +4032,18 @@ impl modgrad_traits::Brain for RegionalBrain {
         _state: RegionalState,
         input: &modgrad_traits::TokenInput,
     ) -> (modgrad_traits::BrainOutput, RegionalState, RegionalCache) {
+        // KNOWN REGRESSION (tracked by PR-AB): the `Brain` trait is
+        // value-shaped — caller passes a state in, expects the new
+        // state out. This impl IGNORES `_state` and constructs a
+        // fresh `RegionalState::new(weights)` below. Same bug as
+        // SaaF review #2.3: outer regional loop is `&mut state`-shaped
+        // while the inner `Ctm::forward_cached` (train.rs:1321) is
+        // correctly value-shaped. Fix lands with the AdamW value-shape
+        // refactor (PR-AB) which makes the whole optimizer-update-cache
+        // chain value-shaped. Today the practical effect is bounded:
+        // continuous-thinking-across-calls isn't currently expressed
+        // anywhere (mazes/main.rs:1366 constructs fresh state per
+        // eval sample anyway), so eval numbers are unaffected.
         let cfg = &weights.config;
         let n_regions = cfg.regions.len();
         let n_sync = cfg.n_global_sync;

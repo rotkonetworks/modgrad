@@ -107,6 +107,26 @@ pub fn ctm_forward(
 
 /// Forward pass with pre-built KV buffer (skips kv_proj). Private
 /// because the public surface routes everything through `CtmInput`.
+///
+/// **Cross-forward state contract** (relevant for AdaptiveGate /
+/// Certainty early-exit and any caller reusing a `CtmState`):
+///
+/// - `state.alpha_out` / `state.beta_out`: **reset every call**. The
+///   `sync_init` invocation below clears and re-initialises them
+///   from `state.activated` regardless of how the previous forward
+///   exited. There is no cross-forward bleed of sync accumulators
+///   even when the prior forward terminated mid-trajectory.
+/// - `state.alpha_action` / `state.beta_action` (Option): **vestigial
+///   on `CtmState`**; the action sync uses local Vecs inside this
+///   function and never writes back. The struct fields exist for
+///   serialisation symmetry with `*_out`.
+/// - `state.activated` / `state.trace`: **persist across forwards**.
+///   `sync_init` *reads* the previous activated to seed `alpha_out`,
+///   then the tick loop fully overwrites both. Continuous-thinking
+///   semantics: a caller that reuses a `CtmState` is implicitly
+///   running connected trajectories. A caller that wants fresh
+///   thinking per sample must construct a new `CtmState`.
+/// - `state.episodic`: persists by design (the memory store).
 fn ctm_forward_with_kv(
     w: &CtmWeights,
     state: &mut CtmState,
