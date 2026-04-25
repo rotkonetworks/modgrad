@@ -1,0 +1,19 @@
+[package]
+name = "bench_maze_resident_medium"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end residency bench at the MEDIUM brain shape (eight_region_medium_multiscale, d_model=512). Companion to bench_maze_resident: same code path (RegionalBrain::forward_cached_resident under HipBatch + RegionalResidentCache) but at the per-dispatch compute size where FFI/sync overhead amortises."
+
+[[bin]]
+name = "bench_maze_resident_medium"
+path = "src/main.rs"
+
+[features]
+default = []
+rocm = ["modgrad-ctm/rocm", "modgrad-compute/rocm", "modgrad-device/rocm"]
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-device = { path = "../../crates/modgrad-device" }
+modgrad-traits = { path = "../../crates/modgrad-traits" }
