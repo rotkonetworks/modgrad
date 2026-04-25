@@ -36,6 +36,16 @@ pub mod onnx_cerebellum;
 // fit. See `layer.rs` for design notes.
 pub mod layer;
 
+// LanguageModel trait — residency-aware forward face for autoregressive
+// transformer LMs. Implemented by `GptModelResident`. See
+// `language_model.rs`.
+pub mod language_model;
+
+// LM trainer — wraps a `LanguageModel` with the orchestration loop
+// (forward → CE loss → [TODO eve: backward → AdamW]). See
+// `lm_trainer.rs` for slice-scope notes.
+pub mod lm_trainer;
+
 /// Generate tokens from a NeuralComputer using the SDK inference runtime.
 pub fn generate_nc(
     nc: &mut modgrad_ctm::graph::NeuralComputer,
