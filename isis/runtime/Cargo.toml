@@ -12,7 +12,10 @@ license = "MIT"
 # libloading and stops demanding libamdhip64/libhipblas at link time.
 default = ["cuda"]
 cuda = ["modgrad-device/cuda"]
-rocm = ["modgrad-device/rocm"]
+# Enables device-resident weight streaming (LinearResidentStreaming +
+# GpuVec::Hip) needed by the layer scheduler. Mirrors the wiring in
+# modgrad-ctm's `rocm` feature.
+rocm = ["modgrad-device/rocm", "modgrad-compute/rocm", "modgrad-ctm/rocm"]
 kfd  = ["modgrad-device/kfd"]
 gpu  = ["modgrad-device/gpu"]
 sdp = ["dep:clarabel"]

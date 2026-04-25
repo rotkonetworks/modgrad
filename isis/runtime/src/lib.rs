@@ -31,6 +31,11 @@ pub mod plural_nc;
 #[cfg(feature = "onnx")]
 pub mod onnx_cerebellum;
 
+// Layer trait + LayerScheduler — orchestrates which weights live in
+// VRAM at any moment when training a foundation model that does not
+// fit. See `layer.rs` for design notes.
+pub mod layer;
+
 /// Generate tokens from a NeuralComputer using the SDK inference runtime.
 pub fn generate_nc(
     nc: &mut modgrad_ctm::graph::NeuralComputer,
