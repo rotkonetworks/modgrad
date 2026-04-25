@@ -44,8 +44,13 @@ impl Backend for CpuBackend {
         // CPU Q4_K decoder in this crate, and the KFD kernel depends on
         // a specific weight layout that isn't trivially unpacked.
         // Future: port the GGUF Q4_K decode from modgrad-io.
+        //
+        // CPU also declines `MatvecResident` — the operands are
+        // hip device pointers and CPU can't dereference them. Caller
+        // must downgrade to `Matvec` (host slices) for CPU dispatch.
         match op {
             Op::Matvec { quant: QuantKind::Q4K, .. } => false,
+            Op::MatvecResident { .. } => false,
             _ => true,
         }
     }
@@ -73,6 +78,10 @@ impl Backend for CpuBackend {
             }
             Op::Matvec { quant: QuantKind::Q4K, .. } => Err(BackendError::Unsupported {
                 op: "matvec",
+                backend: "cpu",
+            }),
+            Op::MatvecResident { .. } => Err(BackendError::Unsupported {
+                op: "matvec_resident",
                 backend: "cpu",
             }),
             Op::MatvecT { d_out, weight, d_input, out_dim, in_dim } => {

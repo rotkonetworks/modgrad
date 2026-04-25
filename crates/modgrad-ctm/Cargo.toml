@@ -10,7 +10,7 @@ license = "MIT"
 # binaries can turn on GPU backends via a single feature on this crate.
 default = []
 kfd = ["modgrad-device/kfd"]
-rocm = ["modgrad-device/rocm"]
+rocm = ["modgrad-device/rocm", "modgrad-compute/rocm"]
 cuda = ["modgrad-device/cuda"]
 gpu = ["modgrad-device/gpu"]
 

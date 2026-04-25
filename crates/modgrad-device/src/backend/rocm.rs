@@ -21,7 +21,7 @@ use super::{DeviceBuffer, QuantKind};
 use super::HostBuffer;
 
 #[cfg(feature = "rocm")]
-mod ffi {
+pub mod ffi {
     #![allow(non_camel_case_types)]
     use std::os::raw::{c_char, c_int, c_uint, c_void};
 
@@ -120,14 +120,33 @@ mod ffi {
 /// RAII wrapper around a single `hipMalloc` allocation. `Drop` calls
 /// `hipFree`; ergonomic "?" error handling in the dispatcher stops
 /// leaking on the first error path because the Drop runs automatically.
+///
+/// Public so `modgrad-compute::GpuVec::Hip` can wrap one for cross-call
+/// device residency (weights uploaded once, kept device-side across
+/// forwards). Pre-residency code used `HipBuffer` only privately
+/// inside one dispatch.
 #[cfg(feature = "rocm")]
-struct HipBuffer {
+pub struct HipBuffer {
     ptr: *mut std::os::raw::c_void,
     bytes: usize,
 }
 
+// Safe to send/sync a hipMalloc'd device pointer between threads —
+// HIP's runtime is internally synchronized; only the holder of the
+// pointer can read/write it. The pointer itself is plain data.
+#[cfg(feature = "rocm")]
+unsafe impl Send for HipBuffer {}
+#[cfg(feature = "rocm")]
+unsafe impl Sync for HipBuffer {}
+
 #[cfg(feature = "rocm")]
 impl HipBuffer {
+    /// Public allocator — used by `GpuVec::Hip` and resident-weight
+    /// caches in `modgrad-compute`.
+    pub fn new(bytes: usize) -> Result<Self, BackendError> {
+        Self::alloc(bytes)
+    }
+
     /// Allocate `bytes` on the current HIP device.
     fn alloc(bytes: usize) -> Result<Self, BackendError> {
         let mut ptr: *mut std::os::raw::c_void = std::ptr::null_mut();
@@ -138,6 +157,26 @@ impl HipBuffer {
             )));
         }
         Ok(Self { ptr, bytes })
+    }
+
+    /// Raw device pointer. For passing to hipBLAS or kernel launches.
+    pub fn device_ptr(&self) -> *mut std::os::raw::c_void { self.ptr }
+
+    /// Allocation size in bytes.
+    pub fn bytes(&self) -> usize { self.bytes }
+
+    /// Capacity in f32 elements.
+    pub fn len_f32(&self) -> usize { self.bytes / 4 }
+
+    /// Public alias for `upload_f32` so callers in other crates can
+    /// stage host data into this buffer.
+    pub fn copy_from_host(&self, src: &[f32]) -> Result<(), BackendError> {
+        self.upload_f32(src)
+    }
+
+    /// Public alias for `download_f32`.
+    pub fn copy_to_host(&self, dst: &mut [f32]) -> Result<(), BackendError> {
+        self.download_f32(dst)
     }
 
     /// Copy `src` (host) into this device buffer.
@@ -191,6 +230,130 @@ impl Drop for HipBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { ffi::hipFree(self.ptr) };
+        }
+    }
+}
+
+/// RAII guard around a sequence of asynchronous HIP dispatches.
+///
+/// **Invariant the caller buys by holding one of these:** any
+/// resident dispatch (`hipblasSgemv`, `hipblasSgemm`, ...) executed
+/// inside this scope is bounded — the queue of pending kernels
+/// never exceeds `sync_every` between syncs, and a final
+/// `hipDeviceSynchronize` runs unconditionally on `Drop`.
+///
+/// **Why this type exists.** `hipblasSgemv` returns the moment the
+/// kernel is queued, not when it runs. The HIP runtime's command
+/// queue has a finite depth. Submitting faster than the GPU
+/// dispatches eventually overflows it; amdgpu's watchdog declares
+/// the device hung and resets it. On a system where the same GPU
+/// drives the display, the reset takes Xorg with it. This was hit
+/// in `examples/bench_resident.rs` on 2026-04-25 — see
+/// `memory/feedback_hip_queue_overflow.md`. Making
+/// `LinearResident::forward` (and any future resident dispatch)
+/// require a `&HipBatch` argument turns the failure mode from
+/// "easy to forget" into "compile error if you do."
+///
+/// **Default cadence (256 dispatches between syncs):** chosen
+/// empirically — well below the queue overflow threshold on
+/// gfx1102 (which started backing up around 4 s ≈ ~600 k unsynced
+/// hipblasSgemv at our shape), and well above the per-sync
+/// overhead break-even point. Tighter cadences are safe but slow;
+/// looser cadences risk the same crash.
+///
+/// **Not Send.** HIP runtime contexts are thread-local in the
+/// general case (rocm 6.x docs). Holding a `HipBatch` and
+/// dispatching from another thread would race against the
+/// internal counter and the per-thread queue. The
+/// `PhantomData<*const ()>` makes that a compile error.
+#[cfg(feature = "rocm")]
+pub struct HipBatch {
+    pending: std::cell::Cell<usize>,
+    sync_every: usize,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "rocm")]
+impl HipBatch {
+    pub const DEFAULT_SYNC_EVERY: usize = 256;
+
+    /// New batch with the default sync cadence.
+    pub fn new() -> Self {
+        Self::with_sync_every(Self::DEFAULT_SYNC_EVERY)
+    }
+
+    /// New batch with a caller-chosen cadence. `n` must be ≥ 1.
+    /// Larger `n` ⇒ less per-call overhead but higher risk of
+    /// queue overflow on weak silicon. The default
+    /// (`DEFAULT_SYNC_EVERY`) is the empirically-validated safe
+    /// point on gfx1102.
+    pub fn with_sync_every(n: usize) -> Self {
+        assert!(n >= 1, "HipBatch::with_sync_every: n must be ≥ 1");
+        Self {
+            pending: std::cell::Cell::new(0),
+            sync_every: n,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Called by resident dispatch ops AFTER they queue a kernel.
+    /// When `pending` reaches `sync_every`, drains the queue
+    /// synchronously. Failure mode: returns the hipError on a
+    /// failed sync — caller (the dispatch op) propagates as
+    /// `BackendError::Runtime`. The dispatcher is structured so
+    /// "queue full → sync fails → dispatch fails" surfaces loudly
+    /// as a Result, never silently.
+    #[doc(hidden)]
+    pub fn note_dispatch(&self) -> Result<(), BackendError> {
+        let new = self.pending.get() + 1;
+        if new >= self.sync_every {
+            let err = unsafe { ffi::hipDeviceSynchronize() };
+            if err != 0 {
+                self.pending.set(0);  // reset even on failure to avoid feedback loop
+                return Err(BackendError::Runtime(format!(
+                    "HipBatch sync (every {}): {}",
+                    self.sync_every, ffi::hip_err_str(err),
+                )));
+            }
+            self.pending.set(0);
+        } else {
+            self.pending.set(new);
+        }
+        Ok(())
+    }
+
+    /// Force an immediate drain. Called by Drop and by callers who
+    /// need a sync mid-scope (e.g. before reading device output
+    /// back to host with `copy_to_host`).
+    pub fn flush(&self) -> Result<(), BackendError> {
+        let err = unsafe { ffi::hipDeviceSynchronize() };
+        self.pending.set(0);
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "HipBatch::flush: {}", ffi::hip_err_str(err)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Default for HipBatch {
+    fn default() -> Self { Self::new() }
+}
+
+#[cfg(feature = "rocm")]
+impl Drop for HipBatch {
+    /// Final drain on scope exit. Cheap if `pending == 0`. We
+    /// deliberately swallow errors here — the alternative is to
+    /// abort, but a single failed sync at scope exit is recoverable
+    /// (the next sync attempt will surface it). Aborting in Drop
+    /// would convert any hip teardown wobble into a hard process
+    /// kill, which is worse than letting the next operation report
+    /// the error.
+    fn drop(&mut self) {
+        if self.pending.get() > 0 {
+            unsafe { let _ = ffi::hipDeviceSynchronize(); }
         }
     }
 }
@@ -324,7 +487,16 @@ impl Backend for RocmBackend {
             match op {
                 Op::Matvec { quant: QuantKind::F32, out_dim, in_dim, .. }
                     if *out_dim >= 64 && *in_dim >= 64 => true,
+                // Resident dispatches skip ALL the per-call overhead
+                // (no malloc / memcpy / cache lookup), so the size
+                // gate is dropped — small ops are still profitable
+                // when weights and activations are already on device.
+                Op::MatvecResident { .. } => true,
                 Op::MatmulNN { m, k, n, .. }
+                    if *m >= 64 && *k >= 64 && *n >= 64 => true,
+                Op::MatmulNT { m, k, n, .. }
+                    if *m >= 64 && *k >= 64 && *n >= 64 => true,
+                Op::MatmulTN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 _ => false,
             }
@@ -360,6 +532,16 @@ impl Backend for RocmBackend {
                     out_dim, in_dim,
                     quant: QuantKind::F32,
                 } => self.matvec_f32(x, weight, bias, out, *out_dim, *in_dim),
+                Op::MatvecResident {
+                    x_dev, weight_dev, bias_dev, out_dev,
+                    out_dim, in_dim,
+                } => self.matvec_resident_f32(
+                    *x_dev as *const std::os::raw::c_void,
+                    *weight_dev as *const std::os::raw::c_void,
+                    *bias_dev as *const std::os::raw::c_void,
+                    *out_dev as *mut std::os::raw::c_void,
+                    *out_dim, *in_dim,
+                ),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
                 } => {
@@ -368,6 +550,30 @@ impl Backend for RocmBackend {
                     // Cost: one pass over `out` (already resident on host
                     // after the download). Negligible relative to the
                     // GEMM itself.
+                    if let Some(bias) = bias {
+                        for r in 0..*m {
+                            let row = &mut out[r * *n..(r + 1) * *n];
+                            for c in 0..*n { row[c] += bias[c]; }
+                        }
+                    }
+                    Ok(())
+                },
+                Op::MatmulNT {
+                    a, b, out, bias, m, k, n,
+                } => {
+                    self.matmul_nt_f32(a, b, out, *m, *k, *n)?;
+                    if let Some(bias) = bias {
+                        for r in 0..*m {
+                            let row = &mut out[r * *n..(r + 1) * *n];
+                            for c in 0..*n { row[c] += bias[c]; }
+                        }
+                    }
+                    Ok(())
+                },
+                Op::MatmulTN {
+                    a, b, out, bias, m, k, n,
+                } => {
+                    self.matmul_tn_f32(a, b, out, *m, *k, *n)?;
                     if let Some(bias) = bias {
                         for r in 0..*m {
                             let row = &mut out[r * *n..(r + 1) * *n];
@@ -520,6 +726,72 @@ impl RocmBackend {
         // host↔driver round-trip for no safety gain.
         d_y.download_f32(out)
     }
+
+    /// Fully-resident matvec: every operand is a hip device pointer.
+    /// Zero PCIe transfers in this call — the whole point. Steps:
+    ///   1. D2D copy bias_dev → out_dev (hipMemcpy DEVICE_TO_DEVICE,
+    ///      so out_dev = bias as the SGEMV initial y).
+    ///   2. hipblasSgemv with weight, x, out — beta = 1.0 means the
+    ///      result accumulates into out (= bias + W·x).
+    /// Output stays on device; caller decides when (if ever) to
+    /// download.
+    fn matvec_resident_f32(
+        &self,
+        x_dev: *const std::os::raw::c_void,
+        weight_dev: *const std::os::raw::c_void,
+        bias_dev: *const std::os::raw::c_void,
+        out_dev: *mut std::os::raw::c_void,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<(), BackendError> {
+        let in_dim_i32 = as_i32(in_dim, "in_dim")?;
+        let out_dim_i32 = as_i32(out_dim, "out_dim")?;
+
+        // Step 1: D2D copy bias → out (initialises y for the
+        // accumulating SGEMV). DEVICE_TO_DEVICE = 3 in the hip enum.
+        const HIP_MEMCPY_DEVICE_TO_DEVICE: std::os::raw::c_int = 3;
+        let bytes = out_dim * 4;
+        let err = unsafe {
+            ffi::hipMemcpy(out_dev, bias_dev, bytes, HIP_MEMCPY_DEVICE_TO_DEVICE)
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipMemcpy D2D bias→out: {}", ffi::hip_err_str(err)
+            )));
+        }
+
+        // Step 2: SGEMV. Same column-major-via-transpose trick as
+        // `matvec_f32`. Weight is row-major [out_dim × in_dim], read
+        // as column-major [in_dim × out_dim]; TRANS=T gives the
+        // row-major matvec we want.
+        let alpha: f32 = 1.0;
+        let beta: f32 = 1.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemv(
+                *handle,
+                ffi::HIPBLAS_OP_T,
+                in_dim_i32,
+                out_dim_i32,
+                &alpha,
+                weight_dev as *const f32,
+                in_dim_i32,
+                x_dev as *const f32,
+                1,
+                &beta,
+                out_dev as *mut f32,
+                1,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemv (resident): status {status}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -583,6 +855,108 @@ impl RocmBackend {
         // before the copy runs.  Skipping the explicit
         // `hipDeviceSynchronize` trims one host↔driver round-trip per
         // dispatch with no correctness loss.
+        d_c.download_f32(out)
+    }
+
+    /// `C[m×n] = A[m×k] @ B[n×k]^T`, row-major. Both operands are
+    /// treated as per-dispatch ephemerals (neither is assumed to be a
+    /// stable weight buffer, matching how NT is typically called from
+    /// gradient computations — `dW = activation @ grad^T`). If a caller
+    /// wants the cache for a weight-like arg here, adapt similarly to
+    /// `matmul_nn_f32`'s `cached_weight_ptr` usage.
+    ///
+    /// Derivation: row-major C[m,n] has the same bytes as col-major
+    /// C^T[n,m]. Computing C^T = B · A^T in column-major via hipBLAS
+    /// reduces to SGEMM(T, N, n, m, k, B, lda=k, A, ldb=k, C, ldc=n) —
+    /// the T on the B-first arg reinterprets B's row-major [n,k]
+    /// storage (= col-major [k,n]) as its transpose [n,k] for the
+    /// multiply.
+    fn matmul_nt_f32(
+        &self, a: &[f32], b: &[f32], out: &mut [f32],
+        m: usize, k: usize, n: usize,
+    ) -> Result<(), BackendError> {
+        debug_assert_eq!(a.len(), m * k, "rocm matmul_nt: a len mismatch");
+        debug_assert_eq!(b.len(), n * k, "rocm matmul_nt: b len mismatch");
+        debug_assert!(out.len() >= m * n, "rocm matmul_nt: out too small");
+
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
+        let d_a = HipBuffer::alloc(m * k * 4)?;
+        let d_b = HipBuffer::alloc(n * k * 4)?;
+        let d_c = HipBuffer::alloc(m * n * 4)?;
+        d_a.upload_f32(a)?;
+        d_b.upload_f32(b)?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_T, ffi::HIPBLAS_OP_N,
+                n_i32, m_i32, k_i32,
+                &alpha,
+                d_b.as_f32_ptr(), k_i32,
+                d_a.as_f32_ptr(), k_i32,
+                &beta,
+                d_c.as_f32_ptr(), n_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!("hipblasSgemm (NT): status {status}")));
+        }
+        d_c.download_f32(out)
+    }
+
+    /// `C[m×n] = A[k×m]^T @ B[k×n]`, row-major. `a` is assumed to be
+    /// the weight-shaped operand (same convention as `matmul_nn_f32`) —
+    /// reuses the weight cache. `b` is uploaded fresh per dispatch.
+    ///
+    /// Derivation: same trick as NN/NT; here the transpose flag is on
+    /// the second SGEMM arg so A's row-major [k,m] storage
+    /// (= col-major [m,k]) is reinterpreted as [k,m] for the multiply.
+    /// Result: SGEMM(N, T, n, m, k, B, lda=n, A, ldb=m, C, ldc=n).
+    fn matmul_tn_f32(
+        &self, a: &[f32], b: &[f32], out: &mut [f32],
+        m: usize, k: usize, n: usize,
+    ) -> Result<(), BackendError> {
+        debug_assert_eq!(a.len(), k * m, "rocm matmul_tn: a len mismatch");
+        debug_assert_eq!(b.len(), k * n, "rocm matmul_tn: b len mismatch");
+        debug_assert!(out.len() >= m * n, "rocm matmul_tn: out too small");
+
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
+        let d_a_ptr = self.cached_weight_ptr(a)?;
+        let d_b = HipBuffer::alloc(k * n * 4)?;
+        let d_c = HipBuffer::alloc(m * n * 4)?;
+        d_b.upload_f32(b)?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_T,
+                n_i32, m_i32, k_i32,
+                &alpha,
+                d_b.as_f32_ptr(), n_i32,
+                d_a_ptr, m_i32,
+                &beta,
+                d_c.as_f32_ptr(), n_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!("hipblasSgemm (TN): status {status}")));
+        }
         d_c.download_f32(out)
     }
 }

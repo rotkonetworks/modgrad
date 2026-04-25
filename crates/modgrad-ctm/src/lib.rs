@@ -16,6 +16,8 @@ pub mod loss;
 // FFN architecture moved to the `modgrad-ffn` crate — parallel to
 // `modgrad-transformer`. Depend on it directly for SwiGLU language models.
 pub mod graph;
+#[cfg(feature = "rocm")]
+pub mod resident;
 /// Re-export of `modgrad_memory` for backward compatibility.
 /// New code should import from `modgrad_memory` directly.
 pub use modgrad_memory as memory;

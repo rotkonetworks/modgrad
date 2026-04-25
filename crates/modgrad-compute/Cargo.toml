@@ -7,6 +7,10 @@ license = "MIT"
 
 [features]
 cuda = ["modgrad-device/cuda", "dep:cudarc", "dep:candle-kernels"]
+# Enables `GpuVec::Hip` backed by hipMalloc'd device memory. Required
+# for any code path that wants weights / activations to stay
+# device-resident across dispatches (the GPU-residency project).
+rocm = ["modgrad-device/rocm"]
 
 [dependencies]
 modgrad-device = { path = "../modgrad-device" }

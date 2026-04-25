@@ -40,6 +40,8 @@ pub use kfd::KfdBackend;
 pub use cuda_be::CudaBackend;
 pub use vulkan::VulkanBackend;
 pub use rocm::RocmBackend;
+#[cfg(feature = "rocm")]
+pub use rocm::{HipBatch, HipBuffer};
 pub use op::{AdamWArgs, Op, QuantKind, SyncBackwardScatterArgs};
 
 /// Kind of physical device a backend runs on.

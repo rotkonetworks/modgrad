@@ -99,6 +99,38 @@ pub fn matvec_t(
     Ok(())
 }
 
+/// Device-resident matvec: `out = weight @ x + bias` where all
+/// operands are hip device pointers. Caller must guarantee the
+/// pointers stay valid for the duration of this call (typically
+/// they come from owned `HipBuffer`s).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `out_dev` has at least `out_dim * 4` bytes allocated.
+/// - `weight_dev` has `out_dim * in_dim * 4` bytes laid out row-major.
+/// - `bias_dev` has `out_dim * 4` bytes.
+/// - `x_dev` has at least `in_dim * 4` bytes.
+///
+/// Backends that don't support resident dispatch (CPU, KFD, others)
+/// return `Unsupported` and the caller must fall back to the
+/// host-slice `matvec` path.
+#[inline]
+pub unsafe fn matvec_resident(
+    x_dev: *const f32,
+    weight_dev: *const f32,
+    bias_dev: *const f32,
+    out_dev: *mut f32,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatvecResident {
+        x_dev, weight_dev, bias_dev, out_dev, out_dim, in_dim,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Accumulating outer product. See [`Op::OuterProductAcc`](super::Op::OuterProductAcc).
 #[inline]
 pub fn outer_product_acc(

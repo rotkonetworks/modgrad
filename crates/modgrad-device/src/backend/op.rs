@@ -135,6 +135,28 @@ pub enum Op<'a> {
         quant: QuantKind,
     },
 
+    /// **Device-resident** forward matvec — same math as `Matvec`,
+    /// but every operand is a hip-device pointer (from a
+    /// `HipBuffer`). The dispatcher hands them straight to
+    /// `hipblasSgemv` with no host↔device transfer. Backends that
+    /// cannot consume device pointers (CPU, vulkan-without-shared-vram)
+    /// must return `BackendError::UnsupportedShape` so callers fall
+    /// back to the host-slice `Matvec`.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers
+    /// remain valid for the duration of the dispatch. Typically the
+    /// pointers come from owned `HipBuffer`s held by `Linear`'s
+    /// weight cache (long-lived) or freshly-allocated activation
+    /// `GpuVec::Hip` buffers (lifetime ≥ this dispatch).
+    MatvecResident {
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        bias_dev: *const f32,
+        out_dev: *mut f32,
+        out_dim: usize,
+        in_dim: usize,
+    },
+
     /// Transposed matvec (typical gradient-of-input for a Linear layer):
     /// `d_input = weight^T @ d_out`.
     MatvecT {
@@ -399,6 +421,7 @@ impl<'a> Op<'a> {
             Op::MatmulNT { .. } => "matmul_nt",
             Op::MatmulTN { .. } => "matmul_tn",
             Op::Matvec { .. } => "matvec",
+            Op::MatvecResident { .. } => "matvec_resident",
             Op::MatvecT { .. } => "matvec_t",
             Op::OuterProductAcc { .. } => "outer_product_acc",
             Op::LayerNormFwd { .. } => "layer_norm_fwd",
