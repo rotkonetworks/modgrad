@@ -180,9 +180,18 @@ impl HipBuffer {
     }
 
     /// Copy `src` (host) into this device buffer.
+    /// Returns `Err(BackendError::Runtime)` if `src` is larger than
+    /// the device allocation — release builds previously over-read
+    /// host memory and silently truncated. The check is a hot-path
+    /// branch but cheaper than the kernel launch it precedes.
     fn upload_f32(&self, src: &[f32]) -> Result<(), BackendError> {
         let nbytes = src.len() * 4;
-        debug_assert!(nbytes <= self.bytes, "upload_f32 overflow");
+        if nbytes > self.bytes {
+            return Err(BackendError::Runtime(format!(
+                "upload_f32: src is {} bytes, device buffer is {} bytes",
+                nbytes, self.bytes,
+            )));
+        }
         let err = unsafe {
             ffi::hipMemcpy(
                 self.ptr,
@@ -199,10 +208,19 @@ impl HipBuffer {
         Ok(())
     }
 
-    /// Copy this device buffer into `dst` (host).
+    /// Copy this device buffer into `dst` (host). Returns
+    /// `Err(BackendError::Runtime)` if `dst` is larger than the
+    /// device allocation — release builds previously short-wrote and
+    /// left tail garbage. The check is a hot-path branch but cheaper
+    /// than the kernel sync it precedes.
     fn download_f32(&self, dst: &mut [f32]) -> Result<(), BackendError> {
         let nbytes = dst.len() * 4;
-        debug_assert!(nbytes <= self.bytes, "download_f32 overflow");
+        if nbytes > self.bytes {
+            return Err(BackendError::Runtime(format!(
+                "download_f32: dst is {} bytes, device buffer is {} bytes",
+                nbytes, self.bytes,
+            )));
+        }
         let err = unsafe {
             ffi::hipMemcpy(
                 dst.as_mut_ptr() as *mut std::os::raw::c_void,
