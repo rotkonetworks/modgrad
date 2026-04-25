@@ -262,6 +262,84 @@ pub enum Op<'a> {
         n: usize,
     },
 
+    /// **Device-resident** bf16 matmul: `C = A @ B`. Same math as
+    /// [`Op::MatmulResidentNN`] but operands are bf16 (stored as `u16`)
+    /// with fp32 accumulate. Dispatched via `hipblasGemmEx` with
+    /// `HIP_R_16BF` input/output and `HIPBLAS_COMPUTE_32F` compute.
+    ///
+    /// `alpha`/`beta` are fp32 — that's the hipblasGemmEx contract for
+    /// 32F-compute mode.
+    ///
+    /// Layout: `a` is `[m × k]` row-major, `b` is `[k × n]` row-major,
+    /// `c` is `[m × n]` row-major. No bias.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    MatmulResidentBf16Nn {
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    },
+
+    /// **Device-resident** bf16 matmul: `C = A @ B^T`. See
+    /// [`Op::MatmulResidentBf16Nn`] for the dispatch contract.
+    ///
+    /// Layout: `a` is `[m × k]` row-major, `b` is `[n × k]` row-major
+    /// (transposed on the fly), `c` is `[m × n]` row-major.
+    MatmulResidentBf16Nt {
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    },
+
+    /// **Device-resident** bf16 matmul: `C = A^T @ B`. See
+    /// [`Op::MatmulResidentBf16Nn`] for the dispatch contract.
+    ///
+    /// Layout: `a` is `[k × m]` row-major (transposed on the fly),
+    /// `b` is `[k × n]` row-major, `c` is `[m × n]` row-major.
+    MatmulResidentBf16Tn {
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    },
+
+    /// **Device-resident** bf16 forward matvec — same math as
+    /// [`Op::MatvecResident`], but every operand is bf16 (stored as
+    /// `u16`). Dispatched via `hipblasGemmEx` (a 1-column GEMM since
+    /// hipblasGemvEx is not available in our hipblas) with bf16
+    /// input/output and fp32 compute.
+    ///
+    /// `out_dim`/`in_dim` semantics match [`Op::MatvecResident`].
+    /// `bias_dev` is bf16; the dispatch seeds `out_dev` from `bias_dev`
+    /// with a D2D copy before the GEMM (alpha = 1, beta = 1 means
+    /// `out = bias + W·x`).
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    MatvecResidentBf16 {
+        x_dev: *const u16,
+        weight_dev: *const u16,
+        bias_dev: *const u16,
+        out_dev: *mut u16,
+        out_dim: usize,
+        in_dim: usize,
+    },
+
     /// **Device-resident** Q4_K_M dequantize.
     ///
     /// Reads `n_blocks` Q4_K-formatted blocks (144 bytes each) from
@@ -778,6 +856,10 @@ impl<'a> Op<'a> {
             Op::MatmulResidentNN { .. } => "matmul_resident_nn",
             Op::MatmulResidentNT { .. } => "matmul_resident_nt",
             Op::MatmulResidentTN { .. } => "matmul_resident_tn",
+            Op::MatmulResidentBf16Nn { .. } => "matmul_resident_bf16_nn",
+            Op::MatmulResidentBf16Nt { .. } => "matmul_resident_bf16_nt",
+            Op::MatmulResidentBf16Tn { .. } => "matmul_resident_bf16_tn",
+            Op::MatvecResidentBf16 { .. } => "matvec_resident_bf16",
             Op::DequantQ4KResident { .. } => "dequant_q4k_resident",
             Op::RmsNormResident { .. } => "rms_norm_resident",
             Op::LayerNormResident { .. } => "layer_norm_resident",
@@ -848,3 +930,39 @@ impl<'a> Op<'a> {
 // Debug/test kernels (test_store, addr_dump, coop_test, lds_test,
 // matmul_dbg) are intentionally NOT exposed — they're dispatch
 // internals, not logical ops.
+
+// ─── bf16 helpers ────────────────────────────────────────────
+//
+// bf16 ("brain float 16") is the top 16 bits of an IEEE-754 fp32 bit
+// pattern: 1 sign bit + 8 exponent bits + 7 mantissa bits. Same dynamic
+// range as fp32, ~3 decimal digits of precision.
+//
+// Rust has no native `bf16` primitive in stable, so we transport it as
+// `u16`. Conversion is bitwise — no library dependency.
+
+/// Convert an `f32` to bf16 (stored as `u16`).
+///
+/// NaN-safe: any fp32 NaN maps to a quiet bf16 NaN. Round-to-nearest-even
+/// per `(bits + 0x7fff + ((bits >> 16) & 1)) >> 16` — the standard
+/// bias-by-half-ULP-then-truncate idiom that breaks ties toward even.
+#[inline]
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7fff_ffff) > 0x7f80_0000 {
+        // NaN — collapse to a canonical quiet NaN so we never produce
+        // an sNaN that traps on FPUs that honour the signal bit.
+        return 0x7fc0;
+    }
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
+/// Convert a bf16 (`u16`) back to `f32`.
+///
+/// Lossless: bf16 is a strict prefix of fp32, so the round-trip is just
+/// a shift-and-zero-extend of the original 16 bits into the high half
+/// of a fresh fp32 bit pattern.
+#[inline]
+pub fn bf16_to_f32(x: u16) -> f32 {
+    f32::from_bits((x as u32) << 16)
+}

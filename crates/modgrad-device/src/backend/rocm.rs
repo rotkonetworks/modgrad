@@ -37,6 +37,20 @@ pub mod ffi {
     pub const HIPBLAS_OP_N: c_int = 111;
     pub const HIPBLAS_OP_T: c_int = 112;
 
+    /// `hipDataType::HIP_R_16BF`. From `hip/library_types.h`:
+    /// real bf16, value 14. The hipblasGemmEx API expects this enum
+    /// (NOT the legacy `hipblasDatatype_t`) for its `*Type` arguments.
+    pub const HIP_R_16BF: c_int = 14;
+
+    /// `hipblasComputeType_t::HIPBLAS_COMPUTE_32F`. From
+    /// `hipblas-common/hipblas-common.h` — the standard mixed-precision
+    /// recipe: bf16 input/output, fp32 accumulate. Value 2.
+    pub const HIPBLAS_COMPUTE_32F: c_int = 2;
+
+    /// `hipblasGemmAlgo_t::HIPBLAS_GEMM_DEFAULT` — let hipblas pick the
+    /// algorithm. Value 160 per `hipblas/hipblas.h`.
+    pub const HIPBLAS_GEMM_DEFAULT: c_int = 160;
+
     #[link(name = "amdhip64")]
     unsafe extern "C" {
         pub fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
@@ -85,6 +99,37 @@ pub mod ffi {
             beta: *const f32,
             c: *mut f32,
             ldc: c_int,
+        ) -> hipblasStatus_t;
+
+        /// Modern hipblas mixed-dtype GEMM. Inputs/output may be bf16,
+        /// fp16, or fp32; compute precision is selectable
+        /// independently. We invoke it with `HIPBLAS_R_16BF` for A/B/C
+        /// and `HIPBLAS_COMPUTE_32F` for the accumulator — the standard
+        /// mixed-precision training recipe.
+        ///
+        /// `alpha`/`beta` are passed as `*const c_void` because the
+        /// underlying type is determined by `compute_type`. For
+        /// `HIPBLAS_COMPUTE_32F` they are fp32 scalars.
+        pub fn hipblasGemmEx(
+            handle: hipblasHandle_t,
+            transa: c_int,
+            transb: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: *const c_void,
+            a: *const c_void,
+            a_type: c_int,
+            lda: c_int,
+            b: *const c_void,
+            b_type: c_int,
+            ldb: c_int,
+            beta: *const c_void,
+            c: *mut c_void,
+            c_type: c_int,
+            ldc: c_int,
+            compute_type: c_int,
+            algo: c_int,
         ) -> hipblasStatus_t;
     }
 
@@ -956,6 +1001,13 @@ impl Backend for RocmBackend {
                 Op::MatmulResidentNN { .. }
                 | Op::MatmulResidentNT { .. }
                 | Op::MatmulResidentTN { .. } => true,
+                // bf16 dispatches via hipblasGemmEx, which is part of
+                // the same hipblas runtime — same supports() story as
+                // the fp32 resident variants.
+                Op::MatmulResidentBf16Nn { .. }
+                | Op::MatmulResidentBf16Nt { .. }
+                | Op::MatmulResidentBf16Tn { .. } => true,
+                Op::MatvecResidentBf16 { .. } => true,
                 // Custom hipcc kernel — only available when build.rs
                 // successfully compiled `kernels/rms_norm.hip`. The
                 // `rms_norm_kernel_present` constant is set from
@@ -1043,6 +1095,28 @@ impl Backend for RocmBackend {
                     a_dev, b_dev, out_dev, m, k, n,
                 } => self.matmul_resident_tn_f32(
                     *a_dev, *b_dev, *out_dev, *m, *k, *n,
+                ),
+                Op::MatmulResidentBf16Nn {
+                    a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+                } => self.matmul_resident_bf16_nn(
+                    *a_dev, *b_dev, *c_dev, *m, *k, *n, *alpha, *beta,
+                ),
+                Op::MatmulResidentBf16Nt {
+                    a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+                } => self.matmul_resident_bf16_nt(
+                    *a_dev, *b_dev, *c_dev, *m, *k, *n, *alpha, *beta,
+                ),
+                Op::MatmulResidentBf16Tn {
+                    a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+                } => self.matmul_resident_bf16_tn(
+                    *a_dev, *b_dev, *c_dev, *m, *k, *n, *alpha, *beta,
+                ),
+                Op::MatvecResidentBf16 {
+                    x_dev, weight_dev, bias_dev, out_dev,
+                    out_dim, in_dim,
+                } => self.matvec_resident_bf16(
+                    *x_dev, *weight_dev, *bias_dev, *out_dev,
+                    *out_dim, *in_dim,
                 ),
                 Op::RmsNormResident {
                     x_dev, weight_dev, y_dev, n, hidden, eps,
@@ -1650,6 +1724,207 @@ impl RocmBackend {
             )));
         }
         Ok(())
+    }
+
+    /// Fully-resident bf16 matmul: `C = A @ B` with fp32 accumulate.
+    /// All operands are bf16 stored as `u16`. Same column-major-via-
+    /// transpose trick as `matmul_resident_nn_f32`: hipBLAS is
+    /// column-major, so we compute `C^T = B^T @ A^T` by passing B as
+    /// the first arg and A as the second.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_resident_bf16_nn(
+        &self,
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+        self.gemm_ex_bf16(
+            ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_N,
+            n_i32, m_i32, k_i32,
+            alpha, beta,
+            b_dev, n_i32,
+            a_dev, k_i32,
+            c_dev, n_i32,
+            "matmul_resident_bf16_nn",
+        )
+    }
+
+    /// Fully-resident bf16 matmul: `C = A @ B^T`. See
+    /// `matmul_resident_nt_f32` for the derivation.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_resident_bf16_nt(
+        &self,
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+        self.gemm_ex_bf16(
+            ffi::HIPBLAS_OP_T, ffi::HIPBLAS_OP_N,
+            n_i32, m_i32, k_i32,
+            alpha, beta,
+            b_dev, k_i32,
+            a_dev, k_i32,
+            c_dev, n_i32,
+            "matmul_resident_bf16_nt",
+        )
+    }
+
+    /// Fully-resident bf16 matmul: `C = A^T @ B`. See
+    /// `matmul_resident_tn_f32` for the derivation.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_resident_bf16_tn(
+        &self,
+        a_dev: *const u16,
+        b_dev: *const u16,
+        c_dev: *mut u16,
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+        self.gemm_ex_bf16(
+            ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_T,
+            n_i32, m_i32, k_i32,
+            alpha, beta,
+            b_dev, n_i32,
+            a_dev, m_i32,
+            c_dev, n_i32,
+            "matmul_resident_bf16_tn",
+        )
+    }
+
+    /// Internal: route a single hipblasGemmEx call with bf16 inputs and
+    /// fp32 compute. Centralises the alpha/beta handle-lock dance so the
+    /// three NN/NT/TN wrappers stay almost-trivial.
+    ///
+    /// `op_label` is included in the error string so failures point at
+    /// the originating dispatch rather than this helper.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ex_bf16(
+        &self,
+        transa: std::os::raw::c_int,
+        transb: std::os::raw::c_int,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        a: *const u16,
+        lda: i32,
+        b: *const u16,
+        ldb: i32,
+        c: *mut u16,
+        ldc: i32,
+        op_label: &'static str,
+    ) -> Result<(), BackendError> {
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasGemmEx(
+                *handle,
+                transa, transb,
+                m, n, k,
+                &alpha as *const f32 as *const std::os::raw::c_void,
+                a as *const std::os::raw::c_void, ffi::HIP_R_16BF, lda,
+                b as *const std::os::raw::c_void, ffi::HIP_R_16BF, ldb,
+                &beta as *const f32 as *const std::os::raw::c_void,
+                c as *mut std::os::raw::c_void, ffi::HIP_R_16BF, ldc,
+                ffi::HIPBLAS_COMPUTE_32F,
+                ffi::HIPBLAS_GEMM_DEFAULT,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasGemmEx ({op_label}): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident bf16 matvec: `out = weight @ x + bias`, all
+    /// bf16 (`u16`), fp32 accumulate. Steps mirror `matvec_resident_f32`:
+    ///   1. D2D copy `bias_dev` → `out_dev` so out_dev seeds with bias.
+    ///   2. hipblasGemmEx with weight, x, out — `beta = 1.0` accumulates
+    ///      `W·x` into the bias-seeded out.
+    ///
+    /// Implementation note: we issue this as a 1-column GEMM rather
+    /// than a hypothetical hipblasGemvEx because the matvec dimension
+    /// for our shapes is small enough that the GEMM overhead doesn't
+    /// matter, and hipblas's matvec-Ex path is not in the hipblas
+    /// runtime we link against.
+    fn matvec_resident_bf16(
+        &self,
+        x_dev: *const u16,
+        weight_dev: *const u16,
+        bias_dev: *const u16,
+        out_dev: *mut u16,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<(), BackendError> {
+        let in_dim_i32 = as_i32(in_dim, "in_dim")?;
+        let out_dim_i32 = as_i32(out_dim, "out_dim")?;
+
+        // Step 1: D2D copy bias → out (bf16 = 2 bytes per elem).
+        const HIP_MEMCPY_DEVICE_TO_DEVICE: std::os::raw::c_int = 3;
+        let bytes = out_dim * 2;
+        let err = unsafe {
+            ffi::hipMemcpy(
+                out_dev as *mut std::os::raw::c_void,
+                bias_dev as *const std::os::raw::c_void,
+                bytes, HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipMemcpy D2D bias→out (bf16): {}", ffi::hip_err_str(err)
+            )));
+        }
+
+        // Step 2: 1-column GEMM. Same column-major-via-transpose trick
+        // as `matvec_resident_f32`: weight is row-major
+        // [out_dim × in_dim], read as col-major [in_dim × out_dim];
+        // transposing the first operand recovers the row-major matvec
+        // we want. We pose this as `C^T = W · x` of shape [out_dim × 1]:
+        //   GemmEx(N, N, m=out_dim, n=1, k=in_dim,
+        //          A = weight (transposed in op-order to get col-major
+        //              [out_dim × in_dim] semantics), lda=in_dim,
+        //          B = x, ldb=in_dim,
+        //          C = out, ldc=out_dim).
+        // Actually we follow the SGEMV pattern: hipblasSgemv(T, ...)
+        // does the transpose; the GemmEx equivalent is to declare
+        // A as [in_dim × out_dim] col-major and transpose it.
+        let alpha: f32 = 1.0;
+        let beta: f32 = 1.0;
+        self.gemm_ex_bf16(
+            ffi::HIPBLAS_OP_T, ffi::HIPBLAS_OP_N,
+            out_dim_i32, 1, in_dim_i32,
+            alpha, beta,
+            weight_dev, in_dim_i32,
+            x_dev, in_dim_i32,
+            out_dev, out_dim_i32,
+            "matvec_resident_bf16",
+        )
     }
 
     /// Resident RMSNorm forward via the custom hipcc kernel built by

@@ -205,6 +205,122 @@ pub unsafe fn matmul_resident_tn(
     Ok(())
 }
 
+/// Device-resident bf16 matmul `C = A @ B` (fp32 accumulate).
+/// See [`Op::MatmulResidentBf16Nn`](super::Op::MatmulResidentBf16Nn).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `m * k * 2` bytes (bf16 row-major).
+/// - `b_dev` covers at least `k * n * 2` bytes (bf16 row-major).
+/// - `c_dev` covers at least `m * n * 2` bytes (bf16 row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_resident_bf16_nn(
+    a_dev: *const u16,
+    b_dev: *const u16,
+    c_dev: *mut u16,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentBf16Nn {
+        a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident bf16 matmul `C = A @ B^T` (fp32 accumulate).
+/// See [`Op::MatmulResidentBf16Nt`](super::Op::MatmulResidentBf16Nt).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `m * k * 2` bytes (bf16 row-major).
+/// - `b_dev` covers at least `n * k * 2` bytes (bf16 row-major;
+///   transposed on the fly).
+/// - `c_dev` covers at least `m * n * 2` bytes (bf16 row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_resident_bf16_nt(
+    a_dev: *const u16,
+    b_dev: *const u16,
+    c_dev: *mut u16,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentBf16Nt {
+        a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident bf16 matmul `C = A^T @ B` (fp32 accumulate).
+/// See [`Op::MatmulResidentBf16Tn`](super::Op::MatmulResidentBf16Tn).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `k * m * 2` bytes (bf16 row-major;
+///   transposed on the fly).
+/// - `b_dev` covers at least `k * n * 2` bytes (bf16 row-major).
+/// - `c_dev` covers at least `m * n * 2` bytes (bf16 row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_resident_bf16_tn(
+    a_dev: *const u16,
+    b_dev: *const u16,
+    c_dev: *mut u16,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentBf16Tn {
+        a_dev, b_dev, c_dev, m, k, n, alpha, beta,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident bf16 matvec: `out = weight @ x + bias`. All operands
+/// are bf16 stored as `u16`. Dispatched via `hipblasGemmEx` with fp32
+/// accumulate (the standard mixed-precision recipe).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `out_dev` has at least `out_dim * 2` bytes allocated.
+/// - `weight_dev` has `out_dim * in_dim * 2` bytes laid out row-major.
+/// - `bias_dev` has `out_dim * 2` bytes.
+/// - `x_dev` has at least `in_dim * 2` bytes.
+#[inline]
+pub unsafe fn matvec_resident_bf16(
+    x_dev: *const u16,
+    weight_dev: *const u16,
+    bias_dev: *const u16,
+    out_dev: *mut u16,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatvecResidentBf16 {
+        x_dev, weight_dev, bias_dev, out_dev, out_dim, in_dim,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident Q4_K_M dequantize.
 /// See [`Op::DequantQ4KResident`](super::Op::DequantQ4KResident).
 ///

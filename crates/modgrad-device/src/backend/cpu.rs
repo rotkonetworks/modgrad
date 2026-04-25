@@ -55,6 +55,10 @@ impl Backend for CpuBackend {
             Op::MatmulResidentNN { .. } => false,
             Op::MatmulResidentNT { .. } => false,
             Op::MatmulResidentTN { .. } => false,
+            Op::MatmulResidentBf16Nn { .. } => false,
+            Op::MatmulResidentBf16Nt { .. } => false,
+            Op::MatmulResidentBf16Tn { .. } => false,
+            Op::MatvecResidentBf16 { .. } => false,
             Op::RmsNormResident { .. } => false,
             Op::DequantQ4KResident { .. } => false,
             Op::LayerNormResident { .. } => false,
@@ -109,6 +113,22 @@ impl Backend for CpuBackend {
             }),
             Op::MatmulResidentTN { .. } => Err(BackendError::Unsupported {
                 op: "matmul_resident_tn",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentBf16Nn { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_bf16_nn",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentBf16Nt { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_bf16_nt",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentBf16Tn { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_bf16_tn",
+                backend: "cpu",
+            }),
+            Op::MatvecResidentBf16 { .. } => Err(BackendError::Unsupported {
+                op: "matvec_resident_bf16",
                 backend: "cpu",
             }),
             Op::RmsNormResident { .. } => Err(BackendError::Unsupported {

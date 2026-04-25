@@ -204,6 +204,160 @@ impl LinearResident {
     }
 }
 
+/// **Mixed-precision** device-resident wrapper. The device-side
+/// weight + bias are bf16 (half the size of fp32), and the forward
+/// path runs `hipblasGemmEx` with bf16 input/output and fp32 compute
+/// — the standard mixed-precision recipe.
+///
+/// Master fp32 copies live host-side: AdamW updates the fp32 master,
+/// then `sync_from_master` re-quantises and re-uploads. fp32 master
+/// weights preserve optimiser stability without inflating the
+/// activation footprint (forward / backward pass tensors stay bf16).
+///
+/// Lifecycle:
+///   - `LinearResidentBf16::from_linear(&lin)?` — quantise lin's fp32
+///     weights to bf16 + upload. Master copy starts equal to `lin`.
+///   - `forward(batch, x_dev, &mut out_dev)` — bf16 in, bf16 out.
+///   - After AdamW (which runs on the host fp32 master),
+///     `sync_from_master()` re-quantises and re-uploads.
+///
+/// Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub struct LinearResidentBf16 {
+    /// bf16 weights on device (in-VRAM, half the size of fp32).
+    pub weight_dev: modgrad_device::backend::HipBuffer,
+    /// bf16 bias on device.
+    pub bias_dev: modgrad_device::backend::HipBuffer,
+    /// fp32 master copy of weights — for AdamW stability.
+    pub host_master_weight: Vec<f32>,
+    /// fp32 master copy of bias.
+    pub host_master_bias: Vec<f32>,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl LinearResidentBf16 {
+    /// Build a bf16 resident wrapper from an fp32 `Linear`. Quantises
+    /// weights + bias to bf16 once and uploads; the fp32 master is
+    /// retained for the AdamW path.
+    pub fn from_linear(lin: &Linear) -> Result<Self, super::backend::ResidencyError> {
+        // bf16 storage is half the bytes of fp32. We can't pass a `&[u16]`
+        // straight to `HipBuffer::copy_from_host` (it expects `&[f32]`),
+        // so pre-quantise into a `Vec<u16>` and reinterpret as bytes via
+        // a fresh fp32 view of the same allocation. The byte count is
+        // identical either way.
+        use modgrad_device::backend::op::f32_to_bf16;
+
+        let wt_bf16: Vec<u16> = lin.weight.iter().map(|&v| f32_to_bf16(v)).collect();
+        let bs_bf16: Vec<u16> = lin.bias.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let weight_dev = modgrad_device::backend::HipBuffer::new(wt_bf16.len() * 2)?;
+        let bias_dev = modgrad_device::backend::HipBuffer::new(bs_bf16.len() * 2)?;
+
+        upload_u16(&weight_dev, &wt_bf16)?;
+        upload_u16(&bias_dev, &bs_bf16)?;
+
+        Ok(Self {
+            weight_dev, bias_dev,
+            host_master_weight: lin.weight.clone(),
+            host_master_bias: lin.bias.clone(),
+            in_dim: lin.in_dim,
+            out_dim: lin.out_dim,
+        })
+    }
+
+    /// Re-quantise the fp32 master to bf16 and re-upload. Call after
+    /// every AdamW step that mutated `host_master_weight` /
+    /// `host_master_bias`.
+    pub fn sync_from_master(&mut self) -> Result<(), super::backend::ResidencyError> {
+        use modgrad_device::backend::op::f32_to_bf16;
+        let wt_bf16: Vec<u16> = self.host_master_weight.iter().map(|&v| f32_to_bf16(v)).collect();
+        let bs_bf16: Vec<u16> = self.host_master_bias.iter().map(|&v| f32_to_bf16(v)).collect();
+        upload_u16(&self.weight_dev, &wt_bf16)?;
+        upload_u16(&self.bias_dev, &bs_bf16)?;
+        Ok(())
+    }
+
+    /// bf16 forward — `x_dev` and `out_dev` must be bf16-flavored
+    /// `GpuVec::Hip` buffers (from `GpuVec::try_hip_bf16`). The fp32
+    /// element count is *not* a meaningful interpretation of these
+    /// buffers; this method takes raw `&GpuVec` for plumbing
+    /// uniformity but reads only the underlying `HipBuffer`.
+    pub fn forward(
+        &self,
+        batch: &modgrad_device::backend::HipBatch,
+        x_dev: &super::backend::GpuVec,
+        out_dev: &mut super::backend::GpuVec,
+    ) -> Result<(), super::backend::ResidencyError> {
+        use super::backend::{GpuVec, ResidencyError};
+        let x_buf = match x_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let out_buf = match out_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        unsafe {
+            modgrad_device::backend::ops::matvec_resident_bf16(
+                x_buf.device_ptr() as *const u16,
+                self.weight_dev.device_ptr() as *const u16,
+                self.bias_dev.device_ptr() as *const u16,
+                out_buf.device_ptr() as *mut u16,
+                self.out_dim,
+                self.in_dim,
+            )?;
+        }
+        batch.note_dispatch()?;
+        Ok(())
+    }
+}
+
+/// Helper: upload a `&[u16]` (bf16 stored as `u16`) into a `HipBuffer`
+/// via the same `hipMemcpy(H2D)` as the fp32 path. The HipBuffer
+/// `copy_from_host` API is fp32-typed; we reinterpret the slice as
+/// bytes-of-the-correct-length so the underlying memcpy is identical.
+#[cfg(feature = "rocm")]
+fn upload_u16(buf: &modgrad_device::backend::HipBuffer, src: &[u16])
+    -> Result<(), super::backend::ResidencyError>
+{
+    // Reinterpret `[u16]` as `[f32]` of half the length. bf16 buffers
+    // are aligned to 2 bytes; f32 needs 4-byte alignment, but since we
+    // only call `copy_from_host` (which routes through hipMemcpy
+    // ultimately taking a `*const c_void`) the alignment is not
+    // dereferenced — only `as_ptr() / len * 4` are read by the FFI.
+    // Pad the src to an even u16 count so the f32 view has integer
+    // length; the HipBuffer was allocated to `src.len() * 2` bytes
+    // (matching `n * 2`), so a one-element pad just costs 2 bytes per
+    // odd dim.
+    let n_u16 = src.len();
+    if n_u16 % 2 == 0 {
+        // Safety: we only reinterpret to satisfy the f32-typed copy
+        // API; alignment of u16 (2) is < f32 (4) but the underlying
+        // memcpy never derefs through the pointer as f32.
+        let view = unsafe {
+            std::slice::from_raw_parts(src.as_ptr() as *const f32, n_u16 / 2)
+        };
+        buf.copy_from_host(view)?;
+    } else {
+        // Odd length — pad to even and upload via a temporary owned
+        // vector so the memcpy still sees an aligned source.
+        let mut padded: Vec<u16> = Vec::with_capacity(n_u16 + 1);
+        padded.extend_from_slice(src);
+        padded.push(0);
+        let view = unsafe {
+            std::slice::from_raw_parts(padded.as_ptr() as *const f32, padded.len() / 2)
+        };
+        buf.copy_from_host(view)?;
+    }
+    Ok(())
+}
+
 /// Streaming variant of `LinearResident` — the host weights live in an
 /// `Arc<Linear>` shared with the optimizer, and the device buffers are
 /// allocated/uploaded on demand and (optionally) torn down right after
@@ -918,9 +1072,9 @@ mod resident_tests {
         // Device-resident path
         let resident = LinearResident::from_linear(&lin)
             .expect("LinearResident::from_linear");
-        let mut x_dev = super::super::backend::GpuVec::try_hip(64).expect("alloc x");
+        let mut x_dev = crate::backend::GpuVec::try_hip(64).expect("alloc x");
         x_dev.copy_from(&host_x);
-        let mut out_dev = super::super::backend::GpuVec::try_hip(128).expect("alloc out");
+        let mut out_dev = crate::backend::GpuVec::try_hip(128).expect("alloc out");
 
         let batch = modgrad_device::backend::HipBatch::new();
         resident.forward(&batch, &x_dev, &mut out_dev).expect("resident forward");
@@ -950,7 +1104,7 @@ mod resident_tests {
         let host_x: Vec<f32> = (0..64).map(|_| rng.next_normal()).collect();
 
         let resident = LinearResident::from_linear(&lin).expect("resident");
-        let mut x_dev = super::super::backend::GpuVec::try_hip(64).expect("x");
+        let mut x_dev = crate::backend::GpuVec::try_hip(64).expect("x");
         x_dev.copy_from(&host_x);
 
         // Run 32 forwards in a row; output of every call should be
@@ -960,7 +1114,7 @@ mod resident_tests {
         let batch = modgrad_device::backend::HipBatch::new();
         let mut first_y: Option<Vec<f32>> = None;
         for _ in 0..32 {
-            let mut out_dev = super::super::backend::GpuVec::try_hip(64).expect("out");
+            let mut out_dev = crate::backend::GpuVec::try_hip(64).expect("out");
             resident.forward(&batch, &x_dev, &mut out_dev).expect("forward");
             // copy_to_host implicitly synchronises (hipMemcpy D2H is
             // synchronous against the default stream), so reads are
@@ -1006,10 +1160,10 @@ mod resident_tests {
         // Device-resident: upload weights once, dispatch once.
         let resident = SuperLinearResident::from_super_linear(&sl)
             .expect("SuperLinearResident::from_super_linear");
-        let mut x_dev = super::super::backend::GpuVec::try_hip(n_neurons * in_per)
+        let mut x_dev = crate::backend::GpuVec::try_hip(n_neurons * in_per)
             .expect("alloc x");
         x_dev.copy_from(&host_x);
-        let mut out_dev = super::super::backend::GpuVec::try_hip(n_neurons * out_per)
+        let mut out_dev = crate::backend::GpuVec::try_hip(n_neurons * out_per)
             .expect("alloc out");
 
         let batch = modgrad_device::backend::HipBatch::new();
@@ -1046,9 +1200,9 @@ mod resident_tests {
         // Reference: existing one-shot LinearResident.
         let resident = LinearResident::from_linear(&lin)
             .expect("LinearResident::from_linear");
-        let mut x_dev = super::super::backend::GpuVec::try_hip(64).expect("alloc x");
+        let mut x_dev = crate::backend::GpuVec::try_hip(64).expect("alloc x");
         x_dev.copy_from(&host_x);
-        let mut ref_out_dev = super::super::backend::GpuVec::try_hip(96).expect("alloc ref out");
+        let mut ref_out_dev = crate::backend::GpuVec::try_hip(96).expect("alloc ref out");
         let batch = modgrad_device::backend::HipBatch::new();
         resident.forward(&batch, &x_dev, &mut ref_out_dev).expect("ref forward");
         batch.flush().expect("ref flush");
@@ -1064,7 +1218,7 @@ mod resident_tests {
         assert!(streaming.is_resident(),
             "ensure_resident must leave both device buffers populated");
 
-        let mut stream_out_dev = super::super::backend::GpuVec::try_hip(96)
+        let mut stream_out_dev = crate::backend::GpuVec::try_hip(96)
             .expect("alloc stream out");
         let stream_batch = modgrad_device::backend::HipBatch::new();
         streaming.forward(&stream_batch, &x_dev, &mut stream_out_dev, false)
@@ -1103,12 +1257,12 @@ mod resident_tests {
         let host_arc = std::sync::Arc::new(lin);
         let mut streaming = LinearResidentStreaming::from_linear_arc(host_arc);
 
-        let mut x_dev = super::super::backend::GpuVec::try_hip(48).expect("alloc x");
+        let mut x_dev = crate::backend::GpuVec::try_hip(48).expect("alloc x");
         x_dev.copy_from(&host_x);
 
         // First forward with auto_evict=true: should upload, dispatch,
         // then immediately drop the device buffers.
-        let mut out_a_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc out a");
+        let mut out_a_dev = crate::backend::GpuVec::try_hip(32).expect("alloc out a");
         let batch_a = modgrad_device::backend::HipBatch::new();
         streaming.forward(&batch_a, &x_dev, &mut out_a_dev, true)
             .expect("first forward");
@@ -1121,7 +1275,7 @@ mod resident_tests {
         // Second forward: must re-upload from host weights and produce
         // the same output. We're testing the round-trip through the
         // ensure_resident gate.
-        let mut out_b_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc out b");
+        let mut out_b_dev = crate::backend::GpuVec::try_hip(32).expect("alloc out b");
         let batch_b = modgrad_device::backend::HipBatch::new();
         streaming.forward(&batch_b, &x_dev, &mut out_b_dev, false)
             .expect("second forward");
@@ -1156,11 +1310,11 @@ mod resident_tests {
         let host_arc = std::sync::Arc::new(lin);
         let mut streaming = LinearResidentStreaming::from_linear_arc(host_arc);
 
-        let mut x_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc x");
+        let mut x_dev = crate::backend::GpuVec::try_hip(32).expect("alloc x");
         x_dev.copy_from(&host_x);
 
         // Forward with the original weights; record output.
-        let mut out_orig_dev = super::super::backend::GpuVec::try_hip(16)
+        let mut out_orig_dev = crate::backend::GpuVec::try_hip(16)
             .expect("alloc out orig");
         let batch_orig = modgrad_device::backend::HipBatch::new();
         streaming.forward(&batch_orig, &x_dev, &mut out_orig_dev, false)
@@ -1191,7 +1345,7 @@ mod resident_tests {
             "evict must drop device buffers");
 
         // Forward with mutated weights.
-        let mut out_new_dev = super::super::backend::GpuVec::try_hip(16)
+        let mut out_new_dev = crate::backend::GpuVec::try_hip(16)
             .expect("alloc out new");
         let batch_new = modgrad_device::backend::HipBatch::new();
         streaming.forward(&batch_new, &x_dev, &mut out_new_dev, false)
@@ -1237,7 +1391,7 @@ mod resident_tests {
 
         let resident = SuperLinearResident::from_super_linear(&sl)
             .expect("resident");
-        let mut x_dev = super::super::backend::GpuVec::try_hip(n_neurons * in_per)
+        let mut x_dev = crate::backend::GpuVec::try_hip(n_neurons * in_per)
             .expect("x");
         x_dev.copy_from(&host_x);
 
@@ -1247,7 +1401,7 @@ mod resident_tests {
         let batch = modgrad_device::backend::HipBatch::new();
         let mut first_y: Option<Vec<f32>> = None;
         for _ in 0..16 {
-            let mut out_dev = super::super::backend::GpuVec::try_hip(n_neurons * out_per)
+            let mut out_dev = crate::backend::GpuVec::try_hip(n_neurons * out_per)
                 .expect("out");
             resident.forward(&batch, &x_dev, &mut out_dev).expect("forward");
             // copy_to_host implicitly synchronises; safe mid-batch.
@@ -1431,6 +1585,172 @@ mod resident_tests {
             assert!(ratio < 0.16,
                 "Q4_K compression ratio {ratio} > 16% of fp32 — \
                  expected ~14% (≈ 7× compression)");
+        }
+    }
+
+    // ─── LinearResidentBf16 (mixed-precision) ──────────────────────
+
+    mod bf16 {
+        use super::*;
+        use modgrad_device::backend::op::{bf16_to_f32, f32_to_bf16};
+
+        /// `LinearResidentBf16::forward` matches the fp32 reference
+        /// produced by `LinearResident::forward` within bf16's 1%
+        /// relative tolerance band. Proves the full mixed-precision
+        /// path: host fp32 → bf16 quantise → upload → bf16 GemmEx
+        /// dispatch → bf16 download → fp32 dequantise.
+        #[test]
+        fn linear_resident_bf16_matches_fp32() {
+            if !runtime_available() {
+                eprintln!("hip runtime unavailable, skipping");
+                return;
+            }
+            // Even dims for the bf16 upload helper (it pads odd
+            // lengths but the matched-shape path is the common case).
+            let in_dim = 64;
+            let out_dim = 128;
+            let lin = Linear::new(in_dim, out_dim);
+            let mut rng = SimpleRng::new(0xBF16);
+            let host_x: Vec<f32> = (0..in_dim).map(|_| rng.next_normal() * 0.5).collect();
+
+            // fp32 reference, but operands are routed through bf16
+            // round-trip so the comparison reflects the same
+            // quantisation noise the device path saw.
+            let lin_q = {
+                let mut q = lin.clone();
+                for w in q.weight.iter_mut() {
+                    *w = bf16_to_f32(f32_to_bf16(*w));
+                }
+                for b in q.bias.iter_mut() {
+                    *b = bf16_to_f32(f32_to_bf16(*b));
+                }
+                q
+            };
+            let host_xq: Vec<f32> = host_x.iter()
+                .map(|&v| bf16_to_f32(f32_to_bf16(v))).collect();
+            let mut ref_y = vec![0.0f32; out_dim];
+            lin_q.forward_into(&host_xq, &mut ref_y);
+
+            // Device-resident bf16 path.
+            let resident = LinearResidentBf16::from_linear(&lin)
+                .expect("LinearResidentBf16::from_linear");
+            let mut x_dev = crate::backend::GpuVec::try_hip_bf16(in_dim)
+                .expect("alloc x bf16");
+            // Upload x as bf16 — copy raw bytes via the HipBuffer's
+            // f32-typed copy_from_host, since the buffer was sized for
+            // bf16 (in_dim * 2 bytes).
+            let xq: Vec<u16> = host_x.iter().map(|&v| f32_to_bf16(v)).collect();
+            if let crate::backend::GpuVec::Hip(buf) = &mut x_dev {
+                let view = unsafe {
+                    std::slice::from_raw_parts(xq.as_ptr() as *const f32, xq.len() / 2)
+                };
+                buf.copy_from_host(view).expect("upload x bf16");
+            } else {
+                panic!("expected Hip variant from try_hip_bf16");
+            }
+            let mut out_dev = crate::backend::GpuVec::try_hip_bf16(out_dim)
+                .expect("alloc out bf16");
+
+            let batch = modgrad_device::backend::HipBatch::new();
+            resident.forward(&batch, &x_dev, &mut out_dev)
+                .expect("bf16 forward");
+            batch.flush().expect("flush");
+
+            // Download as bf16 bytes, dequantise to fp32.
+            let mut out_u16 = vec![0u16; out_dim];
+            if let crate::backend::GpuVec::Hip(buf) = &out_dev {
+                let view = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        out_u16.as_mut_ptr() as *mut f32,
+                        out_u16.len() / 2,
+                    )
+                };
+                buf.copy_to_host(view).expect("download out bf16");
+            } else {
+                panic!("expected Hip variant");
+            }
+            let device_y: Vec<f32> = out_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+
+            // ~1% relative tolerance — bf16 has ~3 decimal digits of
+            // precision and we accumulate `in_dim` terms in fp32.
+            let mut max_rel = 0.0f32;
+            for (a, b) in ref_y.iter().zip(&device_y) {
+                let scale = a.abs().max(b.abs()).max(1e-3);
+                let rel = (a - b).abs() / scale;
+                if rel > max_rel { max_rel = rel; }
+            }
+            assert!(max_rel < 1e-2,
+                "fp32 vs bf16 max rel = {max_rel}, expected < 1%");
+        }
+
+        /// `sync_from_master` round-trips correctly: an in-place edit
+        /// to `host_master_weight` propagates to device on the next
+        /// dispatch.
+        #[test]
+        fn linear_resident_bf16_sync_from_master() {
+            if !runtime_available() {
+                eprintln!("hip runtime unavailable, skipping");
+                return;
+            }
+            let in_dim = 32;
+            let out_dim = 16;
+            let lin = Linear::new(in_dim, out_dim);
+            let mut rng = SimpleRng::new(0xBADF00D);
+            let host_x: Vec<f32> = (0..in_dim).map(|_| rng.next_normal() * 0.5).collect();
+
+            let mut resident = LinearResidentBf16::from_linear(&lin)
+                .expect("LinearResidentBf16::from_linear");
+
+            // Mutate the master weights (simulate AdamW result), call
+            // sync_from_master, dispatch, and assert the new weights
+            // produced a different output than the original.
+            let mut x_dev = crate::backend::GpuVec::try_hip_bf16(in_dim)
+                .expect("alloc x");
+            let xq: Vec<u16> = host_x.iter().map(|&v| f32_to_bf16(v)).collect();
+            if let crate::backend::GpuVec::Hip(buf) = &mut x_dev {
+                let view = unsafe {
+                    std::slice::from_raw_parts(xq.as_ptr() as *const f32, xq.len() / 2)
+                };
+                buf.copy_from_host(view).expect("upload x");
+            }
+            let mut out_dev = crate::backend::GpuVec::try_hip_bf16(out_dim)
+                .expect("alloc out");
+
+            let batch = modgrad_device::backend::HipBatch::new();
+            resident.forward(&batch, &x_dev, &mut out_dev).expect("forward 1");
+            batch.flush().expect("flush 1");
+            let mut out_u16_a = vec![0u16; out_dim];
+            if let crate::backend::GpuVec::Hip(buf) = &out_dev {
+                let view = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        out_u16_a.as_mut_ptr() as *mut f32,
+                        out_u16_a.len() / 2,
+                    )
+                };
+                buf.copy_to_host(view).expect("download a");
+            }
+
+            // Mutate every weight + bias and re-sync.
+            for w in resident.host_master_weight.iter_mut() { *w *= 2.0; }
+            for b in resident.host_master_bias.iter_mut() { *b += 1.0; }
+            resident.sync_from_master().expect("sync_from_master");
+
+            let batch2 = modgrad_device::backend::HipBatch::new();
+            resident.forward(&batch2, &x_dev, &mut out_dev).expect("forward 2");
+            batch2.flush().expect("flush 2");
+            let mut out_u16_b = vec![0u16; out_dim];
+            if let crate::backend::GpuVec::Hip(buf) = &out_dev {
+                let view = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        out_u16_b.as_mut_ptr() as *mut f32,
+                        out_u16_b.len() / 2,
+                    )
+                };
+                buf.copy_to_host(view).expect("download b");
+            }
+
+            assert_ne!(out_u16_a, out_u16_b,
+                "sync_from_master did not propagate weight mutation");
         }
     }
 }

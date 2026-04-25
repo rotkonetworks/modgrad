@@ -90,6 +90,29 @@ impl GpuVec {
         Ok(GpuVec::Hip(buf))
     }
 
+    /// Try to allocate a hip-resident **bf16** device buffer of `n`
+    /// elements. Allocates `n * 2` bytes — half the size of the fp32
+    /// equivalent.
+    ///
+    /// Internally still a `GpuVec::Hip` wrapper; the variant carries no
+    /// dtype tag, so the caller is responsible for never mixing bf16
+    /// and fp32 dispatches against the same buffer. The
+    /// `len()`/`is_host_visible()` accessors return values consistent
+    /// with the byte size, so `len()` reports `n * 2 / 4 = n / 2` —
+    /// callers that need the bf16 element count should track it
+    /// alongside the buffer (typical pattern: capture `out_dim`/`in_dim`
+    /// next to the `LinearResidentBf16` that owns it).
+    ///
+    /// Cannot be reused via `as_slice` / `copy_to_host` for a meaningful
+    /// f32 read — those interpret the buffer as fp32. Use a manual
+    /// `HipBuffer::copy_to_host` into a `Vec<u16>`-equivalent staging
+    /// area instead.
+    #[cfg(feature = "rocm")]
+    pub fn try_hip_bf16(n: usize) -> Result<Self, ResidencyError> {
+        let buf = modgrad_device::backend::HipBuffer::new(n * 2)?;
+        Ok(GpuVec::Hip(buf))
+    }
+
     /// Diagnostic name of the active residency variant. Used by
     /// `ResidencyError::WrongVariant` so callers can see what they
     /// handed us when a Hip-only entry point received `Heap` or
