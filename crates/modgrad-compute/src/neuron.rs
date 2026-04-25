@@ -204,6 +204,130 @@ impl LinearResident {
     }
 }
 
+/// Device-resident wrapper over a `SuperLinear`. Uploads the per-neuron
+/// weight tensor (`[n_neurons × out_per × in_per]` flat, contiguous) and
+/// bias tensor (`[n_neurons × out_per]`) to hipMalloc'd buffers once,
+/// then `forward` issues `n_neurons` resident `matvec_resident` calls
+/// with pointer offsets into the device buffers — zero PCIe transfers
+/// per call.
+///
+/// Layout matches `SuperLinear`: each neuron's weight slice is
+/// `weight_dev[n * out_per * in_per .. (n + 1) * out_per * in_per]`,
+/// row-major within the neuron (one row per output, `in_per` cols).
+/// The bias slice for neuron `n` is
+/// `bias_dev[n * out_per .. (n + 1) * out_per]`.
+///
+/// Lifecycle mirrors `LinearResident`:
+///   - `from_super_linear(&sl)?` — allocate + upload.
+///   - `forward(&batch, x_dev, &mut out_dev)` — per-step dispatch.
+///   - `sync_weights_from(&sl)?` — re-upload after an optimizer step.
+///
+/// Production `n_neurons` is ≤512, so the per-neuron loop dispatching
+/// against the `HipBatch::DEFAULT_SYNC_EVERY = 256` cadence stays
+/// well-behaved without coalescing the matvecs into a fused kernel.
+///
+/// Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub struct SuperLinearResident {
+    pub weight_dev: modgrad_device::backend::HipBuffer,
+    pub bias_dev: modgrad_device::backend::HipBuffer,
+    pub n_neurons: usize,
+    pub in_per: usize,
+    pub out_per: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl SuperLinearResident {
+    /// Allocate device buffers and upload weight + bias from a host-side
+    /// `SuperLinear`. Returns `ResidencyError::Backend(_)` on hipMalloc /
+    /// hipMemcpy failure; match the inner `BackendError` variant for
+    /// typed recovery.
+    pub fn from_super_linear(sl: &SuperLinear) -> Result<Self, super::backend::ResidencyError> {
+        let weight_dev = modgrad_device::backend::HipBuffer::new(sl.weights.len() * 4)?;
+        weight_dev.copy_from_host(&sl.weights)?;
+        let bias_dev = modgrad_device::backend::HipBuffer::new(sl.biases.len() * 4)?;
+        bias_dev.copy_from_host(&sl.biases)?;
+        Ok(Self {
+            weight_dev, bias_dev,
+            n_neurons: sl.n_neurons,
+            in_per: sl.in_per,
+            out_per: sl.out_per,
+        })
+    }
+
+    /// Re-upload weights + biases after an in-place optimizer step.
+    pub fn sync_weights_from(&mut self, sl: &SuperLinear) -> Result<(), super::backend::ResidencyError> {
+        debug_assert_eq!(sl.n_neurons, self.n_neurons);
+        debug_assert_eq!(sl.in_per, self.in_per);
+        debug_assert_eq!(sl.out_per, self.out_per);
+        self.weight_dev.copy_from_host(&sl.weights)?;
+        self.bias_dev.copy_from_host(&sl.biases)?;
+        Ok(())
+    }
+
+    /// Resident forward: `x_dev` and `out_dev` are `GpuVec::Hip`. Issues
+    /// one `matvec_resident` per neuron, with each call's pointers
+    /// offset into the device buffers so the per-neuron weight matrix,
+    /// bias vector, input slice, and output slice are addressed without
+    /// any host staging.
+    ///
+    /// Input shape: `[n_neurons * in_per]` (per-neuron trace concatenated).
+    /// Output shape: `[n_neurons * out_per]`.
+    ///
+    /// **Requires a `&HipBatch`.** See `LinearResident::forward` for
+    /// rationale — the batch turns the queue-sync requirement into a
+    /// compile-time obligation. Each per-neuron dispatch counts toward
+    /// the batch's pending dispatch tally; the auto-sync at
+    /// `DEFAULT_SYNC_EVERY = 256` keeps us bounded against the watchdog
+    /// even for the larger production neuron counts.
+    pub fn forward(
+        &self,
+        batch: &modgrad_device::backend::HipBatch,
+        x_dev: &super::backend::GpuVec,
+        out_dev: &mut super::backend::GpuVec,
+    ) -> Result<(), super::backend::ResidencyError> {
+        use super::backend::{GpuVec, ResidencyError};
+        debug_assert_eq!(x_dev.len(), self.n_neurons * self.in_per);
+        debug_assert_eq!(out_dev.len(), self.n_neurons * self.out_per);
+        let x_buf = match x_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let out_buf = match out_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let x_base = x_buf.device_ptr() as *const f32;
+        let out_base = out_buf.device_ptr() as *mut f32;
+        let w_base = self.weight_dev.device_ptr() as *const f32;
+        let b_base = self.bias_dev.device_ptr() as *const f32;
+        let in_per = self.in_per;
+        let out_per = self.out_per;
+        let weight_stride = out_per * in_per;
+        for n in 0..self.n_neurons {
+            // Per-neuron pointer offsets — same layout the host
+            // `SuperLinear::forward_cpu` uses, just expressed as
+            // pointer arithmetic against the resident buffers.
+            unsafe {
+                modgrad_device::backend::ops::matvec_resident(
+                    x_base.add(n * in_per),
+                    w_base.add(n * weight_stride),
+                    b_base.add(n * out_per),
+                    out_base.add(n * out_per),
+                    out_per,
+                    in_per,
+                )?;
+            }
+            batch.note_dispatch()?;
+        }
+        Ok(())
+    }
+}
+
 /// Minimal PRNG for weight init.
 #[derive(Debug, Clone)]
 pub struct SimpleRng(u64);
@@ -422,6 +546,103 @@ mod resident_tests {
             // synchronous against the default stream), so reads are
             // safe even mid-batch.
             let mut host_y = vec![0.0f32; 64];
+            out_dev.copy_to_host(&mut host_y);
+            match &first_y {
+                None => first_y = Some(host_y),
+                Some(y0) => assert_eq!(*y0, host_y, "drift across calls"),
+            }
+        }
+    }
+
+    /// SuperLinearResident matches the CPU `SuperLinear::forward` output
+    /// within FP tolerance on a small shape (8 neurons × 4 in × 3 out).
+    /// Proves the per-neuron pointer-offset dispatch produces the same
+    /// arithmetic as the host `dot`-based path. Tolerance is loose
+    /// (1e-3) because rocBLAS uses a different accumulation order than
+    /// the AVX-512 `dot` reduction.
+    #[test]
+    fn super_linear_resident_matches_host() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let n_neurons = 8;
+        let in_per = 4;
+        let out_per = 3;
+        let mut sl = SuperLinear::new(n_neurons, in_per, out_per);
+        // Randomize bias (the constructor zeros it) so the bias-add
+        // in the resident path is exercised, not just the matmul.
+        let mut rng = SimpleRng::new(0xABCD);
+        for b in sl.biases.iter_mut() {
+            *b = rng.next_normal() * 0.1;
+        }
+        let host_x: Vec<f32> = (0..n_neurons * in_per)
+            .map(|_| rng.next_normal())
+            .collect();
+
+        // Host reference: route through `SuperLinear::forward`.
+        let host_y = sl.forward(&host_x);
+
+        // Device-resident: upload weights once, dispatch once.
+        let resident = SuperLinearResident::from_super_linear(&sl)
+            .expect("SuperLinearResident::from_super_linear");
+        let mut x_dev = super::super::backend::GpuVec::try_hip(n_neurons * in_per)
+            .expect("alloc x");
+        x_dev.copy_from(&host_x);
+        let mut out_dev = super::super::backend::GpuVec::try_hip(n_neurons * out_per)
+            .expect("alloc out");
+
+        let batch = modgrad_device::backend::HipBatch::new();
+        resident.forward(&batch, &x_dev, &mut out_dev).expect("resident forward");
+        batch.flush().expect("flush");
+
+        let mut device_y = vec![0.0f32; n_neurons * out_per];
+        out_dev.copy_to_host(&mut device_y);
+
+        let max_diff = host_y.iter().zip(&device_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-3,
+            "host vs resident mismatch: max |Δ| = {max_diff}");
+    }
+
+    /// Calling SuperLinearResident.forward many times with the same
+    /// input must produce bit-identical output every iteration. No
+    /// PRNG is in play so any drift would indicate a real bug
+    /// (uninitialized accumulator, lingering state, queue overflow
+    /// silently corrupting output, etc.).
+    #[test]
+    fn super_linear_resident_loop_no_drift() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let n_neurons = 8;
+        let in_per = 4;
+        let out_per = 3;
+        let sl = SuperLinear::new(n_neurons, in_per, out_per);
+        let mut rng = SimpleRng::new(0xFEED);
+        let host_x: Vec<f32> = (0..n_neurons * in_per)
+            .map(|_| rng.next_normal())
+            .collect();
+
+        let resident = SuperLinearResident::from_super_linear(&sl)
+            .expect("resident");
+        let mut x_dev = super::super::backend::GpuVec::try_hip(n_neurons * in_per)
+            .expect("x");
+        x_dev.copy_from(&host_x);
+
+        // 16 forwards on the same input; `n_neurons * 16 = 128`
+        // dispatches stays under the 256 auto-sync threshold so we
+        // verify both the in-batch and end-of-batch paths.
+        let batch = modgrad_device::backend::HipBatch::new();
+        let mut first_y: Option<Vec<f32>> = None;
+        for _ in 0..16 {
+            let mut out_dev = super::super::backend::GpuVec::try_hip(n_neurons * out_per)
+                .expect("out");
+            resident.forward(&batch, &x_dev, &mut out_dev).expect("forward");
+            // copy_to_host implicitly synchronises; safe mid-batch.
+            let mut host_y = vec![0.0f32; n_neurons * out_per];
             out_dev.copy_to_host(&mut host_y);
             match &first_y {
                 None => first_y = Some(host_y),

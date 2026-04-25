@@ -20,6 +20,8 @@ pub mod schedule;
 pub mod modulator;
 #[cfg(feature = "rocm")]
 pub mod resident;
+#[cfg(feature = "rocm")]
+pub mod ctm_resident;
 /// Re-export of `modgrad_memory` for backward compatibility.
 /// New code should import from `modgrad_memory` directly.
 pub use modgrad_memory as memory;
