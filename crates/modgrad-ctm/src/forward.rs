@@ -243,18 +243,30 @@ fn ctm_forward_with_kv(
 // sync_out → output_proj/exit_gate) and download the matvec result
 // back to host before the next host op.
 //
-// **MHA scaled-dot-product stays host for this PR.** Q (1 vector)
-// and per-token K/V are produced by resident matvecs against the
-// row-sliced mha_in_q / mha_in_k / mha_in_v sub-Linears, then the
-// softmax + weighted sum runs on the host (D2H per token, identical
-// arithmetic to the host `multihead_attention` per-head loop). Once
-// `Op::AttentionResident` lands the host softmax block can lift to
-// device. TODO: wire that op when it lands.
+// **MHA softmax now resident.** Q (1 vector) and per-token K/V are
+// produced by resident matvecs against the row-sliced mha_in_q /
+// mha_in_k / mha_in_v sub-Linears. The per-head scores (host
+// dot-product against pre-projected host K) are packed into a
+// `[n_heads × n_tokens]` device buffer and run through a SINGLE
+// `softmax_resident` dispatch (ACCURATE algo, INSTANCE mode → per-N
+// softmax across the C axis), then downloaded as softmax weights.
+// One MIOpen kernel launch per tick instead of n_heads. The
+// per-head V·weights weighted sum stays host because V is in
+// [n_tokens × d_head] layout — turning that into a resident matvec
+// needs a transpose (or rocBLAS sgemv with transpose flag); keeping
+// it host costs only the small per-head reduction. TODO
+// (a) pre-transpose V on device so the weighted sum becomes a
+// resident matvec, or (b) batch the QK dot-product as a resident
+// matvec too so scores never round-trip; either subsumes the
+// current upload/download bracket around the softmax dispatch.
 //
-// **NLM per-neuron GLU stays host** for this PR (D2H → host GLU →
-// H2D between SuperLinear stages). Same reason — no resident GLU
-// op yet. TODO: lift to device when `Op::PerNeuronGluResident`
-// arrives.
+// **NLM per-neuron GLU now resident.** Stage1 produces a device
+// `[d * 2*h]` block; we issue `d` `glu_resident` dispatches (one
+// per neuron) writing into a device `[d * h]` GLU output buffer,
+// then optionally feed that directly into stage2 + a second
+// per-neuron GLU loop. The whole NLM pipeline stays on device;
+// only the final activated state downloads back to host where
+// sync_update consumes it.
 
 #[cfg(feature = "rocm")]
 use modgrad_compute::backend::{GpuVec, ResidencyError};
@@ -351,11 +363,29 @@ pub fn ctm_forward_resident(
     let mut pre_act_dev = GpuVec::try_hip(d)?;
     let mut nlm_in_dev = GpuVec::try_hip(d * m)?;
     let mut nlm_s1_out_dev = GpuVec::try_hip(d * w.nlm_stage1.out_per)?;
+    // Stage1 GLU output: half_size = out_per / 2, n_neurons = d.
+    let s1_half = w.nlm_stage1.out_per / 2;
+    let mut nlm_s1_glu_dev = GpuVec::try_hip(d * s1_half)?;
+    // Stage2 buffers (raw output and GLU output) — only allocated
+    // when stage2 is present.
     let nlm_s2_out_dev: Option<GpuVec> = match &w.nlm_stage2 {
         Some(s2) => Some(GpuVec::try_hip(d * s2.out_per)?),
         None => None,
     };
     let mut nlm_s2_out_dev = nlm_s2_out_dev;
+    let nlm_s2_glu_dev: Option<GpuVec> = match &w.nlm_stage2 {
+        Some(s2) => Some(GpuVec::try_hip(d * (s2.out_per / 2))?),
+        None => None,
+    };
+    let mut nlm_s2_glu_dev = nlm_s2_glu_dev;
+    // MHA softmax scratch — `[n_heads × n_tokens]` packed across
+    // all heads. One input buffer (scores per head) + one output
+    // buffer (softmax weights per head). Both reused across ticks.
+    // We dispatch n_heads softmax_resident calls per tick at offsets
+    // into these buffers, then a single flush + D2H drains them all
+    // — one device sync per tick instead of per head.
+    let mut mha_scores_dev = GpuVec::try_hip(n_heads * n_tokens)?;
+    let mut mha_softmax_dev = GpuVec::try_hip(n_heads * n_tokens)?;
     let mut sync_out_dev = GpuVec::try_hip(cfg.n_synch_out)?;
     let mut pred_dev = GpuVec::try_hip(cfg.out_dims)?;
     let mut gate_dev = if w.exit_gate.is_some() {
@@ -445,30 +475,69 @@ pub fn ctm_forward_resident(
             _ => unreachable!("hip alloc"),
         }
 
-        // ── Per-head scaled dot-product attention (host). ──
-        // K and V tokens were pre-projected once above. We mirror
-        // the host `multihead_attention` per-head loop exactly.
-        // TODO: lift to a resident batched-MHA op when one lands.
+        // ── Per-head scaled dot-product attention. ──
+        // K/V tokens were pre-projected once above. Per-head
+        // QK dot-product runs host (K/V live host). Softmax runs
+        // resident via `softmax_resident` (ACCURATE algo, INSTANCE
+        // mode): all per-head score rows are uploaded packed into
+        // `[n_heads × n_tokens]`, a single softmax_resident
+        // dispatch handles every head row in one MIOpen call,
+        // then we flush + D2H once. The V·weights weighted sum
+        // stays host. TODO: lift QK (resident matvec against
+        // packed K) and the V·weights weighted sum (V transpose +
+        // resident matvec, or sgemv with trans flag) — that
+        // subsumes both the upload-scores and download-weights
+        // bracket around the softmax kernel.
         let mut concat_heads = vec![0.0f32; d_in];
+        let mut scores_host = vec![0.0f32; n_heads * n_tokens];
         for h in 0..n_heads {
             let q_h = &q_full[h * d_head..(h + 1) * d_head];
-
-            let mut scores = Vec::with_capacity(n_tokens);
+            let row = &mut scores_host[h * n_tokens..(h + 1) * n_tokens];
             for t in 0..n_tokens {
                 let k_h = &k_all_host[
                     t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
                 let dot: f32 = q_h.iter().zip(k_h).map(|(&a, &b)| a * b).sum();
-                scores.push(dot * scale);
+                row[t] = dot * scale;
             }
+        }
 
-            let max_s = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let exp_s: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
-            let sum_s: f32 = exp_s.iter().sum();
+        // Single resident softmax over all head rows at once.
+        // [n_heads, n_tokens, 1, 1] tensor with INSTANCE mode → per-N
+        // softmax across the row_len axis. ACCURATE algo (max-
+        // subtracting) matches the host numeric path within fp
+        // tolerance.
+        mha_scores_dev.copy_from(&scores_host);
+        let scores_ptr = match &mha_scores_dev {
+            GpuVec::Hip(b) => b.device_ptr() as *const f32,
+            _ => unreachable!("hip alloc"),
+        };
+        let softmax_ptr = match &mut mha_softmax_dev {
+            GpuVec::Hip(b) => b.device_ptr() as *mut f32,
+            _ => unreachable!("hip alloc"),
+        };
+        unsafe {
+            modgrad_device::backend::ops::softmax_resident(
+                scores_ptr, softmax_ptr,
+                n_heads, n_tokens, false,
+            )?;
+        }
+        batch.note_dispatch()?;
+        batch.flush()?;
+        let mut softmax_host = vec![0.0f32; n_heads * n_tokens];
+        match &mha_softmax_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut softmax_host)?,
+            _ => unreachable!("hip alloc"),
+        }
 
+        // Per-head V·weights weighted sum (host). V is shaped
+        // [n_tokens × d_head] per head, weights are [n_tokens]. TODO
+        // above.
+        for h in 0..n_heads {
+            let weights = &softmax_host[h * n_tokens..(h + 1) * n_tokens];
             let head_out = &mut concat_heads[h * d_head..(h + 1) * d_head];
             for j in 0..d_head { head_out[j] = 0.0; }
             for t in 0..n_tokens {
-                let w_attn = exp_s[t] / sum_s;
+                let w_attn = weights[t];
                 let v_h = &v_all_host[
                     t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
                 for j in 0..d_head {
@@ -508,44 +577,94 @@ pub fn ctm_forward_resident(
             state.trace[base + m - 1] = pre_act[n];
         }
 
-        // ── NLM forward: trace → activated. ──
-        // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out.
-        // Then host per_neuron_glu over `out_per`.
-        // If stage2 is Some, upload glu output, run stage2, host glu again.
+        // ── NLM forward: trace → activated, fully resident. ──
+        // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out_dev.
+        // Per-neuron GLU dispatch loop writes into nlm_s1_glu_dev.
+        // If stage2 is Some: stage2 (resident SuperLinear) reads
+        // nlm_s1_glu_dev → nlm_s2_out_dev, then a second per-neuron
+        // GLU dispatch loop writes nlm_s2_glu_dev. Final activated
+        // is the only host download.
         nlm_in_dev.copy_from(&state.trace);
         cache.nlm_stage1.forward(batch, &nlm_in_dev, &mut nlm_s1_out_dev)?;
-        batch.flush()?;
-        let mut s1_out_host = vec![0.0f32; d * w.nlm_stage1.out_per];
-        match &nlm_s1_out_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut s1_out_host)?,
-            _ => unreachable!("hip alloc"),
+
+        // Per-neuron GLU on stage1 output. Each neuron's slice in
+        // nlm_s1_out_dev is `[2*s1_half]` — laid out as the values
+        // half followed by the gates half WITHIN that neuron — which
+        // matches MIOpen's dim=0 GLU layout when viewed as a single
+        // [2, s1_half, 1, 1] tensor (`n_rows = 1, half_size = s1_half`).
+        // n_neurons (= d) dispatches per stage; same cadence as the
+        // SuperLinearResident matvec loop above.
+        {
+            let s1_out_base = match &nlm_s1_out_dev {
+                GpuVec::Hip(b) => b.device_ptr() as *const f32,
+                _ => unreachable!("hip alloc"),
+            };
+            let s1_glu_base = match &mut nlm_s1_glu_dev {
+                GpuVec::Hip(b) => b.device_ptr() as *mut f32,
+                _ => unreachable!("hip alloc"),
+            };
+            let s1_in_stride = w.nlm_stage1.out_per; // 2 * s1_half
+            for n in 0..d {
+                unsafe {
+                    modgrad_device::backend::ops::glu_resident(
+                        s1_out_base.add(n * s1_in_stride),
+                        s1_glu_base.add(n * s1_half),
+                        1, s1_half,
+                    )?;
+                }
+                batch.note_dispatch()?;
+            }
         }
-        let s1_glu = per_neuron_glu(&s1_out_host, d, w.nlm_stage1.out_per);
 
         let new_activated = if let Some(s2_resident) = &cache.nlm_stage2 {
-            // stage2 is Some — chain through it. nlm_stage2 has
-            // in_per = stage1's glu width = out_per/2.
+            // stage2 reads stage1's GLU output (already device-resident
+            // in nlm_s1_glu_dev). Output goes into nlm_s2_out_dev.
             let s2_weights = w.nlm_stage2.as_ref()
                 .expect("nlm_stage2 host weights present when cache.nlm_stage2 is Some");
-            let s2_in_dev = nlm_s2_out_dev.as_mut()
+            let s2_out_dev = nlm_s2_out_dev.as_mut()
                 .expect("s2 out buffer allocated when stage2 present");
-            // Reuse pre_syn_dev or allocate fresh — actually we need
-            // a separate input buffer; allocate here once.
-            // Cleaner: allocate s2 input once outside the loop. But
-            // the shape (d * in_per) varies per region so allocating
-            // here keeps things simple.
-            let mut s2_in_buf = GpuVec::try_hip(d * s2_resident.in_per)?;
-            s2_in_buf.copy_from(&s1_glu);
-            s2_resident.forward(batch, &s2_in_buf, s2_in_dev)?;
+            s2_resident.forward(batch, &nlm_s1_glu_dev, s2_out_dev)?;
+
+            // Per-neuron GLU on stage2 output, same pattern as stage1.
+            let s2_half = s2_weights.out_per / 2;
+            let s2_glu_dev = nlm_s2_glu_dev.as_mut()
+                .expect("s2 glu buffer allocated when stage2 present");
+            {
+                let s2_out_base = match &*s2_out_dev {
+                    GpuVec::Hip(b) => b.device_ptr() as *const f32,
+                    _ => unreachable!("hip alloc"),
+                };
+                let s2_glu_base = match &mut *s2_glu_dev {
+                    GpuVec::Hip(b) => b.device_ptr() as *mut f32,
+                    _ => unreachable!("hip alloc"),
+                };
+                let s2_in_stride = s2_weights.out_per;
+                for n in 0..d {
+                    unsafe {
+                        modgrad_device::backend::ops::glu_resident(
+                            s2_out_base.add(n * s2_in_stride),
+                            s2_glu_base.add(n * s2_half),
+                            1, s2_half,
+                        )?;
+                    }
+                    batch.note_dispatch()?;
+                }
+            }
             batch.flush()?;
-            let mut s2_out_host = vec![0.0f32; d * s2_weights.out_per];
-            match s2_in_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut s2_out_host)?,
+            let mut activated_host = vec![0.0f32; d * s2_half];
+            match &*s2_glu_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut activated_host)?,
                 _ => unreachable!("hip alloc"),
             }
-            per_neuron_glu(&s2_out_host, d, s2_weights.out_per)
+            activated_host
         } else {
-            s1_glu
+            batch.flush()?;
+            let mut activated_host = vec![0.0f32; d * s1_half];
+            match &nlm_s1_glu_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut activated_host)?,
+                _ => unreachable!("hip alloc"),
+            }
+            activated_host
         };
         state.activated = new_activated;
 
