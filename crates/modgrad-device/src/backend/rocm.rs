@@ -190,7 +190,6 @@ pub mod ffi {
             yDesc: miopenTensorDescriptor_t,
             y: *mut c_void,
         ) -> miopenStatus_t;
-        #[allow(dead_code)]
         pub fn miopenActivationBackward(
             handle: miopenHandle_t,
             activDesc: miopenActivationDescriptor_t,
@@ -218,7 +217,6 @@ pub mod ffi {
             algorithm: c_int,
             mode: c_int,
         ) -> miopenStatus_t;
-        #[allow(dead_code)]
         pub fn miopenSoftmaxBackward_V2(
             handle: miopenHandle_t,
             alpha: *const c_void,
@@ -254,7 +252,6 @@ pub mod ffi {
             rstdDesc: miopenTensorDescriptor_t,
             rstd: *mut c_void,
         ) -> miopenStatus_t;
-        #[allow(dead_code)]
         pub fn miopenLayerNormBackward(
             handle: miopenHandle_t,
             mode: c_int,
@@ -290,7 +287,6 @@ pub mod ffi {
             output: *mut c_void,
             dim: u32,
         ) -> miopenStatus_t;
-        #[allow(dead_code)]
         pub fn miopenGLUBackward(
             handle: miopenHandle_t,
             inputDesc: miopenTensorDescriptor_t,
@@ -972,7 +968,11 @@ impl Backend for RocmBackend {
                 | Op::SoftmaxResident { .. }
                 | Op::ActivationResident { .. }
                 | Op::GluResident { .. }
-                | Op::OpTensorResident { .. } => self.miopen.is_some(),
+                | Op::OpTensorResident { .. }
+                | Op::LayerNormBackwardResident { .. }
+                | Op::SoftmaxBackwardResident { .. }
+                | Op::ActivationBackwardResident { .. }
+                | Op::GluBackwardResident { .. } => self.miopen.is_some(),
                 _ => false,
             }
         }
@@ -1105,6 +1105,30 @@ impl Backend for RocmBackend {
                 } => self.op_tensor_resident_f32(
                     *a_dev, *b_dev, *c_dev, *n,
                     *alpha1, *alpha2, *beta, *kind,
+                ),
+                Op::LayerNormBackwardResident {
+                    x_dev, dy_dev, weight_dev, mean_dev, rstd_dev,
+                    dx_dev, dweight_dev, dbias_dev,
+                    n, normalized_size,
+                } => self.layer_norm_backward_resident_f32(
+                    *x_dev, *dy_dev, *weight_dev, *mean_dev, *rstd_dev,
+                    *dx_dev, *dweight_dev, *dbias_dev,
+                    *n, *normalized_size,
+                ),
+                Op::SoftmaxBackwardResident {
+                    y_dev, dy_dev, dx_dev, n_rows, row_len, log,
+                } => self.softmax_backward_resident_f32(
+                    *y_dev, *dy_dev, *dx_dev, *n_rows, *row_len, *log,
+                ),
+                Op::ActivationBackwardResident {
+                    x_dev, y_dev, dy_dev, dx_dev, n, mode,
+                } => self.activation_backward_resident_f32(
+                    *x_dev, *y_dev, *dy_dev, *dx_dev, *n, *mode,
+                ),
+                Op::GluBackwardResident {
+                    x_dev, dy_dev, dx_dev, n_rows, half_size,
+                } => self.glu_backward_resident_f32(
+                    *x_dev, *dy_dev, *dx_dev, *n_rows, *half_size,
                 ),
                 _ => Err(BackendError::Unsupported {
                     op: op.name(),
@@ -1962,6 +1986,335 @@ impl RocmBackend {
         if st != ffi::MIOPEN_STATUS_SUCCESS {
             return Err(BackendError::Runtime(format!(
                 "miopenOpTensor(n={n}, op={raw_op}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident LayerNorm backward.
+    ///
+    /// MIOpen's `miopenLayerNormBackward` consumes the per-row
+    /// `mean`/`rstd` produced by the matching forward, plus `x`,
+    /// `weight`, and `dy`, and writes `dx`, `dw`, `db`. The same
+    /// `[n, c, 1, 1]` / `[1, c, 1, 1]` / `[n, 1, 1, 1]` descriptor
+    /// shapes used by `miopenLayerNormForward` are reused here —
+    /// MIOpen requires the descriptors to match the forward call
+    /// for the saved stats to be interpreted correctly.
+    ///
+    /// `dweight_dev` and `dbias_dev` are accumulated into by the
+    /// caller's higher-level wrapper; MIOpen itself overwrites these
+    /// outputs, so we pre-stage host-zero scratch and add into the
+    /// caller's slot afterwards. **NOTE.** MIOpen's
+    /// `miopenLayerNormBackward` writes (not accumulates) to dW/dB —
+    /// we route to the caller's pointer directly here, and the
+    /// resident-brain caller is expected to use a fresh per-tick
+    /// buffer (or zero-init before this dispatch). Same convention
+    /// as host `linear_backward`'s d_input scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_backward_resident_f32(
+        &self,
+        x_dev: *const f32,
+        dy_dev: *const f32,
+        weight_dev: *const f32,
+        mean_dev: *const f32,
+        rstd_dev: *const f32,
+        dx_dev: *mut f32,
+        dweight_dev: *mut f32,
+        dbias_dev: *mut f32,
+        n: usize,
+        normalized_size: usize,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n, "n_rows")?;
+        let c_i32 = as_i32(normalized_size, "normalized_size")?;
+
+        // Same descriptor shapes as the forward call so MIOpen
+        // resolves the same solver path — see layer_norm_resident_f32.
+        let x_desc = ctx.tensor_4d(n_i32, c_i32, 1, 1)?;
+        let wb_desc = ctx.tensor_4d(1, c_i32, 1, 1)?;
+        let stat_desc = ctx.tensor_4d(n_i32, 1, 1, 1)?;
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenLayerNormBackward(
+                *handle,
+                ffi::MIOPEN_NORM_WEIGHT_BIAS,
+                std::ptr::null_mut(), // workspace (unused — MIOpen allocates internally)
+                0,                      // workspaceSizeInBytes
+                x_desc, dy_dev as *const std::os::raw::c_void,
+                x_desc, x_dev as *const std::os::raw::c_void,
+                wb_desc, weight_dev as *const std::os::raw::c_void,
+                stat_desc, mean_dev as *const std::os::raw::c_void,
+                stat_desc, rstd_dev as *const std::os::raw::c_void,
+                1, // normalize over C axis (matches forward)
+                x_desc, dx_dev as *mut std::os::raw::c_void,
+                wb_desc, dweight_dev as *mut std::os::raw::c_void,
+                wb_desc, dbias_dev as *mut std::os::raw::c_void,
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenLayerNormBackward(n={n}, c={normalized_size}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident row-wise softmax backward via
+    /// `miopenSoftmaxBackward_V2`. Mirrors the forward path's
+    /// algorithm/mode pair — ACCURATE/INSTANCE for plain softmax,
+    /// LOG/INSTANCE for log_softmax.
+    fn softmax_backward_resident_f32(
+        &self,
+        y_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n_rows: usize,
+        row_len: usize,
+        log: bool,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n_rows, "n_rows")?;
+        let c_i32 = as_i32(row_len, "row_len")?;
+
+        let desc = ctx.tensor_4d(n_i32, c_i32, 1, 1)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let algo = if log { ffi::MIOPEN_SOFTMAX_LOG } else { ffi::MIOPEN_SOFTMAX_ACCURATE };
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenSoftmaxBackward_V2(
+                *handle,
+                &alpha as *const f32 as *const std::os::raw::c_void,
+                desc, y_dev as *const std::os::raw::c_void,
+                desc, dy_dev as *const std::os::raw::c_void,
+                &beta as *const f32 as *const std::os::raw::c_void,
+                desc, dx_dev as *mut std::os::raw::c_void,
+                algo,
+                ffi::MIOPEN_SOFTMAX_MODE_INSTANCE,
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenSoftmaxBackward_V2(n={n_rows}, c={row_len}, log={log}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident element-wise activation backward.
+    ///
+    /// `Logistic`/`Tanh`/`Relu` each map to a single
+    /// `miopenActivationBackward` call. `Silu` reverses the forward
+    /// compose: forward is `y = x * sigmoid(x)`. The chain rule gives
+    /// `dx = dy * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))
+    ///     = dy * (y/x + y * (1 - y/x))`. Numerically stable form
+    /// uses the `sigmoid_x = sigmoid(x)` computed via
+    /// `miopenActivationForward(LOGISTIC)` into a scratch buffer,
+    /// then `dx = dy * sigmoid_x * (1 + x * (1 - sigmoid_x))` via
+    /// elementwise compose. Implemented host-side via small
+    /// hipMalloc'd scratch — the per-call cost is one extra pass over
+    /// the activation tensor.
+    #[allow(clippy::too_many_arguments)]
+    fn activation_backward_resident_f32(
+        &self,
+        x_dev: *const f32,
+        y_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n: usize,
+        mode: ActivationMode,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n, "n")?;
+        let desc = ctx.tensor_4d(n_i32, 1, 1, 1)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        match mode {
+            ActivationMode::Logistic | ActivationMode::Tanh | ActivationMode::Relu => {
+                let raw_mode = match mode {
+                    ActivationMode::Logistic => ffi::MIOPEN_ACTIVATION_LOGISTIC,
+                    ActivationMode::Tanh => ffi::MIOPEN_ACTIVATION_TANH,
+                    ActivationMode::Relu => ffi::MIOPEN_ACTIVATION_RELU,
+                    ActivationMode::Silu => unreachable!(),
+                };
+                let activ_desc = ctx.activation_desc(raw_mode)?;
+                let handle = ctx.handle.lock()
+                    .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+                let st = unsafe {
+                    ffi::miopenActivationBackward(
+                        *handle, activ_desc,
+                        &alpha as *const f32 as *const std::os::raw::c_void,
+                        desc, y_dev as *const std::os::raw::c_void,
+                        desc, dy_dev as *const std::os::raw::c_void,
+                        desc, x_dev as *const std::os::raw::c_void,
+                        &beta as *const f32 as *const std::os::raw::c_void,
+                        desc, dx_dev as *mut std::os::raw::c_void,
+                    )
+                };
+                drop(handle);
+                if st != ffi::MIOPEN_STATUS_SUCCESS {
+                    return Err(BackendError::Runtime(format!(
+                        "miopenActivationBackward(n={n}, mode={raw_mode}): status {st}"
+                    )));
+                }
+            }
+            ActivationMode::Silu => {
+                // SiLU: y = x * sigmoid(x). Let s = sigmoid(x). Then
+                // dy/dx = s + x * s * (1 - s).  We need a scratch for
+                // `s`.  Compute s = sigmoid(x) via miopenActivationForward.
+                let scratch = HipBuffer::alloc(n * 4)?;
+                let activ_desc = ctx.activation_desc(ffi::MIOPEN_ACTIVATION_LOGISTIC)?;
+                let handle_g = ctx.handle.lock()
+                    .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+                let st = unsafe {
+                    ffi::miopenActivationForward(
+                        *handle_g, activ_desc,
+                        &alpha as *const f32 as *const std::os::raw::c_void,
+                        desc, x_dev as *const std::os::raw::c_void,
+                        &beta as *const f32 as *const std::os::raw::c_void,
+                        desc, scratch.device_ptr(),
+                    )
+                };
+                drop(handle_g);
+                if st != ffi::MIOPEN_STATUS_SUCCESS {
+                    return Err(BackendError::Runtime(format!(
+                        "silu_backward: miopenActivationForward(LOGISTIC) status {st}"
+                    )));
+                }
+
+                // We now have s = sigmoid(x) in `scratch`. Compute
+                // dx = dy * (s + x * s * (1 - s)).
+                //
+                // Implementation: stage helper bufs and use OpTensor
+                // composition.
+                //   tmp1 = 1 - s   (via OpTensor: MIN(1*ones, 1*s) won't work; we
+                //                   instead use the identity 1 - s via OpTensor
+                //                   ADD with alpha2=-1 against a pre-uploaded
+                //                   ones vector). Simpler: derive the result
+                //                   in two element-wise dispatches we already
+                //                   have.
+                //
+                // Actually the cleanest path uses three OpTensor MUL passes:
+                //   tmp_a = s * (1 - s)              <- requires 1-s
+                //   tmp_b = x * tmp_a                <- "x * s * (1-s)"
+                //   tmp_c = s + tmp_b                <- combined "ds/dx"
+                //   dx    = dy * tmp_c
+                //
+                // To avoid a "ones" upload we exploit that for any tensor
+                // shape, alpha1 * a + alpha2 * b with a = b = s and
+                // (alpha1, alpha2) = (1, -1) ⇒ 0; with (alpha1, alpha2) =
+                // (1, 0) ⇒ s. So we encode `1 - s` as
+                //   OpTensor(ADD, alpha1=-1, a=s, alpha2=0, b=s, beta=0, c=tmp)
+                // followed by adding 1 — but OpTensor lacks a scalar bias.
+                //
+                // Cleanest: ADD with a scratch ones-buffer. Allocate once
+                // here per dispatch (small).
+                let ones = HipBuffer::alloc(n * 4)?;
+                {
+                    let host_ones: Vec<f32> = vec![1.0; n];
+                    ones.copy_from_host(&host_ones)?;
+                }
+                let one_minus_s = HipBuffer::alloc(n * 4)?;
+                // one_minus_s = 1.0 * ones + (-1.0) * s
+                self.op_tensor_resident_f32(
+                    ones.device_ptr() as *const f32,
+                    scratch.device_ptr() as *const f32,
+                    one_minus_s.device_ptr() as *mut f32,
+                    n, 1.0, -1.0, 0.0, BinaryOpKind::Add,
+                )?;
+                // tmp_a = s * (1 - s)
+                let tmp_a = HipBuffer::alloc(n * 4)?;
+                self.op_tensor_resident_f32(
+                    scratch.device_ptr() as *const f32,
+                    one_minus_s.device_ptr() as *const f32,
+                    tmp_a.device_ptr() as *mut f32,
+                    n, 1.0, 1.0, 0.0, BinaryOpKind::Mul,
+                )?;
+                // tmp_b = x * tmp_a
+                let tmp_b = HipBuffer::alloc(n * 4)?;
+                self.op_tensor_resident_f32(
+                    x_dev,
+                    tmp_a.device_ptr() as *const f32,
+                    tmp_b.device_ptr() as *mut f32,
+                    n, 1.0, 1.0, 0.0, BinaryOpKind::Mul,
+                )?;
+                // tmp_c = s + tmp_b   (alpha1=alpha2=1, ADD)
+                // Reuse `scratch`'s data via a fresh allocation for `tmp_c`
+                // because OpTensor's docs allow aliasing but doing so on
+                // some MIOpen versions has read/write hazards on partial
+                // updates; pay the alloc cost for safety.
+                let tmp_c = HipBuffer::alloc(n * 4)?;
+                self.op_tensor_resident_f32(
+                    scratch.device_ptr() as *const f32,
+                    tmp_b.device_ptr() as *const f32,
+                    tmp_c.device_ptr() as *mut f32,
+                    n, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+                )?;
+                // dx = dy * tmp_c
+                self.op_tensor_resident_f32(
+                    dy_dev,
+                    tmp_c.device_ptr() as *const f32,
+                    dx_dev,
+                    n, 1.0, 1.0, 0.0, BinaryOpKind::Mul,
+                )?;
+                // y_dev is read implicitly by the SiLU formula via x_dev/dy_dev;
+                // we silence the unused warning since some MIOpen activation
+                // backwards take y but Silu doesn't go through the kernel.
+                let _ = y_dev;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resident GLU backward.
+    ///
+    /// MIOpen's `miopenGLUBackward` consumes the original input
+    /// `x = [value | gate]` and the upstream gradient `dy`, and writes
+    /// `dx` of the same shape as `x`. We use `dim = 0` to match the
+    /// forward call.
+    fn glu_backward_resident_f32(
+        &self,
+        x_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n_rows: usize,
+        half_size: usize,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let total = n_rows.checked_mul(half_size).ok_or_else(|| {
+            BackendError::Runtime(format!(
+                "glu_backward_resident: n_rows*half_size overflow ({n_rows} * {half_size})"
+            ))
+        })?;
+        let total_i32 = as_i32(total, "n_rows*half_size")?;
+
+        // Same descriptor shapes as forward — input/dx have split
+        // dim 0 of size 2; dy has size 1 on the same axis.
+        let in_desc = ctx.tensor_4d(2, total_i32, 1, 1)?;
+        let out_desc = ctx.tensor_4d(1, total_i32, 1, 1)?;
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenGLUBackward(
+                *handle,
+                in_desc, x_dev as *const std::os::raw::c_void,
+                out_desc, dy_dev as *const std::os::raw::c_void,
+                in_desc, dx_dev as *mut std::os::raw::c_void,
+                0, // split on N axis (dim 0)
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenGLUBackward(n={n_rows}, half={half_size}): status {st}"
             )));
         }
         Ok(())

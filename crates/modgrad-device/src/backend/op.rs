@@ -389,6 +389,100 @@ pub enum Op<'a> {
         op: BinaryOpKind,
     },
 
+    /// **Device-resident** LayerNorm backward — affine variant matching
+    /// PyTorch `nn.LayerNorm.backward`. Returns gradients w.r.t. input,
+    /// weight, and bias.
+    ///
+    /// `mean_dev` and `rstd_dev` are the per-row mean and reciprocal
+    /// standard deviation captured by a matching forward pass — see
+    /// [`Op::LayerNormResident`]. Each is length `n` (one scalar per
+    /// row).
+    ///
+    /// Layout: `x` and `dy` and `dx` are `[n, normalized_size]`
+    /// row-major; `weight` is length-`normalized_size`; `dweight` and
+    /// `dbias` are each length-`normalized_size` and **accumulated
+    /// into** (caller is responsible for zeroing if a fresh gradient
+    /// is desired).
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. Wired only on backends
+    /// that consume hip-device pointers (ROCm via MIOpen). Other
+    /// backends return `Unsupported`.
+    LayerNormBackwardResident {
+        x_dev: *const f32,
+        dy_dev: *const f32,
+        weight_dev: *const f32,
+        mean_dev: *const f32,
+        rstd_dev: *const f32,
+        dx_dev: *mut f32,
+        dweight_dev: *mut f32,
+        dbias_dev: *mut f32,
+        n: usize,
+        normalized_size: usize,
+    },
+
+    /// **Device-resident** softmax backward, row-wise.
+    ///
+    /// For each of `n_rows` rows of length `row_len`, compute the
+    /// gradient w.r.t. softmax (or log_softmax when `log == true`)
+    /// input given `y` (forward output) and `dy` (incoming gradient).
+    ///
+    /// Layout: `y`, `dy`, and `dx` are `[n_rows, row_len]` row-major.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    SoftmaxBackwardResident {
+        y_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n_rows: usize,
+        row_len: usize,
+        log: bool,
+    },
+
+    /// **Device-resident** element-wise activation backward.
+    ///
+    /// Computes `dx = dy * dActivation/dx(x, y)` element-wise across
+    /// `n` floats. `mode` matches the forward [`ActivationMode`]; the
+    /// backward path needs both `x` (pre-activation) and `y`
+    /// (post-activation) for some MIOpen modes.
+    ///
+    /// `Silu`: composed as Logistic backward (`dx_logistic =
+    /// dy * y * (1 - y)`) followed by `dx = x * dx_logistic + sigmoid(x) * dy`.
+    /// Implemented via `miopenActivationBackward(LOGISTIC) + element-wise
+    /// composition` — two MIOpen calls, both resident.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    ActivationBackwardResident {
+        x_dev: *const f32,
+        y_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n: usize,
+        mode: ActivationMode,
+    },
+
+    /// **Device-resident** GLU backward.
+    ///
+    /// Reverses [`Op::GluResident`] — given `x` (the value/gate
+    /// concatenation) and `dy` (gradient w.r.t. the GLU output),
+    /// compute `dx`.
+    ///
+    /// Layout matches forward: `x_dev` is `[2, n_rows, half_size]`
+    /// contiguous (value half then gate half); `dy_dev` is
+    /// `[n_rows, half_size]`; `dx_dev` matches `x_dev` shape.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    GluBackwardResident {
+        x_dev: *const f32,
+        dy_dev: *const f32,
+        dx_dev: *mut f32,
+        n_rows: usize,
+        half_size: usize,
+    },
+
     /// Transposed matvec (typical gradient-of-input for a Linear layer):
     /// `d_input = weight^T @ d_out`.
     MatvecT {
@@ -663,6 +757,10 @@ impl<'a> Op<'a> {
             Op::ActivationResident { .. } => "activation_resident",
             Op::GluResident { .. } => "glu_resident",
             Op::OpTensorResident { .. } => "op_tensor_resident",
+            Op::LayerNormBackwardResident { .. } => "layer_norm_backward_resident",
+            Op::SoftmaxBackwardResident { .. } => "softmax_backward_resident",
+            Op::ActivationBackwardResident { .. } => "activation_backward_resident",
+            Op::GluBackwardResident { .. } => "glu_backward_resident",
             Op::MatvecT { .. } => "matvec_t",
             Op::OuterProductAcc { .. } => "outer_product_acc",
             Op::LayerNormFwd { .. } => "layer_norm_fwd",

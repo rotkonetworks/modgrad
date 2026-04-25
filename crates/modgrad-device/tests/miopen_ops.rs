@@ -321,6 +321,316 @@ fn op_tensor_resident_matches_cpu() {
     }
 }
 
+// ─── Backward tests ──────────────────────────────────────────
+
+/// Host LayerNorm backward reference (matches MIOpen convention).
+///
+/// Given x, weight, bias, mean, rstd (per-row), and dy:
+///   y = (x - mean) * rstd * weight + bias
+///   dx[r,c] = (1/N) * weight[c] * rstd[r] * (
+///       N * dy[r,c] - sum(dy[r,:] * weight) - x_norm[r,c] * sum(dy[r,:] * weight * x_norm[r,:]))
+///   dweight[c] = sum_r dy[r,c] * x_norm[r,c]
+///   dbias[c]   = sum_r dy[r,c]
+fn host_layer_norm_backward(
+    x: &[f32], dy: &[f32], weight: &[f32], mean: &[f32], rstd: &[f32],
+    dx: &mut [f32], dweight: &mut [f32], dbias: &mut [f32],
+    n: usize, c: usize,
+) {
+    for v in dweight.iter_mut() { *v = 0.0; }
+    for v in dbias.iter_mut() { *v = 0.0; }
+    for r in 0..n {
+        let row_x = &x[r * c..(r + 1) * c];
+        let row_dy = &dy[r * c..(r + 1) * c];
+        let row_dx = &mut dx[r * c..(r + 1) * c];
+        let m = mean[r];
+        let rs = rstd[r];
+
+        // x_norm[c] = (x - m) * rs ; sum_dy_w = Σ dy*weight ; sum_dy_w_xhat = Σ dy*weight*x_norm
+        let mut sum_dy_w = 0.0f32;
+        let mut sum_dy_w_xhat = 0.0f32;
+        for i in 0..c {
+            let xhat = (row_x[i] - m) * rs;
+            sum_dy_w += row_dy[i] * weight[i];
+            sum_dy_w_xhat += row_dy[i] * weight[i] * xhat;
+            // dweight, dbias accumulate
+            dweight[i] += row_dy[i] * xhat;
+            dbias[i] += row_dy[i];
+        }
+        // Standard backward: dx[r,c] = rs * (dy[r,c] * weight[c] -
+        //     (1/N) * sum_dy_w - (1/N) * x_norm[r,c] * sum_dy_w_xhat)
+        let nf = c as f32;
+        for i in 0..c {
+            let xhat = (row_x[i] - m) * rs;
+            row_dx[i] = rs *
+                (row_dy[i] * weight[i] - sum_dy_w / nf - xhat * sum_dy_w_xhat / nf);
+        }
+    }
+}
+
+fn host_softmax_backward(
+    y: &[f32], dy: &[f32], dx: &mut [f32],
+    n_rows: usize, row_len: usize, log: bool,
+) {
+    for r in 0..n_rows {
+        let yrow = &y[r * row_len..(r + 1) * row_len];
+        let dyrow = &dy[r * row_len..(r + 1) * row_len];
+        let dxrow = &mut dx[r * row_len..(r + 1) * row_len];
+        if log {
+            // log_softmax: dx[i] = dy[i] - exp(y[i]) * sum_dy
+            let sum_dy: f32 = dyrow.iter().sum();
+            for i in 0..row_len {
+                dxrow[i] = dyrow[i] - yrow[i].exp() * sum_dy;
+            }
+        } else {
+            // softmax: dx[i] = y[i] * (dy[i] - sum_j(y[j] * dy[j]))
+            let dot: f32 = yrow.iter().zip(dyrow).map(|(&a, &b)| a * b).sum();
+            for i in 0..row_len {
+                dxrow[i] = yrow[i] * (dyrow[i] - dot);
+            }
+        }
+    }
+}
+
+fn host_activation_backward(
+    x: &[f32], y: &[f32], dy: &[f32], dx: &mut [f32], mode: ActivationMode,
+) {
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    for i in 0..x.len() {
+        dx[i] = match mode {
+            // d/dx sigmoid(x) = y * (1 - y)
+            ActivationMode::Logistic => dy[i] * y[i] * (1.0 - y[i]),
+            // d/dx tanh(x) = 1 - y^2
+            ActivationMode::Tanh => dy[i] * (1.0 - y[i] * y[i]),
+            // d/dx relu(x) = (x > 0) ? 1 : 0
+            ActivationMode::Relu => if x[i] > 0.0 { dy[i] } else { 0.0 },
+            // d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+            ActivationMode::Silu => {
+                let s = sigmoid(x[i]);
+                dy[i] * (s + x[i] * s * (1.0 - s))
+            }
+        };
+    }
+}
+
+fn host_glu_backward(
+    x: &[f32], dy: &[f32], dx: &mut [f32], n_rows: usize, half: usize,
+) {
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    let total = n_rows * half;
+    let (values_in, gates_in) = x.split_at(total);
+    let (dx_values, dx_gates) = dx.split_at_mut(total);
+    for i in 0..total {
+        let g = sigmoid(gates_in[i]);
+        // d/d_value = dy[i] * sigmoid(gate)
+        dx_values[i] = dy[i] * g;
+        // d/d_gate = dy[i] * value * sigmoid'(gate)
+        //          = dy[i] * value[i] * g * (1 - g)
+        dx_gates[i] = dy[i] * values_in[i] * g * (1.0 - g);
+    }
+}
+
+#[test]
+fn layer_norm_backward_resident_matches_cpu() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("layer_norm_backward_resident: no ROCm runtime; skipping");
+        return;
+    };
+    let n = 4;
+    let c = 64;
+    let eps = 1e-5;
+
+    // Use the same forward inputs as the forward test so the saved
+    // mean/rstd are well-defined.
+    let x: Vec<f32> = (0..n * c).map(|i| (i as f32 * 0.013).sin() * 1.5 + 0.1).collect();
+    let weight: Vec<f32> = (0..c).map(|i| 1.0 + 0.01 * i as f32).collect();
+    let bias: Vec<f32> = (0..c).map(|i| -0.5 + 0.02 * i as f32).collect();
+    let dy: Vec<f32> = (0..n * c).map(|i| (i as f32 * 0.029).cos() * 0.4 + 0.05).collect();
+
+    // Compute mean / rstd host-side (MIOpen would have produced the
+    // same values during forward).
+    let mut mean = vec![0.0f32; n];
+    let mut rstd = vec![0.0f32; n];
+    for r in 0..n {
+        let row = &x[r * c..(r + 1) * c];
+        let m: f32 = row.iter().sum::<f32>() / c as f32;
+        let v: f32 = row.iter().map(|x| (x - m).powi(2)).sum::<f32>() / c as f32;
+        mean[r] = m;
+        rstd[r] = 1.0 / (v + eps).sqrt();
+    }
+
+    // Host reference.
+    let mut expected_dx = vec![0.0f32; n * c];
+    let mut expected_dweight = vec![0.0f32; c];
+    let mut expected_dbias = vec![0.0f32; c];
+    host_layer_norm_backward(
+        &x, &dy, &weight, &mean, &rstd,
+        &mut expected_dx, &mut expected_dweight, &mut expected_dbias,
+        n, c,
+    );
+
+    let _batch = HipBatch::new();
+    let x_buf = upload(&x).unwrap();
+    let dy_buf = upload(&dy).unwrap();
+    let w_buf = upload(&weight).unwrap();
+    let mean_buf = upload(&mean).unwrap();
+    let rstd_buf = upload(&rstd).unwrap();
+    let dx_buf = alloc_out(n * c).unwrap();
+    let dw_buf = alloc_out(c).unwrap();
+    let db_buf = alloc_out(c).unwrap();
+    // Use bias only to silence unused warning — bias is passed at
+    // forward time, not relevant to the backward dispatch under test.
+    let _ = bias;
+
+    let mut op = Op::LayerNormBackwardResident {
+        x_dev: x_buf.device_ptr() as *const f32,
+        dy_dev: dy_buf.device_ptr() as *const f32,
+        weight_dev: w_buf.device_ptr() as *const f32,
+        mean_dev: mean_buf.device_ptr() as *const f32,
+        rstd_dev: rstd_buf.device_ptr() as *const f32,
+        dx_dev: dx_buf.device_ptr() as *mut f32,
+        dweight_dev: dw_buf.device_ptr() as *mut f32,
+        dbias_dev: db_buf.device_ptr() as *mut f32,
+        n,
+        normalized_size: c,
+    };
+    be.dispatch(&mut op).expect("layer_norm_backward_resident dispatch");
+
+    let mut got_dx = vec![0.0f32; n * c];
+    dx_buf.copy_to_host(&mut got_dx).unwrap();
+    let mut got_dw = vec![0.0f32; c];
+    dw_buf.copy_to_host(&mut got_dw).unwrap();
+    let mut got_db = vec![0.0f32; c];
+    db_buf.copy_to_host(&mut got_db).unwrap();
+
+    assert_close(&got_dx, &expected_dx, "layer_norm_backward dx");
+    assert_close(&got_dw, &expected_dweight, "layer_norm_backward dweight");
+    assert_close(&got_db, &expected_dbias, "layer_norm_backward dbias");
+}
+
+#[test]
+fn softmax_backward_resident_matches_cpu() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("softmax_backward_resident: no ROCm runtime; skipping");
+        return;
+    };
+    let n_rows = 3;
+    let row_len = 32;
+    let x: Vec<f32> = (0..n_rows * row_len)
+        .map(|i| (i as f32 * 0.07).cos() * 2.0 - 0.3)
+        .collect();
+    let dy: Vec<f32> = (0..n_rows * row_len)
+        .map(|i| (i as f32 * 0.041).sin() * 0.6 + 0.02)
+        .collect();
+
+    for log in [false, true] {
+        // Compute forward y first, then host backward expected.
+        let mut y_host = vec![0.0f32; n_rows * row_len];
+        host_softmax(&x, &mut y_host, n_rows, row_len, log);
+        let mut expected_dx = vec![0.0f32; n_rows * row_len];
+        host_softmax_backward(&y_host, &dy, &mut expected_dx, n_rows, row_len, log);
+
+        let _batch = HipBatch::new();
+        let y_buf = upload(&y_host).unwrap();
+        let dy_buf = upload(&dy).unwrap();
+        let dx_buf = alloc_out(n_rows * row_len).unwrap();
+
+        let mut op = Op::SoftmaxBackwardResident {
+            y_dev: y_buf.device_ptr() as *const f32,
+            dy_dev: dy_buf.device_ptr() as *const f32,
+            dx_dev: dx_buf.device_ptr() as *mut f32,
+            n_rows,
+            row_len,
+            log,
+        };
+        be.dispatch(&mut op).expect("softmax_backward_resident dispatch");
+
+        let mut got = vec![0.0f32; n_rows * row_len];
+        dx_buf.copy_to_host(&mut got).unwrap();
+        let label = if log { "softmax_backward(log)" } else { "softmax_backward" };
+        assert_close(&got, &expected_dx, label);
+    }
+}
+
+#[test]
+fn activation_backward_resident_matches_cpu() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("activation_backward_resident: no ROCm runtime; skipping");
+        return;
+    };
+    let n = 257;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.05).collect();
+    let dy: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).cos() * 0.5 + 0.1).collect();
+
+    for mode in [
+        ActivationMode::Logistic,
+        ActivationMode::Tanh,
+        ActivationMode::Relu,
+        ActivationMode::Silu,
+    ] {
+        // Compute forward y.
+        let mut y_host = vec![0.0f32; n];
+        host_activation(&x, &mut y_host, mode);
+        let mut expected_dx = vec![0.0f32; n];
+        host_activation_backward(&x, &y_host, &dy, &mut expected_dx, mode);
+
+        let _batch = HipBatch::new();
+        let x_buf = upload(&x).unwrap();
+        let y_buf = upload(&y_host).unwrap();
+        let dy_buf = upload(&dy).unwrap();
+        let dx_buf = alloc_out(n).unwrap();
+
+        let mut op = Op::ActivationBackwardResident {
+            x_dev: x_buf.device_ptr() as *const f32,
+            y_dev: y_buf.device_ptr() as *const f32,
+            dy_dev: dy_buf.device_ptr() as *const f32,
+            dx_dev: dx_buf.device_ptr() as *mut f32,
+            n,
+            mode,
+        };
+        be.dispatch(&mut op).expect("activation_backward_resident dispatch");
+
+        let mut got = vec![0.0f32; n];
+        dx_buf.copy_to_host(&mut got).unwrap();
+        assert_close(&got, &expected_dx, &format!("activation_backward({mode:?})"));
+    }
+}
+
+#[test]
+fn glu_backward_resident_matches_cpu() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("glu_backward_resident: no ROCm runtime; skipping");
+        return;
+    };
+    let n_rows = 5;
+    let half = 16;
+    let x: Vec<f32> = (0..n_rows * 2 * half)
+        .map(|i| ((i as f32 * 0.11).sin() + 0.4) * 1.2)
+        .collect();
+    let dy: Vec<f32> = (0..n_rows * half)
+        .map(|i| ((i as f32 * 0.07).cos() + 0.2) * 0.4)
+        .collect();
+    let mut expected_dx = vec![0.0f32; n_rows * 2 * half];
+    host_glu_backward(&x, &dy, &mut expected_dx, n_rows, half);
+
+    let _batch = HipBatch::new();
+    let x_buf = upload(&x).unwrap();
+    let dy_buf = upload(&dy).unwrap();
+    let dx_buf = alloc_out(n_rows * 2 * half).unwrap();
+
+    let mut op = Op::GluBackwardResident {
+        x_dev: x_buf.device_ptr() as *const f32,
+        dy_dev: dy_buf.device_ptr() as *const f32,
+        dx_dev: dx_buf.device_ptr() as *mut f32,
+        n_rows,
+        half_size: half,
+    };
+    be.dispatch(&mut op).expect("glu_backward_resident dispatch");
+
+    let mut got = vec![0.0f32; n_rows * 2 * half];
+    dx_buf.copy_to_host(&mut got).unwrap();
+    assert_close(&got, &expected_dx, "glu_backward");
+}
+
 /// Integration smoke-test: SiLU is a Logistic + Mul compose. Verify
 /// the full chain produces the same result as the activation_resident
 /// path AND a host SiLU reference. This catches a regression where

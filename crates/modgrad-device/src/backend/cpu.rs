@@ -61,6 +61,10 @@ impl Backend for CpuBackend {
             Op::ActivationResident { .. } => false,
             Op::GluResident { .. } => false,
             Op::OpTensorResident { .. } => false,
+            Op::LayerNormBackwardResident { .. } => false,
+            Op::SoftmaxBackwardResident { .. } => false,
+            Op::ActivationBackwardResident { .. } => false,
+            Op::GluBackwardResident { .. } => false,
             _ => true,
         }
     }
@@ -128,6 +132,22 @@ impl Backend for CpuBackend {
             }),
             Op::OpTensorResident { .. } => Err(BackendError::Unsupported {
                 op: "op_tensor_resident",
+                backend: "cpu",
+            }),
+            Op::LayerNormBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "layer_norm_backward_resident",
+                backend: "cpu",
+            }),
+            Op::SoftmaxBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "softmax_backward_resident",
+                backend: "cpu",
+            }),
+            Op::ActivationBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "activation_backward_resident",
+                backend: "cpu",
+            }),
+            Op::GluBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "glu_backward_resident",
                 backend: "cpu",
             }),
             Op::MatvecT { d_out, weight, d_input, out_dim, in_dim } => {

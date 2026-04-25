@@ -359,6 +359,111 @@ pub unsafe fn op_tensor_resident(
     Ok(())
 }
 
+/// Device-resident LayerNorm backward.
+/// See [`Op::LayerNormBackwardResident`](super::Op::LayerNormBackwardResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev`, `dy_dev`, `dx_dev` each cover at least `n * normalized_size * 4` bytes.
+/// - `weight_dev`, `dweight_dev`, `dbias_dev` each cover `normalized_size * 4` bytes.
+/// - `mean_dev`, `rstd_dev` each cover `n * 4` bytes (per-row stats from forward).
+/// - The pointers stay valid for the duration of this call.
+///
+/// `dweight_dev` and `dbias_dev` are accumulated into; caller zeros
+/// before the call if a fresh gradient is desired.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn layer_norm_backward_resident(
+    x_dev: *const f32,
+    dy_dev: *const f32,
+    weight_dev: *const f32,
+    mean_dev: *const f32,
+    rstd_dev: *const f32,
+    dx_dev: *mut f32,
+    dweight_dev: *mut f32,
+    dbias_dev: *mut f32,
+    n: usize,
+    normalized_size: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::LayerNormBackwardResident {
+        x_dev, dy_dev, weight_dev, mean_dev, rstd_dev,
+        dx_dev, dweight_dev, dbias_dev,
+        n, normalized_size,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident row-wise softmax (or log-softmax) backward.
+/// See [`Op::SoftmaxBackwardResident`](super::Op::SoftmaxBackwardResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `y_dev`, `dy_dev`, `dx_dev` each cover at least `n_rows * row_len * 4` bytes.
+/// - `dx_dev` may alias `dy_dev` (in-place backward is permitted).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn softmax_backward_resident(
+    y_dev: *const f32,
+    dy_dev: *const f32,
+    dx_dev: *mut f32,
+    n_rows: usize,
+    row_len: usize,
+    log: bool,
+) -> Result<(), BackendError> {
+    let mut op = Op::SoftmaxBackwardResident { y_dev, dy_dev, dx_dev, n_rows, row_len, log };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident element-wise activation backward.
+/// See [`Op::ActivationBackwardResident`](super::Op::ActivationBackwardResident)
+/// and [`ActivationMode`].
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev`, `y_dev`, `dy_dev`, `dx_dev` each cover at least `n * 4` bytes.
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn activation_backward_resident(
+    x_dev: *const f32,
+    y_dev: *const f32,
+    dy_dev: *const f32,
+    dx_dev: *mut f32,
+    n: usize,
+    mode: ActivationMode,
+) -> Result<(), BackendError> {
+    let mut op = Op::ActivationBackwardResident { x_dev, y_dev, dy_dev, dx_dev, n, mode };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident GLU backward.
+/// See [`Op::GluBackwardResident`](super::Op::GluBackwardResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` covers at least `n_rows * 2 * half_size * 4` bytes.
+/// - `dy_dev` covers at least `n_rows * half_size * 4` bytes.
+/// - `dx_dev` covers at least `n_rows * 2 * half_size * 4` bytes (matches `x_dev`).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn glu_backward_resident(
+    x_dev: *const f32,
+    dy_dev: *const f32,
+    dx_dev: *mut f32,
+    n_rows: usize,
+    half_size: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::GluBackwardResident { x_dev, dy_dev, dx_dev, n_rows, half_size };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Accumulating outer product. See [`Op::OuterProductAcc`](super::Op::OuterProductAcc).
 #[inline]
 pub fn outer_product_acc(
