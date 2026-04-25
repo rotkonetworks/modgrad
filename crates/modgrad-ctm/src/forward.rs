@@ -267,10 +267,26 @@ use modgrad_device::backend::HipBatch;
 /// sync accumulators, exit bookkeeping) is identical to the host
 /// path; only the matmul transport changes.
 ///
-/// **Signature mirrors `ctm_forward_with_kv`.** Takes pre-projected
-/// KV in d_input space (the `kv_proj` projection happens in the
+/// **Device-resident KV input.** Takes pre-projected KV in d_input
+/// space as a `&GpuVec` (the `kv_proj` projection happens in the
 /// outer caller — typically `RegionalBrain::forward_cached_resident`
 /// — so this function focuses purely on the inner tick loop).
+/// Accepting `&GpuVec` rather than `&[f32]` lets the caller keep
+/// the connection-synapse output device-resident: the per-connection
+/// D2H bounce in `forward_cached_resident` disappears.
+///
+/// **Strategy (a) — single D2H per call.** Today this function
+/// downloads `kv` to a host scratch once at the top, then keeps the
+/// existing per-token MHA K/V dispatch logic (which uploads each
+/// token's d_in slice via `mha_kv_in_dev.copy_from`). Net D2H per
+/// inner forward: 1 (down from `n_tokens` worth of upload pressure
+/// previously fed by an outer-caller D2H). The per-token H2D
+/// uploads remain. TODO: ship strategy (b) as a follow-up — keep
+/// `kv` device-resident across the whole forward and replace the
+/// per-token H2D upload with a D2D copy from a sub-range of the
+/// input GpuVec into `mha_kv_in_dev`. Doable without API changes
+/// to `LinearResident::forward` once a `hipMemcpy` D2D wrapper is
+/// in place; deferred for honest scope.
 ///
 /// **Cross-forward state contract.** Same as `ctm_forward_with_kv`:
 /// `alpha_out`/`beta_out` reset every call via `sync_init`, action
@@ -286,7 +302,7 @@ pub fn ctm_forward_resident(
     cache: &crate::ctm_resident::CtmResidentCache,
     state: &mut CtmState,
     batch: &HipBatch,
-    kv: &[f32],
+    kv: &GpuVec,
     n_tokens: usize,
 ) -> Result<CtmOutput, ResidencyError> {
     let cfg = &w.config;
@@ -348,6 +364,32 @@ pub fn ctm_forward_resident(
         None
     };
 
+    // Strategy (a): download `kv` (device-resident) to a host scratch
+    // ONCE up front, then keep the per-token MHA K/V dispatch logic
+    // intact (it slices into `kv_host` for `mha_kv_in_dev.copy_from`).
+    // This eliminates the caller-side per-connection D2H — graph.rs
+    // used to download every connection-synapse output to feed
+    // `&[f32]` here. Net D2H per inner forward: 1.
+    //
+    // TODO: lift to strategy (b) — replace the per-token H2D
+    // `mha_kv_in_dev.copy_from` upload with a D2D copy from a
+    // sub-range of `kv` directly. That keeps the input fully
+    // device-resident and removes the host scratch entirely.
+    let kv_host: Vec<f32> = match kv {
+        GpuVec::Hip(buf) => {
+            let mut host = vec![0.0f32; n_tokens * d_in];
+            debug_assert_eq!(buf.len_f32(), n_tokens * d_in,
+                "kv GpuVec length mismatch (n_tokens × d_in)");
+            buf.copy_to_host(&mut host)?;
+            host
+        }
+        // Non-Hip variants are valid host inputs (Heap/Vram are host-
+        // visible per `GpuVec::is_host_visible`); just clone the
+        // backing slice. Keeps the function callable from CPU-only
+        // tests too.
+        _ => kv.as_slice().to_vec(),
+    };
+
     // Project all KV tokens once per call (kv doesn't change across
     // ticks). Each token: K = mha_in_k @ kv_token + bias_k,
     //                     V = mha_in_v @ kv_token + bias_v.
@@ -356,7 +398,7 @@ pub fn ctm_forward_resident(
     let mut k_all_host = vec![0.0f32; n_tokens * d_in];
     let mut v_all_host = vec![0.0f32; n_tokens * d_in];
     for t in 0..n_tokens {
-        mha_kv_in_dev.copy_from(&kv[t * d_in..(t + 1) * d_in]);
+        mha_kv_in_dev.copy_from(&kv_host[t * d_in..(t + 1) * d_in]);
         cache.mha_in_k.forward(batch, &mha_kv_in_dev, &mut mha_k_dev)?;
         cache.mha_in_v.forward(batch, &mha_kv_in_dev, &mut mha_v_dev)?;
         // D2H to host scratch. flush guarantees the matvecs above
@@ -907,13 +949,18 @@ mod tests {
         let mut host_state = CtmState::new(&w);
         let host_out = ctm_forward_with_kv(&w, &mut host_state, &kv, n_tokens);
 
-        // Resident run with a fresh state.
+        // Resident run with a fresh state. Upload `kv` to a
+        // device-resident `GpuVec::Hip` to match the new
+        // `ctm_forward_resident` signature (`&GpuVec`).
         let mut resident_state = CtmState::new(&w);
         let cache = CtmResidentCache::from_weights(&w)
             .expect("CtmResidentCache::from_weights");
         let batch = HipBatch::new();
+        let mut kv_dev = modgrad_compute::backend::GpuVec::try_hip(kv.len())
+            .expect("GpuVec::try_hip(kv)");
+        kv_dev.copy_from(&kv);
         let resident_out = ctm_forward_resident(
-            &w, &cache, &mut resident_state, &batch, &kv, n_tokens,
+            &w, &cache, &mut resident_state, &batch, &kv_dev, n_tokens,
         ).expect("ctm_forward_resident");
         batch.flush().expect("flush");
 

@@ -4055,15 +4055,24 @@ impl RegionalBrain {
     /// Use `forward_cached` for training paths and
     /// `forward_cached_resident` only for inference.
     ///
-    /// **Connection synapse host bounce.** The current
-    /// `ctm_forward_resident` signature takes a `&[f32]` host KV
-    /// slice, so each connection synapse uploads its source vector to
-    /// a scratch `GpuVec::Hip`, dispatches the matvec resident, then
-    /// downloads the result to host before feeding it into the per-
-    /// region forward. This bounce is the same as
-    /// `bench_brain_resident`'s "host" path — marginal win expected,
-    /// but the structure is in place for the follow-up that lifts
-    /// `ctm_forward_resident` to take a `&GpuVec` KV input.
+    /// **KV travels through device.** `ctm_forward_resident` now
+    /// takes a `&GpuVec` KV input (Part A of this slice), so the
+    /// per-region forward call passes a device-resident KV scratch
+    /// rather than a host slice. We still run `kv_proj + LayerNorm`
+    /// host-side between the connection synapse output and the
+    /// resident inner forward — `kv_proj` is a per-region matvec
+    /// that is in the resident inventory (`CtmResidentCache::kv_proj`)
+    /// but the affine LayerNorm has no resident op yet, so the
+    /// roundtrip stays for now. The shape change matters: it
+    /// unblocks strategy (b) where `kv` rides device-resident from
+    /// synapse → kv_proj_resident → LN_resident → MHA without any
+    /// host bounce. Today: synapse(GpuVec) → D2H → kv_proj host →
+    /// LN host → H2D upload to scratch → `ctm_forward_resident(
+    /// &GpuVec)`. The per-token H2D upload inside
+    /// `ctm_forward_resident` is sourced from a one-shot D2H of the
+    /// scratch (strategy a).
+    /// TODO: lift `kv_proj + LN` to resident dispatch and drop the
+    /// host roundtrip entirely.
     ///
     /// **Router fallback.** When `weights.router.is_some()` this
     /// function falls back to `<RegionalBrain as Brain>::forward_cached`
@@ -4117,6 +4126,14 @@ impl RegionalBrain {
             None
         };
 
+        // Per-region KV upload scratch — `ctm_forward_resident` now
+        // takes `&GpuVec`. Allocate once outside the outer-tick loop
+        // and reuse across ticks. Size matches each region's d_input
+        // (= kv_proj.out_dim) for the n_tokens=1 case driven below.
+        let mut region_kv_dev: Vec<GpuVec> = weights.regions.iter()
+            .map(|rw| GpuVec::try_hip(rw.kv_proj.out_dim))
+            .collect::<Result<Vec<_>, _>>()?;
+
         for _outer_tick in 0..cfg.outer_ticks {
             let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
             let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
@@ -4124,10 +4141,12 @@ impl RegionalBrain {
             // ── Connection synapses (resident with host bounce). ──
             // Mirrors the no-router branch of forward_cached. Each
             // synapse: build src on host, upload, matvec_resident,
-            // download for the per-region forward (which still takes
-            // a host KV slice).
-            // TODO: lift the host bounce when ctm_forward_resident
-            // accepts a &GpuVec KV input.
+            // download to feed the host-side `kv_proj + LayerNorm`.
+            // The post-LN `kv` is then re-uploaded to a per-region
+            // device scratch for the resident inner forward (which
+            // now takes `&GpuVec`). TODO: keep the synapse output on
+            // device by lifting `kv_proj + LayerNorm` to resident
+            // dispatch — drops the per-connection D2H here.
             for (ci, conn) in cfg.connections.iter().enumerate() {
                 let mut src = Vec::new();
                 for &from_idx in &conn.from {
@@ -4167,11 +4186,12 @@ impl RegionalBrain {
             // serialised on the GPU side. Driving it sequentially on
             // the host keeps the dispatch order deterministic.
             //
-            // Note: `ctm_forward_resident` takes `&[f32]` host KV in
-            // `d_input` space; the host's `Ctm::forward_cached` runs its
-            // own `kv_proj + LayerNorm` first. To match the host path
-            // numerically the resident call must also project — see the
-            // KV pre-projection block below.
+            // Note: `ctm_forward_resident` takes a `&GpuVec` KV in
+            // `d_input` space; the host's `Ctm::forward_cached` runs
+            // its own `kv_proj + LayerNorm` first. We mirror that
+            // host-side projection block below, then upload to the
+            // per-region device scratch (`region_kv_dev[r]`) for the
+            // resident inner call.
             let mut region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
             let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
             for r in 0..n_regions {
@@ -4197,10 +4217,21 @@ impl RegionalBrain {
                     }
                     projected
                 };
+                // Upload post-kv_proj+LN `kv` to the per-region
+                // device scratch and pass `&GpuVec` to the resident
+                // inner forward. The scratch is reused across outer
+                // ticks (allocated once outside the loop). Inside
+                // `ctm_forward_resident` the GpuVec is downloaded
+                // once at the top (strategy a) — there is no per-
+                // connection D2H bounce here anymore.
+                let kv_dev = &mut region_kv_dev[r];
+                debug_assert_eq!(kv_dev.len(), kv.len(),
+                    "per-region kv scratch dim mismatch (r={r})");
+                kv_dev.copy_from(&kv);
                 let rstate = &mut state.region_states[r];
                 let ctm_cache = &cache_fresh.ctm_caches()[r];
                 let _output = crate::forward::ctm_forward_resident(
-                    rw, ctm_cache, rstate, batch, &kv, 1,
+                    rw, ctm_cache, rstate, batch, kv_dev, 1,
                 )?;
                 region_activated.push(rstate.activated.clone());
                 // ctm_forward_resident does not yet produce a CtmCache;
