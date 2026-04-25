@@ -131,6 +131,103 @@ pub unsafe fn matvec_resident(
     Ok(())
 }
 
+/// Device-resident matmul `C = A @ B`.
+/// See [`Op::MatmulResidentNN`](super::Op::MatmulResidentNN).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `m * k * 4` bytes (row-major).
+/// - `b_dev` covers at least `k * n * 4` bytes (row-major).
+/// - `out_dev` covers at least `m * n * 4` bytes (row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn matmul_resident_nn(
+    a_dev: *const f32,
+    b_dev: *const f32,
+    out_dev: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentNN { a_dev, b_dev, out_dev, m, k, n };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident matmul `C = A @ B^T`.
+/// See [`Op::MatmulResidentNT`](super::Op::MatmulResidentNT).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `m * k * 4` bytes (row-major).
+/// - `b_dev` covers at least `n * k * 4` bytes (row-major; transposed
+///   on the fly).
+/// - `out_dev` covers at least `m * n * 4` bytes (row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn matmul_resident_nt(
+    a_dev: *const f32,
+    b_dev: *const f32,
+    out_dev: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentNT { a_dev, b_dev, out_dev, m, k, n };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident matmul `C = A^T @ B`.
+/// See [`Op::MatmulResidentTN`](super::Op::MatmulResidentTN).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev` covers at least `k * m * 4` bytes (row-major; transposed
+///   on the fly).
+/// - `b_dev` covers at least `k * n * 4` bytes (row-major).
+/// - `out_dev` covers at least `m * n * 4` bytes (row-major).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn matmul_resident_tn(
+    a_dev: *const f32,
+    b_dev: *const f32,
+    out_dev: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatmulResidentTN { a_dev, b_dev, out_dev, m, k, n };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident RMSNorm forward.
+/// See [`Op::RmsNormResident`](super::Op::RmsNormResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` and `y_dev` cover at least `n * hidden * 4` bytes.
+/// - `weight_dev` covers at least `hidden * 4` bytes.
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn rms_norm_resident(
+    x_dev: *const f32,
+    weight_dev: *const f32,
+    y_dev: *mut f32,
+    n: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::RmsNormResident { x_dev, weight_dev, y_dev, n, hidden, eps };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident LayerNorm forward.
 /// See [`Op::LayerNormResident`](super::Op::LayerNormResident).
 ///

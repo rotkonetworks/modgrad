@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench_maze_resident_medium"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-device",
+ "modgrad-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

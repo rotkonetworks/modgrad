@@ -52,6 +52,10 @@ impl Backend for CpuBackend {
         match op {
             Op::Matvec { quant: QuantKind::Q4K, .. } => false,
             Op::MatvecResident { .. } => false,
+            Op::MatmulResidentNN { .. } => false,
+            Op::MatmulResidentNT { .. } => false,
+            Op::MatmulResidentTN { .. } => false,
+            Op::RmsNormResident { .. } => false,
             Op::LayerNormResident { .. } => false,
             Op::SoftmaxResident { .. } => false,
             Op::ActivationResident { .. } => false,
@@ -88,6 +92,22 @@ impl Backend for CpuBackend {
             }),
             Op::MatvecResident { .. } => Err(BackendError::Unsupported {
                 op: "matvec_resident",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentNN { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_nn",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentNT { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_nt",
+                backend: "cpu",
+            }),
+            Op::MatmulResidentTN { .. } => Err(BackendError::Unsupported {
+                op: "matmul_resident_tn",
+                backend: "cpu",
+            }),
+            Op::RmsNormResident { .. } => Err(BackendError::Unsupported {
+                op: "rms_norm_resident",
                 backend: "cpu",
             }),
             Op::LayerNormResident { .. } => Err(BackendError::Unsupported {

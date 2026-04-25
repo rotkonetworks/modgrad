@@ -207,6 +207,84 @@ pub enum Op<'a> {
         in_dim: usize,
     },
 
+    /// **Device-resident** matmul: `C = A @ B`. Same math as
+    /// [`Op::MatmulNN`] but every operand is a hip-device pointer.
+    /// Backends that cannot consume device pointers (CPU, vulkan-
+    /// without-shared-vram) return `BackendError::Unsupported`.
+    ///
+    /// Layout: `a` is `[m × k]` row-major, `b` is `[k × n]` row-major,
+    /// `out` is `[m × n]` row-major. No bias — callers that need bias
+    /// run a follow-up resident add (e.g. `OpTensorResident{Add}`).
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    MatmulResidentNN {
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+
+    /// **Device-resident** matmul: `C = A @ B^T`. Same math as
+    /// [`Op::MatmulNT`] but every operand is a hip-device pointer.
+    ///
+    /// Layout: `a` is `[m × k]` row-major, `b` is `[n × k]` row-major
+    /// (transposed on the fly), `out` is `[m × n]` row-major. No bias.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    MatmulResidentNT {
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+
+    /// **Device-resident** matmul: `C = A^T @ B`. Same math as
+    /// [`Op::MatmulTN`] but every operand is a hip-device pointer.
+    ///
+    /// Layout: `a` is `[k × m]` row-major (transposed on the fly),
+    /// `b` is `[k × n]` row-major, `out` is `[m × n]` row-major. No
+    /// bias.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    MatmulResidentTN {
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+
+    /// **Device-resident** RMSNorm forward.
+    ///
+    /// `y[r, c] = x[r, c] / sqrt(mean(x[r, :]^2) + eps) * weight[c]`
+    ///
+    /// Modern LLM normalisation (Gemma, Llama, Qwen). MIOpen ships
+    /// LayerNorm but no RMSNorm, so this op routes to a custom hipcc
+    /// kernel compiled by `build.rs` for `gfx1102`.
+    ///
+    /// Layout: `x` and `y` are `[n, hidden]` row-major; `weight` is
+    /// length-`hidden`.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. CPU and other non-
+    /// resident backends return `Unsupported`.
+    RmsNormResident {
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        hidden: usize,
+        eps: f32,
+    },
+
     /// **Device-resident** LayerNorm forward — affine variant matching
     /// PyTorch `nn.LayerNorm(elementwise_affine=True)`.
     ///
@@ -576,6 +654,10 @@ impl<'a> Op<'a> {
             Op::MatmulTN { .. } => "matmul_tn",
             Op::Matvec { .. } => "matvec",
             Op::MatvecResident { .. } => "matvec_resident",
+            Op::MatmulResidentNN { .. } => "matmul_resident_nn",
+            Op::MatmulResidentNT { .. } => "matmul_resident_nt",
+            Op::MatmulResidentTN { .. } => "matmul_resident_tn",
+            Op::RmsNormResident { .. } => "rms_norm_resident",
             Op::LayerNormResident { .. } => "layer_norm_resident",
             Op::SoftmaxResident { .. } => "softmax_resident",
             Op::ActivationResident { .. } => "activation_resident",

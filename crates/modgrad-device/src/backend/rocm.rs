@@ -318,6 +318,32 @@ pub mod ffi {
         ) -> miopenStatus_t;
     }
 
+    // ─── Custom hipcc kernels ──────────────────────────────────
+    //
+    // Compiled by `build.rs` from `kernels/rms_norm.hip` and linked in
+    // when `MODGRAD_HIPCC_KERNELS` is set as a build-time cfg by the
+    // build script. Hosts without hipcc don't define the cfg and the
+    // FFI block is omitted entirely — no link-time dependency, no
+    // runtime missing-symbol error, just a lower-tier `Op::supports()`
+    // for `RmsNormResident`.
+    //
+    // Calling convention from `kernels/rms_norm.hip`: one block per
+    // sample, `BLOCK_SIZE` threads per block (the kernel side picks
+    // the value); the launcher computes the grid/block from `n` /
+    // `hidden`. Returning a hipError_t lets the dispatch arm surface
+    // launch failures the same way as hipblas / MIOpen calls.
+    #[cfg(modgrad_hipcc_kernels)]
+    unsafe extern "C" {
+        pub fn launch_rms_norm(
+            x: *const f32,
+            weight: *const f32,
+            y: *mut f32,
+            n: c_int,
+            hidden: c_int,
+            eps: f32,
+        ) -> hipError_t;
+    }
+
     /// Convert a hipError_t into a human-readable String.
     pub fn hip_err_str(code: hipError_t) -> String {
         unsafe {
@@ -868,6 +894,17 @@ unsafe impl Send for RocmBackend {}
 #[cfg(feature = "rocm")]
 unsafe impl Sync for RocmBackend {}
 
+/// True when `build.rs` successfully compiled and linked the custom
+/// hipcc kernels (`kernels/rms_norm.hip`). Hosts without hipcc skip
+/// the compile step in `build.rs`, the cfg stays unset, and this
+/// returns `false` — `RocmBackend::supports(RmsNormResident)` then
+/// returns false and the registry surfaces `Unsupported`.
+#[cfg(feature = "rocm")]
+#[inline]
+fn rms_norm_kernel_present() -> bool {
+    cfg!(modgrad_hipcc_kernels)
+}
+
 /// Bounds-check a `usize` dimension for the hipBLAS `int` FFI. Returns
 /// a loud `Runtime` error rather than silently truncating — matters for
 /// anyone who one day routes a 3B-param weight through here.
@@ -911,6 +948,16 @@ impl Backend for RocmBackend {
                 // gate is dropped — small ops are still profitable
                 // when weights and activations are already on device.
                 Op::MatvecResident { .. } => true,
+                Op::MatmulResidentNN { .. }
+                | Op::MatmulResidentNT { .. }
+                | Op::MatmulResidentTN { .. } => true,
+                // Custom hipcc kernel — only available when build.rs
+                // successfully compiled `kernels/rms_norm.hip`. The
+                // `rms_norm_kernel_present` constant is set from
+                // build.rs via cfg, so a host without hipcc still
+                // compiles (the symbol is gated to the same cfg as
+                // the dispatch arm).
+                Op::RmsNormResident { .. } => rms_norm_kernel_present(),
                 Op::MatmulNN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 Op::MatmulNT { m, k, n, .. }
@@ -969,6 +1016,26 @@ impl Backend for RocmBackend {
                     *bias_dev as *const std::os::raw::c_void,
                     *out_dev as *mut std::os::raw::c_void,
                     *out_dim, *in_dim,
+                ),
+                Op::MatmulResidentNN {
+                    a_dev, b_dev, out_dev, m, k, n,
+                } => self.matmul_resident_nn_f32(
+                    *a_dev, *b_dev, *out_dev, *m, *k, *n,
+                ),
+                Op::MatmulResidentNT {
+                    a_dev, b_dev, out_dev, m, k, n,
+                } => self.matmul_resident_nt_f32(
+                    *a_dev, *b_dev, *out_dev, *m, *k, *n,
+                ),
+                Op::MatmulResidentTN {
+                    a_dev, b_dev, out_dev, m, k, n,
+                } => self.matmul_resident_tn_f32(
+                    *a_dev, *b_dev, *out_dev, *m, *k, *n,
+                ),
+                Op::RmsNormResident {
+                    x_dev, weight_dev, y_dev, n, hidden, eps,
+                } => self.rms_norm_resident_f32(
+                    *x_dev, *weight_dev, *y_dev, *n, *hidden, *eps,
                 ),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
@@ -1415,6 +1482,191 @@ impl RocmBackend {
             return Err(BackendError::Runtime(format!("hipblasSgemm (TN): status {status}")));
         }
         d_c.download_f32(out)
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl RocmBackend {
+    /// Fully-resident `C = A @ B`, all f32 row-major, every operand a
+    /// hip device pointer. Mirrors `matmul_nn_f32`'s column-major-via-
+    /// transpose trick: hipBLAS is column-major, so we compute
+    /// `C^T = B^T @ A^T` by passing B as the first arg and A as the
+    /// second. No transposes, no per-call malloc/upload/free.
+    fn matmul_resident_nn_f32(
+        &self,
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_N,
+                n_i32, m_i32, k_i32,
+                &alpha,
+                b_dev, n_i32,
+                a_dev, k_i32,
+                &beta,
+                out_dev, n_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemm (resident NN): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident `C = A @ B^T`, row-major. See `matmul_nt_f32`
+    /// for the trick — same transposition story, but operands are
+    /// device pointers and we don't touch host memory.
+    fn matmul_resident_nt_f32(
+        &self,
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_T, ffi::HIPBLAS_OP_N,
+                n_i32, m_i32, k_i32,
+                &alpha,
+                b_dev, k_i32,
+                a_dev, k_i32,
+                &beta,
+                out_dev, n_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemm (resident NT): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident `C = A^T @ B`, row-major. See `matmul_tn_f32`
+    /// for the derivation.
+    fn matmul_resident_tn_f32(
+        &self,
+        a_dev: *const f32,
+        b_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let m_i32 = as_i32(m, "m")?;
+        let k_i32 = as_i32(k, "k")?;
+        let n_i32 = as_i32(n, "n")?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_N, ffi::HIPBLAS_OP_T,
+                n_i32, m_i32, k_i32,
+                &alpha,
+                b_dev, n_i32,
+                a_dev, m_i32,
+                &beta,
+                out_dev, n_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemm (resident TN): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident RMSNorm forward via the custom hipcc kernel built by
+    /// `build.rs`. Modern LLM normalisation:
+    ///
+    ///   y[r, c] = x[r, c] / sqrt(mean(x[r, :]^2) + eps) * weight[c]
+    ///
+    /// MIOpen does not ship RMSNorm — only LayerNorm, which subtracts
+    /// the mean and adds bias. Hence the custom kernel.
+    ///
+    /// Caller invariant: `supports()` already confirmed
+    /// `rms_norm_kernel_present()`. We re-check here so that a
+    /// supports/dispatch race surfaces as a loud `Unsupported` rather
+    /// than a missing-symbol link error at runtime.
+    #[cfg(modgrad_hipcc_kernels)]
+    fn rms_norm_resident_f32(
+        &self,
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        let n_i32 = as_i32(n, "n")?;
+        let hidden_i32 = as_i32(hidden, "hidden")?;
+        let err = unsafe {
+            ffi::launch_rms_norm(x_dev, weight_dev, y_dev, n_i32, hidden_i32, eps)
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_rms_norm(n={n}, hidden={hidden}): {}",
+                ffi::hip_err_str(err),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fallback when the hipcc-built kernel isn't present (host without
+    /// hipcc, build.rs skipped the compile). The `supports()` arm
+    /// returns false in this configuration so the registry never
+    /// dispatches here, but we keep the symbol so `dispatch()` still
+    /// matches every `Op` variant.
+    #[cfg(not(modgrad_hipcc_kernels))]
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_resident_f32(
+        &self,
+        _x_dev: *const f32,
+        _weight_dev: *const f32,
+        _y_dev: *mut f32,
+        _n: usize,
+        _hidden: usize,
+        _eps: f32,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported {
+            op: "rms_norm_resident",
+            backend: "rocm",
+        })
     }
 }
 
