@@ -29,6 +29,7 @@ members = [
     "examples/pretrain_retina",
     "examples/bench_maze_resident",
     "examples/bench_maze_resident_medium",
+    "examples/lm_validate",
     "debugger",
     "extra/remu",
 ]

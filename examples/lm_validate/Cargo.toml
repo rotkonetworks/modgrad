@@ -1,0 +1,29 @@
+[package]
+name = "lm_validate"
+version = "0.1.0"
+edition = "2024"
+description = "Real validation of LmTrainer<GptModelResident>: train a tiny byte-level GPT on climbmix English text, track held-out validation loss, and print PASS/WARN/FAIL on whether real-data gradients are working."
+
+[[bin]]
+name = "lm_validate"
+path = "src/main.rs"
+
+[features]
+default = []
+# Same shape as bench_maze_resident: rocm propagates through
+# isis-runtime (which carries the LmTrainer), modgrad-transformer
+# (the resident model), modgrad-compute (GpuVec), modgrad-device
+# (HipBatch / hipblas).
+rocm = [
+    "isis-runtime/rocm",
+    "modgrad-transformer/rocm",
+    "modgrad-compute/rocm",
+    "modgrad-device/rocm",
+]
+
+[dependencies]
+isis-runtime        = { path = "../../isis/runtime" }
+modgrad-transformer = { path = "../../crates/modgrad-transformer" }
+modgrad-compute     = { path = "../../crates/modgrad-compute" }
+modgrad-device      = { path = "../../crates/modgrad-device" }
+modgrad-traits      = { path = "../../crates/modgrad-traits" }
