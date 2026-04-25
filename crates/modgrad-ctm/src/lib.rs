@@ -39,7 +39,7 @@ pub mod monarch;
 pub use config::CtmConfig;
 pub use weights::{CtmWeights, CtmState};
 pub use train::{Ctm, CtmGradients, CtmCache, RegionBackwardResult, train_step, backward_from_activated};
-pub use forward::ctm_forward;
+pub use forward::{ctm_forward, CtmInput};
 pub use loss::{CtmLoss, LastTickCE, ThinkingLoss, ImaginationLoss};
 pub use graph::{RegionalBrain, RegionalCache};
 

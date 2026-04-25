@@ -26,105 +26,87 @@ pub struct CtmOutput {
     pub trajectory: Vec<f32>,
 }
 
-/// Faithful Ctm CTM forward pass.
+/// Input to a CTM forward pass. Carries the projection state of the
+/// observation; the episodic-memory behavior is owned by
+/// `state.episodic.is_some()`, not by which constructor was called.
 ///
-/// `observation`: raw input features [n_tokens × raw_dim].
-/// `n_tokens`:    number of KV tokens (1 for single-vector input).
-/// `raw_dim`:     dimension per token (must match kv_proj.in_dim).
+/// Per the SaaF symmetry-duals review (#6.4): three near-identical
+/// `ctm_forward*` entry points with the same internal tick loop were
+/// branching on input-shape encoded as a function name. This enum
+/// makes the projection state explicit; callers that want to bypass
+/// `kv_proj` use `Projected`.
+pub enum CtmInput<'a> {
+    /// Raw observation, will be projected through `kv_proj` + LayerNorm
+    /// before MHA. Most callers want this.
+    ///
+    /// `obs`: `[n_tokens × raw_dim]` flat. `raw_dim` must equal
+    /// `w.kv_proj.in_dim`.
+    Raw { obs: &'a [f32], n_tokens: usize, raw_dim: usize },
+    /// Pre-projected KV — already in `d_input` space. Used by callers
+    /// that have their own projection chain (e.g. external embedding
+    /// table, frozen language model bridge).
+    Projected { kv: &'a [f32], n_tokens: usize },
+}
+
+/// Faithful CTM forward pass.
+///
+/// When `state.episodic` is `Some` and non-empty, episodic entries are
+/// prepended to the MHA KV stream. After the tick loop completes, the
+/// current observation's projected KV is appended to episodic memory.
+/// `state.episodic = None` is the no-memory default.
 pub fn ctm_forward(
     w: &CtmWeights,
     state: &mut CtmState,
-    observation: &[f32],
-    n_tokens: usize,
-    raw_dim: usize,
+    input: CtmInput<'_>,
 ) -> CtmOutput {
     let d_in = w.config.d_input;
 
-    // Project observation → KV features
-    let mut kv = Vec::with_capacity(n_tokens * d_in);
-    for t in 0..n_tokens {
-        let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
-        let mut projected = w.kv_proj.forward(tok);
-        affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
-        kv.extend_from_slice(&projected);
-    }
-
-    // Delegate to the KV-based forward (single implementation of the tick loop)
-    ctm_forward_with_kv(w, state, &kv, n_tokens)
-}
-
-/// Forward pass with episodic memory.
-///
-/// Wraps `ctm_forward`: prepends episodic KV entries to the observation,
-/// runs the faithful forward, then stores the current observation in memory.
-/// When `state.episodic` is None, this is identical to `ctm_forward`.
-pub fn ctm_forward_episodic(
-    w: &CtmWeights,
-    state: &mut CtmState,
-    observation: &[f32],
-    n_tokens: usize,
-    raw_dim: usize,
-) -> CtmOutput {
-    let d_in = w.config.d_input;
-
-    // If episodic memory has entries, build extended observation
-    let has_entries = state.episodic.as_ref().map_or(false, |e| !e.is_empty());
-
-    if has_entries {
-        let ep = state.episodic.as_ref().unwrap();
-        let ep_kv = ep.as_kv();
-        let ep_n = ep.n_tokens();
-
-        // Episodic entries are already in d_input space.
-        // Build a synthetic observation: [episodic_raw || observation]
-        // where episodic_raw is padded/projected to match raw_dim.
-        // Since ctm_forward projects through kv_proj, and episodic entries
-        // are already projected, we need to bypass kv_proj for episodic entries.
-        // The clean way: call the inner MHA directly with a combined KV buffer.
-        //
-        // For now, we project observation normally, build the combined KV,
-        // and call a variant that takes pre-built KV.
-        let mut kv = Vec::with_capacity((ep_n + n_tokens) * d_in);
-        kv.extend_from_slice(&ep_kv);
-        for t in 0..n_tokens {
-            let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
-            let mut projected = w.kv_proj.forward(tok);
-            affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
-            kv.extend_from_slice(&projected);
-        }
-
-        let output = ctm_forward_with_kv(w, state, &kv, ep_n + n_tokens);
-
-        // Store current observation's projected KV into episodic memory
-        let current_kv_start = ep_n * d_in;
-        if let Some(ref mut mem) = state.episodic {
+    // Step 1: produce this call's KV (project Raw, pass through Projected).
+    let (new_kv, n_new) = match input {
+        CtmInput::Raw { obs, n_tokens, raw_dim } => {
+            let mut kv = Vec::with_capacity(n_tokens * d_in);
             for t in 0..n_tokens {
-                let offset = current_kv_start + t * d_in;
-                mem.push(&kv[offset..offset + d_in]);
-            }
-        }
-
-        output
-    } else {
-        // No episodic entries — run faithful forward, then store
-        let output = ctm_forward(w, state, observation, n_tokens, raw_dim);
-
-        if let Some(ref mut mem) = state.episodic {
-            // Project and store current observation
-            for t in 0..n_tokens {
-                let tok = &observation[t * raw_dim..(t + 1) * raw_dim];
+                let tok = &obs[t * raw_dim..(t + 1) * raw_dim];
                 let mut projected = w.kv_proj.forward(tok);
                 affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
-                mem.push(&projected);
+                kv.extend_from_slice(&projected);
             }
+            (kv, n_tokens)
         }
+        CtmInput::Projected { kv, n_tokens } => (kv.to_vec(), n_tokens),
+    };
 
-        output
+    // Step 2: prepend episodic entries if present. Episodic store owns
+    // its own already-projected KV ring; concat is in d_input space.
+    let has_episodic_entries =
+        state.episodic.as_ref().map_or(false, |e| !e.is_empty());
+    let (kv_used, n_total) = if has_episodic_entries {
+        let ep = state.episodic.as_ref().unwrap();
+        let ep_n = ep.n_tokens();
+        let mut combined = Vec::with_capacity((ep_n + n_new) * d_in);
+        combined.extend_from_slice(&ep.as_kv());
+        combined.extend_from_slice(&new_kv);
+        (combined, ep_n + n_new)
+    } else {
+        (new_kv.clone(), n_new)
+    };
+
+    // Step 3: tick loop on the combined KV.
+    let output = ctm_forward_with_kv(w, state, &kv_used, n_total);
+
+    // Step 4: persist this call's KV into episodic if the slot exists.
+    // (Empty episodic still gets pushed to — first-call bootstrap.)
+    if let Some(ref mut mem) = state.episodic {
+        for t in 0..n_new {
+            mem.push(&new_kv[t * d_in..(t + 1) * d_in]);
+        }
     }
+
+    output
 }
 
-/// Forward pass with pre-built KV buffer (skips kv_proj).
-/// Used by ctm_forward_episodic when episodic entries are already projected.
+/// Forward pass with pre-built KV buffer (skips kv_proj). Private
+/// because the public surface routes everything through `CtmInput`.
 fn ctm_forward_with_kv(
     w: &CtmWeights,
     state: &mut CtmState,
@@ -488,7 +470,9 @@ mod tests {
 
         // Single token observation
         let obs = vec![0.5f32; raw_dim];
-        let out = ctm_forward(&w, &mut state, &obs, 1, raw_dim);
+        let out = ctm_forward(&w, &mut state, CtmInput::Raw {
+            obs: &obs, n_tokens: 1, raw_dim,
+        });
 
         assert_eq!(out.predictions.len(), cfg.iterations);
         assert_eq!(out.predictions[0].len(), cfg.out_dims);

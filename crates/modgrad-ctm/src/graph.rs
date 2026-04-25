@@ -1538,15 +1538,15 @@ pub fn regional_forward(
 
         // Phase B: Run regions (parallel via disjoint mut slices).
         // Take ownership of region_states to get disjoint &mut per element.
+        // ctm_forward branches on rs.episodic.is_some() internally now —
+        // the caller used to dispatch via two function names; that's
+        // collapsed into a single entry point.
         let mut states_vec: Vec<CtmState> = std::mem::take(&mut state.region_states);
         let results: Vec<Vec<f32>> = states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
             let d_input = w.regions[r].config.d_input;
-            if rs.episodic.is_some() {
-                let _output = crate::forward::ctm_forward_episodic(
-                    &w.regions[r], rs, &region_obs[r], 1, d_input);
-            } else {
-                let _output = ctm_forward(&w.regions[r], rs, &region_obs[r], 1, d_input);
-            }
+            let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
+            });
             rs.activated.clone()
         }).collect();
         state.region_states = states_vec;

@@ -12,7 +12,7 @@
 use modgrad_ctm::config::{CtmConfig, ExitStrategy};
 use modgrad_ctm::weights::CtmWeights;
 use modgrad_ctm::train::{train_step, CtmGradients};
-use modgrad_ctm::forward::ctm_forward;
+use modgrad_ctm::forward::{ctm_forward, CtmInput};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -182,7 +182,9 @@ fn run_training(
     for _ in 0..n_eval {
         let (obs, target) = gen_sample(&mut eval_rng, seq_len);
         let mut state = modgrad_ctm::weights::CtmState::new(&w);
-        let output = ctm_forward(&w, &mut state, &obs, n_tokens, raw_dim);
+        let output = ctm_forward(&w, &mut state, CtmInput::Raw {
+            obs: &obs, n_tokens, raw_dim,
+        });
 
         // Use last prediction
         let pred = output.predictions.last().unwrap();

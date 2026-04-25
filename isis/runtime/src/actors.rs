@@ -17,7 +17,7 @@ use std::thread::{self, JoinHandle};
 
 use modgrad_compute::neuron::Linear;
 use modgrad_ctm::weights::{CtmWeights, CtmState};
-use modgrad_ctm::forward::ctm_forward;
+use modgrad_ctm::forward::{ctm_forward, CtmInput};
 
 use super::regional::{RegionalConfig, RegionalWeights};
 
@@ -291,7 +291,9 @@ fn region_loop(
 
         // Run internal CTM ticks
         for _ in 0..ticks_per_step {
-            ctm_forward(weights, &mut state, &obs, 1, d_input);
+            ctm_forward(weights, &mut state, CtmInput::Raw {
+                obs: &obs, n_tokens: 1, raw_dim: d_input,
+            });
         }
         local_tick += ticks_per_step as u64;
 

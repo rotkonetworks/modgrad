@@ -1207,7 +1207,10 @@ impl V4Ctm {
         debug_assert_eq!(tokens.len(), n_tokens * token_dim);
         let mut state = modgrad_ctm::weights::CtmState::new(&self.weights);
         let output = modgrad_ctm::forward::ctm_forward(
-            &self.weights, &mut state, tokens, n_tokens, token_dim,
+            &self.weights, &mut state,
+            modgrad_ctm::forward::CtmInput::Raw {
+                obs: tokens, n_tokens, raw_dim: token_dim,
+            },
         );
         output.sync_out
     }
