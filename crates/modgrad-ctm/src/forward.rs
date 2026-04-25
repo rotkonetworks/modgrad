@@ -225,6 +225,344 @@ fn ctm_forward_with_kv(
     CtmOutput { predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory }
 }
 
+// ─── Device-resident tick loop ─────────────────────────────
+//
+// `ctm_forward_resident` mirrors `ctm_forward_with_kv` but routes the
+// big fixed-cost matvecs (q_proj, MHA Q/K/V, MHA out, synapse U-Net,
+// NLM stages, output_proj, exit_gate) through `CtmResidentCache` —
+// weights stay device-resident across ticks, zero PCIe per dispatch.
+//
+// **What stays host.** The CTM tick state (activated, trace,
+// alpha/beta accumulators, predictions, certainties, exit lambdas,
+// trajectory) is small Vec<f32> bookkeeping driven by scalar ops
+// (sync_init/sync_update, per_neuron_glu, softmax, certainty,
+// trace shift, exit-gate sigmoid). Forcing it onto device buys
+// nothing and complicates code. We upload to GpuVec::Hip on the
+// boundaries where a resident matvec needs it (sync_action →
+// q_proj, q_full → MHA, attn||activated → synapse, trace → NLM,
+// sync_out → output_proj/exit_gate) and download the matvec result
+// back to host before the next host op.
+//
+// **MHA scaled-dot-product stays host for this PR.** Q (1 vector)
+// and per-token K/V are produced by resident matvecs against the
+// row-sliced mha_in_q / mha_in_k / mha_in_v sub-Linears, then the
+// softmax + weighted sum runs on the host (D2H per token, identical
+// arithmetic to the host `multihead_attention` per-head loop). Once
+// `Op::AttentionResident` lands the host softmax block can lift to
+// device. TODO: wire that op when it lands.
+//
+// **NLM per-neuron GLU stays host** for this PR (D2H → host GLU →
+// H2D between SuperLinear stages). Same reason — no resident GLU
+// op yet. TODO: lift to device when `Op::PerNeuronGluResident`
+// arrives.
+
+#[cfg(feature = "rocm")]
+use modgrad_compute::backend::{GpuVec, ResidencyError};
+#[cfg(feature = "rocm")]
+use modgrad_device::backend::HipBatch;
+
+/// Device-resident equivalent of `ctm_forward_with_kv`. Drives the
+/// inner CTM tick loop with the heavy matvecs dispatched through
+/// `CtmResidentCache`. Host state (predictions, certainties,
+/// sync accumulators, exit bookkeeping) is identical to the host
+/// path; only the matmul transport changes.
+///
+/// **Signature mirrors `ctm_forward_with_kv`.** Takes pre-projected
+/// KV in d_input space (the `kv_proj` projection happens in the
+/// outer caller — typically `RegionalBrain::forward_cached_resident`
+/// — so this function focuses purely on the inner tick loop).
+///
+/// **Cross-forward state contract.** Same as `ctm_forward_with_kv`:
+/// `alpha_out`/`beta_out` reset every call via `sync_init`, action
+/// accumulators are local, `activated`/`trace` persist across
+/// forwards (continuous-thinking semantics).
+///
+/// Returns `CtmOutput` matching the host path bit-for-bit within
+/// 1e-3 FP tolerance (rocBLAS reduces in a different order than
+/// AVX-512 dot, hence the loose bound).
+#[cfg(feature = "rocm")]
+pub fn ctm_forward_resident(
+    w: &CtmWeights,
+    cache: &crate::ctm_resident::CtmResidentCache,
+    state: &mut CtmState,
+    batch: &HipBatch,
+    kv: &[f32],
+    n_tokens: usize,
+) -> Result<CtmOutput, ResidencyError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+    let n_heads = cfg.heads;
+    let d_head = d_in / n_heads;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    let r_out: Vec<f32> = w.decay_params_out.iter()
+        .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let r_action: Vec<f32> = w.decay_params_action.iter()
+        .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+
+    sync_init(&state.activated, &w.sync_out_left, &w.sync_out_right,
+        &mut state.alpha_out, &mut state.beta_out);
+
+    let mut alpha_action: Vec<f32> = Vec::new();
+    let mut beta_action: Vec<f32> = Vec::new();
+    let mut action_initialized = false;
+
+    let mut predictions = Vec::with_capacity(k);
+    let mut certainties = Vec::with_capacity(k);
+    let mut exit_lambdas: Vec<f32> = Vec::new();
+    let mut exit_cdf = 0.0f32;
+    let mut survival = 1.0f32;
+    let collect_traj = cfg.collect_trajectories;
+    let mut trajectory = if collect_traj { Vec::with_capacity(k * d) } else { Vec::new() };
+
+    // Pre-allocated device scratch buffers reused across ticks.
+    // q_proj output and MHA Q-projection share d_in shape so they
+    // could share a buffer, but cleanest to keep them distinct;
+    // hipMalloc cost amortises across the tick loop anyway.
+    let n_action = w.q_proj.in_dim;
+    let mut sync_action_dev = GpuVec::try_hip(n_action)?;
+    let mut q_proj_out_dev = GpuVec::try_hip(d_in)?;
+    let mut mha_q_dev = GpuVec::try_hip(d_in)?;
+    let mut mha_kv_in_dev = GpuVec::try_hip(d_in)?;
+    let mut mha_k_dev = GpuVec::try_hip(d_in)?;
+    let mut mha_v_dev = GpuVec::try_hip(d_in)?;
+    let mut mha_concat_dev = GpuVec::try_hip(d_in)?;
+    let mut attn_out_dev = GpuVec::try_hip(d_in)?;
+    let mut pre_syn_dev = GpuVec::try_hip(d_in + d)?;
+    let mut pre_act_dev = GpuVec::try_hip(d)?;
+    let mut nlm_in_dev = GpuVec::try_hip(d * m)?;
+    let mut nlm_s1_out_dev = GpuVec::try_hip(d * w.nlm_stage1.out_per)?;
+    let nlm_s2_out_dev: Option<GpuVec> = match &w.nlm_stage2 {
+        Some(s2) => Some(GpuVec::try_hip(d * s2.out_per)?),
+        None => None,
+    };
+    let mut nlm_s2_out_dev = nlm_s2_out_dev;
+    let mut sync_out_dev = GpuVec::try_hip(cfg.n_synch_out)?;
+    let mut pred_dev = GpuVec::try_hip(cfg.out_dims)?;
+    let mut gate_dev = if w.exit_gate.is_some() {
+        Some(GpuVec::try_hip(1)?)
+    } else {
+        None
+    };
+
+    // Project all KV tokens once per call (kv doesn't change across
+    // ticks). Each token: K = mha_in_k @ kv_token + bias_k,
+    //                     V = mha_in_v @ kv_token + bias_v.
+    // Stored host-side because softmax + weighted sum is host.
+    // n_tokens × d_in each.
+    let mut k_all_host = vec![0.0f32; n_tokens * d_in];
+    let mut v_all_host = vec![0.0f32; n_tokens * d_in];
+    for t in 0..n_tokens {
+        mha_kv_in_dev.copy_from(&kv[t * d_in..(t + 1) * d_in]);
+        cache.mha_in_k.forward(batch, &mha_kv_in_dev, &mut mha_k_dev)?;
+        cache.mha_in_v.forward(batch, &mha_kv_in_dev, &mut mha_v_dev)?;
+        // D2H to host scratch. flush guarantees the matvecs above
+        // are finished before we read.
+        batch.flush()?;
+        let mut k_tok = vec![0.0f32; d_in];
+        let mut v_tok = vec![0.0f32; d_in];
+        match &mha_k_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut k_tok)?,
+            _ => unreachable!("hip alloc"),
+        }
+        match &mha_v_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut v_tok)?,
+            _ => unreachable!("hip alloc"),
+        }
+        k_all_host[t * d_in..(t + 1) * d_in].copy_from_slice(&k_tok);
+        v_all_host[t * d_in..(t + 1) * d_in].copy_from_slice(&v_tok);
+    }
+
+    for _tick in 0..k {
+        // ── Sync (action). Identical scalar op to the host path. ──
+        let sync_action = if !action_initialized {
+            sync_init(&state.activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action);
+            action_initialized = true;
+            sync_read(&alpha_action, &beta_action)
+        } else {
+            sync_update(&state.activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, &r_action)
+        };
+
+        // ── Q projection: sync_action → d_input via q_proj. ──
+        sync_action_dev.copy_from(&sync_action);
+        cache.q_proj.forward(batch, &sync_action_dev, &mut q_proj_out_dev)?;
+
+        // ── MHA Q row of in_proj. ──
+        // Host code: linear_slice(q_in, in_proj, 0, d_input).
+        // Resident: mha_in_q @ q_proj_out → mha_q_dev.
+        cache.mha_in_q.forward(batch, &q_proj_out_dev, &mut mha_q_dev)?;
+        batch.flush()?;
+        let mut q_full = vec![0.0f32; d_in];
+        match &mha_q_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut q_full)?,
+            _ => unreachable!("hip alloc"),
+        }
+
+        // ── Per-head scaled dot-product attention (host). ──
+        // K and V tokens were pre-projected once above. We mirror
+        // the host `multihead_attention` per-head loop exactly.
+        // TODO: lift to a resident batched-MHA op when one lands.
+        let mut concat_heads = vec![0.0f32; d_in];
+        for h in 0..n_heads {
+            let q_h = &q_full[h * d_head..(h + 1) * d_head];
+
+            let mut scores = Vec::with_capacity(n_tokens);
+            for t in 0..n_tokens {
+                let k_h = &k_all_host[
+                    t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
+                let dot: f32 = q_h.iter().zip(k_h).map(|(&a, &b)| a * b).sum();
+                scores.push(dot * scale);
+            }
+
+            let max_s = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_s: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+            let sum_s: f32 = exp_s.iter().sum();
+
+            let head_out = &mut concat_heads[h * d_head..(h + 1) * d_head];
+            for j in 0..d_head { head_out[j] = 0.0; }
+            for t in 0..n_tokens {
+                let w_attn = exp_s[t] / sum_s;
+                let v_h = &v_all_host[
+                    t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
+                for j in 0..d_head {
+                    head_out[j] += w_attn * v_h[j];
+                }
+            }
+        }
+
+        // ── MHA out projection: concat → d_input via mha_out_proj. ──
+        mha_concat_dev.copy_from(&concat_heads);
+        cache.mha_out_proj.forward(batch, &mha_concat_dev, &mut attn_out_dev)?;
+        batch.flush()?;
+        let mut attn_out = vec![0.0f32; d_in];
+        match &attn_out_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut attn_out)?,
+            _ => unreachable!("hip alloc"),
+        }
+
+        // ── Synapse U-Net: concat(attn_out, activated) → d_model. ──
+        // Build the concat host-side then upload as one block.
+        let mut pre_syn = Vec::with_capacity(d_in + d);
+        pre_syn.extend_from_slice(&attn_out);
+        pre_syn.extend_from_slice(&state.activated);
+        pre_syn_dev.copy_from(&pre_syn);
+        cache.synapse.forward(batch, &pre_syn_dev, &mut pre_act_dev)?;
+        batch.flush()?;
+        let mut pre_act = vec![0.0f32; d];
+        match &pre_act_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut pre_act)?,
+            _ => unreachable!("hip alloc"),
+        }
+
+        // ── Trace shift (host, scalar). ──
+        for n in 0..d {
+            let base = n * m;
+            state.trace.copy_within(base + 1..base + m, base);
+            state.trace[base + m - 1] = pre_act[n];
+        }
+
+        // ── NLM forward: trace → activated. ──
+        // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out.
+        // Then host per_neuron_glu over `out_per`.
+        // If stage2 is Some, upload glu output, run stage2, host glu again.
+        nlm_in_dev.copy_from(&state.trace);
+        cache.nlm_stage1.forward(batch, &nlm_in_dev, &mut nlm_s1_out_dev)?;
+        batch.flush()?;
+        let mut s1_out_host = vec![0.0f32; d * w.nlm_stage1.out_per];
+        match &nlm_s1_out_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut s1_out_host)?,
+            _ => unreachable!("hip alloc"),
+        }
+        let s1_glu = per_neuron_glu(&s1_out_host, d, w.nlm_stage1.out_per);
+
+        let new_activated = if let Some(s2_resident) = &cache.nlm_stage2 {
+            // stage2 is Some — chain through it. nlm_stage2 has
+            // in_per = stage1's glu width = out_per/2.
+            let s2_weights = w.nlm_stage2.as_ref()
+                .expect("nlm_stage2 host weights present when cache.nlm_stage2 is Some");
+            let s2_in_dev = nlm_s2_out_dev.as_mut()
+                .expect("s2 out buffer allocated when stage2 present");
+            // Reuse pre_syn_dev or allocate fresh — actually we need
+            // a separate input buffer; allocate here once.
+            // Cleaner: allocate s2 input once outside the loop. But
+            // the shape (d * in_per) varies per region so allocating
+            // here keeps things simple.
+            let mut s2_in_buf = GpuVec::try_hip(d * s2_resident.in_per)?;
+            s2_in_buf.copy_from(&s1_glu);
+            s2_resident.forward(batch, &s2_in_buf, s2_in_dev)?;
+            batch.flush()?;
+            let mut s2_out_host = vec![0.0f32; d * s2_weights.out_per];
+            match s2_in_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut s2_out_host)?,
+                _ => unreachable!("hip alloc"),
+            }
+            per_neuron_glu(&s2_out_host, d, s2_weights.out_per)
+        } else {
+            s1_glu
+        };
+        state.activated = new_activated;
+
+        if collect_traj {
+            trajectory.extend_from_slice(&state.activated);
+        }
+
+        // ── Sync (out): identical scalar op to host. ──
+        let sync_out = sync_update(&state.activated, &w.sync_out_left, &w.sync_out_right,
+            &mut state.alpha_out, &mut state.beta_out, &r_out);
+
+        // ── Output projection: sync_out → out_dims via output_proj. ──
+        sync_out_dev.copy_from(&sync_out);
+        cache.output_proj.forward(batch, &sync_out_dev, &mut pred_dev)?;
+        batch.flush()?;
+        let mut pred = vec![0.0f32; cfg.out_dims];
+        match &pred_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut pred)?,
+            _ => unreachable!("hip alloc"),
+        }
+        let cert = compute_certainty(&pred);
+        predictions.push(pred);
+        certainties.push(cert);
+
+        // ── Exit strategy: identical to host. ──
+        match &cfg.exit_strategy {
+            crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
+                if let (Some(gate_resident), Some(gate_buf)) =
+                    (cache.exit_gate.as_ref(), gate_dev.as_mut())
+                {
+                    gate_resident.forward(batch, &sync_out_dev, gate_buf)?;
+                    batch.flush()?;
+                    let mut gate_out = [0.0f32; 1];
+                    match &*gate_buf {
+                        GpuVec::Hip(buf) => buf.copy_to_host(&mut gate_out)?,
+                        _ => unreachable!("hip alloc"),
+                    }
+                    let lambda = 1.0 / (1.0 + (-gate_out[0]).exp());
+                    exit_lambdas.push(lambda);
+                    let p_exit = lambda * survival;
+                    exit_cdf += p_exit;
+                    survival *= 1.0 - lambda;
+                    if exit_cdf > *threshold { break; }
+                }
+            }
+            crate::config::ExitStrategy::Certainty { threshold } => {
+                if cert[1] > *threshold { break; }
+            }
+            crate::config::ExitStrategy::None => {}
+        }
+    }
+
+    let ticks_used = predictions.len();
+    let sync_out = sync_read(&state.alpha_out, &state.beta_out);
+    Ok(CtmOutput {
+        predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory,
+    })
+}
+
 // ─── Episodic memory bridge ────────────────────────────────
 
 /// Store a CtmOutput as an episodic memory entry.
@@ -512,5 +850,95 @@ mod tests {
             .sum();
         eprintln!("  pred diff (tick 0 vs last): {:.4}", diff);
         assert!(diff > 0.0, "predictions should change across ticks");
+    }
+
+    /// Host `ctm_forward_with_kv` and resident `ctm_forward_resident`
+    /// must produce matching predictions (first tick, last tick) and
+    /// matching final sync_out within 1e-3 FP tolerance. rocBLAS
+    /// reduces in a different order than AVX-512 dot, so the bound
+    /// is loose. AdaptiveGate is enabled to exercise the resident
+    /// exit_gate dispatch path.
+    ///
+    /// **Why two states.** Both forwards mutate `CtmState` (trace,
+    /// activated, alpha/beta_out). To keep the comparison clean each
+    /// path gets its own state, both seeded identically from
+    /// `CtmState::new(&w)`.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn ctm_forward_resident_matches_host() {
+        use crate::config::ExitStrategy;
+        use crate::ctm_resident::CtmResidentCache;
+        use modgrad_device::backend::HipBatch;
+        use modgrad_device::backend::rocm::ffi::runtime_available;
+        use modgrad_compute::neuron::SimpleRng;
+
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+
+        let cfg = CtmConfig {
+            iterations: 4,
+            d_model: 64,
+            d_input: 32,
+            heads: 4,
+            n_synch_out: 32,
+            n_synch_action: 32,
+            synapse_depth: 3,
+            memory_length: 8,
+            deep_nlms: true,
+            memory_hidden_dims: 4,
+            out_dims: 10,
+            n_random_pairing_self: 0,
+            min_width: 16,
+            exit_strategy: ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            collect_trajectories: false,
+        };
+        let raw_input_dim = 16;
+        let w = CtmWeights::new(cfg.clone(), raw_input_dim);
+
+        // Pre-projected kv in d_input space; n_tokens = 3.
+        let n_tokens = 3;
+        let mut rng = SimpleRng::new(0xCD_FE_E0);
+        let kv: Vec<f32> = (0..n_tokens * cfg.d_input)
+            .map(|_| rng.next_normal()).collect();
+
+        // Host run.
+        let mut host_state = CtmState::new(&w);
+        let host_out = ctm_forward_with_kv(&w, &mut host_state, &kv, n_tokens);
+
+        // Resident run with a fresh state.
+        let mut resident_state = CtmState::new(&w);
+        let cache = CtmResidentCache::from_weights(&w)
+            .expect("CtmResidentCache::from_weights");
+        let batch = HipBatch::new();
+        let resident_out = ctm_forward_resident(
+            &w, &cache, &mut resident_state, &batch, &kv, n_tokens,
+        ).expect("ctm_forward_resident");
+        batch.flush().expect("flush");
+
+        assert_eq!(host_out.ticks_used, resident_out.ticks_used,
+            "ticks_used mismatch (exit gate decided differently)");
+        let last = host_out.ticks_used.saturating_sub(1);
+        assert!(host_out.ticks_used >= 1);
+
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        let p0 = max_diff(&host_out.predictions[0], &resident_out.predictions[0]);
+        assert!(p0 < 1e-3, "predictions[0] mismatch: max |Δ| = {p0}");
+
+        let pl = max_diff(&host_out.predictions[last], &resident_out.predictions[last]);
+        assert!(pl < 1e-3, "predictions[last] mismatch: max |Δ| = {pl}");
+
+        let sd = max_diff(&host_out.sync_out, &resident_out.sync_out);
+        assert!(sd < 1e-3, "sync_out mismatch: max |Δ| = {sd}");
+
+        eprintln!("  ticks_used = {}", resident_out.ticks_used);
+        eprintln!("  max |Δ predictions[0]|    = {p0:.6}");
+        eprintln!("  max |Δ predictions[last]| = {pl:.6}");
+        eprintln!("  max |Δ sync_out|          = {sd:.6}");
     }
 }
