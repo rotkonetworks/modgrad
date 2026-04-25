@@ -204,6 +204,181 @@ impl LinearResident {
     }
 }
 
+/// Streaming variant of `LinearResident` — the host weights live in an
+/// `Arc<Linear>` shared with the optimizer, and the device buffers are
+/// allocated/uploaded on demand and (optionally) torn down right after
+/// dispatch. Foundation for the foundation-model layer-streaming use
+/// case where the full weight set doesn't fit in 8GB VRAM and layers
+/// have to rotate through.
+///
+/// Lifecycle:
+///   - `LinearResidentStreaming::from_linear_arc(host)` — no upload yet.
+///   - `forward(batch, x_dev, &mut out_dev, auto_evict)` — uploads if not
+///     already resident, dispatches, optionally evicts.
+///   - `evict()` — drop device buffers (frees VRAM via `hipFree`).
+///
+/// **Caller-mutation contract.** `LinearResidentStreaming` does *not*
+/// hash or generation-count the host weights. If the caller mutates
+/// `Arc<Linear>` (typically via `Arc::get_mut` after an AdamW step),
+/// the caller MUST call `evict()` before the next `forward` so the
+/// next dispatch re-uploads the new weights. This mirrors the
+/// `sync_weights_from` contract on the non-streaming `LinearResident`.
+/// We keep the contract caller-side because adding a generation
+/// counter to `Linear` would be a much wider surface change than this
+/// slice warrants — see the design notes in the implementing PR.
+///
+/// Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub struct LinearResidentStreaming {
+    /// Host-side weights — shared with the optimizer (so AdamW updates
+    /// land in this same memory). Cloning the `Arc` is O(1); the
+    /// streamer does not own the only reference.
+    host: std::sync::Arc<Linear>,
+    /// Device-side weight buffer, present only when uploaded. `None`
+    /// means not currently resident in VRAM.
+    weight_dev: Option<modgrad_device::backend::HipBuffer>,
+    /// Device-side bias buffer, present only when uploaded.
+    bias_dev: Option<modgrad_device::backend::HipBuffer>,
+}
+
+#[cfg(feature = "rocm")]
+impl LinearResidentStreaming {
+    /// Wrap a host `Arc<Linear>` for streaming. Does *not* upload — the
+    /// first `forward` (or an explicit `ensure_resident()`) does that.
+    pub fn from_linear_arc(host: std::sync::Arc<Linear>) -> Self {
+        Self { host, weight_dev: None, bias_dev: None }
+    }
+
+    /// Read-only view of the host `Arc<Linear>`. Useful if the caller
+    /// wants to clone the `Arc` for the optimizer.
+    pub fn host(&self) -> &std::sync::Arc<Linear> { &self.host }
+
+    /// Mutable access to the inner `Arc<Linear>` slot. Useful when the
+    /// caller is the *only* holder of strong references and wants to
+    /// `Arc::get_mut` for an in-place weight rewrite (test scaffolding,
+    /// or rare cases where the streamer also owns the optimizer's
+    /// reference). In production the optimizer typically clones its
+    /// own `Arc` and mutates through that — both copies see the same
+    /// underlying allocation, so the streamer's view stays consistent.
+    pub fn host_arc_mut(&mut self) -> &mut std::sync::Arc<Linear> {
+        &mut self.host
+    }
+
+    /// Are weight + bias currently uploaded to VRAM?
+    pub fn is_resident(&self) -> bool {
+        self.weight_dev.is_some() && self.bias_dev.is_some()
+    }
+
+    /// Input dimension (from the host `Linear`).
+    pub fn in_dim(&self) -> usize { self.host.in_dim }
+
+    /// Output dimension (from the host `Linear`).
+    pub fn out_dim(&self) -> usize { self.host.out_dim }
+
+    /// Ensure both device buffers are allocated and contain the current
+    /// host weights. No-op if already resident. After an `evict()` (or
+    /// for the very first dispatch) this allocates fresh `HipBuffer`s
+    /// and uploads — the cost is one `hipMalloc` + one H2D `hipMemcpy`
+    /// per buffer, dominated by the H2D for typical weight sizes.
+    pub fn ensure_resident(&mut self) -> Result<(), super::backend::ResidencyError> {
+        if self.weight_dev.is_none() {
+            let buf = modgrad_device::backend::HipBuffer::new(self.host.weight.len() * 4)?;
+            buf.copy_from_host(&self.host.weight)?;
+            self.weight_dev = Some(buf);
+        }
+        if self.bias_dev.is_none() {
+            let buf = modgrad_device::backend::HipBuffer::new(self.host.bias.len() * 4)?;
+            buf.copy_from_host(&self.host.bias)?;
+            self.bias_dev = Some(buf);
+        }
+        Ok(())
+    }
+
+    /// Drop the device buffers. `hipFree` runs on each `HipBuffer::Drop`,
+    /// returning the VRAM to the allocator. The next `forward` (or
+    /// `ensure_resident()`) will re-upload from the host.
+    pub fn evict(&mut self) {
+        // Order doesn't matter for hipFree; just drop both.
+        self.weight_dev = None;
+        self.bias_dev = None;
+    }
+
+    /// Streaming forward — uploads if needed, dispatches, optionally
+    /// evicts. `auto_evict = true` is the tight-memory path: the device
+    /// buffers are released immediately after the dispatch is recorded
+    /// on the queue. `auto_evict = false` keeps the buffers resident
+    /// for the next call (hot path, equivalent to the non-streaming
+    /// `LinearResident` once the first upload has happened).
+    ///
+    /// **Requires a `&HipBatch`** for the same queue-bookkeeping reason
+    /// as `LinearResident::forward`. See its doc-comment for the
+    /// compile-time-obligation rationale.
+    ///
+    /// Note on `auto_evict` semantics: dropping the `HipBuffer` calls
+    /// `hipFree`, which on the runtime we use is synchronous against
+    /// in-flight work touching that allocation. The dispatch's
+    /// `note_dispatch` may have triggered an in-batch sync already; if
+    /// not, the eventual `HipBatch` flush (or the explicit `flush()` /
+    /// `Drop`) will drain the queue. We deliberately do NOT add an
+    /// eager sync here — the batch's invariant is the canonical
+    /// place for that, and double-syncing would cost throughput in
+    /// the non-evict case.
+    pub fn forward(
+        &mut self,
+        batch: &modgrad_device::backend::HipBatch,
+        x_dev: &super::backend::GpuVec,
+        out_dev: &mut super::backend::GpuVec,
+        auto_evict: bool,
+    ) -> Result<(), super::backend::ResidencyError> {
+        use super::backend::{GpuVec, ResidencyError};
+        debug_assert_eq!(x_dev.len(), self.host.in_dim);
+        debug_assert_eq!(out_dev.len(), self.host.out_dim);
+
+        // Stage 1: make sure weights are on device.
+        self.ensure_resident()?;
+
+        // Stage 2: unwrap GpuVec variants and dispatch. The
+        // `is_resident()` postcondition of `ensure_resident` makes
+        // these `Option::unwrap`s infallible, but we still match
+        // defensively to keep the error surface honest.
+        let x_buf = match x_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let out_buf = match out_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let weight_dev = self.weight_dev.as_ref()
+            .expect("ensure_resident postcondition: weight_dev is Some");
+        let bias_dev = self.bias_dev.as_ref()
+            .expect("ensure_resident postcondition: bias_dev is Some");
+
+        unsafe {
+            modgrad_device::backend::ops::matvec_resident(
+                x_buf.device_ptr() as *const f32,
+                weight_dev.device_ptr() as *const f32,
+                bias_dev.device_ptr() as *const f32,
+                out_buf.device_ptr() as *mut f32,
+                self.host.out_dim,
+                self.host.in_dim,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 3: if requested, drop device buffers now. The next
+        // `forward` will re-upload from `self.host`.
+        if auto_evict {
+            self.evict();
+        }
+        Ok(())
+    }
+}
+
 /// Device-resident wrapper over a `SuperLinear`. Uploads the per-neuron
 /// weight tensor (`[n_neurons × out_per × in_per]` flat, contiguous) and
 /// bias tensor (`[n_neurons × out_per]`) to hipMalloc'd buffers once,
@@ -604,6 +779,195 @@ mod resident_tests {
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-3,
             "host vs resident mismatch: max |Δ| = {max_diff}");
+    }
+
+    /// `LinearResidentStreaming::forward` produces the same output as
+    /// the one-shot `LinearResident::forward` on the same weights and
+    /// the same input. This validates the on-demand upload path: the
+    /// streaming wrapper must allocate, upload, and dispatch in a way
+    /// that is bitwise-equivalent to the persistent path — any
+    /// divergence here would mean the upload is corrupting weights or
+    /// the dispatch is reading from the wrong pointer.
+    #[test]
+    fn streaming_basic() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let lin = Linear::new(64, 96);  // out_dim=96, in_dim=64
+        let mut rng = SimpleRng::new(0xBABE);
+        let host_x: Vec<f32> = (0..64).map(|_| rng.next_normal()).collect();
+
+        // Reference: existing one-shot LinearResident.
+        let resident = LinearResident::from_linear(&lin)
+            .expect("LinearResident::from_linear");
+        let mut x_dev = super::super::backend::GpuVec::try_hip(64).expect("alloc x");
+        x_dev.copy_from(&host_x);
+        let mut ref_out_dev = super::super::backend::GpuVec::try_hip(96).expect("alloc ref out");
+        let batch = modgrad_device::backend::HipBatch::new();
+        resident.forward(&batch, &x_dev, &mut ref_out_dev).expect("ref forward");
+        batch.flush().expect("ref flush");
+        let mut ref_y = vec![0.0f32; 96];
+        ref_out_dev.copy_to_host(&mut ref_y);
+
+        // Streaming: from_linear_arc → ensure_resident → forward.
+        let host_arc = std::sync::Arc::new(lin);
+        let mut streaming = LinearResidentStreaming::from_linear_arc(host_arc);
+        assert!(!streaming.is_resident(),
+            "streaming wrapper must not allocate at construction");
+        streaming.ensure_resident().expect("ensure_resident");
+        assert!(streaming.is_resident(),
+            "ensure_resident must leave both device buffers populated");
+
+        let mut stream_out_dev = super::super::backend::GpuVec::try_hip(96)
+            .expect("alloc stream out");
+        let stream_batch = modgrad_device::backend::HipBatch::new();
+        streaming.forward(&stream_batch, &x_dev, &mut stream_out_dev, false)
+            .expect("streaming forward");
+        stream_batch.flush().expect("stream flush");
+        let mut stream_y = vec![0.0f32; 96];
+        stream_out_dev.copy_to_host(&mut stream_y);
+
+        // Bit-exact: same weights → same hipBLAS path → same output.
+        // We allow a tiny FP slack (1e-6) because nothing in the
+        // streaming path changes accumulation order, but a strict
+        // equality assertion would be brittle to future hipBLAS
+        // updates.
+        let max_diff = ref_y.iter().zip(&stream_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-6,
+            "LinearResident vs LinearResidentStreaming mismatch: max |Δ| = {max_diff}");
+    }
+
+    /// `auto_evict = true` must drop the device buffers right after
+    /// the dispatch, and a subsequent `forward` must transparently
+    /// re-upload and produce the same output. This is the
+    /// foundation-model layer-rotation pattern: weights enter VRAM,
+    /// run, leave VRAM, then come back later.
+    #[test]
+    fn streaming_evict_then_reupload() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let lin = Linear::new(48, 32);  // out_dim=32, in_dim=48
+        let mut rng = SimpleRng::new(0xC0FFEE);
+        let host_x: Vec<f32> = (0..48).map(|_| rng.next_normal()).collect();
+
+        let host_arc = std::sync::Arc::new(lin);
+        let mut streaming = LinearResidentStreaming::from_linear_arc(host_arc);
+
+        let mut x_dev = super::super::backend::GpuVec::try_hip(48).expect("alloc x");
+        x_dev.copy_from(&host_x);
+
+        // First forward with auto_evict=true: should upload, dispatch,
+        // then immediately drop the device buffers.
+        let mut out_a_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc out a");
+        let batch_a = modgrad_device::backend::HipBatch::new();
+        streaming.forward(&batch_a, &x_dev, &mut out_a_dev, true)
+            .expect("first forward");
+        batch_a.flush().expect("flush a");
+        assert!(!streaming.is_resident(),
+            "auto_evict=true must drop device buffers post-dispatch");
+        let mut y_a = vec![0.0f32; 32];
+        out_a_dev.copy_to_host(&mut y_a);
+
+        // Second forward: must re-upload from host weights and produce
+        // the same output. We're testing the round-trip through the
+        // ensure_resident gate.
+        let mut out_b_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc out b");
+        let batch_b = modgrad_device::backend::HipBatch::new();
+        streaming.forward(&batch_b, &x_dev, &mut out_b_dev, false)
+            .expect("second forward");
+        batch_b.flush().expect("flush b");
+        assert!(streaming.is_resident(),
+            "auto_evict=false must leave device buffers populated");
+        let mut y_b = vec![0.0f32; 32];
+        out_b_dev.copy_to_host(&mut y_b);
+
+        // No PRNG, deterministic dispatch — outputs must agree exactly.
+        assert_eq!(y_a, y_b,
+            "evict+reupload changed output: bug in upload path");
+    }
+
+    /// After the caller mutates the host weights and calls `evict()`,
+    /// the next `forward` must reflect the new weights. This is the
+    /// AdamW-step contract: the optimizer mutates the shared
+    /// `Arc<Linear>`, and the streaming wrapper picks up the change on
+    /// the next upload. We use `Arc::get_mut` to do the mutation —
+    /// requires no other strong references to be live, which is the
+    /// realistic optimizer-driven pattern.
+    #[test]
+    fn streaming_after_host_mutation() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let lin = Linear::new(32, 16);  // small; mutation is cheap
+        let mut rng = SimpleRng::new(0xDEADBEEF);
+        let host_x: Vec<f32> = (0..32).map(|_| rng.next_normal()).collect();
+
+        let host_arc = std::sync::Arc::new(lin);
+        let mut streaming = LinearResidentStreaming::from_linear_arc(host_arc);
+
+        let mut x_dev = super::super::backend::GpuVec::try_hip(32).expect("alloc x");
+        x_dev.copy_from(&host_x);
+
+        // Forward with the original weights; record output.
+        let mut out_orig_dev = super::super::backend::GpuVec::try_hip(16)
+            .expect("alloc out orig");
+        let batch_orig = modgrad_device::backend::HipBatch::new();
+        streaming.forward(&batch_orig, &x_dev, &mut out_orig_dev, false)
+            .expect("forward orig");
+        batch_orig.flush().expect("flush orig");
+        let mut y_orig = vec![0.0f32; 16];
+        out_orig_dev.copy_to_host(&mut y_orig);
+
+        // Mutate the host weights — simulate an optimizer step that
+        // overwrites every weight with a known different value.
+        // `Arc::get_mut` succeeds because the streaming wrapper holds
+        // the only strong reference at this point.
+        {
+            let host_mut = std::sync::Arc::get_mut(streaming.host_arc_mut())
+                .expect("Arc::get_mut: only strong ref must be the streamer");
+            // Set every weight to 0.5 and every bias to 1.0 — easy to
+            // verify the new output reflects these values.
+            for w in host_mut.weight.iter_mut() { *w = 0.5; }
+            for b in host_mut.bias.iter_mut() { *b = 1.0; }
+        }
+
+        // Caller-side contract: after host mutation, evict so the next
+        // forward re-uploads. (If we skipped this, the cached device
+        // buffers would still hold the old weights — that's the
+        // documented hazard.)
+        streaming.evict();
+        assert!(!streaming.is_resident(),
+            "evict must drop device buffers");
+
+        // Forward with mutated weights.
+        let mut out_new_dev = super::super::backend::GpuVec::try_hip(16)
+            .expect("alloc out new");
+        let batch_new = modgrad_device::backend::HipBatch::new();
+        streaming.forward(&batch_new, &x_dev, &mut out_new_dev, false)
+            .expect("forward new");
+        batch_new.flush().expect("flush new");
+        let mut y_new = vec![0.0f32; 16];
+        out_new_dev.copy_to_host(&mut y_new);
+
+        // Output must differ from y_orig. With weights=0.5 and bias=1.0,
+        // y[i] = 1.0 + 0.5 * sum(host_x); compute that explicitly and
+        // compare against the device output for a sharper check than
+        // just inequality vs. y_orig.
+        let expected_each = 1.0 + 0.5 * host_x.iter().sum::<f32>();
+        let max_diff = y_new.iter()
+            .map(|v| (v - expected_each).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-3,
+            "post-mutation output not reflecting new weights: \
+             expected each ≈ {expected_each}, got {y_new:?}");
+        assert_ne!(y_orig, y_new,
+            "post-mutation output identical to original — re-upload didn't happen");
     }
 
     /// Calling SuperLinearResident.forward many times with the same
