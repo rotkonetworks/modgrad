@@ -273,6 +273,193 @@ use modgrad_compute::backend::{GpuVec, ResidencyError};
 #[cfg(feature = "rocm")]
 use modgrad_device::backend::HipBatch;
 
+// ─── Resident-forward cache (PART A of backward-resident) ───────
+//
+// `CtmCacheResident` is the device-resident equivalent of host
+// `crate::train::CtmCache`. It exists separately rather than reusing
+// the host type because:
+//   1. The host `CtmCache` and its inner `TickCache` are private to
+//      `train.rs` (no public constructor); we cannot construct one
+//      from this file.
+//   2. The cache shape that resident BACKWARD will consume is shaped
+//      around MIOpen's *Backward* dispatch contracts (LN backward,
+//      activation backward, GLU backward, softmax backward), which
+//      take (input, grad_output) and recompute internal stats — so
+//      the resident cache only needs to save inputs to each forward
+//      stage, not the normalized/inv_std/pre-silu trio that the host
+//      CPU backward consumes. Same logical content; flatter shape.
+//
+// Storage strategy. Everything is host-side `Vec<f32>` for THIS
+// slice. Resident-backward (next slice) re-uploads whatever it
+// needs. Rationale: keeping (iterations × U-Net depth × per-block
+// buffers) as `GpuVec` would explode VRAM (every outer-tick × region
+// × inner-tick × block keeps a buffer live across the whole backward
+// pass) — and the cache lifecycle straddles the entire outer-tick
+// loop in `RegionalBrain::forward_cached_resident`. Host-side keeps
+// the device-residency window tight to just-the-forward.
+//
+// What the resident path materialises vs. doesn't.
+//   - Already host-resident in `ctm_forward_resident`: q_full,
+//     k_all, v_all, attn_weights, attn_out, pre_syn (synapse input),
+//     pre_act (synapse output), state.activated (post-NLM),
+//     sync_action, sync_out, beta_action, beta_out, predictions,
+//     exit_lambda, exit_gate input (= sync_out). These flow into
+//     the cache directly — no extra D2H.
+//   - Need an extra D2H to fill the cache: q_proj output (= input
+//     to mha_in_q), nlm stage1 raw output (pre per-neuron-GLU), nlm
+//     stage1 GLU output (= stage2 input when present), nlm stage2
+//     raw output. Four small D2Hs per tick total (the last one
+//     gated on `cfg.deep_nlms`).
+//   - U-Net interior intermediates (per-block linear input, per-
+//     block ln norm/invstd/pre-silu, skip-LN cache, down_outs,
+//     pre_skip_ln). NOT captured here. The resident U-Net dispatch
+//     (`SynapseUNetResident::forward`) is monolithic — pre_syn in,
+//     pre_act out, no per-block hooks. Resident backward will need
+//     either (a) a host-side `synapse.forward_cached(pre_syn)` to
+//     reconstruct intermediates, or (b) a future
+//     `SynapseUNetResident::forward_cached` that exposes per-block
+//     buffers. Both are out-of-scope for this slice and tracked on
+//     the next-slice plan. The cache stores `pre_syn` and `pre_act`
+//     so either approach is unblocked.
+
+/// Per-tick host-side cache from a resident inner CTM forward.
+///
+/// Mirrors the host `crate::train::TickCache` content needed for
+/// backward, but flat (one struct, no nested `LinearCache`/`MhaCache`/
+/// `UNetCache`/`NlmCache`) because resident backward will dispatch
+/// directly through MIOpen *Backward* symbols which take only
+/// (input, grad_output) — no need to thread normalized/inv_std
+/// per-LN.
+///
+/// All fields are host-resident `Vec<f32>` for this slice. Resident
+/// backward re-uploads as needed; see the module-level comment on
+/// `CtmCacheResident` for the storage rationale.
+#[cfg(feature = "rocm")]
+pub struct CtmTickCacheResident {
+    /// Activated state at start of tick (pre-NLM, pre-trace-shift).
+    /// Used by sync_action backward (gradient w.r.t. activated_prev)
+    /// and as the U-Net residual half (`pre_syn[d_in..]`).
+    pub activated_prev: Vec<f32>,
+    /// `sync_action` vector at this tick (= input to `q_proj`).
+    /// Length `cfg.n_synch_action`.
+    pub sync_action: Vec<f32>,
+    /// `beta_action` accumulator at this tick (read by sync_action
+    /// backward). Length `cfg.n_synch_action`.
+    pub beta_action: Vec<f32>,
+    /// `q_proj` output (= input to `mha_in_proj`). Length `d_input`.
+    /// Captured via an extra D2H of `q_proj_out_dev` per tick (the
+    /// existing path only downloads `mha_q_dev`).
+    pub q_proj_out: Vec<f32>,
+    /// MHA Q row of in_proj (= `mha_in_q @ q_proj_out`).
+    /// Length `d_input`. Used by MHA backward (per-head Q gradient).
+    pub q_full: Vec<f32>,
+    /// MHA K all-tokens (`[n_tokens × d_input]`, packed by token then
+    /// head). Used by MHA backward (per-head K gradient and the
+    /// QK-attention gradient).
+    pub k_all: Vec<f32>,
+    /// MHA V all-tokens (`[n_tokens × d_input]`). Used by MHA
+    /// backward (V gradient and softmax-input gradient).
+    pub v_all: Vec<f32>,
+    /// Per-token KV input to `mha_in_k`/`mha_in_v` (= the kv slice
+    /// passed in, sliced per token). `kv_tokens[t]` length =
+    /// `d_input`. Used by MHA backward to compute the gradient
+    /// w.r.t. the KV input — itself the synapse input for upstream
+    /// regions.
+    pub kv_tokens: Vec<Vec<f32>>,
+    /// Softmax weights per head, packed `[n_heads × n_tokens]`.
+    /// Used by MHA softmax backward.
+    pub attn_weights: Vec<f32>,
+    /// Concatenated heads (= input to `mha_out_proj`). Length
+    /// `d_input`. Used by `mha_out_proj` backward.
+    pub concat_heads: Vec<f32>,
+    /// Attention output (= `mha_out_proj` output, which is the first
+    /// half of the synapse input). Length `d_input`.
+    pub attn_out: Vec<f32>,
+    /// Synapse U-Net input — the concat `[attn_out, activated_prev]`
+    /// fed to `synapse.forward()`. Length `d_input + d_model`.
+    /// **Backward gap.** The resident U-Net dispatch is monolithic;
+    /// per-block intermediates (linear input, ln norm/invstd,
+    /// pre-silu, skip caches) are NOT captured here. Resident
+    /// backward must either (a) re-run the host-side
+    /// `unet_forward_cached(pre_syn)` to recover intermediates, or
+    /// (b) wait for `SynapseUNetResident::forward_cached` to expose
+    /// per-block buffers. See module-level comment on
+    /// `CtmCacheResident`.
+    pub pre_syn: Vec<f32>,
+    /// Synapse output (= U-Net output, pre-trace-shift). Length
+    /// `d_model`. Saved as the U-Net upstream gradient target so
+    /// resident backward can verify the dx shape.
+    pub pre_act: Vec<f32>,
+    /// Trace state AFTER trace-shift, BEFORE NLM forward (=
+    /// `nlm_stage1` input). Length `d_model × memory_length`.
+    /// **No D2H needed** — trace lives host-side already
+    /// (`state.trace`); cache holds a clone.
+    pub trace: Vec<f32>,
+    /// `nlm_stage1` raw output (BEFORE per-neuron GLU). Length
+    /// `d_model × stage1.out_per`. **D2H added by this slice.**
+    /// Required by GLU backward (the per-neuron GLU input is the raw
+    /// stage1 output).
+    pub nlm_s1_out: Vec<f32>,
+    /// `nlm_stage1` GLU output (= `nlm_stage2` input when stage2 is
+    /// present, else = `activated_post`). Length
+    /// `d_model × (stage1.out_per / 2)`. **D2H added by this slice.**
+    pub nlm_s1_glu: Vec<f32>,
+    /// `nlm_stage2` raw output (BEFORE per-neuron GLU). `Some` iff
+    /// `cfg.deep_nlms`. Length `d_model × stage2.out_per`. **D2H
+    /// added by this slice when stage2 is present.**
+    pub nlm_s2_out: Option<Vec<f32>>,
+    /// Activated state AFTER NLM (= region output). Length
+    /// `d_model`.
+    pub activated_post: Vec<f32>,
+    /// `sync_out` at this tick (= input to `output_proj` and to
+    /// `exit_gate`). Length `cfg.n_synch_out`.
+    pub sync_out: Vec<f32>,
+    /// `beta_out` accumulator at this tick. Length `cfg.n_synch_out`.
+    pub beta_out: Vec<f32>,
+    /// Output projection logits (`output_proj.forward(sync_out)`).
+    /// Length `cfg.out_dims`. Used to short-circuit certainty/loss
+    /// recomputation in backward.
+    pub pred: Vec<f32>,
+    /// Exit gate logit (saved as length-1 vec for shape consistency
+    /// with the other LinearCache slots). `Some` iff
+    /// `cfg.exit_strategy == AdaptiveGate { .. }` AND
+    /// `w.exit_gate.is_some()`. Length 1.
+    pub exit_gate_logit: Option<Vec<f32>>,
+    /// `λ_t = σ(gate_logit)` at this tick. `0.0` when gate is off.
+    pub exit_lambda: f32,
+}
+
+/// Cache from `ctm_forward_resident` — everything resident backward
+/// will need to drive a BPTT pass through `RegionalBrain` regions.
+///
+/// Mirrors the layout of host `crate::train::CtmCache` (top-level KV
+/// + per-tick caches + decay rates); see `CtmTickCacheResident` for
+/// the per-tick content. Built and consumed by:
+/// - `ctm_forward_resident` (this file) — populates.
+/// - `RegionalBrain::backward_cached_resident` (next slice) —
+///   consumes through `OuterTickCache::region_caches_resident`.
+#[cfg(feature = "rocm")]
+pub struct CtmCacheResident {
+    /// Per-tick caches. Length = `ticks_used` (may be less than
+    /// `cfg.iterations` when adaptive exit fires).
+    pub tick_caches: Vec<CtmTickCacheResident>,
+    /// KV stream for the inner forward (host-side copy of the
+    /// downloaded device KV — same as `kv_host` in the inner forward
+    /// fn). `[n_tokens × d_input]`.
+    pub kv: Vec<f32>,
+    /// Number of KV tokens (matches `n_tokens` arg to inner forward).
+    pub n_tokens: usize,
+    /// `cfg.d_input`. Cached for backward shape arithmetic without
+    /// re-reading config.
+    pub d_input: usize,
+    /// Sync-out decay rates `r_out[i] = exp(-decay_params_out[i])`.
+    /// Used by sync-out backward.
+    pub r_out: Vec<f32>,
+    /// Sync-action decay rates `r_action[i] = exp(-decay_params_action[i])`.
+    /// Used by sync-action backward.
+    pub r_action: Vec<f32>,
+}
+
 /// Device-resident equivalent of `ctm_forward_with_kv`. Drives the
 /// inner CTM tick loop with the heavy matvecs dispatched through
 /// `CtmResidentCache`. Host state (predictions, certainties,
@@ -305,9 +492,22 @@ use modgrad_device::backend::HipBatch;
 /// accumulators are local, `activated`/`trace` persist across
 /// forwards (continuous-thinking semantics).
 ///
-/// Returns `CtmOutput` matching the host path bit-for-bit within
-/// 1e-3 FP tolerance (rocBLAS reduces in a different order than
-/// AVX-512 dot, hence the loose bound).
+/// Returns `(CtmOutput, CtmCacheResident)` matching the host path
+/// bit-for-bit within 1e-3 FP tolerance (rocBLAS reduces in a
+/// different order than AVX-512 dot, hence the loose bound). The
+/// cache contains everything resident backward needs — see the
+/// module-level comment on `CtmCacheResident` for storage rationale
+/// and the known U-Net interior gap.
+///
+/// **PART A of backward-resident.** Returning a populated
+/// `CtmCacheResident` (rather than just `CtmOutput`) is the
+/// prerequisite for `RegionalBrain::backward_cached_resident` (next
+/// slice). The forward numerics are unchanged; the only behavioral
+/// difference is four extra small D2H downloads per tick to
+/// capture q_proj output, nlm stage1 raw output, stage1 GLU output,
+/// and (when `deep_nlms`) stage2 raw output. The U-Net pre-syn /
+/// pre-act pair is already host-resident in this function (no
+/// extra D2H).
 #[cfg(feature = "rocm")]
 pub fn ctm_forward_resident(
     w: &CtmWeights,
@@ -316,7 +516,7 @@ pub fn ctm_forward_resident(
     batch: &HipBatch,
     kv: &GpuVec,
     n_tokens: usize,
-) -> Result<CtmOutput, ResidencyError> {
+) -> Result<(CtmOutput, CtmCacheResident), ResidencyError> {
     let cfg = &w.config;
     let d = cfg.d_model;
     let d_in = cfg.d_input;
@@ -345,6 +545,13 @@ pub fn ctm_forward_resident(
     let mut survival = 1.0f32;
     let collect_traj = cfg.collect_trajectories;
     let mut trajectory = if collect_traj { Vec::with_capacity(k * d) } else { Vec::new() };
+
+    // Resident-backward cache accumulator. Pushed exactly once per
+    // tick that runs to completion (mirrors `predictions.push`
+    // cadence); when adaptive exit fires mid-tick we still push for
+    // the just-completed tick before breaking, so
+    // `tick_caches.len() == predictions.len() == ticks_used` holds.
+    let mut tick_caches: Vec<CtmTickCacheResident> = Vec::with_capacity(k);
 
     // Pre-allocated device scratch buffers reused across ticks.
     // q_proj output and MHA Q-projection share d_in shape so they
@@ -449,6 +656,11 @@ pub fn ctm_forward_resident(
     }
 
     for _tick in 0..k {
+        // ── Cache: activated_prev (snapshot before NLM mutates it). ──
+        // Backward needs this for the sync_action gradient and for
+        // the U-Net residual half (`pre_syn[d_in..]` = activated_prev).
+        let activated_prev_cache: Vec<f32> = state.activated.clone();
+
         // ── Sync (action). Identical scalar op to the host path. ──
         let sync_action = if !action_initialized {
             sync_init(&state.activated, &w.sync_action_left, &w.sync_action_right,
@@ -459,10 +671,25 @@ pub fn ctm_forward_resident(
             sync_update(&state.activated, &w.sync_action_left, &w.sync_action_right,
                 &mut alpha_action, &mut beta_action, &r_action)
         };
+        // beta_action snapshot for sync_action backward (the action
+        // sync accumulators decay across the next tick — clone now).
+        let beta_action_cache: Vec<f32> = beta_action.clone();
 
         // ── Q projection: sync_action → d_input via q_proj. ──
         sync_action_dev.copy_from(&sync_action);
         cache.q_proj.forward(batch, &sync_action_dev, &mut q_proj_out_dev)?;
+
+        // ── Cache: q_proj_out (= input to mha_in_q). ──
+        // Existing path only downloads `mha_q_dev` (= mha_in_q @
+        // q_proj_out). For backward through `mha_in_proj` we need the
+        // q_proj output itself (which is the `q_in` of `MhaCache` in
+        // the host). Extra D2H of d_in floats per tick.
+        batch.flush()?;
+        let mut q_proj_out_cache = vec![0.0f32; d_in];
+        match &q_proj_out_dev {
+            GpuVec::Hip(buf) => buf.copy_to_host(&mut q_proj_out_cache)?,
+            _ => unreachable!("hip alloc"),
+        }
 
         // ── MHA Q row of in_proj. ──
         // Host code: linear_slice(q_in, in_proj, 0, d_input).
@@ -569,6 +796,10 @@ pub fn ctm_forward_resident(
             GpuVec::Hip(buf) => buf.copy_to_host(&mut pre_act)?,
             _ => unreachable!("hip alloc"),
         }
+        // Cache the U-Net input/output. Per-block intermediates
+        // remain a known gap; see CtmCacheResident doc-comment.
+        let pre_syn_cache: Vec<f32> = pre_syn.clone();
+        let pre_act_cache: Vec<f32> = pre_act.clone();
 
         // ── Trace shift (host, scalar). ──
         for n in 0..d {
@@ -576,6 +807,10 @@ pub fn ctm_forward_resident(
             state.trace.copy_within(base + 1..base + m, base);
             state.trace[base + m - 1] = pre_act[n];
         }
+        // Cache trace AFTER shift (= input to NLM stage1). The host
+        // CtmCache analogue is `s1_cache.input` inside `NlmCache`.
+        // Cloned host-side (no D2H needed: trace lives host-side).
+        let trace_cache: Vec<f32> = state.trace.clone();
 
         // ── NLM forward: trace → activated, fully resident. ──
         // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out_dev.
@@ -616,7 +851,34 @@ pub fn ctm_forward_resident(
             }
         }
 
-        let new_activated = if let Some(s2_resident) = &cache.nlm_stage2 {
+        // ── Cache: D2H stage1 raw output (BEFORE per-neuron GLU). ──
+        // Required by GLU backward (the per-neuron GLU input is the
+        // raw stage1 output). The kernel is async, so flush before
+        // download. d_model × stage1.out_per floats per tick.
+        batch.flush()?;
+        let nlm_s1_out_cache: Vec<f32> = {
+            let mut h = vec![0.0f32; d * w.nlm_stage1.out_per];
+            match &nlm_s1_out_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
+                _ => unreachable!("hip alloc"),
+            }
+            h
+        };
+        // ── Cache: D2H stage1 GLU output (= stage2 input or =
+        // activated when no stage2). Required by stage2 backward
+        // (input gradient w.r.t. stage1 GLU). d_model × s1_half
+        // floats per tick.
+        let nlm_s1_glu_cache: Vec<f32> = {
+            let mut h = vec![0.0f32; d * s1_half];
+            match &nlm_s1_glu_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
+                _ => unreachable!("hip alloc"),
+            }
+            h
+        };
+
+        let (new_activated, nlm_s2_out_cache_opt): (Vec<f32>, Option<Vec<f32>>) =
+        if let Some(s2_resident) = &cache.nlm_stage2 {
             // stage2 reads stage1's GLU output (already device-resident
             // in nlm_s1_glu_dev). Output goes into nlm_s2_out_dev.
             let s2_weights = w.nlm_stage2.as_ref()
@@ -624,6 +886,21 @@ pub fn ctm_forward_resident(
             let s2_out_dev = nlm_s2_out_dev.as_mut()
                 .expect("s2 out buffer allocated when stage2 present");
             s2_resident.forward(batch, &nlm_s1_glu_dev, s2_out_dev)?;
+
+            // ── Cache: D2H stage2 raw output (BEFORE per-neuron GLU). ──
+            // Required by GLU backward (the per-neuron GLU input is
+            // the raw stage2 output). Flush before download to wait
+            // on the stage2 matvec dispatches. d_model × stage2.out_per
+            // floats per tick when deep_nlms.
+            batch.flush()?;
+            let s2_out_cache: Vec<f32> = {
+                let mut h = vec![0.0f32; d * s2_weights.out_per];
+                match &*s2_out_dev {
+                    GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
+                    _ => unreachable!("hip alloc"),
+                }
+                h
+            };
 
             // Per-neuron GLU on stage2 output, same pattern as stage1.
             let s2_half = s2_weights.out_per / 2;
@@ -656,15 +933,13 @@ pub fn ctm_forward_resident(
                 GpuVec::Hip(buf) => buf.copy_to_host(&mut activated_host)?,
                 _ => unreachable!("hip alloc"),
             }
-            activated_host
+            (activated_host, Some(s2_out_cache))
         } else {
-            batch.flush()?;
-            let mut activated_host = vec![0.0f32; d * s1_half];
-            match &nlm_s1_glu_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut activated_host)?,
-                _ => unreachable!("hip alloc"),
-            }
-            activated_host
+            // No stage2: activated = nlm_s1_glu (already downloaded
+            // above into `nlm_s1_glu_cache`). Reuse that download to
+            // avoid a second D2H of the same buffer. The flush above
+            // already ensured the GLU dispatches completed.
+            (nlm_s1_glu_cache.clone(), None)
         };
         state.activated = new_activated;
 
@@ -686,10 +961,19 @@ pub fn ctm_forward_resident(
             _ => unreachable!("hip alloc"),
         }
         let cert = compute_certainty(&pred);
-        predictions.push(pred);
+        predictions.push(pred.clone());
         certainties.push(cert);
 
         // ── Exit strategy: identical to host. ──
+        // Run the gate dispatch first (when AdaptiveGate is on) so
+        // its logit can be captured into the per-tick cache before
+        // we decide whether to break out of the loop. We push the
+        // cache UNCONDITIONALLY (mirroring `predictions.push` above)
+        // so `tick_caches.len() == predictions.len()` holds across
+        // both early-exit and full runs.
+        let mut should_break = false;
+        let mut exit_gate_logit_cache: Option<Vec<f32>> = None;
+        let mut exit_lambda_cache: f32 = 0.0;
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let (Some(gate_resident), Some(gate_buf)) =
@@ -707,21 +991,69 @@ pub fn ctm_forward_resident(
                     let p_exit = lambda * survival;
                     exit_cdf += p_exit;
                     survival *= 1.0 - lambda;
-                    if exit_cdf > *threshold { break; }
+                    exit_gate_logit_cache = Some(vec![gate_out[0]]);
+                    exit_lambda_cache = lambda;
+                    if exit_cdf > *threshold { should_break = true; }
                 }
             }
             crate::config::ExitStrategy::Certainty { threshold } => {
-                if cert[1] > *threshold { break; }
+                if cert[1] > *threshold { should_break = true; }
             }
             crate::config::ExitStrategy::None => {}
         }
+
+        // ── Cache push (mirrors host `tick_caches.push`). ──
+        // Same cadence as `predictions.push` above so length
+        // invariants hold for backward. Per-tick locals (sync_action,
+        // q_full, softmax_host, concat_heads, attn_out, sync_out)
+        // are MOVED in; loop-invariant scratches (k_all_host,
+        // v_all_host, kv_host slices) are CLONED because backward
+        // wants per-tick MhaCache content (host TickCache layout).
+        tick_caches.push(CtmTickCacheResident {
+            activated_prev: activated_prev_cache,
+            sync_action,
+            beta_action: beta_action_cache,
+            q_proj_out: q_proj_out_cache,
+            q_full,
+            k_all: k_all_host.clone(),
+            v_all: v_all_host.clone(),
+            kv_tokens: (0..n_tokens)
+                .map(|t| kv_host[t * d_in..(t + 1) * d_in].to_vec())
+                .collect(),
+            attn_weights: softmax_host,
+            concat_heads,
+            attn_out,
+            pre_syn: pre_syn_cache,
+            pre_act: pre_act_cache,
+            trace: trace_cache,
+            nlm_s1_out: nlm_s1_out_cache,
+            nlm_s1_glu: nlm_s1_glu_cache,
+            nlm_s2_out: nlm_s2_out_cache_opt,
+            activated_post: state.activated.clone(),
+            sync_out,
+            beta_out: state.beta_out.clone(),
+            pred,
+            exit_gate_logit: exit_gate_logit_cache,
+            exit_lambda: exit_lambda_cache,
+        });
+
+        if should_break { break; }
     }
 
     let ticks_used = predictions.len();
     let sync_out = sync_read(&state.alpha_out, &state.beta_out);
-    Ok(CtmOutput {
+    let output = CtmOutput {
         predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory,
-    })
+    };
+    let ctm_cache_resident = CtmCacheResident {
+        tick_caches,
+        kv: kv_host,
+        n_tokens,
+        d_input: d_in,
+        r_out,
+        r_action,
+    };
+    Ok((output, ctm_cache_resident))
 }
 
 // ─── Episodic memory bridge ────────────────────────────────
@@ -1078,10 +1410,18 @@ mod tests {
         let mut kv_dev = modgrad_compute::backend::GpuVec::try_hip(kv.len())
             .expect("GpuVec::try_hip(kv)");
         kv_dev.copy_from(&kv);
-        let resident_out = ctm_forward_resident(
+        let (resident_out, resident_cache) = ctm_forward_resident(
             &w, &cache, &mut resident_state, &batch, &kv_dev, n_tokens,
         ).expect("ctm_forward_resident");
         batch.flush().expect("flush");
+
+        // Forward correctness still the contract; the cache is a
+        // bonus payload. PART A check: tick_caches.len() must equal
+        // ticks_used (so backward sees one cache per emitted prediction).
+        assert_eq!(resident_cache.tick_caches.len(), resident_out.ticks_used,
+            "CtmCacheResident.tick_caches.len() = {} but ticks_used = {} — \
+             cache push cadence drifted from predictions push cadence",
+            resident_cache.tick_caches.len(), resident_out.ticks_used);
 
         assert_eq!(host_out.ticks_used, resident_out.ticks_used,
             "ticks_used mismatch (exit gate decided differently)");

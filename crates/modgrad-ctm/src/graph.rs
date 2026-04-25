@@ -1687,8 +1687,22 @@ pub struct OuterTickCache {
     /// Per-region: activated state AFTER forward (= region output).
     #[allow(dead_code)] // retained for potential future backward / inspection use
     region_activated: Vec<Vec<f32>>,
-    /// Per-region: SDK CTM cache for inner-tick BPTT.
+    /// Per-region: SDK CTM cache for inner-tick BPTT (HOST path).
+    /// Populated by `<RegionalBrain as Brain>::forward_cached`,
+    /// `regional_train_step`, and `forward_cached_frozen`. The
+    /// resident path leaves this `None` because the host `CtmCache`
+    /// constructor lives in private module-scope of `train.rs` —
+    /// see `region_caches_resident` for the resident equivalent.
     region_caches: Vec<Option<CtmCache>>,
+    /// Per-region: device-resident CTM cache for resident BPTT.
+    /// Populated by `RegionalBrain::forward_cached_resident` (PART A
+    /// of the backward-resident slice). All host-path forwards leave
+    /// this `None` because they don't run resident dispatch. Backward
+    /// resident (next slice) reads here; backward host reads from
+    /// `region_caches`. Mutually exclusive across the two paths.
+    #[cfg(feature = "rocm")]
+    #[allow(dead_code)] // consumed by the next-slice backward_cached_resident
+    region_caches_resident: Vec<Option<crate::forward::CtmCacheResident>>,
     /// All activations concatenated (for global sync backward).
     all_activations: Vec<f32>,
     /// Global sync values at this tick.
@@ -2332,6 +2346,8 @@ pub fn regional_train_step(
             region_obs,
             region_activated: state.region_outputs.clone(),
             region_caches,
+            #[cfg(feature = "rocm")]
+            region_caches_resident: (0..n_regions).map(|_| None).collect(),
             all_activations,
             global_sync: global_sync.clone(),
             global_beta: state.global_beta.clone(),
@@ -2919,6 +2935,8 @@ fn regional_train_step_inner(
             region_obs,
             region_activated: state.region_outputs.clone(),
             region_caches,
+            #[cfg(feature = "rocm")]
+            region_caches_resident: (0..n_regions).map(|_| None).collect(),
             all_activations: all_act_buf.clone(),
             global_sync: gs_buf.clone(),
             global_beta: state.global_beta.clone(),
@@ -3994,6 +4012,8 @@ impl RegionalBrain {
                 region_obs,
                 region_activated: state.region_outputs.clone(),
                 region_caches,
+                #[cfg(feature = "rocm")]
+                region_caches_resident: (0..n_regions).map(|_| None).collect(),
                 all_activations,
                 global_sync: global_sync.clone(),
                 global_beta: state.global_beta.clone(),
@@ -4046,14 +4066,22 @@ impl RegionalBrain {
     /// `CtmResidentCache` for `weights.regions[r]`); we do not re-check
     /// inside this function.
     ///
-    /// **Forward-only RegionalCache.** The returned `RegionalCache`
-    /// has `tick_caches[t].region_caches[r] = None` for every region
-    /// — `ctm_forward_resident` does not yet produce a `CtmCache` (it
-    /// returns `CtmOutput`). Backward-through-resident is therefore
-    /// not yet supported; calling `<RegionalBrain as Brain>::backward`
-    /// on the resulting cache will dereference `None` and panic.
-    /// Use `forward_cached` for training paths and
-    /// `forward_cached_resident` only for inference.
+    /// **Cache shape.** The returned `RegionalCache` has
+    /// `tick_caches[t].region_caches[r] = None` for every region —
+    /// the host `CtmCache` constructor is private to `train.rs`, so
+    /// we cannot synthesise one from outside the module. The
+    /// resident BPTT-bound payload lives in
+    /// `tick_caches[t].region_caches_resident[r]`, populated as
+    /// `Some(CtmCacheResident)` per region (PART A of the
+    /// backward-resident slice). Calling
+    /// `<RegionalBrain as Brain>::backward` on this cache will still
+    /// dereference `None` from `region_caches[r]` and panic — that
+    /// path stays host-only. The next slice adds an inherent
+    /// `RegionalBrain::backward_cached_resident` that consumes
+    /// `region_caches_resident` instead. Until that lands, use
+    /// `forward_cached` for training paths and `forward_cached_resident`
+    /// only for inference (or as the forward half of a future
+    /// resident BPTT).
     ///
     /// **KV travels through device.** `ctm_forward_resident` now
     /// takes a `&GpuVec` KV input (Part A of this slice), so the
@@ -4193,7 +4221,17 @@ impl RegionalBrain {
             // per-region device scratch (`region_kv_dev[r]`) for the
             // resident inner call.
             let mut region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
-            let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
+            // The host-shape `region_caches` slot stays empty on the
+            // resident path — `CtmCache` constructor lives in
+            // `train.rs` private scope and we cannot synthesise one
+            // from outside the module. Resident BPTT consumes
+            // `region_caches_resident` instead. See the host-vs-
+            // resident comment on `OuterTickCache::region_caches`.
+            let region_caches: Vec<Option<CtmCache>> =
+                (0..n_regions).map(|_| None).collect();
+            let mut region_caches_resident:
+                Vec<Option<crate::forward::CtmCacheResident>> =
+                Vec::with_capacity(n_regions);
             for r in 0..n_regions {
                 let rw = &weights.regions[r];
                 // Project region_obs[r] through kv_proj + affine LN per
@@ -4230,13 +4268,15 @@ impl RegionalBrain {
                 kv_dev.copy_from(&kv);
                 let rstate = &mut state.region_states[r];
                 let ctm_cache = &cache_fresh.ctm_caches()[r];
-                let _output = crate::forward::ctm_forward_resident(
-                    rw, ctm_cache, rstate, batch, kv_dev, 1,
-                )?;
+                // PART A: ctm_forward_resident now returns a
+                // populated `CtmCacheResident`; stash it for the next
+                // slice's `backward_cached_resident`.
+                let (_output, ctm_cache_resident) =
+                    crate::forward::ctm_forward_resident(
+                        rw, ctm_cache, rstate, batch, kv_dev, 1,
+                    )?;
                 region_activated.push(rstate.activated.clone());
-                // ctm_forward_resident does not yet produce a CtmCache;
-                // backward-through-resident is a follow-up.
-                region_caches.push(None);
+                region_caches_resident.push(Some(ctm_cache_resident));
             }
             state.region_outputs = region_activated;
 
@@ -4285,6 +4325,8 @@ impl RegionalBrain {
                 region_obs,
                 region_activated: state.region_outputs.clone(),
                 region_caches,
+                #[cfg(feature = "rocm")]
+                region_caches_resident,
                 all_activations,
                 global_sync: global_sync.clone(),
                 global_beta: state.global_beta.clone(),
@@ -4494,6 +4536,8 @@ impl modgrad_traits::Brain for RegionalBrain {
                 region_obs,
                 region_activated: state.region_outputs.clone(),
                 region_caches,
+                #[cfg(feature = "rocm")]
+                region_caches_resident: (0..n_regions).map(|_| None).collect(),
                 all_activations,
                 global_sync: global_sync.clone(),
                 global_beta: state.global_beta.clone(),
