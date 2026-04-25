@@ -17,6 +17,7 @@ pub mod loss;
 // `modgrad-transformer`. Depend on it directly for SwiGLU language models.
 pub mod graph;
 pub mod schedule;
+pub mod modulator;
 #[cfg(feature = "rocm")]
 pub mod resident;
 /// Re-export of `modgrad_memory` for backward compatibility.

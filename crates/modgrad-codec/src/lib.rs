@@ -10,3 +10,4 @@ pub mod librispeech;
 pub mod stl10;
 pub mod edge_of_chaos;
 pub mod genome;
+pub mod topdown;
