@@ -34,3 +34,21 @@ pub use dims::*;
 pub use error::TransformerError;
 pub use builder::TransformerBuilder;
 pub use ops::TransformerOps;
+
+// ─── Resident path (--features rocm) ────────────────────────
+//
+// Device-resident wrappers over the host transformer types. Kept in
+// separate modules so the host crate compiles on every host (no
+// `rocm` link dependencies pulled in by default), and the resident
+// path opts in by enabling the `rocm` feature.
+
+#[cfg(feature = "rocm")]
+pub mod kv_cache_resident;
+#[cfg(feature = "rocm")]
+pub mod resident;
+#[cfg(feature = "rocm")]
+pub use kv_cache_resident::KvCacheResident;
+#[cfg(feature = "rocm")]
+pub use resident::{
+    AttentionResident, GptModelResident, SwigluResident, TransformerBlockResident,
+};

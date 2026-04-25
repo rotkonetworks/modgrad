@@ -21,6 +21,13 @@ use modgrad_traits::ParamIter;
 use rayon::prelude::*;
 use wincode_derive::{SchemaRead, SchemaWrite};
 
+/// Device-resident SwiGLU FFN block. See [`crate::resident::FfnBlockResident`].
+/// Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub mod resident;
+#[cfg(feature = "rocm")]
+pub use resident::{FfnBlockResident, FfnBlockScratch};
+
 /// FFN cerebellum config.
 #[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct FfnConfig {

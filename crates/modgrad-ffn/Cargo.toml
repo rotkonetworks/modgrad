@@ -5,6 +5,12 @@ edition = "2024"
 description = "FFN architecture (SwiGLU MLP language model) for the modgrad ML SDK"
 license = "MIT"
 
+[features]
+# Enables the device-resident `SwigluResident` / `FfnBlockResident` wrappers
+# in `crate::resident`. Propagates through to compute + device crates so
+# `LinearResident`, `GpuVec::Hip`, and the resident MIOpen ops are available.
+rocm = ["modgrad-compute/rocm", "modgrad-device/rocm"]
+
 [dependencies]
 modgrad-traits  = { path = "../modgrad-traits" }  # for ParamIter
 modgrad-compute = { path = "../modgrad-compute" }
