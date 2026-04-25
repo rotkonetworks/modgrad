@@ -38,6 +38,12 @@ pub struct CtmConfig {
     /// How the tick loop decides when to stop thinking.
     #[serde(default)]
     pub exit_strategy: ExitStrategy,
+    /// Collect per-tick activated states for episodic memory.
+    /// When true, `CtmOutput.trajectory` is populated with the full
+    /// tick-by-tick activated-state path `[ticks_used * d_model]`.
+    /// Zero-cost when false.
+    #[serde(default)]
+    pub collect_trajectories: bool,
 }
 
 /// Tick-loop exit strategy. Exactly one mechanism — no overlap, no ambiguity.
@@ -117,6 +123,7 @@ impl Default for CtmConfig {
             n_random_pairing_self: 0,
             min_width: 16,
             exit_strategy: ExitStrategy::None,
+            collect_trajectories: false,
         }
     }
 }
@@ -171,6 +178,7 @@ impl CtmConfig {
             n_random_pairing_self: 0,
             min_width,
             exit_strategy,
+            collect_trajectories: false,
         }
     }
 

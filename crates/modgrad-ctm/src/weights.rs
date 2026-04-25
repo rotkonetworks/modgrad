@@ -227,6 +227,7 @@ mod tests {
             n_random_pairing_self: 0,
             min_width: 4,
             exit_strategy: ExitStrategy::None,
+            collect_trajectories: false,
         }
     }
 

@@ -4,7 +4,7 @@
 //! What this shows: the actual input distribution the cortex would
 //! face on the maze benchmark. Not an adjoint of anything, not a
 //! downstream derivative — just the pixel tensor that gets fed into
-//! `VisualRetina::encode`, upscaled for visibility and with the
+//! `VisualCortex::encode`, upscaled for visibility and with the
 //! optimal route drawn on top.
 //!
 //! The visual contrast with `dream_gallery` is the point: real mazes

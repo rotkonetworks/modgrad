@@ -53,6 +53,25 @@ pub struct TokenInput {
     pub token_dim: usize,
 }
 
+/// Bundle of token streams at multiple processing scales — the
+/// encoder's "tap points" along its hierarchy. Mirrors how the
+/// biological visual cortex projects to many brain areas at once,
+/// not just from V4/IT outward. A single-scale encoder (text,
+/// audio without explicit hierarchy) returns a one-element vector.
+///
+/// Each scale is a `TokenInput` with its own `token_dim` — they
+/// don't have to match. By convention, scale 0 is the "primary"
+/// (highest-level / most-processed) stream — what a single-scale
+/// encoder would have returned.
+pub struct MultiScaleTokens {
+    pub scales: Vec<TokenInput>,
+}
+
+impl MultiScaleTokens {
+    pub fn primary(&self) -> &TokenInput { &self.scales[0] }
+    pub fn n_scales(&self) -> usize { self.scales.len() }
+}
+
 /// Input for brains that take integer token IDs and embed internally.
 /// Used by: Transformer (embedding table is part of Weights).
 pub struct SeqInput {
@@ -80,6 +99,20 @@ pub trait Encoder {
 
     /// Output dimension per token.
     fn token_dim(&self) -> usize;
+
+    /// Multi-scale variant: emit one token stream per processing tier
+    /// the encoder exposes. Default impl wraps `encode()` in a
+    /// single-element bundle, so existing encoders (text, audio,
+    /// embedding tables) work unchanged. Hierarchical encoders
+    /// (visual cortex) override this to expose V1 / V2 / V4 tap
+    /// points and let the brain wire connections to specific tiers.
+    fn encode_multiscale(&self, raw: &Self::Raw) -> MultiScaleTokens {
+        MultiScaleTokens { scales: vec![self.encode(raw)] }
+    }
+
+    /// Per-scale token dimensions, in the order returned by
+    /// `encode_multiscale`. Default returns `[self.token_dim()]`.
+    fn token_dims(&self) -> Vec<usize> { vec![self.token_dim()] }
 }
 
 /// Embedding table encoder: token ID → vector lookup.
@@ -193,7 +226,7 @@ pub type ClassTarget = usize;
 /// Imagination wrapper: applies tick-skipping to any inner loss.
 ///
 /// Delegates to `inner` but only passes the committed ticks (last fraction).
-/// Works with RouteLoss, ClassTarget losses, DistributionLoss — anything.
+/// Works with StepwiseCE, ClassTarget losses, DistributionLoss — anything.
 pub struct Imagination<L> {
     pub inner: L,
     pub imagine_ratio: f32,
@@ -347,30 +380,64 @@ impl LossFn for RewardLoss {
     }
 }
 
-/// Route prediction loss: per-position CE on output reshaped as [route_len × n_classes].
+/// Per-step cross-entropy over a fixed-length sequence, with CTM-aware
+/// tick selection and a prefix-growing curriculum.
 ///
-/// The brain outputs a flat vector of `route_len * n_classes` logits.
-/// This loss reshapes it, computes CE at each position against the target
-/// direction, and uses an auto-curriculum: only train on the correct prefix
-/// + `lookahead` steps beyond it. This lets the model learn the route
-///   incrementally from start to finish.
+/// # Output & target contract
 ///
-/// Matches the Python CTM maze_loss with curriculum.
-pub struct RouteLoss {
-    /// Number of classes per position (e.g. 5 for Up/Down/Left/Right/Wait).
+/// Each tick's prediction is a flat `Vec<f32>` of length `seq_len × n_classes`
+/// laid out row-major: `pred[p * n_classes + c]` is the logit for class `c` at
+/// position `p`. The target is `&[usize]` of length `seq_len`; each entry is a
+/// class index in `0 .. n_classes`.
+///
+/// # Tick selection — which ticks receive gradient
+///
+/// CTM produces `K` predictions (one per internal tick). Only *two* ticks get
+/// gradient, weighted 0.5 each; all others stay zero:
+///
+/// - **`min_tick`** — the tick with the lowest mean per-position CE.
+///   Reinforcement: "reach the correct internal state earlier next time."
+/// - **`cert_tick`** — the tick the model itself was most confident at
+///   (max `certainties[t][1]`). Calibration: if the model was confidently
+///   wrong, `cert_tick` pulls that confidence toward the right answer.
+///
+/// Zeroing every other tick is deliberate. CTM's whole point is to choose
+/// *when* to commit; training every tick to be right collapses that choice.
+///
+/// # Prefix curriculum — why & how
+///
+/// In stepwise prediction, errors at position `k` cascade: if the model
+/// can't solve step 0 yet, backpropping through step 20 is noise. This loss:
+///
+/// 1. At `min_tick`, walks positions from 0 and counts the longest
+///    correct-argmax prefix `P`.
+/// 2. Trains only positions `0 .. min(P + lookahead, seq_len)`.
+///
+/// The window grows as the model masters the start. `lookahead` is the slop —
+/// how far past the correct frontier to push for. Tuning:
+///
+/// - `lookahead = 0`: only train what's already correct. Stalls; avoid.
+/// - `lookahead` small-positive (e.g. 2–8): standard; pulls the frontier
+///   forward one chunk at a time.
+/// - `lookahead >= seq_len`: curriculum disabled; always train every position.
+///
+/// # Applicable tasks
+///
+/// Any sequence-of-categorical prediction: byte-latent / token LM
+/// (`n_classes = vocab_size`), POS tagging, chord progressions, action
+/// trajectories in gridworlds, programs-as-token-sequences, bit patterns, etc.
+/// The `n_classes` and `lookahead` numbers are a caller concern — task
+/// semantics (what the classes *mean*) live at the construction site.
+pub struct StepwiseCE {
+    /// Number of classes per position.
     pub n_classes: usize,
-    /// How far past the correct prefix to train (curriculum lookahead).
+    /// Curriculum lookahead: train positions `0 .. correct_prefix + lookahead`.
+    /// Set to `>= seq_len` to disable the curriculum; avoid 0 (stalls).
     pub lookahead: usize,
 }
 
-impl RouteLoss {
-    pub fn maze() -> Self {
-        Self { n_classes: 5, lookahead: 5 }
-    }
-}
-
-impl LossFn for RouteLoss {
-    type Target = [usize]; // direction per route step
+impl LossFn for StepwiseCE {
+    type Target = [usize];
 
     fn compute(
         &self,
@@ -378,26 +445,27 @@ impl LossFn for RouteLoss {
         certainties: &[[f32; 2]],
         target: &[usize],
     ) -> (f32, Vec<Vec<f32>>) {
-        let k = predictions.len(); // number of ticks
+        let k = predictions.len();
         if k == 0 { return (0.0, Vec::new()); }
         let out_dim = predictions[0].len();
-        let route_len = target.len();
+        let seq_len = target.len();
         let nc = self.n_classes;
-        assert!(out_dim >= route_len * nc, "output dim {} < route_len {} × n_classes {}", out_dim, route_len, nc);
+        assert!(
+            out_dim >= seq_len * nc,
+            "output dim {} < seq_len {} × n_classes {}", out_dim, seq_len, nc,
+        );
 
-        // Compute per-position CE loss at each tick
-        // losses[t][pos] = CE at position pos for tick t's prediction
+        // Per-tick per-position CE + grad. per_tick_pos_loss[t][p] is the CE
+        // for tick `t` at position `p`; per_tick_pos_grad[t][p] is the length-
+        // `nc` softmax gradient for that position.
         let mut per_tick_pos_loss: Vec<Vec<f32>> = Vec::with_capacity(k);
         let mut per_tick_pos_grad: Vec<Vec<Vec<f32>>> = Vec::with_capacity(k);
-
         for pred in predictions {
-            let mut pos_losses = Vec::with_capacity(route_len);
-            let mut pos_grads = Vec::with_capacity(route_len);
-
+            let mut pos_losses = Vec::with_capacity(seq_len);
+            let mut pos_grads = Vec::with_capacity(seq_len);
             for (pos, &tgt) in target.iter().enumerate() {
                 let offset = pos * nc;
-                let logits = &pred[offset..offset + nc];
-                let (loss, grad) = cross_entropy_grad(logits, tgt);
+                let (loss, grad) = cross_entropy_grad(&pred[offset..offset + nc], tgt);
                 pos_losses.push(loss);
                 pos_grads.push(grad);
             }
@@ -405,11 +473,11 @@ impl LossFn for RouteLoss {
             per_tick_pos_grad.push(pos_grads);
         }
 
-        // Find the tick to use: min-loss tick and most-certain tick (CTM-style)
+        // min_tick = argmin mean-CE; cert_tick = argmax confidence.
+        // See type docstring for *why* only these two ticks get gradient.
         let tick_losses: Vec<f32> = (0..k).map(|t| {
-            per_tick_pos_loss[t].iter().sum::<f32>() / route_len as f32
+            per_tick_pos_loss[t].iter().sum::<f32>() / seq_len as f32
         }).collect();
-
         let min_tick = (0..k).min_by(|&a, &b|
             tick_losses[a].partial_cmp(&tick_losses[b]).unwrap()).unwrap_or(k - 1);
         let cert_tick = if certainties.len() == k {
@@ -419,7 +487,9 @@ impl LossFn for RouteLoss {
             k - 1
         };
 
-        // Auto-curriculum: find correct prefix at min_tick, train up to prefix + lookahead
+        // Argmax-based prefix: measure what the model *would emit at
+        // inference*, not what has the lowest loss. Keeps training signal
+        // aligned with deployment behavior.
         let mut prefix_len = 0usize;
         for (pos, &tgt) in target.iter().enumerate() {
             let offset = pos * nc;
@@ -433,18 +503,17 @@ impl LossFn for RouteLoss {
                 break;
             }
         }
-        let train_upto = (prefix_len + self.lookahead).min(route_len);
+        let train_upto = (prefix_len + self.lookahead).min(seq_len);
 
-        // Compute masked loss: only positions 0..train_upto contribute
         let masked_loss = |t: usize| -> f32 {
             per_tick_pos_loss[t][..train_upto].iter().sum::<f32>() / train_upto.max(1) as f32
         };
-
         let loss = (masked_loss(min_tick) + masked_loss(cert_tick)) / 2.0;
 
-        // Gradients: half from min_tick, half from cert_tick, masked by curriculum
+        // Gradients: 0.5/train_upto scaling so each winner tick contributes
+        // half the magnitude; positions past `train_upto` and all non-winner
+        // ticks stay zero.
         let mut d_preds = vec![vec![0.0f32; out_dim]; k];
-
         for &tick in &[min_tick, cert_tick] {
             let scale = 0.5 / train_upto.max(1) as f32;
             for (pos, grad) in per_tick_pos_grad[tick][..train_upto].iter().enumerate() {

@@ -208,7 +208,7 @@ pub fn set_render_mode_sdf(on: bool) {
 /// Process-wide toggle for retina bypass. Same atomic-static pattern
 /// as `RENDER_SDF`. When set, the training loop replaces
 /// `encoder.encode(&pixels)` with `bypass_tokens(...)` — raw pixel
-/// average-pool in place of the VisualRetina conv stack. Answers "is
+/// average-pool in place of the VisualCortex conv stack. Answers "is
 /// vision net-positive vs neutral vs net-negative" on the maze task.
 static RETINA_BYPASS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -219,6 +219,23 @@ pub fn set_retina_bypass(on: bool) {
 
 pub fn retina_bypass_enabled() -> bool {
     RETINA_BYPASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide setting for `--pretrained-retina PATH`. Set once in
+/// `main` after arg parsing; the three encoder construction sites
+/// (main-training, OOD-eval, run_brain) read it via
+/// `pretrained_retina_path()`. `OnceLock` is the right shape: the
+/// value is written exactly once at startup and read many times;
+/// Option<String> can't live inside an atomic directly.
+static PRETRAINED_RETINA_PATH: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+pub fn set_pretrained_retina_path(path: Option<String>) {
+    let _ = PRETRAINED_RETINA_PATH.set(path);
+}
+
+pub fn pretrained_retina_path() -> Option<&'static str> {
+    PRETRAINED_RETINA_PATH.get().and_then(|p| p.as_deref())
 }
 
 /// Average-pool raw [3 × in_h × in_w] pixels into an

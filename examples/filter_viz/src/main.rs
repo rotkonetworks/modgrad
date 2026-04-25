@@ -1,4 +1,4 @@
-//! Render VisualRetina's Conv2d filter weights as tiled images —
+//! Render VisualCortex's Conv2d filter weights as tiled images —
 //! the Olshausen & Field 1996 "did Gabors emerge?" plot, ported.
 //!
 //! This is the most direct test of "did training shape the cortex".
@@ -24,7 +24,7 @@
 //!   cargo run -p filter_viz --release
 //!   cargo run -p filter_viz --release -- --size 21 --pretrain-samples 500
 
-use modgrad_codec::retina::{Conv2d, LsdConfig, VisualRetina};
+use modgrad_codec::retina::{Conv2d, LsdConfig, VisualCortex};
 use std::io::Write;
 use std::path::Path;
 
@@ -134,23 +134,121 @@ fn upscale_rgb(tile_rgb: &[u8], h: usize, w: usize, factor: usize) -> (Vec<u8>, 
 // Per-filter tiles.
 // ────────────────────────────────────────────────────────────────
 
-/// V1 has in_channels=3 — render each filter as a proper RGB 3×3 tile.
-/// Weights are [out_ch × 3 × kh × kw]. Extract filter `oc`, reshape,
-/// min-max normalise per-channel, emit RGB. If the fixed Gabor-ish
-/// init is working, tiles will show centre-surround / edge patterns.
+/// V1 has in_channels=12 (retinal ganglion output) — pick the retinal
+/// input channel where this filter has the most energy and render that
+/// one as a 3×3 grayscale tile. The Gabor init places each V1 filter
+/// onto exactly one of retinal channels 0 (luminance ON) or 1
+/// (luminance OFF); GHL training can spread weight across channels.
+/// The max-energy channel is the most informative view.
 fn v1_tile_rgb(conv: &Conv2d, oc: usize) -> Vec<u8> {
     let k = conv.kernel_size;
-    assert_eq!(conv.in_channels, 3);
-    let mut rgb_f = vec![0.0f32; 3 * k * k];
-    for ic in 0..3 {
-        for y in 0..k {
-            for x in 0..k {
-                let w_idx = oc * (3 * k * k) + ic * (k * k) + y * k + x;
-                rgb_f[(y * k + x) * 3 + ic] = conv.weight[w_idx];
+    let in_ch = conv.in_channels;
+    let mut best_ic = 0usize;
+    let mut best_energy = 0.0f32;
+    for ic in 0..in_ch {
+        let mut e = 0.0f32;
+        for i in 0..(k * k) {
+            let w_idx = oc * (in_ch * k * k) + ic * (k * k) + i;
+            let v = conv.weight[w_idx];
+            e += v * v;
+        }
+        if e > best_energy { best_energy = e; best_ic = ic; }
+    }
+    let mut gray_f = vec![0.0f32; 3 * k * k];
+    for y in 0..k {
+        for x in 0..k {
+            let w_idx = oc * (in_ch * k * k) + best_ic * (k * k) + y * k + x;
+            let v = conv.weight[w_idx];
+            let p = (y * k + x) * 3;
+            gray_f[p] = v;
+            gray_f[p + 1] = v;
+            gray_f[p + 2] = v;
+        }
+    }
+    normalise_to_u8(&gray_f)
+}
+
+/// Pull a single V2 or V4 filter's weights back through V1 (and V2 if
+/// going from V4) to pixel space. This is the "effective receptive
+/// field" visualization — what pixel pattern maximally activates this
+/// filter, assuming the downstream layers are passthrough.
+///
+/// For V2 filter `oc`: treat its `[32 × 3 × 3]` weights as a one-hot
+/// activation grid at the V2-output layer, then `v1.transpose_forward`
+/// scatters it to `[3 × 5 × 5]` pixel-space (one extra cell per
+/// 3×3 kernel on each side due to the convolution's receptive field).
+/// That's a 3-channel RGB patch we can display directly.
+///
+/// For V4 filter `oc`: two transpose_forward passes — V2 first then V1.
+/// Resulting pixel patch is larger (receptive field compounds).
+fn pixelspace_receptive_field(
+    cortex: &VisualCortex,
+    layer: &'static str,
+    oc: usize,
+) -> (Vec<f32>, usize, usize) {
+    let v1 = &cortex.v1;
+    let v2 = &cortex.v2;
+    let v4 = &cortex.v4;
+    let k1 = v1.kernel_size;
+    let k2 = v2.kernel_size;
+    let k4 = v4.kernel_size;
+    let s1 = v1.stride;
+    let s2 = v2.stride;
+    let s4 = v4.stride;
+    let p1 = v1.padding;
+    let p2 = v2.padding;
+    let p4 = v4.padding;
+
+    // Seed: the filter weights of this oc, treated as an activation
+    // map at the matching layer's output. Shape [in_ch × k × k].
+    match layer {
+        "v2" => {
+            // V2 weights shape [oc × in_ch=32 × k2 × k2]. Extract this filter.
+            let w2_off = oc * v2.in_channels * k2 * k2;
+            let seed_v1 = &v2.weight[w2_off..w2_off + v2.in_channels * k2 * k2];
+            // Pull V1 adjoint: input "activation" of shape [32 × k2 × k2]
+            // scatters to [3 × h1_pre × w1_pre] pixel space.
+            // The forward V1: (h + 2p - k) / s + 1 = k2; solve for
+            // pre-V1 h: h_pre = (k2 - 1)*s1 + k1 - 2*p1.
+            let h_pre = (k2 - 1) * s1 + k1 - 2 * p1;
+            let w_pre = h_pre;
+            let pixels = v1.transpose_forward(seed_v1, 1, k2, k2, h_pre, w_pre);
+            (pixels, h_pre, w_pre)
+        }
+        "v4" => {
+            // V4 weights [oc × in_ch=64 × k4 × k4]. Treat as activations
+            // at V4-output, pull through V2 then V1.
+            let w4_off = oc * v4.in_channels * k4 * k4;
+            let seed_v2 = &v4.weight[w4_off..w4_off + v4.in_channels * k4 * k4];
+            // Through V2 adjoint: [64 × k4 × k4] → [32 × h2 × w2]
+            let h2 = (k4 - 1) * s2 + k2 - 2 * p2;
+            let w2d = h2;
+            let via_v2 = v2.transpose_forward(seed_v2, 1, k4, k4, h2, w2d);
+            // Through V1 adjoint: [32 × h2 × w2] → [3 × h1 × w1]
+            let h_pre = (h2 - 1) * s1 + k1 - 2 * p1;
+            let w_pre = h_pre;
+            let pixels = v1.transpose_forward(&via_v2, 1, h2, w2d, h_pre, w_pre);
+            (pixels, h_pre, w_pre)
+        }
+        _ => panic!("pixelspace_receptive_field: layer must be v2 or v4"),
+    }
+}
+
+/// Render one cortex filter as its pixel-space receptive field tile
+/// (RGB). Normalises per-tile so each filter's pattern is visible
+/// regardless of absolute magnitude.
+fn rf_tile_rgb(cortex: &VisualCortex, layer: &'static str, oc: usize) -> (Vec<u8>, usize, usize) {
+    let (pixels, h, w) = pixelspace_receptive_field(cortex, layer, oc);
+    // Re-layout from CHW to HWC, per-tile min-max over all channels.
+    let mut hwc = vec![0.0f32; 3 * h * w];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                hwc[(y * w + x) * 3 + c] = pixels[c * h * w + y * w + x];
             }
         }
     }
-    normalise_to_u8(&rgb_f)
+    (normalise_to_u8(&hwc), h, w)
 }
 
 /// V2/V4 have many in channels — collapse with per-position L2 norm
@@ -221,7 +319,50 @@ fn render_layer_grid(
 // Per-condition dump.
 // ────────────────────────────────────────────────────────────────
 
-fn dump_condition(label: &str, retina: &VisualRetina, out_dir: &Path, factor: usize) -> std::io::Result<()> {
+/// Render a grid of pixel-space receptive fields for V2 or V4. Each
+/// tile shows one filter's preferred stimulus (pulled back through V1
+/// adjoint, or V2→V1 for V4). `cols` tiles per row; per-tile upscale
+/// applied for visibility.
+fn write_rf_grid(
+    cortex: &VisualCortex, layer: &'static str,
+    cols: usize, upscale: usize,
+    path: &Path,
+) -> std::io::Result<()> {
+    let n = match layer {
+        "v2" => cortex.v2.out_channels,
+        "v4" => cortex.v4.out_channels,
+        _ => unreachable!(),
+    };
+    // Probe tile size off filter 0.
+    let (_, th, tw) = rf_tile_rgb(cortex, layer, 0);
+    let tile_h = th * upscale;
+    let tile_w = tw * upscale;
+    let rows = (n + cols - 1) / cols;
+    let border = 2usize;
+    let gh = rows * tile_h + (rows + 1) * border;
+    let gw = cols * tile_w + (cols + 1) * border;
+    let mut grid = vec![60u8; 3 * gh * gw];
+    for oc in 0..n {
+        let (rgb, h, w) = rf_tile_rgb(cortex, layer, oc);
+        let (tile, _, _) = upscale_rgb(&rgb, h, w, upscale);
+        let r = oc / cols;
+        let c = oc % cols;
+        let oy = border + r * (tile_h + border);
+        let ox = border + c * (tile_w + border);
+        for y in 0..tile_h {
+            for x in 0..tile_w {
+                let src = (y * tile_w + x) * 3;
+                let dst = ((oy + y) * gw + (ox + x)) * 3;
+                grid[dst] = tile[src];
+                grid[dst + 1] = tile[src + 1];
+                grid[dst + 2] = tile[src + 2];
+            }
+        }
+    }
+    write_ppm(path, &grid, gh, gw)
+}
+
+fn dump_condition(label: &str, retina: &VisualCortex, out_dir: &Path, factor: usize) -> std::io::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     let (v1, h1, w1) = render_layer_grid(&retina.v1, true, 8, factor);
     let (v2, h2, w2) = render_layer_grid(&retina.v2, false, 8, factor);
@@ -229,6 +370,13 @@ fn dump_condition(label: &str, retina: &VisualRetina, out_dir: &Path, factor: us
     write_ppm(&out_dir.join("v1_filters.ppm"), &v1, h1, w1)?;
     write_ppm(&out_dir.join("v2_filters.ppm"), &v2, h2, w2)?;
     write_ppm(&out_dir.join("v4_filters.ppm"), &v4, h4, w4)?;
+
+    // Pixel-space receptive fields: what pixel pattern would maximally
+    // activate each V2/V4 filter. Much more informative than per-position
+    // norm tiles for deep filters — you're literally seeing Olshausen/
+    // Field-style "preferred stimulus" patches.
+    write_rf_grid(retina, "v2", 8, 12, &out_dir.join("v2_rf.ppm"))?;
+    write_rf_grid(retina, "v4", 16, 8, &out_dir.join("v4_rf.ppm"))?;
 
     // Filter magnitude stats per layer — helps spot dead / saturated filters.
     let mut meta = std::fs::File::create(out_dir.join("meta.txt"))?;
@@ -270,6 +418,10 @@ fn main() -> std::io::Result<()> {
     let mut pretrain_epochs = 2usize;
     let mut integration = 0.7f32;
     let mut out_root = String::from("/tmp/filter_viz");
+    // --load PATH: skip the maze-based conditions and just dump filters
+    // from a pretrained cortex file (e.g. retina_stl10.bin from
+    // pretrain_retina). Only produces `<out-dir>/loaded/{v1,v2,v4}.ppm`.
+    let mut load_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -281,6 +433,7 @@ fn main() -> std::io::Result<()> {
             "--pretrain-epochs" => { pretrain_epochs = args[i+1].parse().unwrap(); i += 2; }
             "--integration" => { integration = args[i+1].parse().unwrap(); i += 2; }
             "--out-dir" => { out_root = args[i+1].clone(); i += 2; }
+            "--load" => { load_path = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!(
 "Usage: filter_viz [--size N] [--seed N] [--factor N]
@@ -307,23 +460,40 @@ Pure noise = training did nothing.
     std::fs::create_dir_all(root)?;
     eprintln!("filter_viz: size={size} seed={seed} factor={factor}");
 
+    // ── --load mode: dump filters from a pretrained file, no training. ──
+    if let Some(path) = &load_path {
+        let cortex = VisualCortex::load(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("failed to load {path}: {e}")))?;
+        eprintln!(
+            "[loaded from {path}] V1 {}→{}  V2 {}→{}  V4 {}→{}  input {}×{}",
+            cortex.v1.in_channels, cortex.v1.out_channels,
+            cortex.v2.in_channels, cortex.v2.out_channels,
+            cortex.v4.in_channels, cortex.v4.out_channels,
+            cortex.input_h, cortex.input_w,
+        );
+        dump_condition("loaded", &cortex, &root.join("loaded"), factor)?;
+        eprintln!("\ndone.  look at {}/loaded/*.ppm", root.display());
+        return Ok(());
+    }
+
     // Build the shared maze bank once.
     let bank = maze_pixel_bank(pretrain_samples, size, seed);
     let bank_refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
 
     // Sober.
-    let sober = VisualRetina::maze(size, size);
+    let sober = VisualCortex::preserve_spatial(size, size);
     eprintln!("[sober]   dumping weights");
     dump_condition("sober", &sober, &root.join("sober"), factor)?;
 
     // Hebbian.
-    let mut hebbian = VisualRetina::maze(size, size);
+    let mut hebbian = VisualCortex::preserve_spatial(size, size);
     eprintln!("[hebbian] training on {pretrain_samples} real mazes");
     hebbian.train_hebbian(&bank_refs, pretrain_epochs, 2e-4);
     dump_condition("hebbian", &hebbian, &root.join("hebbian"), factor)?;
 
     // LSD.
-    let mut lsd = VisualRetina::maze(size, size);
+    let mut lsd = VisualCortex::preserve_spatial(size, size);
     eprintln!("[lsd_{integration:.2}]   hebbian + lsd(integration={integration:.2})");
     lsd.train_hebbian(&bank_refs, pretrain_epochs, 2e-4);
     lsd.lsd(LsdConfig {

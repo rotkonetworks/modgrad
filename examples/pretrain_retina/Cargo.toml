@@ -1,0 +1,19 @@
+[package]
+name = "pretrain_retina"
+version = "0.1.0"
+edition = "2024"
+description = "Hebbian pretraining of VisualRetina V2/V4 on STL-10 unlabeled natural images. Save weights for reuse in downstream tasks."
+
+[[bin]]
+name = "pretrain_retina"
+path = "src/main.rs"
+
+[features]
+default = []
+kfd = ["modgrad-codec/kfd"]
+rocm = ["modgrad-codec/rocm"]
+cuda = ["modgrad-codec/cuda"]
+gpu = ["modgrad-codec/gpu"]
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }

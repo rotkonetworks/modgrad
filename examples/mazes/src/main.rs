@@ -1,6 +1,6 @@
 //! Maze solving benchmark for CTM.
 //!
-//! Pipeline: maze pixels → Encoder (VisualRetina) → TokenInput → Brain (CTM) → RouteLoss
+//! Pipeline: maze pixels → Encoder (VisualCortex) → TokenInput → Brain (CTM) → StepwiseCE
 //!
 //! Uses the SDK trait system: Encoder + Brain + LossFn compose cleanly.
 //! No ad-hoc training code — the same path works for any modality.
@@ -16,23 +16,55 @@ use modgrad_ctm::config::{CtmConfig, ExitStrategy};
 use modgrad_ctm::weights::CtmWeights;
 use modgrad_ctm::train::{Ctm, accumulate_gradients};
 use modgrad_ctm::graph::{
-    RegionalConfig, RegionalWeights, RegionalGradients, RegionalState,
+    RegionalWeights, RegionalGradients, RegionalState,
     RegionalAdamW, RegionalBrain, regional_forward,
 };
-use modgrad_codec::retina::{LsdConfig, VisualRetina};
-use modgrad_traits::{Brain, Encoder, LossFn, RouteLoss, Imagination, TokenInput};
+use modgrad_codec::retina::{LsdConfig, VisualCortex};
+use modgrad_codec::genome::Genome;
+use modgrad_traits::{Brain, Encoder, LossFn, StepwiseCE, Imagination, TokenInput};
+
+/// Maze action vocabulary: Up / Down / Left / Right / Wait.
+/// Task semantics live at the construction site per the SDK neutrality rule —
+/// `StepwiseCE` itself just sees `n_classes = 5`.
+const MAZE_N_CLASSES: usize = 5;
+/// Curriculum lookahead for maze routes: pull the training frontier two
+/// cells past the correct prefix each step. Small enough that early-training
+/// gradient stays focused on the start of the route.
+const MAZE_LOOKAHEAD: usize = 5;
+
+fn maze_loss() -> StepwiseCE {
+    StepwiseCE { n_classes: MAZE_N_CLASSES, lookahead: MAZE_LOOKAHEAD }
+}
+
+/// Construct a retina for maze-sized input. If `--pretrained-retina
+/// PATH` was passed, load weights from that path and reshape the
+/// `input_h`/`input_w` fields for this call site's dimensions (Conv2d
+/// weights are dimension-independent; only those two fields need to
+/// match the actual input). Otherwise fresh `::preserve_spatial`.
+fn make_encoder(h: usize, w: usize) -> VisualCortex {
+    if let Some(path) = pretrained_retina_path() {
+        let mut r = VisualCortex::load(path)
+            .unwrap_or_else(|e| panic!("--pretrained-retina: failed to load {path}: {e}"));
+        r.input_h = h;
+        r.input_w = w;
+        eprintln!("Encoder: pretrained retina loaded from {path} (reshape to {h}×{w})");
+        r
+    } else {
+        VisualCortex::preserve_spatial(h, w)
+    }
+}
 
 /// Dispatch between the full retina encode and the --no-retina
 /// bypass. Called from every training/eval step; flag is read once
 /// from the global AtomicBool so no parameter plumbing.
 fn encode_maybe_bypass(
-    encoder: &VisualRetina,
+    encoder: &VisualCortex,
     pixels: &[f32],
     in_h: usize,
     in_w: usize,
 ) -> TokenInput {
     if retina_bypass_enabled() {
-        let (_, _, _, _, h_tok, w_tok) = encoder.stage_dims();
+        let (_, _, _, _, _, _, h_tok, w_tok) = encoder.stage_dims();
         let token_dim = encoder.token_dim();
         TokenInput {
             tokens: bypass_tokens(pixels, in_h, in_w, h_tok, w_tok, token_dim),
@@ -41,6 +73,31 @@ fn encode_maybe_bypass(
         }
     } else {
         encoder.encode(pixels)
+    }
+}
+
+/// Multi-scale encoding: concatenate V4, V2, V1 streams into a single
+/// flat `TokenInput.tokens` buffer that the brain slices per
+/// connection via `obs_scale_slice`. Layout matches
+/// `Encoder::token_dims()` order: V4 first, then V2, then V1.
+fn encode_multiscale_concat(
+    encoder: &VisualCortex,
+    pixels: &[f32],
+) -> TokenInput {
+    let multi = encoder.encode_multiscale(pixels);
+    let mut tokens = Vec::with_capacity(
+        multi.scales.iter().map(|s| s.tokens.len()).sum(),
+    );
+    for s in &multi.scales {
+        tokens.extend_from_slice(&s.tokens);
+    }
+    // Brain doesn't introspect n_tokens / token_dim from the
+    // observation buffer — it uses obs_scale_dims. Pick scale-0
+    // (V4) shape as a representative for the TokenInput contract.
+    TokenInput {
+        n_tokens: multi.scales[0].n_tokens,
+        token_dim: multi.scales[0].token_dim,
+        tokens,
     }
 }
 
@@ -83,7 +140,7 @@ fn main() {
     let mut dream_sparsity_k = 8usize;
     let mut ood_size = 0usize;
     // --lsd-integration F: if <1.0 AND --dream-epochs>0, route dream
-    // pretraining through VisualRetina::lsd with this integration. 1.0
+    // pretraining through VisualCortex::lsd with this integration. 1.0
     // falls through to the legacy permanent train_dream path.
     let mut lsd_integration = 1.0f32;
     // --live-viz DIR --live-every N: every N steps, forward-pass a
@@ -97,7 +154,7 @@ fn main() {
     // changes. A/B this against baseline to see if the retina was
     // information-bottlenecked by the binary wall/path encoding.
     let mut use_sdf = false;
-    // --no-retina: skip the VisualRetina conv stack, feed avg-pooled
+    // --no-retina: skip the VisualCortex conv stack, feed avg-pooled
     // raw pixels into the brain. Binary A/B on whether the retina is
     // net-positive vs neutral vs net-negative on the task.
     let mut no_retina = false;
@@ -107,6 +164,44 @@ fn main() {
     // Opt-in so mazes stays pure when this isn't wanted — the only
     // cost when enabled is a handful of small sysfs reads per step.
     let mut substrate_log: Option<String> = None;
+    // --pretrained-retina PATH: load V1/V2/V4 weights pretrained on
+    // natural images (e.g. STL-10 via `pretrain_retina`) instead of
+    // random init. Conv2d weights are input-size-independent, so the
+    // pretrained weights drop in at any maze_size.
+    let mut pretrained_retina: Option<String> = None;
+    // --ghl-retina: enable GHL (Global-guided Hebbian Learning) updates
+    // on V2/V4 during training (arXiv:2601.21367). Requires --brain
+    // because we need `regional_train_step_generic`'s d_observation
+    // return to backprop into the retina. When off, retina weights
+    // are whatever we started with (random or pretrained).
+    let mut ghl_retina = false;
+    let mut ghl_lr = 1e-3f32;
+    let mut ghl_tau = 1.0f32;
+    // --topdown: enable brain→retina control flow. Pass 1 runs a
+    // regional_forward to populate state.region_outputs; the
+    // `attention` region's activated state is then deterministically
+    // projected to a per-spatial-position gain mask (sigmoid over
+    // tiled attention vector). Pass 2 re-encodes pixels with the gain
+    // applied to V4 tokens and is the pass that backprops. Demonstrates
+    // "brain's executive attention steers perception" using the
+    // existing attention region rather than adding new top-down
+    // weights. --brain required.
+    let mut topdown = false;
+    // --topdown-alpha F: scalar gate for the top-down gain mask. The
+    // gate `gain = 1 + α · (sigmoid(attn) − 0.5)` lives on the attn→V*
+    // pathway. α is read from `Genome::pathway_gates.topdown_alpha`
+    // (defaults to 0 → identity), but this CLI flag overrides the
+    // genome-derived value so users can A/B test without rebuilding the
+    // genome. `Some(0.0)` makes top-down a no-op even with --topdown
+    // on; `Some(1.0)` gives the original full-strength sigmoid.
+    let mut topdown_alpha_override: Option<f32> = None;
+
+    // --multiscale: brain regions wire to V1 / V2 / V4 directly
+    // instead of all consuming V4. INPUT/MOTOR get V4 (categorical),
+    // ATTENTION gets V2 (mid-contour), MOTOR/CEREBELLUM get V1
+    // (fine spatial). Mirrors real cortical wiring where V1 has
+    // direct projections to many areas, not only via the V2→V4 path.
+    let mut multiscale = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -143,6 +238,13 @@ fn main() {
             "--sdf" => { use_sdf = true; i += 1; }
             "--no-retina" => { no_retina = true; i += 1; }
             "--substrate-log" => { substrate_log = Some(args[i+1].clone()); i += 2; }
+            "--pretrained-retina" => { pretrained_retina = Some(args[i+1].clone()); i += 2; }
+            "--ghl-retina" => { ghl_retina = true; i += 1; }
+            "--ghl-lr" => { ghl_lr = args[i+1].parse().unwrap(); i += 2; }
+            "--ghl-tau" => { ghl_tau = args[i+1].parse().unwrap(); i += 2; }
+            "--topdown" => { topdown = true; i += 1; }
+            "--topdown-alpha" => { topdown_alpha_override = Some(args[i+1].parse().unwrap()); i += 2; }
+            "--multiscale" => { multiscale = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -162,6 +264,7 @@ fn main() {
     // this flag is on, otherwise the standard `render_maze`.
     set_render_mode_sdf(use_sdf);
     set_retina_bypass(no_retina);
+    set_pretrained_retina_path(pretrained_retina.clone());
     if use_sdf {
         eprintln!("Input encoding: SDF (wall-distance normalised into luminance)");
     }
@@ -188,7 +291,7 @@ fn main() {
     } else { maze_size };
 
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs, train_bank, test_bank);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs, train_bank, test_bank, ghl_retina, ghl_lr, ghl_tau, topdown, topdown_alpha_override, multiscale);
         return;
     }
 
@@ -196,7 +299,7 @@ fn main() {
                route_len={route_len} batch={batch_size}");
 
     // ── Encoder: visual retina → spatial tokens ──
-    let mut encoder = VisualRetina::maze(maze_size, maze_size);
+    let mut encoder = make_encoder(maze_size, maze_size);
     let token_dim = encoder.token_dim();
 
     // Probe token count with dummy image
@@ -224,7 +327,7 @@ fn main() {
     }
 
     // ── Optional dream pretraining (Hoel 2021) ──
-    // Delegates to VisualRetina::train_dream: synthesize N pseudo-images
+    // Delegates to VisualCortex::train_dream: synthesize N pseudo-images
     // via V4→V2→V1 adjoint projection, then Hebbian-train V2/V4 on those.
     // Combine with --hebbian-epochs to first seed with a real-data prior
     // then refine with dream augmentation.
@@ -281,20 +384,21 @@ fn main() {
         n_random_pairing_self: 0,
         min_width: 16,
         exit_strategy,
+        collect_trajectories: false,
     };
 
     let mut w = CtmWeights::new(cfg, token_dim);
     eprintln!("Brain: d_model={d_model} d_input={} ticks={ticks} out={out_dims} params={}",
         w.config.d_input, w.n_params());
 
-    // ── Loss: route prediction with auto-curriculum ──
-    let base_loss = RouteLoss::maze();
-    let imagination_loss = Imagination::new(RouteLoss::maze());
+    // ── Loss: stepwise CE with auto-curriculum (maze-configured) ──
+    let base_loss = maze_loss();
+    let imagination_loss = Imagination::new(maze_loss());
     let loss_fn: &dyn LossFn<Target = [usize]> = if imagination {
-        eprintln!("Loss: Imagination<RouteLoss> (ratio=0.5)");
+        eprintln!("Loss: Imagination<StepwiseCE> (ratio=0.5)");
         &imagination_loss
     } else {
-        eprintln!("Loss: RouteLoss (Sakana baseline)");
+        eprintln!("Loss: StepwiseCE (Sakana baseline)");
         &base_loss
     };
 
@@ -480,7 +584,7 @@ fn main() {
     if ood_size > 0 && ood_size != maze_size {
         let ood_size = ood_size | 1;
         eprintln!("\n--- OOD Evaluation (200 mazes, size={ood_size}) ---");
-        let ood_encoder = VisualRetina::maze(ood_size, ood_size);
+        let ood_encoder = make_encoder(ood_size, ood_size);
         let ood_stats = eval(&w, &ood_encoder, loss_fn, ood_size, route_len, seed + 1999,
              false, training_seconds, step, w.n_params());
         eprintln!("\n--- Generalization gap (ID={maze_size} → OOD={ood_size}) ---");
@@ -506,7 +610,7 @@ fn main() {
 // ═══════════════════════════════════════════════════════════════
 
 mod live_viz {
-    use modgrad_codec::retina::VisualRetina;
+    use modgrad_codec::retina::VisualCortex;
     use std::io::Write;
 
     fn leaky_relu(x: &mut [f32]) {
@@ -583,17 +687,17 @@ mod live_viz {
 
     /// Forward `pixels` through `retina` and dump one combined panel to `path`.
     pub fn dump_combined(
-        retina: &VisualRetina,
+        retina: &VisualCortex,
         pixels: &[f32],
         in_h: usize,
         in_w: usize,
         path: &str,
     ) -> std::io::Result<()> {
-        let (mut v1, h1, w1) = retina.v1.forward(pixels, in_h, in_w);
+        let (mut v1, h1, w1) = retina.v1.forward(pixels, 1, in_h, in_w);
         leaky_relu(&mut v1);
-        let (mut v2, h2, w2) = retina.v2.forward(&v1, h1, w1);
+        let (mut v2, h2, w2) = retina.v2.forward(&v1, 1, h1, w1);
         leaky_relu(&mut v2);
-        let (mut v4, h4, w4) = retina.v4.forward(&v2, h2, w2);
+        let (mut v4, h4, w4) = retina.v4.forward(&v2, 1, h2, w2);
         leaky_relu(&mut v4);
 
         let us_in = 16usize;
@@ -651,7 +755,7 @@ struct EvalStats {
 }
 
 fn eval(
-    w: &CtmWeights, encoder: &VisualRetina, _loss_fn: &dyn LossFn<Target = [usize]>,
+    w: &CtmWeights, encoder: &VisualCortex, _loss_fn: &dyn LossFn<Target = [usize]>,
     maze_size: usize, route_len: usize, seed: u64,
     autoresearch_summary: bool, training_seconds: f32,
     num_steps: usize, num_params: usize,
@@ -763,6 +867,9 @@ fn run_brain(
     plural_mode: bool, csv_mode: bool, cereb_size: usize, frozen_cereb: bool,
     autoresearch_summary: bool, budget_secs: Option<u64>,
     train_bank: Option<Vec<Maze>>, test_bank: Option<Vec<Maze>>,
+    ghl_retina: bool, ghl_lr: f32, ghl_tau: f32,
+    topdown: bool, topdown_alpha_override: Option<f32>,
+    multiscale: bool,
 ) {
     let t_train_start = std::time::Instant::now();
     let budget = budget_secs.map(std::time::Duration::from_secs);
@@ -774,11 +881,35 @@ fn run_brain(
     use modgrad_ctm::bio::pain::PainConfig;
     use modgrad_ctm::cerebellum::FrozenCerebellum;
 
-    let encoder = VisualRetina::maze(maze_size, maze_size);
-    let token_dim = encoder.token_dim();
     let out_dims = route_len * N_DIRECTIONS;
 
-    let mut cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
+    // Express the brain from a Genome. Pretrained-retina path
+    // overrides the encoder; the connectome (still genome-derived)
+    // is unaffected. Keep `genome` bound — its `pathway_gates`
+    // scalars are read at the per-sample top-down/subcortical sites.
+    let genome = if multiscale {
+        Genome::default_human_visual(maze_size, maze_size, out_dims, ticks)
+    } else {
+        Genome::blank_slate(maze_size, maze_size, out_dims, ticks)
+    };
+    let modgrad_codec::genome::ExpressedBrain { cortex: expressed_cortex, config: expressed_cfg } =
+        genome.express();
+    // Resolve the top-down gate: CLI override beats genome default.
+    // `0.0` → top-down is identity (no-op), preserving the zero-init
+    // property even when `--topdown` is passed.
+    let topdown_alpha: f32 = topdown_alpha_override
+        .unwrap_or(genome.pathway_gates.topdown_alpha);
+    let mut encoder = if pretrained_retina_path().is_some() {
+        make_encoder(maze_size, maze_size)
+    } else {
+        expressed_cortex
+    };
+    let token_dim = encoder.token_dim();
+    let mut cfg = expressed_cfg;
+    if multiscale {
+        eprintln!("[multiscale] obs_scale_dims = {:?} (V4, V2, V1)", cfg.obs_scale_dims);
+    }
+    let _ = token_dim;
 
     // Cerebellum: 64 neurons × 16 ticks is the sweet spot for this scale.
     if pain_mode {
@@ -824,13 +955,13 @@ fn run_brain(
 
     w.print_summary();
 
-    let base_loss = RouteLoss::maze();
-    let imagination_loss = Imagination::new(RouteLoss::maze());
+    let base_loss = maze_loss();
+    let imagination_loss = Imagination::new(maze_loss());
     let loss_fn: &dyn LossFn<Target = [usize]> = if imagination {
-        eprintln!("Loss: Imagination<RouteLoss>");
+        eprintln!("Loss: Imagination<StepwiseCE>");
         &imagination_loss
     } else {
-        eprintln!("Loss: RouteLoss (baseline)");
+        eprintln!("Loss: StepwiseCE (baseline)");
         &base_loss
     };
 
@@ -849,6 +980,23 @@ fn run_brain(
     let d_model = w.config.regions[0].d_model;
     let n_regions = w.config.regions.len();
     let pain_warmup = steps / 10;
+
+    // Cache attention region index — used every sample when --topdown
+    // is on. Fallback to 1 (attention is typically the second region
+    // after `input`).
+    let attn_region_idx: usize = w.config.region_names.iter()
+        .position(|n| n.contains("attention"))
+        .unwrap_or(1);
+    if topdown {
+        eprintln!(
+            "Top-down: attention region [{}] = '{}' gates V4 tokens (2× forward/sample) \
+             alpha={:.3}{}",
+            attn_region_idx,
+            w.config.region_names.get(attn_region_idx).map(|s| s.as_str()).unwrap_or("?"),
+            topdown_alpha,
+            if topdown_alpha == 0.0 { " — gain=1.0 (identity, no-op)" } else { "" },
+        );
+    }
 
     // Organism composes all pain/memory/dream/plural state
     let mut org = Organism::new(OrganismConfig {
@@ -918,7 +1066,11 @@ fn run_brain(
             if maze.path_length < 3 { continue; }
 
             let pixels = render_input(&maze);
-            let input = encoder.encode(&pixels);
+            let input = if multiscale {
+                encode_multiscale_concat(&encoder, &pixels)
+            } else {
+                encoder.encode(&pixels)
+            };
 
             let mut route = maze.route.clone();
             route.truncate(route_len);
@@ -944,6 +1096,56 @@ fn run_brain(
                 }
             }
 
+            // ── Optional top-down pass ─────────────────────────────
+            // When --topdown is on, the `attention` region's output from
+            // a scratch forward pass projects to a per-spatial-position
+            // gain mask, which is then applied to the V4 tokens in the
+            // *actual* training pass. With --multiscale, the same gain
+            // is applied at V1, V2, AND V4 — mirroring biology's V4→V2
+            // and V2→V1 back-projections. Costs 2× forward per sample.
+            let input = if topdown && !retina_bypass_enabled() {
+                let scratch_state = RegionalBrain::init_state(&w);
+                let (_, state_after, _) = if let Some(ref mut frozen) = frozen_model {
+                    RegionalBrain::forward_cached_frozen(&w, scratch_state, &input, frozen)
+                } else {
+                    RegionalBrain::forward_cached(&w, scratch_state, &input)
+                };
+                let attn = &state_after.region_outputs[attn_region_idx];
+                let n_pos = input.n_tokens;
+                let mut gain = vec![0.0f32; n_pos];
+                let al = attn.len().max(1);
+                // Gated sigmoid centred at 1.0: `gain = 1 + α·(σ − 0.5)`.
+                // α = 0 → gain ≡ 1 (identity, top-down off even with --topdown).
+                // α = 1 → range [0.5, 1.5], the original full-strength sigmoid
+                //         shifted to be centred on no-op.
+                // This matches `PathwayGates`' meditation-ring zero-init
+                // contract: every new pathway starts as a no-op.
+                for i in 0..n_pos {
+                    let v = attn[i % al];
+                    let s = 1.0 / (1.0 + (-v).exp());
+                    gain[i] = 1.0 + topdown_alpha * (s - 0.5);
+                }
+                if multiscale {
+                    // Apply the same gain at V1, V2, V4 — multistage
+                    // top-down. Concatenate V4/V2/V1 streams the same
+                    // way encode_multiscale_concat does.
+                    let multi = encoder.encode_gated_multistage(&pixels, &gain);
+                    let mut tokens = Vec::with_capacity(
+                        multi.scales.iter().map(|s| s.tokens.len()).sum(),
+                    );
+                    for s in &multi.scales { tokens.extend_from_slice(&s.tokens); }
+                    TokenInput {
+                        n_tokens: multi.scales[0].n_tokens,
+                        token_dim: multi.scales[0].token_dim,
+                        tokens,
+                    }
+                } else {
+                    encoder.encode_gated(&pixels, &gain)
+                }
+            } else {
+                input
+            };
+
             let (output, _state, cache) = if let Some(ref mut frozen) = frozen_model {
                 RegionalBrain::forward_cached_frozen(&w, state, &input, frozen)
             } else {
@@ -951,7 +1153,17 @@ fn run_brain(
             };
             let (loss, d_preds) = loss_fn.compute(
                 &output.predictions, &output.certainties, &route);
-            let sample_grads = RegionalBrain::backward(&w, cache, &d_preds);
+            let sample_grads = if ghl_retina {
+                let (g, d_obs) =
+                    RegionalBrain::backward_with_input_grad(&w, cache, &d_preds);
+                // d_obs is the gradient w.r.t. the flattened observation
+                // (= `TokenInput.tokens`, shape `[n_tokens × token_dim]`),
+                // which is exactly the `d_tokens` layout `ghl_step` wants.
+                encoder.ghl_step(&pixels, &d_obs, ghl_lr, ghl_tau);
+                g
+            } else {
+                RegionalBrain::backward(&w, cache, &d_preds)
+            };
 
             // Accumulate gradients
             let add = |d: &mut [f32], s: &[f32]| {
@@ -1140,7 +1352,11 @@ fn run_brain(
         if maze.path_length < 3 { continue; }
 
         let pixels = render_input(&maze);
-        let input = encoder.encode(&pixels);
+        let input = if multiscale {
+            encode_multiscale_concat(&encoder, &pixels)
+        } else {
+            encoder.encode(&pixels)
+        };
         let obs: Vec<f32> = input.tokens.clone();
 
         let mut route = maze.route.clone();

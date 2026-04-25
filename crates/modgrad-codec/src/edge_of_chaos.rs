@@ -23,7 +23,7 @@
 //! RLE is not LZ77, but it captures the same "how much of the signal
 //! is repeated neighbours" property cheaply and works well on the
 //! kinds of grids modgrad produces (cortex activations after
-//! normalisation, maze cell bitmaps, retina output magnitudes). If a
+//! normalisation, tile-based input bitmaps, retina output magnitudes). If a
 //! future caller needs sharper compressibility, a zlib-backed variant
 //! can be added behind a `zlib` feature.
 

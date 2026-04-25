@@ -301,13 +301,13 @@ impl VqVae {
     /// Input: [3 × 32 × 32] flat (CHW).
     /// Output: [64 × code_dim] flat (8×8 spatial positions, each code_dim dims).
     pub fn encode(&self, pixels: &[f32]) -> Vec<f32> {
-        let (mut h1, h, w) = self.enc1.forward(pixels, 32, 32);
+        let (mut h1, h, w) = self.enc1.forward(pixels, 1, 32, 32);
         relu_vec(&mut h1);
-        let (mut h2, h, w) = self.enc2.forward(&h1, h, w);
+        let (mut h2, h, w) = self.enc2.forward(&h1, 1, h, w);
         relu_vec(&mut h2);
-        let (mut h3, h, w) = self.enc3.forward(&h2, h, w);
+        let (mut h3, h, w) = self.enc3.forward(&h2, 1, h, w);
         relu_vec(&mut h3);
-        let (z, _, _) = self.enc_proj.forward(&h3, h, w);
+        let (z, _, _) = self.enc_proj.forward(&h3, 1, h, w);
         z
     }
 
@@ -346,7 +346,7 @@ impl VqVae {
             }
         }
 
-        let (mut h1, oh, ow) = self.dec_proj.forward(&latent, h, w);
+        let (mut h1, oh, ow) = self.dec_proj.forward(&latent, 1, h, w);
         relu_vec(&mut h1);
         let (mut h2, oh, ow) = self.dec1.forward(&h1, oh, ow);
         relu_vec(&mut h2);

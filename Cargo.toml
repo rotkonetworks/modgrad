@@ -26,6 +26,7 @@ members = [
     "examples/retina_viz",
     "examples/filter_viz",
     "examples/hebbian_sanity",
+    "examples/pretrain_retina",
     "debugger",
     "extra/remu",
 ]

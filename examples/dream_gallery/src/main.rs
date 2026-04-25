@@ -1,4 +1,4 @@
-//! Visualise what a `VisualRetina` dreams — adjoint-projected samples
+//! Visualise what a `VisualCortex` dreams — adjoint-projected samples
 //! from sparse V4 noise, rendered as PPM images.
 //!
 //! Two modes run by default, side-by-side:
@@ -21,7 +21,7 @@
 //!
 //! Output default: /tmp/dream_gallery/{sober,lsd_0.7,summary.txt}
 
-use modgrad_codec::retina::{LsdConfig, VisualRetina};
+use modgrad_codec::retina::{LsdConfig, VisualCortex};
 use std::io::Write;
 use std::path::Path;
 
@@ -179,7 +179,7 @@ fn maze_pixel_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
 
 struct Gallery<'a> {
     label: &'a str,
-    retina: &'a VisualRetina,
+    retina: &'a VisualCortex,
     count: usize,
     base_seed: u64,
     sparsity_k: usize,
@@ -269,7 +269,7 @@ fn main() -> std::io::Result<()> {
 
 Dumps two side-by-side galleries:
   <out>/sober/      - dreams from a fresh (untrained) cortex
-  <out>/lsd_<I>/    - dreams after VisualRetina::lsd(integration=<I>)
+  <out>/lsd_<I>/    - dreams after VisualCortex::lsd(integration=<I>)
                       applied to a synthetic maze-like pixel bank
 
 Each sub-directory contains:
@@ -291,7 +291,7 @@ from identical args (deterministic RNG + serialized retina weights).
     std::fs::create_dir_all(root)?;
 
     // ── Condition 1: sober cortex ──
-    let sober = VisualRetina::maze(size, size);
+    let sober = VisualCortex::preserve_spatial(size, size);
     let sober_dir = root.join("sober");
     eprintln!("[sober] random V2/V4 — no pretraining");
     let sober_stats = run_gallery(&Gallery {
@@ -302,7 +302,7 @@ from identical args (deterministic RNG + serialized retina weights).
     })?;
 
     // ── Condition 2: LSD-pretrained cortex ──
-    let mut trained = VisualRetina::maze(size, size);
+    let mut trained = VisualCortex::preserve_spatial(size, size);
     let bank = maze_pixel_bank(pretrain_samples, size, seed);
     let bank_refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
     // First shape the cortex on real mazes (Hebbian prior), then

@@ -137,7 +137,7 @@ fn main() {
         let w_before = conv.weight.clone();
         for img_idx in 0..n_imgs {
             let img = &data[img_idx * h * w..(img_idx + 1) * h * w];
-            conv.hebbian_update(img, h, w, LR, SPARSITY_K);
+            conv.hebbian_update(img, 1, h, w, LR, SPARSITY_K);
         }
         let w_now_norm = l2(&conv.weight);
         let delta: f32 = conv.weight.iter().zip(&w_before)

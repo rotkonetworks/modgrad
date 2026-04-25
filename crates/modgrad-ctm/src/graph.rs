@@ -128,6 +128,18 @@ pub struct Connection {
     /// before the synapse projection. This is how external input enters the graph.
     #[serde(default)]
     pub receives_observation: bool,
+    /// Which observation scale this connection consumes when
+    /// `receives_observation` is true. The encoder may emit multiple
+    /// scales (V1, V2, V4 for visual cortex); this index selects
+    /// which one feeds this connection. Default 0 = primary scale,
+    /// matching back-compat single-scale encoders.
+    ///
+    /// Biology: V1 projects directly to many brain areas (pulvinar,
+    /// FEF, parietal) — not only via V2/V4. Per-connection scale
+    /// selection lets a brain treat different regions as direct V1
+    /// vs V4 consumers, mirroring real cortical wiring.
+    #[serde(default)]
+    pub observation_scale: usize,
 }
 
 /// Toggleable auxiliary losses inspired by neuroscience.
@@ -465,8 +477,18 @@ pub struct RegionalConfig {
     pub n_global_sync: usize,
     /// Final output dimension (vocab size, num classes, etc.).
     pub out_dims: usize,
-    /// Raw observation dimension (input to the system).
+    /// Raw observation dimension (input to the system). For multi-
+    /// scale encoders, this is the **concatenated** length across
+    /// all scales — i.e. `obs_scale_dims.iter().sum()`. Single-scale
+    /// configs satisfy `raw_obs_dim == obs_scale_dims[0]`.
     pub raw_obs_dim: usize,
+    /// Per-scale observation dimensions when the encoder is
+    /// multi-scale (e.g. V1 / V2 / V4 for visual cortex). The brain
+    /// concatenates all scales into a single flat `input.tokens`
+    /// vector and connections slice into it by `observation_scale`.
+    /// Defaults to `vec![raw_obs_dim]` for single-scale back-compat.
+    #[serde(default)]
+    pub obs_scale_dims: Vec<usize>,
     /// Auxiliary bio-inspired losses (optional, toggleable).
     #[serde(default)]
     pub aux_losses: AuxLossConfig,
@@ -482,6 +504,22 @@ pub struct RegionalConfig {
 }
 
 impl RegionalConfig {
+    /// `(start, len)` slice of the flat observation buffer for the
+    /// given scale index. Used by forward and backward to extract
+    /// each connection's observation portion. Falls back to
+    /// `(0, raw_obs_dim)` when `obs_scale_dims` is empty (legacy
+    /// single-scale configs that didn't set the field).
+    pub fn obs_scale_slice(&self, scale_idx: usize) -> (usize, usize) {
+        if self.obs_scale_dims.is_empty() {
+            return (0, self.raw_obs_dim);
+        }
+        let mut start = 0;
+        for i in 0..scale_idx {
+            start += self.obs_scale_dims[i];
+        }
+        (start, self.obs_scale_dims[scale_idx])
+    }
+
     /// Default 8-region brain topology (~81M params).
     ///
     /// Cortical: d_model=512, memory=64. Subcortical: d_model=64, memory=32.
@@ -523,14 +561,14 @@ impl RegionalConfig {
         ].into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
-            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
-            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
-            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
-            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -544,7 +582,7 @@ impl RegionalConfig {
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync,
             out_dims,
-            raw_obs_dim: obs_dim,
+            raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
@@ -590,14 +628,14 @@ impl RegionalConfig {
         ].into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
-            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
-            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
-            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
-            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -611,9 +649,116 @@ impl RegionalConfig {
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync,
             out_dims,
-            raw_obs_dim: obs_dim,
+            raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
             aux_losses: AuxLossConfig::default(),
             router: None, // no router at this scale
+            cereb_mode: Default::default(),
+        }
+    }
+
+    /// Multi-scale variant of `eight_region_small`. Mirrors the
+    /// biological wiring where V1 projects directly to motor/parietal
+    /// and V2 to attention areas, not only via V4 → IT → PFC.
+    ///
+    /// `obs_scale_dims` order matches `Encoder::token_dims()` for
+    /// `VisualCortex`: `[v4_dim, v2_dim, v1_dim]`. Scale 0 is V4
+    /// (high-level semantic), scale 1 is V2 (mid contour), scale 2
+    /// is V1 (fine spatial / oriented edges).
+    ///
+    /// Connection routing:
+    /// - INPUT  ← MOTOR + V4 (high-level integration)
+    /// - ATTENTION ← INPUT + V2 (mid-level gating signal)
+    /// - OUTPUT ← ATTENTION (no obs needed)
+    /// - MOTOR ← OUTPUT + V1 (fine-grained motor uses raw spatial)
+    /// - CEREBELLUM ← MOTOR + V1 (predictive timing wants raw signal)
+    /// - others: lateral, no observation
+    pub fn eight_region_small_multiscale(
+        obs_scale_dims: &[usize],
+        out_dims: usize,
+        ticks: usize,
+    ) -> Self {
+        assert!(obs_scale_dims.len() >= 3,
+            "multi-scale config expects at least 3 scales [V4, V2, V1]");
+        let has_subcortical = obs_scale_dims.len() >= 4;
+
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let regions = vec![
+            CtmConfig::region("input", 32, 16, 8, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 32, 16, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 32, 16, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 32, 16, 8, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 8, 8, 4, false, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 8, 8, 8, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        // INSULA wires to scale 3 (raw retinal ganglion) when the
+        // encoder exposes it — the subcortical superior-colliculus →
+        // pulvinar → amygdala fast path. With only 3 scales, INSULA
+        // stays on its old hippocampus-driven (lateral, no obs) path.
+        let insula_obs_scale: usize = if has_subcortical { 3 } else { 0 };
+        let insula_receives_obs = has_subcortical;
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT,
+                receives_observation: true, observation_scale: 0 },     // V4
+            Connection { from: vec![INPUT], to: ATTENTION,
+                receives_observation: true, observation_scale: 1 },     // V2
+            Connection { from: vec![ATTENTION], to: OUTPUT,
+                receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR,
+                receives_observation: true, observation_scale: 2 },     // V1
+            Connection { from: vec![MOTOR], to: CEREBELLUM,
+                receives_observation: true, observation_scale: 2 },     // V1
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA,
+                receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA,
+                receives_observation: insula_receives_obs,
+                observation_scale: insula_obs_scale },                  // Ganglion (subcortical)
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS,
+                receives_observation: false, observation_scale: 0 },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(256);
+        let raw_obs_dim: usize = obs_scale_dims.iter().sum();
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate {
+                beta: 0.1, threshold: 0.99
+            },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim,
+            obs_scale_dims: obs_scale_dims.to_vec(),
+            aux_losses: AuxLossConfig::default(),
+            router: None,
             cereb_mode: Default::default(),
         }
     }
@@ -632,10 +777,10 @@ impl RegionalConfig {
             .into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![3], to: 0, receives_observation: true },  // motor + obs → input
-            Connection { from: vec![0], to: 1, receives_observation: false }, // input → attention
-            Connection { from: vec![1], to: 2, receives_observation: false }, // attention → output
-            Connection { from: vec![2], to: 3, receives_observation: false }, // output → motor
+            Connection { from: vec![3], to: 0, receives_observation: true, observation_scale: 0 },  // motor + obs → input
+            Connection { from: vec![0], to: 1, receives_observation: false, observation_scale: 0 }, // input → attention
+            Connection { from: vec![1], to: 2, receives_observation: false, observation_scale: 0 }, // attention → output
+            Connection { from: vec![2], to: 3, receives_observation: false, observation_scale: 0 }, // output → motor
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -648,7 +793,7 @@ impl RegionalConfig {
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync: total_neurons.min(256),
             out_dims,
-            raw_obs_dim: obs_dim,
+            raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
             aux_losses: AuxLossConfig::default(),
             router: None,
             cereb_mode: Default::default(),
@@ -693,14 +838,14 @@ impl RegionalConfig {
         ].into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
-            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
-            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
-            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
-            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -714,7 +859,122 @@ impl RegionalConfig {
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync,
             out_dims,
-            raw_obs_dim: obs_dim,
+            raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
+            aux_losses: AuxLossConfig::default(),
+            router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
+        }
+    }
+
+    /// Multi-scale variant of the medium 8-region. GPU-stress topology
+    /// (cortical d_model=512, subcortical d_model=64) — sized to keep
+    /// SuperLinear above the GPU dispatch threshold so a `--features
+    /// rocm` run actually exercises the matmul path.
+    ///
+    /// `obs_scale_dims` order matches `Encoder::token_dims()` for
+    /// `VisualCortex`: `[v4_dim, v2_dim, v1_dim]`. Scale 0 is V4
+    /// (high-level semantic), scale 1 is V2 (mid contour), scale 2
+    /// is V1 (fine spatial / oriented edges). A 4th entry, when
+    /// supplied, is the subcortical raw-ganglion fast path consumed
+    /// by INSULA.
+    ///
+    /// Connection routing mirrors `eight_region_small_multiscale`:
+    /// - INPUT  ← MOTOR + V4 (high-level integration)
+    /// - ATTENTION ← INPUT + V2 (mid-level gating signal)
+    /// - OUTPUT ← ATTENTION (no obs needed)
+    /// - MOTOR ← OUTPUT + V1 (fine-grained motor uses raw spatial)
+    /// - CEREBELLUM ← MOTOR + V1 (predictive timing wants raw signal)
+    /// - INSULA ← HIPPOCAMPUS (+ subcortical ganglion when present)
+    /// - HIPPOCAMPUS ← INPUT/ATTENTION/OUTPUT/MOTOR (lateral, no obs)
+    pub fn eight_region_medium_multiscale(
+        obs_scale_dims: &[usize],
+        out_dims: usize,
+        ticks: usize,
+    ) -> Self {
+        assert!(obs_scale_dims.len() >= 3,
+            "multi-scale config expects at least 3 scales [V4, V2, V1]");
+        let has_subcortical = obs_scale_dims.len() >= 4;
+
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        // Region sizes tuned for GPU stress: cortical d_model=512 keeps
+        // SuperLinear flops above the GPU dispatch crossover, subcortical
+        // d_model=64 stays modest. d_input is half of d_model — connection
+        // synapses project incoming inter-region signal to that width.
+        let regions = vec![
+            CtmConfig::region("input", 512, 256, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", 512, 256, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", 512, 256, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", 512, 256, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 64, 64, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 64, 64, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 64, 64, 32, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 64, 64, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        // INSULA wires to scale 3 (raw retinal ganglion) when the
+        // encoder exposes it — the subcortical superior-colliculus →
+        // pulvinar → amygdala fast path. With only 3 scales, INSULA
+        // stays on its hippocampus-driven (lateral, no obs) path.
+        let insula_obs_scale: usize = if has_subcortical { 3 } else { 0 };
+        let insula_receives_obs = has_subcortical;
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT,
+                receives_observation: true, observation_scale: 0 },     // V4
+            Connection { from: vec![INPUT], to: ATTENTION,
+                receives_observation: true, observation_scale: 1 },     // V2
+            Connection { from: vec![ATTENTION], to: OUTPUT,
+                receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR,
+                receives_observation: true, observation_scale: 2 },     // V1
+            Connection { from: vec![MOTOR], to: CEREBELLUM,
+                receives_observation: true, observation_scale: 2 },     // V1
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA,
+                receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA,
+                receives_observation: insula_receives_obs,
+                observation_scale: insula_obs_scale },                  // Ganglion (subcortical)
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS,
+                receives_observation: false, observation_scale: 0 },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(1024);
+        let raw_obs_dim: usize = obs_scale_dims.iter().sum();
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate {
+                beta: 0.1, threshold: 0.99
+            },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim,
+            obs_scale_dims: obs_scale_dims.to_vec(),
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
@@ -760,14 +1020,14 @@ impl RegionalConfig {
         ].into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
-            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
-            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
-            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
-            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -777,7 +1037,7 @@ impl RegionalConfig {
             regions, region_names: names, connections,
             outer_ticks: ticks,
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
-            n_global_sync, out_dims, raw_obs_dim: obs_dim,
+            n_global_sync, out_dims, raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
@@ -824,14 +1084,14 @@ impl RegionalConfig {
         ].into_iter().map(String::from).collect();
 
         let connections = vec![
-            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false },
-            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false },
-            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false },
-            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true },
-            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false },
-            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false },
-            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false },
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
@@ -845,7 +1105,7 @@ impl RegionalConfig {
             exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
             n_global_sync,
             out_dims,
-            raw_obs_dim: obs_dim,
+            raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
@@ -965,13 +1225,17 @@ impl RegionalWeights {
             .map(|cfg| CtmWeights::new(cfg.clone(), cfg.d_input))
             .collect();
 
-        // Build connection synapses
+        // Build connection synapses. Each connection picks one
+        // observation scale (default 0); the synapse's input dim
+        // includes only that scale's length, not the full
+        // concatenated multi-scale buffer.
         let connection_synapses: Vec<Linear> = config.connections.iter().map(|conn| {
             let mut src_dim: usize = conn.from.iter()
                 .map(|&r| regions[r].config.d_model)
                 .sum();
             if conn.receives_observation {
-                src_dim += config.raw_obs_dim;
+                let (_start, len) = config.obs_scale_slice(conn.observation_scale);
+                src_dim += len;
             }
             let tgt_dim = regions[conn.to].config.d_input;
             Linear::new(src_dim, tgt_dim)
@@ -2386,7 +2650,7 @@ pub fn regional_train_step_full(
 /// Train one step with an arbitrary loss function.
 ///
 /// The `compute_loss` closure receives (predictions, certainties) and returns (loss, d_preds).
-/// This is the generic version — works with RouteLoss, ClassTarget, anything.
+/// This is the generic version — works with StepwiseCE, ClassTarget, anything.
 /// Returns (loss, d_observation).
 pub fn regional_train_step_generic(
     w: &RegionalWeights,
@@ -3607,7 +3871,8 @@ impl RegionalBrain {
                         src.extend_from_slice(&state.region_outputs[from_idx]);
                     }
                     if conn.receives_observation {
-                        src.extend_from_slice(&input.tokens);
+                        let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                        src.extend_from_slice(&input.tokens[s..s + len]);
                     }
                     connection_inputs.push(src.clone());
                     let projected = weights.connection_synapses[ci].forward(&src);
@@ -3801,7 +4066,8 @@ impl modgrad_traits::Brain for RegionalBrain {
                         src.extend_from_slice(&state.region_outputs[from_idx]);
                     }
                     if conn.receives_observation {
-                        src.extend_from_slice(&input.tokens);
+                        let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                        src.extend_from_slice(&input.tokens[s..s + len]);
                     }
                     connection_inputs.push(src.clone());
                     let projected = weights.connection_synapses[ci].forward(&src);
@@ -4052,6 +4318,196 @@ impl modgrad_traits::Brain for RegionalBrain {
     }
 }
 
+impl RegionalBrain {
+    /// Like `<Self as Brain>::backward` but additionally returns the
+    /// gradient of the task loss with respect to the input
+    /// `observation` (the concatenated token buffer passed into
+    /// `forward_cached`). This unblocks end-to-end training of any
+    /// encoder that feeds RegionalBrain — e.g., GHL-adaptive retina,
+    /// V4-CTM trained jointly with the brain, or a future learnable
+    /// top-down projection seeded from the observation-side gradient.
+    ///
+    /// Limitations:
+    /// - Router-based configs (`config.router.is_some()`) currently
+    ///   propagate d_observation only through the optional `obs_proj`
+    ///   fallback, which `eight_region_small` doesn't use. For the
+    ///   non-router connection-synapse path (the default in
+    ///   `eight_region_small`), d_observation is computed exactly
+    ///   via the transpose of each connection synapse whose
+    ///   `receives_observation == true`.
+    ///
+    /// Returns `(grads, d_observation)`. `d_observation.len() ==
+    /// cache.observation.len()`.
+    pub fn backward_with_input_grad(
+        weights: &RegionalWeights,
+        cache: RegionalCache,
+        d_predictions: &[Vec<f32>],
+    ) -> (RegionalGradients, Vec<f32>) {
+        let cfg = &weights.config;
+        let n_regions = cfg.regions.len();
+        let mut grads = RegionalGradients::zeros(weights);
+        let obs_len = cache.observation.len();
+        let mut d_observation = vec![0.0f32; obs_len];
+
+        let add = |d: &mut [f32], s: &[f32]| {
+            for (d, s) in d.iter_mut().zip(s) { *d += s; }
+        };
+
+        // Exit gate gradients (same as trait backward).
+        if let Some(ref gate) = weights.outer_exit_gate {
+            let predictions: Vec<Vec<f32>> = cache.tick_caches.iter()
+                .map(|tc| weights.output_proj.forward(&tc.global_sync))
+                .collect();
+            let lambdas: Vec<f32> = cache.tick_caches.iter()
+                .map(|tc| tc.exit_lambda).collect();
+            let beta = cfg.exit_strategy.beta();
+            let (_exit_loss, _exit_d_preds, d_lambdas) =
+                crate::train::adaptive_exit_loss(&predictions, &lambdas, 0, beta);
+            let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
+            for (t, d_lambda) in d_lambdas.iter().enumerate() {
+                if let Some(ref ec) = cache.tick_caches[t].exit_gate_cache {
+                    let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
+                    let gb = grads.outer_exit_gate_db.as_mut().unwrap();
+                    crate::train::linear_backward(
+                        gate, &[*d_lambda], ec, gw, gb,
+                        &mut d_gate_in_scratch);
+                }
+            }
+        }
+
+        let aux_region_activations = cache.last_region_activations.clone();
+        let aux_observation = cache.observation.clone();
+
+        for (t, tc) in cache.tick_caches.into_iter().enumerate().rev() {
+            let d_logits = &d_predictions[t];
+
+            // output_proj backward
+            let out_dim = weights.output_proj.out_dim;
+            let in_dim = weights.output_proj.in_dim;
+            let mut d_global_sync = vec![0.0f32; in_dim];
+            for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+            modgrad_device::backend::ops::outer_product_acc(
+                d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+                out_dim, in_dim,
+            ).expect("output_proj backward: outer_product_acc dispatch");
+            modgrad_device::backend::ops::matvec_t(
+                d_logits, &weights.output_proj.weight, &mut d_global_sync,
+                out_dim, in_dim,
+            ).expect("output_proj backward: matvec_t dispatch");
+
+            // global sync backward
+            let total_act_dim = tc.all_activations.len();
+            let d_all_activations = global_sync_backward(
+                &d_global_sync, &tc.all_activations, &tc.global_beta,
+                &weights.global_sync_left, &weights.global_sync_right, total_act_dim,
+            );
+
+            // Split per region
+            let mut offset = 0;
+            let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let dim = weights.regions[r].config.d_model;
+                d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
+                offset += dim;
+            }
+
+            // Per-region BPTT → d_region_obs[r] (gradient w.r.t. what went into region r)
+            let mut d_region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            let mut region_caches = tc.region_caches;
+            for r in 0..n_regions {
+                if let Some(rcache) = region_caches[r].take() {
+                    let result = backward_from_activated(
+                        &weights.regions[r], &rcache, &d_region_activated[r]);
+                    let dst = &mut grads.region_grads[r];
+                    add(&mut dst.nlm_s1_w, &result.grads.nlm_s1_w);
+                    add(&mut dst.nlm_s1_b, &result.grads.nlm_s1_b);
+                    if let (Some(dw), Some(sw)) = (&mut dst.nlm_s2_w, &result.grads.nlm_s2_w) {
+                        add(dw, sw);
+                    }
+                    if let (Some(db), Some(sb)) = (&mut dst.nlm_s2_b, &result.grads.nlm_s2_b) {
+                        add(db, sb);
+                    }
+                    add(&mut dst.d_start_activated, &result.grads.d_start_activated);
+                    add(&mut dst.d_start_trace, &result.grads.d_start_trace);
+                    add(&mut dst.kv_proj_w, &result.grads.kv_proj_w);
+                    add(&mut dst.kv_proj_b, &result.grads.kv_proj_b);
+                    add(&mut dst.q_proj_w, &result.grads.q_proj_w);
+                    add(&mut dst.q_proj_b, &result.grads.q_proj_b);
+                    add(&mut dst.mha_in_w, &result.grads.mha_in_w);
+                    add(&mut dst.mha_in_b, &result.grads.mha_in_b);
+                    add(&mut dst.mha_out_w, &result.grads.mha_out_w);
+                    add(&mut dst.mha_out_b, &result.grads.mha_out_b);
+                    add(&mut dst.out_proj_w, &result.grads.out_proj_w);
+                    add(&mut dst.out_proj_b, &result.grads.out_proj_b);
+                    d_region_obs[r] = result.d_observation;
+                }
+            }
+
+            // Connection synapse backward — weight grads AND d_observation.
+            // Each connection synapse projects `concat(from_region_outputs[, tokens])`
+            // to region_obs[to]. To get d_observation, back through the
+            // synapse's weight and slice out the observation portion.
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let r = conn.to;
+                if d_region_obs[r].is_empty() { continue; }
+                let d_proj_out = &d_region_obs[r];
+                let syn = &weights.connection_synapses[ci];
+                let Some(input) = tc.connection_inputs.get(ci) else { continue };
+
+                // Weight grads (same as trait backward).
+                let o_max = syn.out_dim.min(d_proj_out.len());
+                let j_max = syn.in_dim.min(input.len());
+                for i in 0..o_max {
+                    grads.connection_db[ci][i] += d_proj_out[i];
+                    for j in 0..j_max {
+                        grads.connection_dw[ci][i * syn.in_dim + j] += d_proj_out[i] * input[j];
+                    }
+                }
+
+                // d_input[j] = Σᵢ d_proj_out[i] · W[i, j]. The synapse's
+                // observation portion is the slice of length
+                // `cfg.obs_scale_slice(conn.observation_scale).1`,
+                // appended after the from-region outputs. Backprop
+                // sends that gradient back to the matching slice of
+                // the flat multi-scale `d_observation` buffer.
+                if conn.receives_observation {
+                    let mut src_offset = 0usize;
+                    for &from_idx in &conn.from {
+                        src_offset += weights.regions[from_idx].config.d_model;
+                    }
+                    let (obs_start_in_buf, scale_len) =
+                        cfg.obs_scale_slice(conn.observation_scale);
+                    let obs_end = (src_offset + scale_len).min(syn.in_dim);
+                    for j in src_offset..obs_end {
+                        let mut acc = 0.0f32;
+                        for i in 0..o_max {
+                            acc += d_proj_out[i] * syn.weight[i * syn.in_dim + j];
+                        }
+                        let dobs_idx = obs_start_in_buf + (j - src_offset);
+                        if dobs_idx < d_observation.len() {
+                            d_observation[dobs_idx] += acc;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Aux head gradients — same as trait backward.
+        if cfg.aux_losses.cerebellar_prediction
+            || cfg.aux_losses.bg_temporal_difference
+        {
+            accumulate_aux_gradients(
+                weights, &mut grads,
+                &aux_region_activations,
+                &aux_observation,
+                0.0,
+            );
+        }
+
+        (grads, d_observation)
+    }
+}
+
 /// NC runtime state: wraps the CTM state and provides the
 /// update-and-render loop from the NC paper (Eq 2.1).
 ///
@@ -4285,6 +4741,45 @@ impl NeuralComputer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `backward_with_input_grad` returns the same region/weight grads
+    /// as the trait `backward`, plus a non-zero `d_observation` of
+    /// length matching the input token buffer. Needed for GHL retina,
+    /// V4-CTM joint training, and any learnable top-down projection.
+    #[test]
+    fn backward_with_input_grad_returns_d_observation() {
+        let token_dim = 16usize;
+        let n_tokens = 4usize;
+        let out_dims = 64usize;
+        let ticks = 2usize;
+        let cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
+        let w = RegionalWeights::new(cfg);
+
+        let tokens = modgrad_traits::TokenInput {
+            tokens: (0..n_tokens * token_dim).map(|i| (i as f32 * 0.01).sin()).collect(),
+            n_tokens,
+            token_dim,
+        };
+        let state = <RegionalBrain as modgrad_traits::Brain>::init_state(&w);
+        let (output, _state, cache) =
+            <RegionalBrain as modgrad_traits::Brain>::forward_cached(&w, state, &tokens);
+
+        let d_preds: Vec<Vec<f32>> = output.predictions.iter()
+            .map(|p| p.iter().map(|&v| v * 1e-3).collect()).collect();
+
+        let (_grads, d_obs) = RegionalBrain::backward_with_input_grad(&w, cache, &d_preds);
+
+        assert_eq!(d_obs.len(), n_tokens * token_dim,
+            "d_observation length must match input.tokens length");
+        // At least one element should be non-zero — the observation
+        // entered a connection synapse on some tick, so gradient flows.
+        let max_abs: f32 = d_obs.iter().map(|x| x.abs()).fold(0.0, f32::max);
+        assert!(max_abs > 0.0,
+            "d_observation should have at least one non-zero component");
+        for (i, &v) in d_obs.iter().enumerate() {
+            assert!(v.is_finite(), "d_obs[{i}] = {v} must be finite");
+        }
+    }
 
     #[test]
     fn episodic_memory_accumulates() {

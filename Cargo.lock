@@ -2529,6 +2529,8 @@ name = "modgrad-codec"
 version = "0.1.0"
 dependencies = [
  "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-device",
  "modgrad-persist",
  "modgrad-traits",
  "rayon",
@@ -3529,6 +3531,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "pretrain_retina"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 //! Does the retina actually see? This binary runs one real maze
-//! through `VisualRetina`'s forward pass and dumps:
+//! through `VisualCortex`'s forward pass and dumps:
 //!
 //!   input.ppm    — the [3 × h × w] maze pixels, upscaled for viewing.
 //!   v1.ppm       — 32 V1 activation heatmaps after `leaky_relu`.
@@ -22,7 +22,7 @@
 //!   cargo run -p retina_viz --release
 //!   cargo run -p retina_viz --release -- --size 21 --seed 7
 
-use modgrad_codec::retina::{LsdConfig, VisualRetina};
+use modgrad_codec::retina::{LsdConfig, VisualCortex};
 use std::io::Write;
 use std::path::Path;
 
@@ -326,7 +326,7 @@ fn render_input(path: &Path, pixels: &[f32], h: usize, w: usize, upscale: usize)
 }
 
 // ────────────────────────────────────────────────────────────────
-// Retina forward pass — mirror of VisualRetina::spatial_tokens up
+// Retina forward pass — mirror of VisualCortex::spatial_tokens up
 // through each layer, but keeping intermediates.
 // ────────────────────────────────────────────────────────────────
 
@@ -341,15 +341,21 @@ struct LayerOut {
     w: usize,
 }
 
-fn retina_forward(retina: &VisualRetina, pixels: &[f32]) -> (LayerOut, LayerOut, LayerOut) {
+fn retina_forward(retina: &VisualCortex, pixels: &[f32]) -> (LayerOut, LayerOut, LayerOut) {
     let (h, w) = (retina.input_h, retina.input_w);
-    let (mut v1, h1, w1) = retina.v1.forward(pixels, h, w);
+    // Retina ganglion (fixed DoG + color opponents, 3→12)
+    let (mut g, gh, gw) = retina.retina.forward(pixels, 1, h, w);
+    leaky_relu(&mut g);
+    // V1 (learnable, 12→32)
+    let (mut v1, h1, w1) = retina.v1.forward(&g, 1, gh, gw);
     leaky_relu(&mut v1);
     let v1_out = LayerOut { data: v1.clone(), channels: retina.v1.out_channels, h: h1, w: w1 };
-    let (mut v2, h2, w2) = retina.v2.forward(&v1, h1, w1);
+    // V2 (learnable, 32→64)
+    let (mut v2, h2, w2) = retina.v2.forward(&v1, 1, h1, w1);
     leaky_relu(&mut v2);
     let v2_out = LayerOut { data: v2.clone(), channels: retina.v2.out_channels, h: h2, w: w2 };
-    let (mut v4, h4, w4) = retina.v4.forward(&v2, h2, w2);
+    // V4 (learnable, 64→128)
+    let (mut v4, h4, w4) = retina.v4.forward(&v2, 1, h2, w2);
     leaky_relu(&mut v4);
     let v4_out = LayerOut { data: v4, channels: retina.v4.out_channels, h: h4, w: w4 };
     (v1_out, v2_out, v4_out)
@@ -381,7 +387,7 @@ fn maze_pixel_bank(n: usize, size: usize, seed: u64) -> Vec<Vec<f32>> {
 
 fn dump_condition(
     label: &str,
-    retina: &VisualRetina,
+    retina: &VisualCortex,
     pixels: &[f32],
     out_dir: &Path,
     upscale: usize,
@@ -449,6 +455,10 @@ fn main() -> std::io::Result<()> {
     let mut pretrain_epochs = 2usize;
     let mut integration = 0.7f32;
     let mut out_root = String::from("/tmp/retina_viz");
+    // --load PATH: skip the sober/hebbian/lsd conditions, just dump
+    // activations from a pretrained cortex on the test maze. Result
+    // goes to <out-dir>/loaded/.
+    let mut load_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -460,13 +470,14 @@ fn main() -> std::io::Result<()> {
             "--pretrain-epochs" => { pretrain_epochs = args[i+1].parse().unwrap(); i += 2; }
             "--integration" => { integration = args[i+1].parse().unwrap(); i += 2; }
             "--out-dir" => { out_root = args[i+1].clone(); i += 2; }
+            "--load" => { load_path = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!(
 "Usage: retina_viz [--size N (odd, ≥5)] [--seed N] [--upscale N]
                   [--pretrain-samples N] [--pretrain-epochs N] [--integration F]
                   [--out-dir PATH]
 
-Runs one real maze through VisualRetina's forward pass and dumps:
+Runs one real maze through VisualCortex's forward pass and dumps:
   <out>/<cond>/input.ppm     — the maze pixels (upscaled for viewing)
   <out>/<cond>/v1.ppm        — 32 V1 activation tiles (leaky_relu'd)
   <out>/<cond>/v2.ppm        — 64 V2 activation tiles
@@ -495,13 +506,32 @@ Flat or pure noise tiles = broken layer.
 
     eprintln!("retina_viz: size={size} seed={seed} upscale={upscale}");
 
+    // ── --load mode: dump activations from a pretrained file, no training. ──
+    if let Some(path) = &load_path {
+        let mut cortex = VisualCortex::load(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("failed to load {path}: {e}")))?;
+        // Pretrained cortex likely has input_h/w from pretraining (96×96
+        // for STL-10). Reshape for the current maze size so forward's
+        // h,w args match.
+        cortex.input_h = size;
+        cortex.input_w = size;
+        eprintln!("[loaded from {path}] V1 {}→{}  V2 {}→{}  V4 {}→{}",
+            cortex.v1.in_channels, cortex.v1.out_channels,
+            cortex.v2.in_channels, cortex.v2.out_channels,
+            cortex.v4.in_channels, cortex.v4.out_channels);
+        dump_condition("loaded", &cortex, &pixels, &root.join("loaded"), upscale)?;
+        eprintln!("\ndone.  look at {}/loaded/*.ppm", root.display());
+        return Ok(());
+    }
+
     // Sober.
-    let sober = VisualRetina::maze(size, size);
+    let sober = VisualCortex::preserve_spatial(size, size);
     eprintln!("[sober]   random cortex");
     dump_condition("sober", &sober, &pixels, &root.join("sober"), upscale)?;
 
     // Hebbian.
-    let mut hebbian = VisualRetina::maze(size, size);
+    let mut hebbian = VisualCortex::preserve_spatial(size, size);
     let bank = maze_pixel_bank(pretrain_samples, size, seed);
     let refs: Vec<&[f32]> = bank.iter().map(|v| v.as_slice()).collect();
     eprintln!("[hebbian] train_hebbian on {pretrain_samples} synthetic mazes");
@@ -509,7 +539,7 @@ Flat or pure noise tiles = broken layer.
     dump_condition("hebbian", &hebbian, &pixels, &root.join("hebbian"), upscale)?;
 
     // LSD (hebbian prior + lsd trip).
-    let mut lsd = VisualRetina::maze(size, size);
+    let mut lsd = VisualCortex::preserve_spatial(size, size);
     eprintln!("[lsd_{integration:.2}]   hebbian + lsd(integration={integration:.2})");
     lsd.train_hebbian(&refs, pretrain_epochs, 2e-4);
     lsd.lsd(LsdConfig {

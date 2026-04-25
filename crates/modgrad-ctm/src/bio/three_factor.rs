@@ -4,7 +4,8 @@
 //! ΔW  = θ_t · advantage · S_t                     (salience-scaled update)
 //!
 //! Titans (Behrouz et al. 2024) dynamics: data-dependent decay and learning rate.
-//! +26pp on 7×7 maze with salience gating in original implementation.
+//! Salience gating gave a large accuracy delta on the reference benchmark
+//! that first validated this rule (see `examples/mazes`).
 
 use super::salience;
 

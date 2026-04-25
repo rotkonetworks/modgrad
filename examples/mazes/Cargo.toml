@@ -9,12 +9,13 @@ name = "mazes"
 path = "src/main.rs"
 
 [features]
-# Opt-in GPU backends. `kfd` turns on the hand-written gfx1102 fast
-# path; the registry then prefers it over ROCm / CUDA. Off by default
-# so `cargo build -p mazes --release` stays fast on any host.
+# Opt-in GPU backends. ROCm is the supported path (rocBLAS SGEMM
+# dispatch). KFD has been retired — the hand-written gfx1102 ISA
+# kernels conflict with the HSA runtime, panic on first forward,
+# and lock us out of rocBLAS. The KFD source is still in-tree but
+# can no longer be enabled via cargo features here.
 default = []
-kfd = ["modgrad-ctm/kfd", "modgrad-device/kfd"]
-rocm = ["modgrad-ctm/rocm", "modgrad-device/rocm"]
+rocm = ["modgrad-ctm/rocm", "modgrad-device/rocm", "modgrad-compute/rocm"]
 cuda = ["modgrad-ctm/cuda", "modgrad-device/cuda"]
 
 [dependencies]

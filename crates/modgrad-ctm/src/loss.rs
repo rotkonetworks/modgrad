@@ -2,7 +2,7 @@
 //!
 //! These use tick semantics (min-tick, most-certain-tick, imagination phases)
 //! that are specific to the CTM architecture. Generic losses (DistributionLoss,
-//! ReconstructionLoss, RouteLoss, etc.) live in modgrad-traits.
+//! ReconstructionLoss, StepwiseCE, etc.) live in modgrad-traits.
 
 use modgrad_traits::{LossFn, ClassTarget, cross_entropy_grad};
 

@@ -2,7 +2,7 @@
 //!
 //! Runs the mazes binary across a fixed set of pretraining conditions
 //! and prints one comparison table at the end. Use this to reproduce
-//! the empirical claims in VisualRetina::lsd and train_dream docs.
+//! the empirical claims in VisualCortex::lsd and train_dream docs.
 //!
 //! Prereq:
 //!   cargo build -p mazes --release

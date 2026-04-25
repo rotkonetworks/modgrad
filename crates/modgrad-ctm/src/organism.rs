@@ -40,7 +40,7 @@ pub struct OrganismConfig {
     pub episodic: EpisodicConfig,
     /// Warmup steps before pain activates.
     pub warmup_steps: usize,
-    /// Max number of route positions to track.
+    /// Max number of positions per sample to track (sequence length upper bound).
     pub n_positions: usize,
     /// Enable plural system (pressure-driven splitting).
     pub plural: bool,
@@ -224,7 +224,7 @@ impl Organism {
         }
     }
 
-    /// Called for each position in the route. Handles pain + adaptive focus.
+    /// Called for each position in the sample sequence. Handles pain + adaptive focus.
     pub fn after_position(
         &mut self,
         position: usize,

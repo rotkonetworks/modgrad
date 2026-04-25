@@ -20,6 +20,10 @@ pub struct CtmOutput {
     pub exit_lambdas: Vec<f32>,
     /// How many ticks actually ran (may be < iterations if early exit).
     pub ticks_used: usize,
+    /// Per-tick activated states, flat `[ticks_used * d_model]`.
+    /// Only populated when `config.collect_trajectories` is true — enables
+    /// episodic-memory trajectory storage. Empty otherwise.
+    pub trajectory: Vec<f32>,
 }
 
 /// Faithful Ctm CTM forward pass.
@@ -150,6 +154,8 @@ fn ctm_forward_with_kv(
     let mut exit_lambdas: Vec<f32> = Vec::new();
     let mut exit_cdf = 0.0f32;
     let mut survival = 1.0f32;
+    let collect_traj = cfg.collect_trajectories;
+    let mut trajectory = if collect_traj { Vec::with_capacity(k * d) } else { Vec::new() };
 
     for _tick in 0..k {
         let sync_action = if !action_initialized {
@@ -181,6 +187,10 @@ fn ctm_forward_with_kv(
 
         state.activated = nlm_forward(&state.trace, &w.nlm_stage1, w.nlm_stage2.as_ref(), d);
 
+        if collect_traj {
+            trajectory.extend_from_slice(&state.activated);
+        }
+
         let sync_out = sync_update(&state.activated, &w.sync_out_left, &w.sync_out_right,
             &mut state.alpha_out, &mut state.beta_out, &r_out);
 
@@ -210,7 +220,57 @@ fn ctm_forward_with_kv(
 
     let ticks_used = predictions.len();
     let sync_out = sync_read(&state.alpha_out, &state.beta_out);
-    CtmOutput { predictions, certainties, sync_out, exit_lambdas, ticks_used }
+    CtmOutput { predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory }
+}
+
+// ─── Episodic memory bridge ────────────────────────────────
+
+/// Store a CtmOutput as an episodic memory entry.
+///
+/// Requires the forward pass to have run with `config.collect_trajectories = true`;
+/// panics on an empty trajectory to fail loudly on misconfigured callers rather
+/// than silently storing zero-length episodes.
+pub fn store_episodic_from_output(
+    mem: modgrad_memory::episodic::EpisodicMemory,
+    output: &CtmOutput,
+    surprise: f32,
+) -> (modgrad_memory::episodic::EpisodicMemory, bool) {
+    assert!(
+        !output.trajectory.is_empty(),
+        "store_episodic_from_output: CtmOutput.trajectory is empty — \
+         set config.collect_trajectories = true before the forward pass"
+    );
+    modgrad_memory::episodic::store(
+        mem,
+        &output.trajectory,
+        &output.certainties,
+        &output.exit_lambdas,
+        output.ticks_used,
+        surprise,
+    )
+}
+
+/// Store a CtmOutput with an explicit valence receipt.
+pub fn store_episodic_from_output_with_valence(
+    mem: modgrad_memory::episodic::EpisodicMemory,
+    output: &CtmOutput,
+    surprise: f32,
+    receipt: Option<modgrad_memory::episodic::ValenceReceipt>,
+) -> (modgrad_memory::episodic::EpisodicMemory, bool) {
+    assert!(
+        !output.trajectory.is_empty(),
+        "store_episodic_from_output_with_valence: CtmOutput.trajectory is empty — \
+         set config.collect_trajectories = true before the forward pass"
+    );
+    modgrad_memory::episodic::store_with_valence(
+        mem,
+        &output.trajectory,
+        &output.certainties,
+        &output.exit_lambdas,
+        output.ticks_used,
+        surprise,
+        receipt,
+    )
 }
 
 // ─── Sync (random-pairing) ─────────────────────────────────

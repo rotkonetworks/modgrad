@@ -5,10 +5,24 @@ edition = "2024"
 description = "Modality codecs for the modgrad ML SDK: vision, audio, text"
 license = "MIT"
 
+[features]
+# Plumb backend features through to modgrad-device so downstream
+# binaries can turn on GPU backends via a single feature on this crate.
+default = []
+kfd = ["modgrad-device/kfd"]
+rocm = ["modgrad-device/rocm"]
+cuda = ["modgrad-device/cuda"]
+gpu = ["modgrad-device/gpu"]
+
 [dependencies]
 modgrad-compute = { path = "../modgrad-compute" }
+modgrad-device = { path = "../modgrad-device" }
 modgrad-persist = { path = "../modgrad-persist" }
 modgrad-traits = { path = "../modgrad-traits" }
+# V4 in VisualCortex is a CTM instance (Option A/C from retina-v2
+# design). Needs CtmWeights / CtmState / ctm_forward from modgrad-ctm.
+# Confirmed no cycle: modgrad-ctm does not depend on modgrad-codec.
+modgrad-ctm = { path = "../modgrad-ctm" }
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
 tracing = "0.1"

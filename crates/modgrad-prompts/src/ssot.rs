@@ -20,7 +20,7 @@
 //! Relation to modgrad: these prompts apply wherever we drive an
 //! external LLM and need (a) unbiased categorical sampling from a
 //! known target distribution (PIF) or (b) diverse completions across
-//! repeated calls (DAG). The `VisualRetina::dream_pixel` operator
+//! repeated calls (DAG). The `VisualCortex::dream_pixel` operator
 //! already implements the SSoT shape for vision — seed → sparse noise
 //! → deterministic adjoint projection — so these text prompts are the
 //! language-side counterpart of that same discipline.
