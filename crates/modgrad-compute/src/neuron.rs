@@ -125,16 +125,14 @@ pub struct LinearResident {
 
 #[cfg(feature = "rocm")]
 impl LinearResident {
-    /// Allocate device buffers and upload weight + bias.
-    pub fn from_linear(lin: &Linear) -> Result<Self, String> {
-        let weight_dev = modgrad_device::backend::HipBuffer::new(lin.weight.len() * 4)
-            .map_err(|e| format!("hipMalloc(weight): {e:?}"))?;
-        weight_dev.copy_from_host(&lin.weight)
-            .map_err(|e| format!("upload weight: {e:?}"))?;
-        let bias_dev = modgrad_device::backend::HipBuffer::new(lin.bias.len() * 4)
-            .map_err(|e| format!("hipMalloc(bias): {e:?}"))?;
-        bias_dev.copy_from_host(&lin.bias)
-            .map_err(|e| format!("upload bias: {e:?}"))?;
+    /// Allocate device buffers and upload weight + bias. Returns
+    /// `ResidencyError::Backend(_)` on hipMalloc / hipMemcpy failure;
+    /// match the inner `BackendError` variant for typed recovery.
+    pub fn from_linear(lin: &Linear) -> Result<Self, super::backend::ResidencyError> {
+        let weight_dev = modgrad_device::backend::HipBuffer::new(lin.weight.len() * 4)?;
+        weight_dev.copy_from_host(&lin.weight)?;
+        let bias_dev = modgrad_device::backend::HipBuffer::new(lin.bias.len() * 4)?;
+        bias_dev.copy_from_host(&lin.bias)?;
         Ok(Self {
             weight_dev, bias_dev,
             in_dim: lin.in_dim, out_dim: lin.out_dim,
@@ -143,13 +141,11 @@ impl LinearResident {
 
     /// Re-upload weights after an in-place optimizer step. Bias too,
     /// in case it was updated.
-    pub fn sync_weights_from(&mut self, lin: &Linear) -> Result<(), String> {
+    pub fn sync_weights_from(&mut self, lin: &Linear) -> Result<(), super::backend::ResidencyError> {
         debug_assert_eq!(lin.in_dim, self.in_dim);
         debug_assert_eq!(lin.out_dim, self.out_dim);
-        self.weight_dev.copy_from_host(&lin.weight)
-            .map_err(|e| format!("re-upload weight: {e:?}"))?;
-        self.bias_dev.copy_from_host(&lin.bias)
-            .map_err(|e| format!("re-upload bias: {e:?}"))?;
+        self.weight_dev.copy_from_host(&lin.weight)?;
+        self.bias_dev.copy_from_host(&lin.bias)?;
         Ok(())
     }
 
@@ -173,17 +169,21 @@ impl LinearResident {
         batch: &modgrad_device::backend::HipBatch,
         x_dev: &super::backend::GpuVec,
         out_dev: &mut super::backend::GpuVec,
-    ) -> Result<(), String> {
-        use super::backend::GpuVec;
+    ) -> Result<(), super::backend::ResidencyError> {
+        use super::backend::{GpuVec, ResidencyError};
         debug_assert_eq!(x_dev.len(), self.in_dim);
         debug_assert_eq!(out_dev.len(), self.out_dim);
         let x_buf = match x_dev {
             GpuVec::Hip(b) => b,
-            _ => return Err("LinearResident::forward requires GpuVec::Hip x".into()),
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
         };
         let out_buf = match out_dev {
             GpuVec::Hip(b) => b,
-            _ => return Err("LinearResident::forward requires GpuVec::Hip out".into()),
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
         };
         unsafe {
             modgrad_device::backend::ops::matvec_resident(
@@ -193,13 +193,13 @@ impl LinearResident {
                 out_buf.device_ptr() as *mut f32,
                 self.out_dim,
                 self.in_dim,
-            ).map_err(|e| format!("matvec_resident: {e:?}"))?;
+            )?;
         }
         // Bookkeeping for the auto-sync cadence. If the batch's
         // pending count just hit sync_every, this drains the queue
         // before returning — keeping us strictly bounded against
         // the watchdog deadline.
-        batch.note_dispatch().map_err(|e| format!("HipBatch::note_dispatch: {e:?}"))?;
+        batch.note_dispatch()?;
         Ok(())
     }
 }

@@ -31,6 +31,7 @@
 
 #![cfg(feature = "rocm")]
 
+use modgrad_compute::backend::ResidencyError;
 use modgrad_compute::neuron::LinearResident;
 
 use crate::graph::RegionalWeights;
@@ -52,26 +53,26 @@ pub struct RegionalResidentCache {
 
 impl RegionalResidentCache {
     /// Allocate device buffers and upload all top-level Linears.
-    /// Returns `Err` if any hipMalloc fails (typically: out of
-    /// VRAM, no HIP runtime).
-    pub fn from_weights(w: &RegionalWeights) -> Result<Self, String> {
+    /// Returns `ResidencyError::Backend(_)` on hipMalloc / hipMemcpy
+    /// failure; the inner `BackendError` distinguishes
+    /// `OutOfMemory` (retry after eviction is sensible) from
+    /// `DeviceLost` (fail the run). Build site doesn't know which
+    /// Linear failed — that information is gone the moment we go
+    /// from String concatenation to typed errors. If diagnostics
+    /// matter the caller can `Err`-trace the call.
+    pub fn from_weights(w: &RegionalWeights) -> Result<Self, ResidencyError> {
         let connection_synapses = w.connection_synapses.iter()
             .map(LinearResident::from_linear)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("connection synapse upload: {e}"))?;
-        let obs_proj = LinearResident::from_linear(&w.obs_proj)
-            .map_err(|e| format!("obs_proj upload: {e}"))?;
-        let output_proj = LinearResident::from_linear(&w.output_proj)
-            .map_err(|e| format!("output_proj upload: {e}"))?;
+            .collect::<Result<Vec<_>, _>>()?;
+        let obs_proj = LinearResident::from_linear(&w.obs_proj)?;
+        let output_proj = LinearResident::from_linear(&w.output_proj)?;
         let outer_exit_gate = match &w.outer_exit_gate {
-            Some(g) => Some(LinearResident::from_linear(g)
-                .map_err(|e| format!("outer_exit_gate upload: {e}"))?),
+            Some(g) => Some(LinearResident::from_linear(g)?),
             None => None,
         };
         let extra_heads = w.extra_heads.iter()
             .map(LinearResident::from_linear)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("extra heads upload: {e}"))?;
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             connection_synapses, obs_proj, output_proj,
             outer_exit_gate, extra_heads,
@@ -83,24 +84,21 @@ impl RegionalResidentCache {
     /// it, the resident path will run forwards against pre-step
     /// weights while the host path uses post-step. Match the host
     /// pattern of "step optimizer → invalidate caches" exactly.
-    pub fn sync_from_weights(&mut self, w: &RegionalWeights) -> Result<(), String> {
+    /// (The PR-AB lift will turn this into a generation-counter
+    /// witness; today it is a runtime contract.)
+    pub fn sync_from_weights(&mut self, w: &RegionalWeights) -> Result<(), ResidencyError> {
         debug_assert_eq!(self.connection_synapses.len(), w.connection_synapses.len());
         for (r, lin) in self.connection_synapses.iter_mut().zip(&w.connection_synapses) {
-            r.sync_weights_from(lin)
-                .map_err(|e| format!("connection synapse sync: {e}"))?;
+            r.sync_weights_from(lin)?;
         }
-        self.obs_proj.sync_weights_from(&w.obs_proj)
-            .map_err(|e| format!("obs_proj sync: {e}"))?;
-        self.output_proj.sync_weights_from(&w.output_proj)
-            .map_err(|e| format!("output_proj sync: {e}"))?;
+        self.obs_proj.sync_weights_from(&w.obs_proj)?;
+        self.output_proj.sync_weights_from(&w.output_proj)?;
         if let (Some(r), Some(lin)) = (self.outer_exit_gate.as_mut(), w.outer_exit_gate.as_ref()) {
-            r.sync_weights_from(lin)
-                .map_err(|e| format!("outer_exit_gate sync: {e}"))?;
+            r.sync_weights_from(lin)?;
         }
         debug_assert_eq!(self.extra_heads.len(), w.extra_heads.len());
         for (r, lin) in self.extra_heads.iter_mut().zip(&w.extra_heads) {
-            r.sync_weights_from(lin)
-                .map_err(|e| format!("extra heads sync: {e}"))?;
+            r.sync_weights_from(lin)?;
         }
         Ok(())
     }

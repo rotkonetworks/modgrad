@@ -81,12 +81,26 @@ impl GpuVec {
     /// Returns `Err` if the rocm runtime isn't available or
     /// hipMalloc fails. Caller decides the fallback policy
     /// (typically: heap allocation + accept the per-call transfer
-    /// cost).
+    /// cost). The inner `BackendError` distinguishes
+    /// `OutOfMemory` (retry after eviction is sensible) from
+    /// `DeviceLost` (fail the run) — match on the variant.
     #[cfg(feature = "rocm")]
-    pub fn try_hip(n: usize) -> Result<Self, String> {
-        let buf = modgrad_device::backend::HipBuffer::new(n * 4)
-            .map_err(|e| format!("hipMalloc({n} f32): {e:?}"))?;
+    pub fn try_hip(n: usize) -> Result<Self, ResidencyError> {
+        let buf = modgrad_device::backend::HipBuffer::new(n * 4)?;
         Ok(GpuVec::Hip(buf))
+    }
+
+    /// Diagnostic name of the active residency variant. Used by
+    /// `ResidencyError::WrongVariant` so callers can see what they
+    /// handed us when a Hip-only entry point received `Heap` or
+    /// `Vram`.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            GpuVec::Heap(_) => "Heap",
+            GpuVec::Vram { .. } => "Vram",
+            #[cfg(feature = "rocm")]
+            GpuVec::Hip(_) => "Hip",
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -182,6 +196,60 @@ impl std::ops::Deref for GpuVec {
 impl std::ops::DerefMut for GpuVec {
     fn deref_mut(&mut self) -> &mut [f32] { self.as_mut_slice() }
 }
+
+// ─── Residency error ───────────────────────────────────────
+//
+// Typed errors for device-resident dispatch. `Backend` wraps a
+// `modgrad_device::backend::BackendError` so callers can match on
+// `OutOfMemory`/`DeviceLost`/`Runtime` for typed recovery; the
+// `WrongVariant` arm catches `GpuVec` flavor mismatches at the
+// boundary where Hip-only entry points reject `Heap`/`Vram`.
+//
+// Why not `Result<_, String>`: every layer that bubbled a String
+// stacked another `format!` on top, allocating in a VRAM-pressured
+// hot path and turning typed device errors into substring-match
+// soup. SaaF lens (review #5): policy in mechanism. Typed errors
+// let cancellation, retry, and tracing recover information.
+
+/// Error for device-resident dispatch operations. Wraps a typed
+/// `BackendError` plus a `WrongVariant` arm for callers that handed
+/// a Hip-only entry point a `GpuVec` of the wrong residency flavor.
+#[cfg(feature = "rocm")]
+#[derive(Debug)]
+pub enum ResidencyError {
+    /// Underlying device runtime error: hipMalloc OOM, queue
+    /// overflow, kernel crash. Match on the inner variant for typed
+    /// recovery (`OutOfMemory` → evict + retry; `DeviceLost` → fail
+    /// run).
+    Backend(modgrad_device::backend::BackendError),
+    /// A `GpuVec` argument was the wrong residency flavor — typically
+    /// a `Heap` or `Vram` slipping into a Hip-only dispatch path.
+    WrongVariant {
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+#[cfg(feature = "rocm")]
+impl From<modgrad_device::backend::BackendError> for ResidencyError {
+    fn from(e: modgrad_device::backend::BackendError) -> Self {
+        Self::Backend(e)
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl std::fmt::Display for ResidencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(e) => write!(f, "{e}"),
+            Self::WrongVariant { expected, got } =>
+                write!(f, "wrong GpuVec variant: expected {expected}, got {got}"),
+        }
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl std::error::Error for ResidencyError {}
 
 // ─── Explicit AVX-512 dot product ───────────────────────────
 
