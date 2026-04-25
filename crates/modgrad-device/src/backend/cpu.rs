@@ -56,6 +56,7 @@ impl Backend for CpuBackend {
             Op::MatmulResidentNT { .. } => false,
             Op::MatmulResidentTN { .. } => false,
             Op::RmsNormResident { .. } => false,
+            Op::DequantQ4KResident { .. } => false,
             Op::LayerNormResident { .. } => false,
             Op::SoftmaxResident { .. } => false,
             Op::ActivationResident { .. } => false,
@@ -112,6 +113,10 @@ impl Backend for CpuBackend {
             }),
             Op::RmsNormResident { .. } => Err(BackendError::Unsupported {
                 op: "rms_norm_resident",
+                backend: "cpu",
+            }),
+            Op::DequantQ4KResident { .. } => Err(BackendError::Unsupported {
+                op: "dequant_q4k_resident",
                 backend: "cpu",
             }),
             Op::LayerNormResident { .. } => Err(BackendError::Unsupported {

@@ -338,6 +338,15 @@ pub mod ffi {
             hidden: c_int,
             eps: f32,
         ) -> hipError_t;
+
+        // Q4_K_M dequantize. `q4k` is `n_blocks * 144` bytes of GGUF
+        // Q4_K format; `fp32_out` receives `n_blocks * 256` fp32
+        // values. See `kernels/dequant_q4k.hip` for the kernel.
+        pub fn launch_dequant_q4k(
+            q4k: *const u8,
+            n_blocks: c_int,
+            fp32_out: *mut f32,
+        ) -> hipError_t;
     }
 
     /// Convert a hipError_t into a human-readable String.
@@ -954,6 +963,9 @@ impl Backend for RocmBackend {
                 // compiles (the symbol is gated to the same cfg as
                 // the dispatch arm).
                 Op::RmsNormResident { .. } => rms_norm_kernel_present(),
+                // Q4_K_M dequant lives in the same hipcc-compiled
+                // archive as RmsNormResident — same gate.
+                Op::DequantQ4KResident { .. } => rms_norm_kernel_present(),
                 Op::MatmulNN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 Op::MatmulNT { m, k, n, .. }
@@ -1036,6 +1048,11 @@ impl Backend for RocmBackend {
                     x_dev, weight_dev, y_dev, n, hidden, eps,
                 } => self.rms_norm_resident_f32(
                     *x_dev, *weight_dev, *y_dev, *n, *hidden, *eps,
+                ),
+                Op::DequantQ4KResident {
+                    q4k_dev, fp32_dev, n_blocks,
+                } => self.dequant_q4k_resident_f32(
+                    *q4k_dev, *fp32_dev, *n_blocks,
                 ),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
@@ -1689,6 +1706,50 @@ impl RocmBackend {
     ) -> Result<(), BackendError> {
         Err(BackendError::Unsupported {
             op: "rms_norm_resident",
+            backend: "rocm",
+        })
+    }
+
+    /// Dispatch the Q4_K_M dequantize kernel. `q4k_dev` is a
+    /// hip-device byte pointer covering `n_blocks * 144` bytes;
+    /// `fp32_dev` receives `n_blocks * 256` fp32 values. The kernel
+    /// is launched with one workgroup per block (256 threads), so
+    /// each block reads the 16-byte header into shared memory once
+    /// and the per-thread work is a single nibble extract + scale.
+    ///
+    /// Caller invariant: `supports()` already confirmed the hipcc
+    /// archive is present. Re-checking here surfaces a
+    /// supports/dispatch race as a loud `Unsupported` rather than a
+    /// link-time missing-symbol crash.
+    #[cfg(modgrad_hipcc_kernels)]
+    fn dequant_q4k_resident_f32(
+        &self,
+        q4k_dev: *const u8,
+        fp32_dev: *mut f32,
+        n_blocks: usize,
+    ) -> Result<(), BackendError> {
+        let n_i32 = as_i32(n_blocks, "n_blocks")?;
+        let err = unsafe {
+            ffi::launch_dequant_q4k(q4k_dev, n_i32, fp32_dev)
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_dequant_q4k(n_blocks={n_blocks}): {}",
+                ffi::hip_err_str(err),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(modgrad_hipcc_kernels))]
+    fn dequant_q4k_resident_f32(
+        &self,
+        _q4k_dev: *const u8,
+        _fp32_dev: *mut f32,
+        _n_blocks: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported {
+            op: "dequant_q4k_resident",
             backend: "rocm",
         })
     }

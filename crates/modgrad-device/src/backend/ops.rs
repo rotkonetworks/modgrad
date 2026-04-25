@@ -205,6 +205,31 @@ pub unsafe fn matmul_resident_tn(
     Ok(())
 }
 
+/// Device-resident Q4_K_M dequantize.
+/// See [`Op::DequantQ4KResident`](super::Op::DequantQ4KResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - `q4k_dev` is a valid hip-device pointer covering at least
+///   `n_blocks * 144` bytes of Q4_K_M-formatted weight data.
+/// - `fp32_dev` is a valid hip-device pointer with at least
+///   `n_blocks * 256 * 4` bytes allocated.
+/// - The pointers stay valid for the duration of this call.
+///
+/// Backends without a hipcc-built Q4_K kernel (CPU, hip without
+/// hipcc) return `Unsupported`; callers must dequantise on host
+/// (`kfd::gguf::dequantize_row_q4_k`) and upload fp32 instead.
+#[inline]
+pub unsafe fn dequant_q4k_resident(
+    q4k_dev: *const u8,
+    fp32_dev: *mut f32,
+    n_blocks: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::DequantQ4KResident { q4k_dev, fp32_dev, n_blocks };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident RMSNorm forward.
 /// See [`Op::RmsNormResident`](super::Op::RmsNormResident).
 ///

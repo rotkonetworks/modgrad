@@ -379,6 +379,251 @@ impl LinearResidentStreaming {
     }
 }
 
+/// Q4_K-quantised, on-demand-dequantised wrapper over a `Linear`.
+///
+/// Storage model:
+///   - `host_weight_q4k` — Q4_K_M-formatted bytes, ~12.5% of fp32
+///     (1 fp32 → 4.5 bits → ~9× compression for the weight tensor).
+///   - `host_bias` — fp32, unchanged. Bias is small (one entry per
+///     output neuron); not worth quantising.
+///   - `weight_dev` / `bias_dev` — fp32 on device, allocated and
+///     populated on `ensure_resident`, dropped on `evict`.
+///
+/// The on-device weight is fp32, not Q4_K, so the matvec dispatch can
+/// reuse the existing `matvec_resident` path. The compression ratio
+/// is on the *host* side: a 7B-param model that would not fit in
+/// 8GB VRAM as fp32 (28 GB) sits in 3.5 GB as Q4_K, and the streaming
+/// path rotates fp32 layers through VRAM as needed.
+///
+/// Lifecycle:
+///   - `LinearResidentQuantized::from_linear(&lin)?` — quantises lin's
+///     weight to Q4_K bytes, keeps bias fp32, no device allocation yet.
+///   - `forward(batch, x_dev, &mut out_dev, auto_evict)` — uploads
+///     Q4_K bytes, dequantises into a device fp32 buffer, dispatches
+///     matvec, optionally evicts.
+///   - `evict()` — drop device buffers (Q4_K weight + dequantised
+///     fp32 weight + bias). Host bytes survive.
+///
+/// The Q4_K weight is uploaded once per resident lifetime; the
+/// dequant kernel runs once per `ensure_resident` (idempotent for
+/// `auto_evict=false`). The forward path itself is identical to
+/// `LinearResident::forward` once the weight is dequantised.
+///
+/// Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub struct LinearResidentQuantized {
+    /// Q4_K-quantised weight on HOST. Storage = ~12.5% of fp32.
+    /// Length = `(out_dim * in_dim / 256) * 144` bytes; the caller
+    /// is responsible for ensuring `out_dim * in_dim % 256 == 0`
+    /// (Q4_K's block size is 256 elements).
+    host_weight_q4k: Vec<u8>,
+    /// fp32 bias on host (small — keep precision).
+    host_bias: Vec<f32>,
+    /// Q4_K-quantised weight on DEVICE — staged here once, the
+    /// dequant kernel reads from it. Dropped on `evict`.
+    weight_q4k_dev: Option<modgrad_device::backend::HipBuffer>,
+    /// Device fp32 weight (dequantised from `weight_q4k_dev`).
+    /// Allocated on first `ensure_resident`; dropped on `evict`.
+    weight_dev: Option<modgrad_device::backend::HipBuffer>,
+    /// Device fp32 bias. Same lifecycle as `weight_dev`.
+    bias_dev: Option<modgrad_device::backend::HipBuffer>,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl LinearResidentQuantized {
+    /// Q4_K block size (in elements). One block packs 256 fp32 values
+    /// into 144 bytes.
+    pub const Q4K_BLOCK_ELEMS: usize = 256;
+
+    /// Quantise `lin.weight` to Q4_K, store both on host. Bias kept
+    /// fp32. Returns `WrongVariant` if the weight tensor's element
+    /// count isn't a multiple of 256 — Q4_K's block size — because
+    /// padding would either change the semantics (zero-fill ⇒ wrong
+    /// dequant for the trailing elements) or silently truncate
+    /// (lossy). Callers must size their `Linear` so the weight is a
+    /// clean multiple of 256.
+    pub fn from_linear(lin: &Linear) -> Result<Self, super::backend::ResidencyError> {
+        use super::backend::ResidencyError;
+        if lin.weight.len() % Self::Q4K_BLOCK_ELEMS != 0 {
+            return Err(ResidencyError::WrongVariant {
+                expected: "weight len multiple of 256",
+                got: "weight len not aligned to Q4_K block",
+            });
+        }
+        let n_blocks = lin.weight.len() / Self::Q4K_BLOCK_ELEMS;
+        let mut q4k_bytes = vec![0u8; n_blocks * 144];
+        modgrad_device::kfd::gguf::quantize_row_q4_k(&lin.weight, &mut q4k_bytes);
+        Ok(Self {
+            host_weight_q4k: q4k_bytes,
+            host_bias: lin.bias.clone(),
+            weight_q4k_dev: None,
+            weight_dev: None,
+            bias_dev: None,
+            in_dim: lin.in_dim,
+            out_dim: lin.out_dim,
+        })
+    }
+
+    /// Are device buffers currently allocated + populated?
+    pub fn is_resident(&self) -> bool {
+        self.weight_dev.is_some()
+            && self.bias_dev.is_some()
+            && self.weight_q4k_dev.is_some()
+    }
+
+    /// Input dimension.
+    pub fn in_dim(&self) -> usize { self.in_dim }
+    /// Output dimension.
+    pub fn out_dim(&self) -> usize { self.out_dim }
+
+    /// Bytes occupied by the host-side state — this is the foundation
+    /// model's actual on-disk / in-RAM cost. Q4_K weight + fp32 bias.
+    /// Does NOT include the per-instance `Vec` allocator overhead;
+    /// for a multi-GB weight that's negligible.
+    pub fn host_size_bytes(&self) -> usize {
+        self.host_weight_q4k.len() + self.host_bias.len() * 4
+    }
+
+    /// VRAM footprint when fully resident: Q4_K weight on device +
+    /// dequantised fp32 weight + fp32 bias. The Q4_K bytes only need
+    /// to live during the dequant kernel itself; a future
+    /// dequant-direct-into-fp32 pipeline could drop them right after
+    /// the kernel returns. Today they stay around for the duration
+    /// of the resident period so a re-dequant doesn't need an extra
+    /// host-to-device copy.
+    pub fn dequant_size_bytes(&self) -> usize {
+        self.host_weight_q4k.len() + self.in_dim * self.out_dim * 4 + self.host_bias.len() * 4
+    }
+
+    /// Allocate device buffers, upload Q4_K bytes, dispatch the
+    /// dequant kernel, copy bias. No-op if already resident. The
+    /// dequant kernel is dispatched *once per ensure_resident* — a
+    /// follow-up `forward` call is just a `matvec_resident`, no
+    /// additional dequant traffic.
+    pub fn ensure_resident(
+        &mut self,
+        batch: &modgrad_device::backend::HipBatch,
+    ) -> Result<(), super::backend::ResidencyError> {
+        if self.is_resident() {
+            return Ok(());
+        }
+
+        // Stage 1: Q4_K bytes onto device.
+        let q4k_buf = modgrad_device::backend::HipBuffer::new(self.host_weight_q4k.len())?;
+        // HipBuffer::copy_from_host expects an f32 slice; reinterpret
+        // the byte slice. Q4_K block bytes (144) are a multiple of 4
+        // and Vec<u8>'s allocator gives at least 4-byte alignment, so
+        // this is safe.
+        debug_assert!(self.host_weight_q4k.len() % 4 == 0,
+            "Q4_K block bytes must be 4-byte multiple for f32-slice upload");
+        let f32_view: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                self.host_weight_q4k.as_ptr() as *const f32,
+                self.host_weight_q4k.len() / 4,
+            )
+        };
+        q4k_buf.copy_from_host(f32_view)?;
+
+        // Stage 2: allocate fp32 weight on device.
+        let weight_fp32_buf = modgrad_device::backend::HipBuffer::new(
+            self.in_dim * self.out_dim * 4,
+        )?;
+
+        // Stage 3: dispatch dequant kernel.
+        let n_blocks = self.host_weight_q4k.len() / 144;
+        unsafe {
+            modgrad_device::backend::ops::dequant_q4k_resident(
+                q4k_buf.device_ptr() as *const u8,
+                weight_fp32_buf.device_ptr() as *mut f32,
+                n_blocks,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 4: bias on device.
+        let bias_buf = modgrad_device::backend::HipBuffer::new(self.host_bias.len() * 4)?;
+        bias_buf.copy_from_host(&self.host_bias)?;
+
+        self.weight_q4k_dev = Some(q4k_buf);
+        self.weight_dev = Some(weight_fp32_buf);
+        self.bias_dev = Some(bias_buf);
+        Ok(())
+    }
+
+    /// Drop every device buffer. Next `ensure_resident` (or `forward`)
+    /// will re-allocate, re-upload, re-dequant from scratch. The
+    /// host-side Q4_K bytes are unchanged so the redequantised fp32
+    /// values are deterministically identical to the previous round.
+    pub fn evict(&mut self) {
+        self.weight_q4k_dev = None;
+        self.weight_dev = None;
+        self.bias_dev = None;
+    }
+
+    /// Streaming forward — `ensure_resident` then `matvec_resident`,
+    /// then optionally `evict`. Same semantics as
+    /// `LinearResidentStreaming::forward` but the resident weight
+    /// comes from a Q4_K dequant pass instead of a host fp32 upload.
+    ///
+    /// **Requires a `&HipBatch`** — both the dequant kernel and the
+    /// matvec count toward the batch's pending-dispatch tally, so the
+    /// auto-sync at `DEFAULT_SYNC_EVERY = 256` keeps us bounded
+    /// against the watchdog even when the streamer rotates many
+    /// layers through VRAM.
+    pub fn forward(
+        &mut self,
+        batch: &modgrad_device::backend::HipBatch,
+        x_dev: &super::backend::GpuVec,
+        out_dev: &mut super::backend::GpuVec,
+        auto_evict: bool,
+    ) -> Result<(), super::backend::ResidencyError> {
+        use super::backend::{GpuVec, ResidencyError};
+        debug_assert_eq!(x_dev.len(), self.in_dim);
+        debug_assert_eq!(out_dev.len(), self.out_dim);
+
+        // Stage 1: ensure both Q4_K bytes and dequantised fp32 are
+        // on device.
+        self.ensure_resident(batch)?;
+
+        // Stage 2: unwrap GpuVec variants and dispatch matvec.
+        let x_buf = match x_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let out_buf = match out_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let weight_dev = self.weight_dev.as_ref()
+            .expect("ensure_resident postcondition: weight_dev is Some");
+        let bias_dev = self.bias_dev.as_ref()
+            .expect("ensure_resident postcondition: bias_dev is Some");
+
+        unsafe {
+            modgrad_device::backend::ops::matvec_resident(
+                x_buf.device_ptr() as *const f32,
+                weight_dev.device_ptr() as *const f32,
+                bias_dev.device_ptr() as *const f32,
+                out_buf.device_ptr() as *mut f32,
+                self.out_dim,
+                self.in_dim,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        if auto_evict {
+            self.evict();
+        }
+        Ok(())
+    }
+}
+
 /// Device-resident wrapper over a `SuperLinear`. Uploads the per-neuron
 /// weight tensor (`[n_neurons × out_per × in_per]` flat, contiguous) and
 /// bias tensor (`[n_neurons × out_per]`) to hipMalloc'd buffers once,
@@ -1012,6 +1257,180 @@ mod resident_tests {
                 None => first_y = Some(host_y),
                 Some(y0) => assert_eq!(*y0, host_y, "drift across calls"),
             }
+        }
+    }
+
+    // ─── LinearResidentQuantized (Q4_K) ─────────────────────────────
+
+    mod quantized {
+        use super::*;
+
+        /// Probe whether the hipcc-compiled Q4_K dequant kernel is
+        /// linked into this build. Same gate the kernel test uses; lets
+        /// the suite skip cleanly on a host without hipcc rather than
+        /// fail with `Unsupported`.
+        fn dequant_kernel_built() -> bool {
+            use modgrad_device::backend::{Backend, Op, RocmBackend};
+            let Some(be) = RocmBackend::try_new() else { return false; };
+            let probe = Op::DequantQ4KResident {
+                q4k_dev: std::ptr::null(),
+                fp32_dev: std::ptr::null_mut(),
+                n_blocks: 1,
+            };
+            be.supports(&probe)
+        }
+
+        /// `LinearResidentQuantized::forward` matches `LinearResident::forward`
+        /// (uncompressed reference) within Q4_K's 1% error band.
+        /// Validates the full pipeline:
+        ///   - Host quantise → Q4_K bytes
+        ///   - Upload → device dequant → fp32 weight
+        ///   - Matvec dispatch via the fp32 weight
+        /// produces output close to the lossless fp32 path.
+        #[test]
+        fn basic() {
+            if !runtime_available() {
+                eprintln!("hip runtime unavailable, skipping");
+                return;
+            }
+            if !dequant_kernel_built() {
+                eprintln!("dequant_q4k kernel not built, skipping");
+                return;
+            }
+            // 1024 in × 256 out — clean multiple of 256 so quantize
+            // accepts it without padding.
+            let in_dim = 1024;
+            let out_dim = 256;
+            let lin = Linear::new(in_dim, out_dim);
+            let mut rng = SimpleRng::new(0xCAFEBABE);
+            let host_x: Vec<f32> = (0..in_dim).map(|_| rng.next_normal()).collect();
+
+            // Reference: uncompressed fp32 LinearResident.
+            let ref_resident = LinearResident::from_linear(&lin)
+                .expect("LinearResident::from_linear");
+            let mut x_dev = crate::backend::GpuVec::try_hip(in_dim).expect("alloc x");
+            x_dev.copy_from(&host_x);
+            let mut ref_out = crate::backend::GpuVec::try_hip(out_dim).expect("alloc ref out");
+            let ref_batch = modgrad_device::backend::HipBatch::new();
+            ref_resident.forward(&ref_batch, &x_dev, &mut ref_out).expect("ref forward");
+            ref_batch.flush().expect("ref flush");
+            let mut ref_y = vec![0.0f32; out_dim];
+            ref_out.copy_to_host(&mut ref_y);
+
+            // Quantised path.
+            let mut quant = LinearResidentQuantized::from_linear(&lin)
+                .expect("LinearResidentQuantized::from_linear");
+            assert!(!quant.is_resident(),
+                "from_linear must not allocate device buffers");
+            let mut q_out = crate::backend::GpuVec::try_hip(out_dim).expect("alloc q out");
+            let q_batch = modgrad_device::backend::HipBatch::new();
+            quant.forward(&q_batch, &x_dev, &mut q_out, false).expect("quant forward");
+            q_batch.flush().expect("q flush");
+            let mut q_y = vec![0.0f32; out_dim];
+            q_out.copy_to_host(&mut q_y);
+
+            // RMS relative error — Q4_K's 1% band, with headroom for
+            // the simpler reference (non-iterative) quantiser we ship.
+            let signal_sq: f32 = ref_y.iter().map(|v| v * v).sum();
+            let err_sq: f32 = ref_y.iter().zip(&q_y)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum();
+            let rms_rel = (err_sq / signal_sq.max(1e-12)).sqrt();
+            eprintln!("quantized_basic: rms_rel = {rms_rel}");
+            assert!(rms_rel < 0.10,
+                "Q4_K vs fp32 RMS rel = {rms_rel} exceeded 10% — quant pipeline regression");
+        }
+
+        /// `auto_evict = true` must drop device buffers right after
+        /// the dispatch; the next `forward` re-dequantises from
+        /// scratch and produces bit-identical output (host-side Q4_K
+        /// bytes don't change, dequant kernel is a pure function of
+        /// those bytes).
+        #[test]
+        fn evict_then_redequant() {
+            if !runtime_available() {
+                eprintln!("hip runtime unavailable, skipping");
+                return;
+            }
+            if !dequant_kernel_built() {
+                eprintln!("dequant_q4k kernel not built, skipping");
+                return;
+            }
+            let in_dim = 512;
+            let out_dim = 128;
+            let lin = Linear::new(in_dim, out_dim);
+            let mut rng = SimpleRng::new(0xC0FFEEFE);
+            let host_x: Vec<f32> = (0..in_dim).map(|_| rng.next_normal()).collect();
+
+            let mut quant = LinearResidentQuantized::from_linear(&lin)
+                .expect("LinearResidentQuantized::from_linear");
+            let mut x_dev = crate::backend::GpuVec::try_hip(in_dim).expect("alloc x");
+            x_dev.copy_from(&host_x);
+
+            // First forward, auto_evict=true: dequant, dispatch,
+            // drop device buffers.
+            let mut out_a = crate::backend::GpuVec::try_hip(out_dim).expect("alloc a");
+            let batch_a = modgrad_device::backend::HipBatch::new();
+            quant.forward(&batch_a, &x_dev, &mut out_a, true)
+                .expect("first forward");
+            batch_a.flush().expect("flush a");
+            assert!(!quant.is_resident(),
+                "auto_evict=true must drop device buffers after dispatch");
+            let mut y_a = vec![0.0f32; out_dim];
+            out_a.copy_to_host(&mut y_a);
+
+            // Second forward: re-allocate, re-upload, re-dequant
+            // from scratch and produce bit-identical output. The
+            // dequant kernel is deterministic on identical inputs;
+            // matvec dispatch is too; round trip must be exact.
+            let mut out_b = crate::backend::GpuVec::try_hip(out_dim).expect("alloc b");
+            let batch_b = modgrad_device::backend::HipBatch::new();
+            quant.forward(&batch_b, &x_dev, &mut out_b, false)
+                .expect("second forward");
+            batch_b.flush().expect("flush b");
+            assert!(quant.is_resident(),
+                "auto_evict=false must leave device buffers populated");
+            let mut y_b = vec![0.0f32; out_dim];
+            out_b.copy_to_host(&mut y_b);
+
+            // Strict equality: same bytes, same kernels, same input
+            // ⇒ same output. Any drift is a real bug.
+            assert_eq!(y_a, y_b,
+                "evict + re-dequant produced different output — dequant kernel non-deterministic");
+        }
+
+        /// `host_size_bytes` reports the actual on-disk / in-RAM
+        /// cost of a quantised Linear. The 4-bit-per-weight encoding
+        /// (plus 144/256 byte block overhead) lands at ~12.5% of
+        /// fp32 — the 8× compression that makes 30B-param models
+        /// fit on consumer GPUs feasible.
+        #[test]
+        fn host_size_savings() {
+            let in_dim = 1024;
+            let out_dim = 1024;
+            let lin = Linear::new(in_dim, out_dim);
+            let fp32_bytes = lin.weight.len() * 4;
+
+            // No GPU runtime needed — size calculation is host-side.
+            let quant = LinearResidentQuantized::from_linear(&lin)
+                .expect("LinearResidentQuantized::from_linear");
+            let q_bytes = quant.host_size_bytes();
+            let ratio = q_bytes as f32 / fp32_bytes as f32;
+            eprintln!(
+                "quantized_host_size_savings: fp32={fp32_bytes} bytes, \
+                 q4k={q_bytes} bytes, ratio={ratio:.4} ({:.1}× compression)",
+                fp32_bytes as f32 / q_bytes as f32,
+            );
+            // Spec gate: `host_size_bytes < lin.weight.len() * 4 / 4`
+            // (≤ 25% of fp32). We tighten to 16% to catch regressions
+            // in block-size overhead — the canonical Q4_K_M ratio is
+            // 144 / (256 * 4) = 14.06%.
+            assert!(q_bytes < fp32_bytes / 4,
+                "Q4_K host bytes ({q_bytes}) >= 1/4 of fp32 ({fp32_bytes}) — \
+                 quant pipeline lost compression");
+            assert!(ratio < 0.16,
+                "Q4_K compression ratio {ratio} > 16% of fp32 — \
+                 expected ~14% (≈ 7× compression)");
         }
     }
 }

@@ -262,6 +262,33 @@ pub enum Op<'a> {
         n: usize,
     },
 
+    /// **Device-resident** Q4_K_M dequantize.
+    ///
+    /// Reads `n_blocks` Q4_K-formatted blocks (144 bytes each) from
+    /// `q4k_dev` and writes `n_blocks * 256` fp32 values into
+    /// `fp32_dev`. The byte pointer is opaque so callers can hand in
+    /// either a hip-device buffer they uploaded with hipMemcpy or a
+    /// hip-pinned host mirror.
+    ///
+    /// Layout of each block (matches `kfd::gguf` / llama.cpp):
+    ///   +0x00: d (fp16), dmin (fp16) — super-block scale and min
+    ///   +0x04: scales[12]            — packed 6-bit (sc, m) for 8 sub-blocks
+    ///   +0x10: qs[128]               — 256 4-bit quants
+    ///
+    /// Foundation primitive for the streaming-quantised-weight path:
+    /// host stores Q4_K bytes (~12.5% of fp32 size), device fp32 buffer
+    /// is filled on demand, evicted on reuse pressure.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. Backends without a
+    /// hipcc-built Q4_K kernel (CPU, vulkan, hip without hipcc) return
+    /// `Unsupported`.
+    DequantQ4KResident {
+        q4k_dev: *const u8,
+        fp32_dev: *mut f32,
+        n_blocks: usize,
+    },
+
     /// **Device-resident** RMSNorm forward.
     ///
     /// `y[r, c] = x[r, c] / sqrt(mean(x[r, :]^2) + eps) * weight[c]`
@@ -751,6 +778,7 @@ impl<'a> Op<'a> {
             Op::MatmulResidentNN { .. } => "matmul_resident_nn",
             Op::MatmulResidentNT { .. } => "matmul_resident_nt",
             Op::MatmulResidentTN { .. } => "matmul_resident_tn",
+            Op::DequantQ4KResident { .. } => "dequant_q4k_resident",
             Op::RmsNormResident { .. } => "rms_norm_resident",
             Op::LayerNormResident { .. } => "layer_norm_resident",
             Op::SoftmaxResident { .. } => "softmax_resident",
