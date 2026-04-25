@@ -4028,6 +4028,279 @@ impl RegionalBrain {
 
         (brain_output, state, cache)
     }
+
+    /// Device-resident equivalent of `<RegionalBrain as Brain>::forward_cached`.
+    ///
+    /// Mirrors the host outer-tick loop but routes every heavy matvec
+    /// (connection synapses, per-region inner CTM tick loop via
+    /// `ctm_forward_resident`, output projection, optional outer exit
+    /// gate) through `RegionalResidentCache`. Weights stay resident on
+    /// device across ticks; numerics match the host path within
+    /// `~1e-3` FP tolerance (rocBLAS reduces in a different order than
+    /// AVX-512 dot, hence the loose bound).
+    ///
+    /// **Cache freshness.** The caller is responsible for going through
+    /// `RegionalResidentCache::fresh(&weights)?` and handing the
+    /// resulting `FreshCache` to this function. The freshness witness
+    /// covers the entire dispatch chain (top-level Linears + every
+    /// `CtmResidentCache` for `weights.regions[r]`); we do not re-check
+    /// inside this function.
+    ///
+    /// **Forward-only RegionalCache.** The returned `RegionalCache`
+    /// has `tick_caches[t].region_caches[r] = None` for every region
+    /// — `ctm_forward_resident` does not yet produce a `CtmCache` (it
+    /// returns `CtmOutput`). Backward-through-resident is therefore
+    /// not yet supported; calling `<RegionalBrain as Brain>::backward`
+    /// on the resulting cache will dereference `None` and panic.
+    /// Use `forward_cached` for training paths and
+    /// `forward_cached_resident` only for inference.
+    ///
+    /// **Connection synapse host bounce.** The current
+    /// `ctm_forward_resident` signature takes a `&[f32]` host KV
+    /// slice, so each connection synapse uploads its source vector to
+    /// a scratch `GpuVec::Hip`, dispatches the matvec resident, then
+    /// downloads the result to host before feeding it into the per-
+    /// region forward. This bounce is the same as
+    /// `bench_brain_resident`'s "host" path — marginal win expected,
+    /// but the structure is in place for the follow-up that lifts
+    /// `ctm_forward_resident` to take a `&GpuVec` KV input.
+    ///
+    /// **Router fallback.** When `weights.router.is_some()` this
+    /// function falls back to `<RegionalBrain as Brain>::forward_cached`
+    /// on host. Routing the learned MoS-style router through resident
+    /// dispatch is a separate iteration.
+    #[cfg(feature = "rocm")]
+    pub fn forward_cached_resident(
+        weights: &RegionalWeights,
+        cache_fresh: crate::resident::FreshCache<'_>,
+        batch: &modgrad_device::backend::HipBatch,
+        input: &modgrad_traits::TokenInput,
+    ) -> Result<
+        (modgrad_traits::BrainOutput, RegionalState, RegionalCache),
+        modgrad_compute::backend::ResidencyError,
+    > {
+        use modgrad_compute::backend::GpuVec;
+
+        // Router path is not yet resident — fall through to host. The
+        // dynamic routing logic owns its own forward/backward chain,
+        // and its matvecs are not in the connection_synapses inventory.
+        if weights.router.is_some() {
+            let state = RegionalState::new(weights);
+            return Ok(<Self as modgrad_traits::Brain>::forward_cached(
+                weights, state, input,
+            ));
+        }
+
+        let cfg = &weights.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+
+        // Same structure as the host forward_cached: fresh state per
+        // call (the trait's `_state` parameter is also ignored on the
+        // host path — see KNOWN REGRESSION at line 4078). Resident
+        // path drives `ctm_forward_resident` which takes `&mut CtmState`,
+        // so we use `RegionalState::new`'s per-region `CtmState`s
+        // directly rather than the `CtmStateExplicit` parallel-vec the
+        // host path builds for `Ctm::forward_cached`.
+        let obs_projected = weights.obs_proj.forward(&input.tokens);
+        let mut state = RegionalState::new(weights);
+        let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
+
+        // Resident scratch buffers reused across ticks. global_sync_dev
+        // and pred_dev hold the output_proj input/output; gate_dev is
+        // allocated only if the outer exit gate exists.
+        let mut global_sync_dev = GpuVec::try_hip(weights.output_proj.in_dim)?;
+        let mut pred_dev = GpuVec::try_hip(weights.output_proj.out_dim)?;
+        let mut gate_dev = if weights.outer_exit_gate.is_some() {
+            Some(GpuVec::try_hip(1)?)
+        } else {
+            None
+        };
+
+        for _outer_tick in 0..cfg.outer_ticks {
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+
+            // ── Connection synapses (resident with host bounce). ──
+            // Mirrors the no-router branch of forward_cached. Each
+            // synapse: build src on host, upload, matvec_resident,
+            // download for the per-region forward (which still takes
+            // a host KV slice).
+            // TODO: lift the host bounce when ctm_forward_resident
+            // accepts a &GpuVec KV input.
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let mut src = Vec::new();
+                for &from_idx in &conn.from {
+                    src.extend_from_slice(&state.region_outputs[from_idx]);
+                }
+                if conn.receives_observation {
+                    let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                    src.extend_from_slice(&input.tokens[s..s + len]);
+                }
+                connection_inputs.push(src.clone());
+
+                let synapse = &cache_fresh.connection_synapses()[ci];
+                debug_assert_eq!(synapse.in_dim, src.len(),
+                    "connection synapse in_dim mismatch (ci={ci})");
+                let mut x_dev = GpuVec::try_hip(synapse.in_dim)?;
+                x_dev.copy_from(&src);
+                let mut y_dev = GpuVec::try_hip(synapse.out_dim)?;
+                synapse.forward(batch, &x_dev, &mut y_dev)?;
+                batch.flush()?;
+                let mut projected = vec![0.0f32; synapse.out_dim];
+                match &y_dev {
+                    GpuVec::Hip(buf) => buf.copy_to_host(&mut projected)?,
+                    _ => unreachable!("hip alloc"),
+                }
+                region_obs[conn.to] = projected;
+            }
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() {
+                    region_obs[r] = obs_projected.clone();
+                }
+            }
+
+            // ── Per-region inner CTM forward (resident). ──
+            // Sequential, not parallel: the host path uses rayon for
+            // disjoint mut, but resident dispatch shares a single
+            // HipBatch / command queue, so per-region work is naturally
+            // serialised on the GPU side. Driving it sequentially on
+            // the host keeps the dispatch order deterministic.
+            //
+            // Note: `ctm_forward_resident` takes `&[f32]` host KV in
+            // `d_input` space; the host's `Ctm::forward_cached` runs its
+            // own `kv_proj + LayerNorm` first. To match the host path
+            // numerically the resident call must also project — see the
+            // KV pre-projection block below.
+            let mut region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let rw = &weights.regions[r];
+                // Project region_obs[r] through kv_proj + affine LN per
+                // token (n_tokens = 1) to match the host's
+                // Ctm::forward_cached pre-tick projection. Done host-
+                // side because kv_proj is not in CtmResidentCache for
+                // this slice (would be a small additional matvec; not
+                // load-bearing).
+                let kv = {
+                    let tok = &region_obs[r];
+                    debug_assert_eq!(tok.len(), rw.kv_proj.in_dim);
+                    let mut projected = rw.kv_proj.forward(tok);
+                    let n = projected.len() as f32;
+                    let mean: f32 = projected.iter().sum::<f32>() / n;
+                    let var: f32 = projected.iter()
+                        .map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+                    let inv_std = 1.0 / (var + 1e-5).sqrt();
+                    for i in 0..projected.len() {
+                        projected[i] = rw.kv_ln_gamma[i] * (projected[i] - mean) * inv_std
+                            + rw.kv_ln_beta[i];
+                    }
+                    projected
+                };
+                let rstate = &mut state.region_states[r];
+                let ctm_cache = &cache_fresh.ctm_caches()[r];
+                let _output = crate::forward::ctm_forward_resident(
+                    rw, ctm_cache, rstate, batch, &kv, 1,
+                )?;
+                region_activated.push(rstate.activated.clone());
+                // ctm_forward_resident does not yet produce a CtmCache;
+                // backward-through-resident is a follow-up.
+                region_caches.push(None);
+            }
+            state.region_outputs = region_activated;
+
+            let mut all_activations = Vec::new();
+            for r in 0..n_regions {
+                all_activations.extend_from_slice(&state.region_outputs[r]);
+            }
+
+            // ── Global sync (host scalar op, identical to host path). ──
+            for i in 0..n_sync {
+                let l = weights.global_sync_left[i];
+                let ri = weights.global_sync_right[i];
+                if l < all_activations.len() && ri < all_activations.len() {
+                    let pw = all_activations[l] * all_activations[ri];
+                    let decay = (-weights.global_decay[i].clamp(0.0, 15.0)).exp();
+                    state.global_alpha[i] = decay * state.global_alpha[i] + pw;
+                    state.global_beta[i] = decay * state.global_beta[i] + 1.0;
+                }
+            }
+
+            let global_sync: Vec<f32> = (0..n_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+
+            // ── Outer exit gate (resident). ──
+            // No LinearCache produced here — the host forward_cached
+            // builds one for backward, but this is the forward-only
+            // resident path. exit_gate_cache stays None.
+            let exit_lambda = if let (Some(gate_resident), Some(gate_buf)) =
+                (cache_fresh.outer_exit_gate(), gate_dev.as_mut())
+            {
+                global_sync_dev.copy_from(&global_sync);
+                gate_resident.forward(batch, &global_sync_dev, gate_buf)?;
+                batch.flush()?;
+                let mut gate_out = [0.0f32; 1];
+                match &*gate_buf {
+                    GpuVec::Hip(buf) => buf.copy_to_host(&mut gate_out)?,
+                    _ => unreachable!("hip alloc"),
+                }
+                1.0 / (1.0 + (-gate_out[0]).exp())
+            } else {
+                0.0
+            };
+
+            tick_caches.push(OuterTickCache {
+                region_obs,
+                region_activated: state.region_outputs.clone(),
+                region_caches,
+                all_activations,
+                global_sync: global_sync.clone(),
+                global_beta: state.global_beta.clone(),
+                connection_inputs,
+                // Forward-only path: no LinearCache for backward. See
+                // doc comment above ("Forward-only RegionalCache").
+                exit_gate_cache: None,
+                exit_lambda,
+                router_cache: None,
+            });
+        }
+
+        // ── Output projection (resident, one dispatch per tick). ──
+        let out_dim = weights.output_proj.out_dim;
+        let mut predictions: Vec<Vec<f32>> = Vec::with_capacity(tick_caches.len());
+        for tc in &tick_caches {
+            global_sync_dev.copy_from(&tc.global_sync);
+            cache_fresh.output_proj().forward(batch, &global_sync_dev, &mut pred_dev)?;
+            batch.flush()?;
+            let mut pred = vec![0.0f32; out_dim];
+            match &pred_dev {
+                GpuVec::Hip(buf) => buf.copy_to_host(&mut pred)?,
+                _ => unreachable!("hip alloc"),
+            }
+            predictions.push(pred);
+        }
+        let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
+            let c = compute_certainty(p);
+            [1.0 - c, c]
+        }).collect();
+
+        let brain_output = modgrad_traits::BrainOutput {
+            predictions,
+            certainties,
+            sync: tick_caches.last()
+                .map(|tc| tc.global_sync.clone())
+                .unwrap_or_default(),
+        };
+
+        let cache = RegionalCache {
+            tick_caches,
+            observation: input.tokens.clone(),
+            last_region_activations: state.region_outputs.clone(),
+        };
+
+        Ok((brain_output, state, cache))
+    }
 }
 
 impl modgrad_traits::Brain for RegionalBrain {
@@ -4910,5 +5183,93 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(NeuralComputer::sidecar_path(&path));
+    }
+
+    /// Host `<RegionalBrain as Brain>::forward_cached` and the resident
+    /// `RegionalBrain::forward_cached_resident` must produce matching
+    /// per-tick predictions and a matching final sync vector within
+    /// 1e-3 FP tolerance. rocBLAS reduces in a different order than
+    /// the host AVX-512 dot, plus each connection synapse takes a host
+    /// bounce in this slice (see the doc comment on
+    /// `forward_cached_resident`), so the bound is loose. AdaptiveGate
+    /// is enabled at both inner and outer levels via
+    /// `eight_region_small`'s default config — exercises the resident
+    /// outer exit gate dispatch path.
+    ///
+    /// **No router.** `eight_region_small` sets `router = None`; the
+    /// resident path falls back to host when a router is configured,
+    /// so the matching test covers only the no-router path
+    /// (the fallback is by definition bit-identical).
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn forward_cached_resident_matches_host() {
+        use modgrad_device::backend::rocm::ffi::runtime_available;
+        use modgrad_device::backend::HipBatch;
+        use crate::resident::RegionalResidentCache;
+
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+
+        // Match the resident.rs/ctm_resident.rs test fixtures: small
+        // 8-region brain with adaptive exit, single token observation.
+        let token_dim = 16usize;
+        let n_tokens = 4usize;
+        let out_dims = 64usize;
+        let ticks = 2usize;
+        let cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
+        let weights = RegionalWeights::new(cfg);
+        assert!(weights.router.is_none(), "this test exercises the no-router resident path");
+
+        let tokens = modgrad_traits::TokenInput {
+            tokens: (0..n_tokens * token_dim)
+                .map(|i| (i as f32 * 0.013 - 0.21).sin())
+                .collect(),
+            n_tokens,
+            token_dim,
+        };
+
+        // Host run.
+        let host_state = <RegionalBrain as modgrad_traits::Brain>::init_state(&weights);
+        let (host_out, _host_state, _host_cache) =
+            <RegionalBrain as modgrad_traits::Brain>::forward_cached(
+                &weights, host_state, &tokens);
+
+        // Resident run.
+        let cache = RegionalResidentCache::from_weights(&weights)
+            .expect("RegionalResidentCache::from_weights");
+        let fresh = cache.fresh(&weights).expect("fresh on first build");
+        let batch = HipBatch::new();
+        let (resident_out, _resident_state, _resident_cache) =
+            RegionalBrain::forward_cached_resident(
+                &weights, fresh, &batch, &tokens,
+            ).expect("forward_cached_resident");
+        batch.flush().expect("flush");
+
+        assert_eq!(host_out.predictions.len(), resident_out.predictions.len(),
+            "tick count mismatch: host={} resident={}",
+            host_out.predictions.len(), resident_out.predictions.len());
+        assert!(!host_out.predictions.is_empty(),
+            "expected at least one tick");
+
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Compare predictions at last tick (most error accumulation).
+        let last = host_out.predictions.len() - 1;
+        let pl = max_diff(&host_out.predictions[last], &resident_out.predictions[last]);
+        assert!(pl < 1e-3,
+            "predictions[last] mismatch: max |Δ| = {pl}");
+
+        // Final global sync vector.
+        let sd = max_diff(&host_out.sync, &resident_out.sync);
+        assert!(sd < 1e-3, "sync mismatch: max |Δ| = {sd}");
+
+        eprintln!("  ticks = {}", host_out.predictions.len());
+        eprintln!("  max |Δ predictions[last]| = {pl:.6}");
+        eprintln!("  max |Δ sync|              = {sd:.6}");
     }
 }

@@ -31,18 +31,20 @@
 //! `LinearResident::forward` takes `&HipBatch` exactly so callers
 //! can't forget — the GPU hang that crashed Xorg is a compile error.
 //!
-//! **Out of scope (deferred).** Per-region `CtmWeights` Linears
-//! (NLM s1, MHA in/out, KV/Q projections) are not yet lifted into
-//! the cache. The biggest fixed-cost matvecs in the maze brain are
-//! the connection synapses (multi-scale obs concatenated → region
-//! d_input), so this slice covers the largest item first. Wiring
-//! the per-region internals is a separate iteration.
+//! **Per-region inner CTM caches.** The `ctm_caches` field holds one
+//! `CtmResidentCache` per region (NLM stages, MHA Q/K/V split, kv/q
+//! projection, output projection, optional exit gate, synapse U-Net).
+//! The outer freshness witness (`weights.generation()`) covers both
+//! the top-level Linears and every per-region inner CTM, so a single
+//! `cache.fresh(&w)` check protects the entire RegionalBrain
+//! resident-forward dispatch chain.
 
 #![cfg(feature = "rocm")]
 
 use modgrad_compute::backend::ResidencyError;
 use modgrad_compute::neuron::LinearResident;
 
+use crate::ctm_resident::CtmResidentCache;
 use crate::graph::RegionalWeights;
 
 /// Error returned when a resident cache dispatch detects staleness
@@ -94,6 +96,13 @@ pub struct RegionalResidentCache {
     pub(crate) output_proj: LinearResident,
     pub(crate) outer_exit_gate: Option<LinearResident>,
     pub(crate) extra_heads: Vec<LinearResident>,
+    /// Per-region inner CTM caches — one entry per region in
+    /// `weights.regions`. Each holds the per-region `CtmWeights`
+    /// Linears (kv/q proj, MHA Q/K/V row-slices, MHA out, output_proj,
+    /// optional exit gate), both NLM SuperLinears, and the synapse
+    /// U-Net. Resident dispatch through this slice is what
+    /// `RegionalBrain::forward_cached_resident` chains across regions.
+    pub(crate) ctm_caches: Vec<CtmResidentCache>,
     /// Generation counter snapshot from `weights.generation()` at
     /// build/refresh time. Compared against `weights.generation()`
     /// on every dispatch to detect staleness.
@@ -117,9 +126,12 @@ impl RegionalResidentCache {
         let extra_heads = w.extra_heads.iter()
             .map(LinearResident::from_linear)
             .collect::<Result<Vec<_>, _>>()?;
+        let ctm_caches = w.regions.iter()
+            .map(CtmResidentCache::from_weights)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             connection_synapses, obs_proj, output_proj,
-            outer_exit_gate, extra_heads,
+            outer_exit_gate, extra_heads, ctm_caches,
             snapshot_gen: w.generation(),
         })
     }
@@ -140,6 +152,10 @@ impl RegionalResidentCache {
         debug_assert_eq!(self.extra_heads.len(), w.extra_heads.len());
         for (r, lin) in self.extra_heads.iter_mut().zip(&w.extra_heads) {
             r.sync_weights_from(lin)?;
+        }
+        debug_assert_eq!(self.ctm_caches.len(), w.regions.len());
+        for (cache, rw) in self.ctm_caches.iter_mut().zip(&w.regions) {
+            cache.sync_from_weights(rw)?;
         }
         self.snapshot_gen = w.generation();
         Ok(())
@@ -208,6 +224,11 @@ impl<'a> FreshCache<'a> {
         self.cache.outer_exit_gate.as_ref()
     }
     pub fn extra_heads(&self) -> &'a [LinearResident] { &self.cache.extra_heads }
+    /// Per-region inner CTM caches in the same order as
+    /// `weights.regions`. Used by `RegionalBrain::forward_cached_resident`
+    /// to dispatch each region's `ctm_forward_resident` against its own
+    /// resident weight buffers.
+    pub fn ctm_caches(&self) -> &'a [CtmResidentCache] { &self.cache.ctm_caches }
 }
 
 #[cfg(test)]
