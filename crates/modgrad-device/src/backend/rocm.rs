@@ -16,7 +16,7 @@
 
 use super::{Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, Op};
 #[cfg(feature = "rocm")]
-use super::{DeviceBuffer, QuantKind};
+use super::{ActivationMode, BinaryOpKind, DeviceBuffer, QuantKind};
 #[cfg(not(feature = "rocm"))]
 use super::HostBuffer;
 
@@ -86,6 +86,236 @@ pub mod ffi {
             c: *mut f32,
             ldc: c_int,
         ) -> hipblasStatus_t;
+    }
+
+    // ─── MIOpen ────────────────────────────────────────────────
+    //
+    // Bound directly per /opt/rocm/include/miopen/miopen.h. The handle
+    // and descriptor types are all `MIOPEN_DECLARE_OBJECT`-style
+    // pointers to opaque structs — i.e. `*mut c_void` from FFI's
+    // perspective. Every function returns `miopenStatus_t` (an int);
+    // `0` = `miopenStatusSuccess`. The signatures below mirror the
+    // header literally — DO NOT reorder or retype arguments without
+    // re-reading the header, MIOpen is unforgiving about ABI.
+    //
+    // Backward functions are declared but not invoked yet — they're
+    // here so the FFI block ships complete and limit #1 (backward
+    // through resident) can wire them without another FFI edit.
+
+    pub type miopenHandle_t = *mut c_void;
+    pub type miopenTensorDescriptor_t = *mut c_void;
+    pub type miopenActivationDescriptor_t = *mut c_void;
+    pub type miopenStatus_t = c_int;
+
+    /// `miopenStatusSuccess` — the only success code from MIOpen.
+    pub const MIOPEN_STATUS_SUCCESS: miopenStatus_t = 0;
+
+    /// `miopenDataType_t::miopenFloat`.
+    pub const MIOPEN_DATA_FLOAT: c_int = 1;
+
+    /// `miopenSoftmaxAlgorithm_t::MIOPEN_SOFTMAX_ACCURATE`.
+    /// We hard-pick ACCURATE so the kernel subtracts the row max before
+    /// exp — matches the CPU reference numerically.
+    pub const MIOPEN_SOFTMAX_ACCURATE: c_int = 1;
+    /// `miopenSoftmaxAlgorithm_t::MIOPEN_SOFTMAX_LOG`.
+    pub const MIOPEN_SOFTMAX_LOG: c_int = 2;
+
+    /// `miopenSoftmaxMode_t::MIOPEN_SOFTMAX_MODE_INSTANCE`.
+    /// Per-image normalisation (one row of the [n, c, 1, 1] tensor at a
+    /// time) which is what we want for row-wise softmax.
+    pub const MIOPEN_SOFTMAX_MODE_INSTANCE: c_int = 0;
+
+    /// `miopenActivationMode_t` — only the modes we expose.
+    pub const MIOPEN_ACTIVATION_LOGISTIC: c_int = 1;
+    pub const MIOPEN_ACTIVATION_TANH: c_int = 2;
+    pub const MIOPEN_ACTIVATION_RELU: c_int = 3;
+
+    /// `miopenTensorOp_t` — element-wise tensor ops.
+    pub const MIOPEN_OP_TENSOR_ADD: c_int = 0;
+    pub const MIOPEN_OP_TENSOR_MUL: c_int = 1;
+    pub const MIOPEN_OP_TENSOR_MIN: c_int = 2;
+    pub const MIOPEN_OP_TENSOR_MAX: c_int = 3;
+
+    /// `miopenNormMode_t::MIOPEN_WEIGHT_BIAS` — affine LayerNorm with
+    /// learnable weight and bias. Matches PyTorch
+    /// `nn.LayerNorm(elementwise_affine=True)`. The `MIOPEN_BETA_API`
+    /// header guards this enum, but the symbol is always exported by
+    /// libMIOpen.so on this hardware (verified by `nm -D`).
+    pub const MIOPEN_NORM_WEIGHT_BIAS: c_int = 1;
+
+    #[link(name = "MIOpen")]
+    unsafe extern "C" {
+        // Handle lifecycle. Probed working in examples/miopen_probe.rs
+        // (commit 3e46684).
+        pub fn miopenCreate(handle: *mut miopenHandle_t) -> miopenStatus_t;
+        pub fn miopenDestroy(handle: miopenHandle_t) -> miopenStatus_t;
+
+        // Tensor descriptor lifecycle.
+        pub fn miopenCreateTensorDescriptor(
+            tensorDesc: *mut miopenTensorDescriptor_t,
+        ) -> miopenStatus_t;
+        pub fn miopenDestroyTensorDescriptor(
+            tensorDesc: miopenTensorDescriptor_t,
+        ) -> miopenStatus_t;
+        pub fn miopenSet4dTensorDescriptor(
+            tensorDesc: miopenTensorDescriptor_t,
+            dataType: c_int,
+            n: c_int,
+            c: c_int,
+            h: c_int,
+            w: c_int,
+        ) -> miopenStatus_t;
+
+        // Activation descriptor + forward/backward.
+        pub fn miopenCreateActivationDescriptor(
+            activDesc: *mut miopenActivationDescriptor_t,
+        ) -> miopenStatus_t;
+        pub fn miopenDestroyActivationDescriptor(
+            activDesc: miopenActivationDescriptor_t,
+        ) -> miopenStatus_t;
+        pub fn miopenSetActivationDescriptor(
+            activDesc: miopenActivationDescriptor_t,
+            mode: c_int,
+            activAlpha: f64,
+            activBeta: f64,
+            activGamma: f64,
+        ) -> miopenStatus_t;
+        pub fn miopenActivationForward(
+            handle: miopenHandle_t,
+            activDesc: miopenActivationDescriptor_t,
+            alpha: *const c_void,
+            xDesc: miopenTensorDescriptor_t,
+            x: *const c_void,
+            beta: *const c_void,
+            yDesc: miopenTensorDescriptor_t,
+            y: *mut c_void,
+        ) -> miopenStatus_t;
+        #[allow(dead_code)]
+        pub fn miopenActivationBackward(
+            handle: miopenHandle_t,
+            activDesc: miopenActivationDescriptor_t,
+            alpha: *const c_void,
+            yDesc: miopenTensorDescriptor_t,
+            y: *const c_void,
+            dyDesc: miopenTensorDescriptor_t,
+            dy: *const c_void,
+            xDesc: miopenTensorDescriptor_t,
+            x: *const c_void,
+            beta: *const c_void,
+            dxDesc: miopenTensorDescriptor_t,
+            dx: *mut c_void,
+        ) -> miopenStatus_t;
+
+        // Softmax V2.
+        pub fn miopenSoftmaxForward_V2(
+            handle: miopenHandle_t,
+            alpha: *const c_void,
+            xDesc: miopenTensorDescriptor_t,
+            x: *const c_void,
+            beta: *const c_void,
+            yDesc: miopenTensorDescriptor_t,
+            y: *mut c_void,
+            algorithm: c_int,
+            mode: c_int,
+        ) -> miopenStatus_t;
+        #[allow(dead_code)]
+        pub fn miopenSoftmaxBackward_V2(
+            handle: miopenHandle_t,
+            alpha: *const c_void,
+            yDesc: miopenTensorDescriptor_t,
+            y: *const c_void,
+            dyDesc: miopenTensorDescriptor_t,
+            dy: *const c_void,
+            beta: *const c_void,
+            dxDesc: miopenTensorDescriptor_t,
+            dx: *mut c_void,
+            algorithm: c_int,
+            mode: c_int,
+        ) -> miopenStatus_t;
+
+        // LayerNorm (BETA_API in the header but symbols are exported).
+        // The signature uses `float epsilon` (not f64) and
+        // `int32_t normalized_dim` — bound here as f32 / c_int.
+        pub fn miopenLayerNormForward(
+            handle: miopenHandle_t,
+            mode: c_int,
+            xDesc: miopenTensorDescriptor_t,
+            x: *const c_void,
+            weightDesc: miopenTensorDescriptor_t,
+            weight: *const c_void,
+            biasDesc: miopenTensorDescriptor_t,
+            bias: *const c_void,
+            epsilon: f32,
+            normalized_dim: c_int,
+            yDesc: miopenTensorDescriptor_t,
+            y: *mut c_void,
+            meanDesc: miopenTensorDescriptor_t,
+            mean: *mut c_void,
+            rstdDesc: miopenTensorDescriptor_t,
+            rstd: *mut c_void,
+        ) -> miopenStatus_t;
+        #[allow(dead_code)]
+        pub fn miopenLayerNormBackward(
+            handle: miopenHandle_t,
+            mode: c_int,
+            workspace: *mut c_void,
+            workspaceSizeInBytes: usize,
+            dyDesc: miopenTensorDescriptor_t,
+            dy: *const c_void,
+            xDesc: miopenTensorDescriptor_t,
+            x: *const c_void,
+            weightDesc: miopenTensorDescriptor_t,
+            weight: *const c_void,
+            meanDesc: miopenTensorDescriptor_t,
+            mean: *const c_void,
+            rstdDesc: miopenTensorDescriptor_t,
+            rstd: *const c_void,
+            normalized_dim: c_int,
+            dxDesc: miopenTensorDescriptor_t,
+            dx: *mut c_void,
+            dwDesc: miopenTensorDescriptor_t,
+            dw: *mut c_void,
+            dbDesc: miopenTensorDescriptor_t,
+            db: *mut c_void,
+        ) -> miopenStatus_t;
+
+        // GLU (BETA_API in the header but symbols are exported).
+        // `dim` is the split dimension — for the `n_rows × 2*half`
+        // tensors we wire here, that's the last (W) axis = 3.
+        pub fn miopenGLUForward(
+            handle: miopenHandle_t,
+            inputDesc: miopenTensorDescriptor_t,
+            input: *const c_void,
+            outputDesc: miopenTensorDescriptor_t,
+            output: *mut c_void,
+            dim: u32,
+        ) -> miopenStatus_t;
+        #[allow(dead_code)]
+        pub fn miopenGLUBackward(
+            handle: miopenHandle_t,
+            inputDesc: miopenTensorDescriptor_t,
+            input: *const c_void,
+            outputGradDesc: miopenTensorDescriptor_t,
+            outputGrad: *const c_void,
+            inputGradDesc: miopenTensorDescriptor_t,
+            inputGrad: *mut c_void,
+            dim: u32,
+        ) -> miopenStatus_t;
+
+        // OpTensor (binary elementwise).
+        pub fn miopenOpTensor(
+            handle: miopenHandle_t,
+            tensorOp: c_int,
+            alpha1: *const c_void,
+            aDesc: miopenTensorDescriptor_t,
+            a: *const c_void,
+            alpha2: *const c_void,
+            bDesc: miopenTensorDescriptor_t,
+            b: *const c_void,
+            beta: *const c_void,
+            cDesc: miopenTensorDescriptor_t,
+            c: *mut c_void,
+        ) -> miopenStatus_t;
     }
 
     /// Convert a hipError_t into a human-readable String.
@@ -376,6 +606,163 @@ impl Drop for HipBatch {
     }
 }
 
+/// MIOpen context — RAII handle plus lazily-cached descriptors.
+///
+/// Mirrors the hipBLAS-handle pattern on `RocmBackend`: one process-wide
+/// instance, owned by `RocmBackend`, dropped via `Drop`. MIOpen handles
+/// are **not** thread-safe (same as hipBLAS), so the inner pointer
+/// lives behind `Mutex`. Tensor descriptors are cached per
+/// `(n, c, h, w)` shape so we don't burn a `miopenCreateTensorDescriptor`
+/// + `miopenSet4d` per dispatch — those calls are cheap individually
+/// but allocate a small heap each time, which adds up across a
+/// training loop.
+///
+/// The activation descriptor is per-mode (LOGISTIC/TANH/RELU); the
+/// `Silu` activation reuses the LOGISTIC descriptor and then issues a
+/// follow-up `miopenOpTensor` MUL — see [`ActivationMode::Silu`].
+///
+/// Dropping the context calls `miopenDestroy`; per the MIOpen docs,
+/// destroying the handle implicitly invalidates the descriptors it
+/// holds, but we explicitly destroy each cached descriptor first so
+/// the order matches the create-then-destroy contract literally.
+#[cfg(feature = "rocm")]
+pub(crate) struct MiopenContext {
+    /// MIOpen handle. Initialised once via `miopenCreate`. Wrapped
+    /// in `Mutex` because the handle is not safe for concurrent
+    /// dispatches per the MIOpen docs (and we serialise hipBLAS the
+    /// same way for the same reason).
+    handle: std::sync::Mutex<ffi::miopenHandle_t>,
+    /// Cached 4D tensor descriptors keyed by `(n, c, h, w)`. Hit rate
+    /// is high in steady-state training because most layers use the
+    /// same shape every step. Lock-then-lookup-then-clone-pointer; the
+    /// pointer remains valid because dropping the context destroys
+    /// every entry before destroying the handle.
+    tensor_descs:
+        std::sync::Mutex<std::collections::HashMap<(i32, i32, i32, i32), ffi::miopenTensorDescriptor_t>>,
+    /// Cached activation descriptors keyed by mode. Allocated on first
+    /// use of each mode, never invalidated.
+    activation_descs:
+        std::sync::Mutex<std::collections::HashMap<i32, ffi::miopenActivationDescriptor_t>>,
+}
+
+#[cfg(feature = "rocm")]
+impl MiopenContext {
+    /// Create a fresh MIOpen handle. Returns `None` if `miopenCreate`
+    /// fails — the caller (`RocmBackend::try_new`) treats that as "no
+    /// MIOpen support" and degrades gracefully (the resident-MIOpen ops
+    /// will fall through to whichever backend is next in the registry,
+    /// or surface `Unsupported` if none is).
+    fn try_new() -> Option<Self> {
+        let mut handle: ffi::miopenHandle_t = std::ptr::null_mut();
+        let status = unsafe { ffi::miopenCreate(&mut handle) };
+        if status != ffi::MIOPEN_STATUS_SUCCESS || handle.is_null() {
+            return None;
+        }
+        Some(Self {
+            handle: std::sync::Mutex::new(handle),
+            tensor_descs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            activation_descs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Get-or-create a 4D tensor descriptor for the given NCHW shape.
+    /// Returns the raw descriptor pointer, valid for the lifetime of
+    /// the `MiopenContext`. Caller must NOT call
+    /// `miopenDestroyTensorDescriptor` on it — the context owns it.
+    fn tensor_4d(
+        &self, n: i32, c: i32, h: i32, w: i32,
+    ) -> Result<ffi::miopenTensorDescriptor_t, BackendError> {
+        let key = (n, c, h, w);
+        let mut map = self.tensor_descs.lock()
+            .map_err(|_| BackendError::Runtime("miopen: tensor_descs mutex poisoned".into()))?;
+        if let Some(desc) = map.get(&key) {
+            return Ok(*desc);
+        }
+        let mut desc: ffi::miopenTensorDescriptor_t = std::ptr::null_mut();
+        let st = unsafe { ffi::miopenCreateTensorDescriptor(&mut desc) };
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenCreateTensorDescriptor: status {st}"
+            )));
+        }
+        let st = unsafe { ffi::miopenSet4dTensorDescriptor(desc, ffi::MIOPEN_DATA_FLOAT, n, c, h, w) };
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            unsafe { ffi::miopenDestroyTensorDescriptor(desc); }
+            return Err(BackendError::Runtime(format!(
+                "miopenSet4dTensorDescriptor({n},{c},{h},{w}): status {st}"
+            )));
+        }
+        map.insert(key, desc);
+        Ok(desc)
+    }
+
+    /// Get-or-create an activation descriptor for the given mode.
+    /// Alpha/beta/gamma are 0/0/0 for LOGISTIC, RELU; (1,1,1) for TANH
+    /// (so the formula reduces to plain `tanh(x)`). Mode is the raw
+    /// `miopenActivationMode_t` int (LOGISTIC=1, TANH=2, RELU=3, ...).
+    fn activation_desc(
+        &self, mode: i32,
+    ) -> Result<ffi::miopenActivationDescriptor_t, BackendError> {
+        let mut map = self.activation_descs.lock()
+            .map_err(|_| BackendError::Runtime("miopen: activation_descs mutex poisoned".into()))?;
+        if let Some(d) = map.get(&mode) { return Ok(*d); }
+        let mut desc: ffi::miopenActivationDescriptor_t = std::ptr::null_mut();
+        let st = unsafe { ffi::miopenCreateActivationDescriptor(&mut desc) };
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenCreateActivationDescriptor: status {st}"
+            )));
+        }
+        // Alpha/beta/gamma defaults: LOGISTIC/RELU don't read them,
+        // TANH wants alpha=beta=1 for plain tanh(x). Set 1/1/1 across
+        // the board — extra params are ignored by the modes we expose.
+        let st = unsafe { ffi::miopenSetActivationDescriptor(desc, mode, 1.0, 1.0, 1.0) };
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            unsafe { ffi::miopenDestroyActivationDescriptor(desc); }
+            return Err(BackendError::Runtime(format!(
+                "miopenSetActivationDescriptor(mode={mode}): status {st}"
+            )));
+        }
+        map.insert(mode, desc);
+        Ok(desc)
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Drop for MiopenContext {
+    fn drop(&mut self) {
+        // Destroy descriptors first, then the handle. MIOpen would
+        // tolerate the reverse order on most ROCm versions but the
+        // documented contract is "destroy children before parent" —
+        // matching it keeps us out of trouble on future ROCm bumps.
+        if let Ok(mut m) = self.tensor_descs.lock() {
+            for (_, d) in m.drain() {
+                unsafe { ffi::miopenDestroyTensorDescriptor(d); }
+            }
+        }
+        if let Ok(mut m) = self.activation_descs.lock() {
+            for (_, d) in m.drain() {
+                unsafe { ffi::miopenDestroyActivationDescriptor(d); }
+            }
+        }
+        if let Ok(handle) = self.handle.lock() {
+            if !handle.is_null() {
+                unsafe { ffi::miopenDestroy(*handle); }
+            }
+        }
+    }
+}
+
+// SAFETY: same argument as `RocmBackend` — MiopenContext holds only
+// raw `*mut c_void` pointers, never mutated outside the per-field
+// `Mutex`. MIOpen's handle is not thread-safe, but the Mutex
+// serialises every access; the unsafe impls just tell Rust we've done
+// the work.
+#[cfg(feature = "rocm")]
+unsafe impl Send for MiopenContext {}
+#[cfg(feature = "rocm")]
+unsafe impl Sync for MiopenContext {}
+
 /// AMD ROCm backend. Holds a hipblas handle across ops; dropped cleanly
 /// via `Drop`.
 ///
@@ -388,6 +775,14 @@ impl Drop for HipBatch {
 #[cfg(feature = "rocm")]
 pub struct RocmBackend {
     handle: std::sync::Mutex<ffi::hipblasHandle_t>,
+    /// MIOpen context (handle + cached descriptors). `None` when
+    /// `miopenCreate` failed at probe time — the resident-MIOpen ops
+    /// fall through to whichever backend is next in the registry, and
+    /// every other dispatch path keeps working. In practice on this
+    /// hardware MIOpen is always available alongside hipBLAS, but
+    /// keeping it optional means no panic on machines that ship with
+    /// rocm-libraries minus MIOpen.
+    miopen: Option<MiopenContext>,
     /// Weight VRAM cache — mirrors the KFD `GpuQueue::weight_cache`
     /// pattern (see `kfd/dispatch_queue.rs`). Eliminates the per-dispatch
     /// `hipMalloc + hipMemcpy H2D + hipFree` triple that otherwise runs
@@ -435,8 +830,14 @@ impl RocmBackend {
             let mut handle: ffi::hipblasHandle_t = std::ptr::null_mut();
             let status = unsafe { ffi::hipblasCreate(&mut handle) };
             if status != 0 { return None; }
+            // MIOpen is best-effort — failing to create the handle
+            // disables the resident-MIOpen ops without disabling
+            // the whole backend. On this hardware (ROCm 6.x) the
+            // probe should always succeed.
+            let miopen = MiopenContext::try_new();
             Some(Self {
                 handle: std::sync::Mutex::new(handle),
+                miopen,
                 cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
@@ -516,6 +917,15 @@ impl Backend for RocmBackend {
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 Op::MatmulTN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
+                // MIOpen-backed resident ops — supported only when
+                // the MIOpen handle was created successfully. Same
+                // "no per-call malloc/memcpy" argument as
+                // MatvecResident: small shapes are still profitable.
+                Op::LayerNormResident { .. }
+                | Op::SoftmaxResident { .. }
+                | Op::ActivationResident { .. }
+                | Op::GluResident { .. }
+                | Op::OpTensorResident { .. } => self.miopen.is_some(),
                 _ => false,
             }
         }
@@ -600,6 +1010,35 @@ impl Backend for RocmBackend {
                     }
                     Ok(())
                 },
+                Op::LayerNormResident {
+                    x_dev, weight_dev, bias_dev, y_dev,
+                    n, normalized_size, epsilon,
+                } => self.layer_norm_resident_f32(
+                    *x_dev, *weight_dev, *bias_dev, *y_dev,
+                    *n, *normalized_size, *epsilon,
+                ),
+                Op::SoftmaxResident {
+                    x_dev, y_dev, n_rows, row_len, log,
+                } => self.softmax_resident_f32(
+                    *x_dev, *y_dev, *n_rows, *row_len, *log,
+                ),
+                Op::ActivationResident {
+                    x_dev, y_dev, n, mode,
+                } => self.activation_resident_f32(
+                    *x_dev, *y_dev, *n, *mode,
+                ),
+                Op::GluResident {
+                    x_dev, y_dev, n_rows, half_size,
+                } => self.glu_resident_f32(
+                    *x_dev, *y_dev, *n_rows, *half_size,
+                ),
+                Op::OpTensorResident {
+                    a_dev, b_dev, c_dev, n,
+                    alpha1, alpha2, beta, op: kind,
+                } => self.op_tensor_resident_f32(
+                    *a_dev, *b_dev, *c_dev, *n,
+                    *alpha1, *alpha2, *beta, *kind,
+                ),
                 _ => Err(BackendError::Unsupported {
                     op: op.name(),
                     backend: "rocm",
@@ -976,6 +1415,304 @@ impl RocmBackend {
             return Err(BackendError::Runtime(format!("hipblasSgemm (TN): status {status}")));
         }
         d_c.download_f32(out)
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl RocmBackend {
+    /// Locked accessor for the MIOpen context. Resident-MIOpen
+    /// dispatchers all start by calling this; if MIOpen wasn't
+    /// available at probe time it surfaces here as a `Runtime` error
+    /// (`supports()` returns false in that case so the registry
+    /// shouldn't pick this backend, but defending against a
+    /// supports/dispatch race is cheap).
+    fn miopen(&self) -> Result<&MiopenContext, BackendError> {
+        self.miopen.as_ref().ok_or_else(|| {
+            BackendError::Runtime(
+                "rocm: MIOpen handle not available — re-probe failed at startup".into(),
+            )
+        })
+    }
+
+    /// Resident LayerNorm: `y = ((x - mean) * rstd) * weight + bias`,
+    /// row-wise over `n` rows of length `normalized_size`.
+    ///
+    /// MIOpen's `miopenLayerNormForward` always allocates per-row
+    /// `mean` and `rstd` outputs. We can't elide them — the API
+    /// requires both pointers to be non-null — so we burn two
+    /// `hipMalloc`s per dispatch for them. Fixing that needs a
+    /// resident scratch arena; today it's `hipMalloc + hipFree`,
+    /// which the dispatcher already does for transient activations
+    /// in `matmul_nn_f32`. Cost on this hardware is sub-microsecond
+    /// per pair.
+    ///
+    /// The MIOpen layout we use is `[n, c=normalized_size, h=1, w=1]`
+    /// with `normalized_dim = 1` (normalise over the C axis). That
+    /// matches the row-wise affine LN every Phase-5b consumer
+    /// expects.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_resident_f32(
+        &self,
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        bias_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        normalized_size: usize,
+        epsilon: f32,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n, "n_rows")?;
+        let c_i32 = as_i32(normalized_size, "normalized_size")?;
+
+        // x and y have shape [n, c, 1, 1]; weight and bias have shape
+        // [1, c, 1, 1] (broadcast across the batch axis); mean/rstd
+        // have shape [n, 1, 1, 1] (one scalar per row).
+        let x_desc = ctx.tensor_4d(n_i32, c_i32, 1, 1)?;
+        let y_desc = x_desc;
+        let wb_desc = ctx.tensor_4d(1, c_i32, 1, 1)?;
+        let stat_desc = ctx.tensor_4d(n_i32, 1, 1, 1)?;
+
+        // mean and rstd outputs — allocated and dropped per dispatch.
+        // They're discarded for inference paths but the MIOpen API
+        // requires non-null pointers.
+        let mean_buf = HipBuffer::alloc(n * 4)?;
+        let rstd_buf = HipBuffer::alloc(n * 4)?;
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenLayerNormForward(
+                *handle,
+                ffi::MIOPEN_NORM_WEIGHT_BIAS,
+                x_desc, x_dev as *const std::os::raw::c_void,
+                wb_desc, weight_dev as *const std::os::raw::c_void,
+                wb_desc, bias_dev as *const std::os::raw::c_void,
+                epsilon,
+                1, // normalize over C axis
+                y_desc, y_dev as *mut std::os::raw::c_void,
+                stat_desc, mean_buf.device_ptr(),
+                stat_desc, rstd_buf.device_ptr(),
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenLayerNormForward(n={n}, c={normalized_size}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident row-wise softmax (or log-softmax) via
+    /// `miopenSoftmaxForward_V2` with the ACCURATE/LOG algorithm.
+    ///
+    /// We model rows as the C (channel) axis of an [n_rows, row_len, 1, 1]
+    /// tensor and pick `MIOPEN_SOFTMAX_MODE_INSTANCE`. With H=W=1,
+    /// INSTANCE = "compute per N across C" — exactly row-wise softmax.
+    /// `MIOPEN_SOFTMAX_MODE_CHANNEL` would compute per (N,H,W) across C
+    /// which is the same when H=W=1 but the semantics are clearer this
+    /// way.
+    fn softmax_resident_f32(
+        &self,
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_rows: usize,
+        row_len: usize,
+        log: bool,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n_rows, "n_rows")?;
+        let c_i32 = as_i32(row_len, "row_len")?;
+
+        let desc = ctx.tensor_4d(n_i32, c_i32, 1, 1)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let algo = if log { ffi::MIOPEN_SOFTMAX_LOG } else { ffi::MIOPEN_SOFTMAX_ACCURATE };
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenSoftmaxForward_V2(
+                *handle,
+                &alpha as *const f32 as *const std::os::raw::c_void,
+                desc, x_dev as *const std::os::raw::c_void,
+                &beta as *const f32 as *const std::os::raw::c_void,
+                desc, y_dev as *mut std::os::raw::c_void,
+                algo,
+                ffi::MIOPEN_SOFTMAX_MODE_INSTANCE,
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenSoftmaxForward_V2(n={n_rows}, c={row_len}, log={log}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident element-wise activation. `Logistic` / `Tanh` / `Relu`
+    /// each map to a single `miopenActivationForward` call. `Silu` is
+    /// `Logistic(x) -> y` followed by `OpTensor(MUL, x, y) -> y` —
+    /// MIOpen has no native SiLU/Swish kernel.
+    fn activation_resident_f32(
+        &self,
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        mode: ActivationMode,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n, "n")?;
+        // Flat 1D-into-NCHW: shape [n, 1, 1, 1] is a length-n vector.
+        let desc = ctx.tensor_4d(n_i32, 1, 1, 1)?;
+
+        // Map the public enum to the raw mode int.
+        let raw_mode = match mode {
+            ActivationMode::Logistic => ffi::MIOPEN_ACTIVATION_LOGISTIC,
+            ActivationMode::Tanh => ffi::MIOPEN_ACTIVATION_TANH,
+            ActivationMode::Relu => ffi::MIOPEN_ACTIVATION_RELU,
+            ActivationMode::Silu => ffi::MIOPEN_ACTIVATION_LOGISTIC,
+        };
+        let activ_desc = ctx.activation_desc(raw_mode)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        // Step 1: y = sigmoid(x) [or tanh/relu, pass-through for Silu].
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenActivationForward(
+                *handle, activ_desc,
+                &alpha as *const f32 as *const std::os::raw::c_void,
+                desc, x_dev as *const std::os::raw::c_void,
+                &beta as *const f32 as *const std::os::raw::c_void,
+                desc, y_dev as *mut std::os::raw::c_void,
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenActivationForward(n={n}, mode={raw_mode}): status {st}"
+            )));
+        }
+
+        // Step 2 (Silu only): y = x * y. OpTensor(MUL) reads x and y,
+        // writes back to y. alpha1 = alpha2 = 1.0, beta = 0.0 ⇒
+        // c = (1.0 * a) * (1.0 * b) + 0.0 * c.
+        if matches!(mode, ActivationMode::Silu) {
+            self.op_tensor_resident_f32(
+                x_dev, y_dev, y_dev, n,
+                1.0, 1.0, 0.0, BinaryOpKind::Mul,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Resident GLU forward.
+    ///
+    /// MIOpen's GLU solver only supports `dim == 0` splits — see
+    /// `src/solver/glu/forward_glu.cpp` in the rocm-libraries source.
+    /// We model the input as a 4D `[2, n_rows * half_size, 1, 1]`
+    /// tensor and split on dim 0. That places the value half in the
+    /// first `n_rows * half_size` floats and the gate half in the
+    /// next `n_rows * half_size`, matching the MIOpen kernel's
+    /// `inputFirstHalf = input; inputSecondHalf = input + N`
+    /// arithmetic exactly. Output is `[1, n_rows * half_size, 1, 1]`.
+    ///
+    /// Callers whose input is laid out per-row (value then gate
+    /// alternating per row) must scatter into the two planes before
+    /// calling this op, or call once per row with `n_rows = 1`.
+    fn glu_resident_f32(
+        &self,
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_rows: usize,
+        half_size: usize,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let total = n_rows.checked_mul(half_size).ok_or_else(|| {
+            BackendError::Runtime(format!(
+                "glu_resident: n_rows*half_size overflow ({n_rows} * {half_size})"
+            ))
+        })?;
+        let total_i32 = as_i32(total, "n_rows*half_size")?;
+
+        // Input has split-dim 0 of size 2; output has size 1 on the
+        // same axis. Other axes match.
+        let in_desc = ctx.tensor_4d(2, total_i32, 1, 1)?;
+        let out_desc = ctx.tensor_4d(1, total_i32, 1, 1)?;
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenGLUForward(
+                *handle,
+                in_desc, x_dev as *const std::os::raw::c_void,
+                out_desc, y_dev as *mut std::os::raw::c_void,
+                0, // split on N axis (dim 0)
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenGLUForward(n={n_rows}, half={half_size}): status {st}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident binary element-wise op:
+    /// `c = op(alpha1 * a, alpha2 * b) + beta * c`.
+    ///
+    /// All three operands share the same shape — laid out as a flat
+    /// `[n, 1, 1, 1]` tensor. MIOpen's OpTensor handles strided/broadcast
+    /// shapes too, but we only expose the dense 1D variant from this
+    /// op.
+    #[allow(clippy::too_many_arguments)]
+    fn op_tensor_resident_f32(
+        &self,
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        n: usize,
+        alpha1: f32,
+        alpha2: f32,
+        beta: f32,
+        kind: BinaryOpKind,
+    ) -> Result<(), BackendError> {
+        let ctx = self.miopen()?;
+        let n_i32 = as_i32(n, "n")?;
+        let desc = ctx.tensor_4d(n_i32, 1, 1, 1)?;
+
+        let raw_op = match kind {
+            BinaryOpKind::Add => ffi::MIOPEN_OP_TENSOR_ADD,
+            BinaryOpKind::Mul => ffi::MIOPEN_OP_TENSOR_MUL,
+            BinaryOpKind::Min => ffi::MIOPEN_OP_TENSOR_MIN,
+            BinaryOpKind::Max => ffi::MIOPEN_OP_TENSOR_MAX,
+        };
+
+        let handle = ctx.handle.lock()
+            .map_err(|_| BackendError::Runtime("miopen: handle mutex poisoned".into()))?;
+        let st = unsafe {
+            ffi::miopenOpTensor(
+                *handle, raw_op,
+                &alpha1 as *const f32 as *const std::os::raw::c_void,
+                desc, a_dev as *const std::os::raw::c_void,
+                &alpha2 as *const f32 as *const std::os::raw::c_void,
+                desc, b_dev as *const std::os::raw::c_void,
+                &beta as *const f32 as *const std::os::raw::c_void,
+                desc, c_dev as *mut std::os::raw::c_void,
+            )
+        };
+        drop(handle);
+        if st != ffi::MIOPEN_STATUS_SUCCESS {
+            return Err(BackendError::Runtime(format!(
+                "miopenOpTensor(n={n}, op={raw_op}): status {st}"
+            )));
+        }
+        Ok(())
     }
 }
 

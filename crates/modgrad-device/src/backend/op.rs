@@ -28,6 +28,56 @@ pub enum QuantKind {
     Q4K,
 }
 
+/// Element-wise activation mode for [`Op::ActivationResident`].
+///
+/// Each variant maps to a specific MIOpen `miopenActivationMode_t` plus
+/// any required compose step. The composite `Silu` variant is
+/// implemented as `Logistic` followed by `OpTensor(MUL)` against the
+/// original input — MIOpen has no native SiLU/Swish kernel, but the
+/// two-call path stays fully device-resident.
+///
+/// Only the modes we actually consume from the Phase 5b residency chain
+/// are listed. Adding a new mode is mechanical: extend the enum, map it
+/// in the ROCm dispatch, document any compose semantics here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMode {
+    /// Sigmoid: `y = 1 / (1 + e^-x)`. Maps to `miopenActivationLOGISTIC`.
+    Logistic,
+    /// Hyperbolic tangent: `y = tanh(x)`. MIOpen's TANH applies
+    /// `beta * tanh(alpha * x)`; alpha=beta=1 is the standard form
+    /// callers expect. Maps to `miopenActivationTANH`.
+    Tanh,
+    /// Rectified linear unit: `y = max(0, x)`.
+    /// Maps to `miopenActivationRELU`.
+    Relu,
+    /// SiLU / Swish: `y = x * sigmoid(x)`. Composed as
+    /// `Logistic(x) -> y` followed by `OpTensor(MUL, x, y) -> y`.
+    /// Two MIOpen calls; both stay device-resident.
+    Silu,
+}
+
+/// Binary element-wise op for [`Op::OpTensorResident`].
+///
+/// Maps directly to `miopenTensorOp_t`. The MIOpen call computes
+/// `c = op(alpha1 * a, alpha2 * b) + beta * c`. Only the four ops the
+/// Phase 5b chain consumes are exposed; extending is mechanical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOpKind {
+    /// Add: `c = alpha1 * a + alpha2 * b + beta * c`.
+    /// Maps to `miopenTensorOpAdd`.
+    Add,
+    /// Multiply: `c = (alpha1 * a) * (alpha2 * b) + beta * c`.
+    /// Used in SiLU compose (and any other gate * value pattern).
+    /// Maps to `miopenTensorOpMul`.
+    Mul,
+    /// Min: `c = min(alpha1 * a, alpha2 * b) + beta * c`.
+    /// Maps to `miopenTensorOpMin`.
+    Min,
+    /// Max: `c = max(alpha1 * a, alpha2 * b) + beta * c`.
+    /// Maps to `miopenTensorOpMax`.
+    Max,
+}
+
 /// Arguments to [`Op::AdamW`]. Pulled out of the enum variant so callers
 /// get labeled-field ergonomics and future additions (new moment, new
 /// hyperparameter) don't break every match arm — struct fields are
@@ -155,6 +205,110 @@ pub enum Op<'a> {
         out_dev: *mut f32,
         out_dim: usize,
         in_dim: usize,
+    },
+
+    /// **Device-resident** LayerNorm forward — affine variant matching
+    /// PyTorch `nn.LayerNorm(elementwise_affine=True)`.
+    ///
+    /// `y[r, c] = ((x[r, c] - mean[r]) / sqrt(var[r] + epsilon)) * weight[c] + bias[c]`
+    ///
+    /// Layout: `x` is `[n, normalized_size]` row-major; `weight` and
+    /// `bias` are length-`normalized_size`; `y` matches `x`.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. Wired only on backends
+    /// that consume hip-device pointers (ROCm via MIOpen). Other
+    /// backends return `Unsupported`.
+    LayerNormResident {
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        bias_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        normalized_size: usize,
+        epsilon: f32,
+    },
+
+    /// **Device-resident** softmax forward, row-wise.
+    ///
+    /// For each of `n_rows` rows of length `row_len`, compute either
+    /// `softmax` (`log == false`) or `log_softmax` (`log == true`).
+    /// MIOpen's accurate (max-subtracting) algorithm is selected so
+    /// numerical behaviour matches the CPU reference.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    SoftmaxResident {
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_rows: usize,
+        row_len: usize,
+        log: bool,
+    },
+
+    /// **Device-resident** element-wise activation forward.
+    ///
+    /// Applies `mode` element-wise across `n` floats. `Silu` decomposes
+    /// into `Logistic` followed by `OpTensor(MUL)` against the original
+    /// input — see [`ActivationMode::Silu`] for the contract. All other
+    /// modes map to a single `miopenActivationForward` call.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    ActivationResident {
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n: usize,
+        mode: ActivationMode,
+    },
+
+    /// **Device-resident** GLU forward.
+    ///
+    /// Input layout — set by MIOpen's GLU kernel: a contiguous
+    /// `[2, n_rows, half_size]` block where the first
+    /// `n_rows * half_size` floats are the value half and the next
+    /// `n_rows * half_size` floats are the gate half. Output is a
+    /// contiguous `[n_rows, half_size]` block:
+    /// `y[r, i] = value[r, i] * sigmoid(gate[r, i])`.
+    ///
+    /// **NOT** the per-row interleaved layout
+    /// (`[value_0..N, gate_0..N]` repeated per row). MIOpen's GLU
+    /// solver only supports `dim = 0` splits today (per
+    /// `src/solver/glu/forward_glu.cpp`), so the split MUST be along
+    /// the leading axis. Callers using per-row interleaving must
+    /// transpose the input before issuing this op (or scatter into
+    /// the value/gate planes during the producing matvec).
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    GluResident {
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_rows: usize,
+        half_size: usize,
+    },
+
+    /// **Device-resident** binary element-wise op.
+    ///
+    /// `c = op(alpha1 * a, alpha2 * b) + beta * c`, applied element-wise
+    /// over `n` floats with all three buffers shaped identically.
+    ///
+    /// Maps to `miopenOpTensor`. The compose step inside the SiLU
+    /// activation uses this op variant under the hood, but it's
+    /// independently useful for any gate * value pattern that already
+    /// has both operands resident.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch.
+    OpTensorResident {
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        n: usize,
+        alpha1: f32,
+        alpha2: f32,
+        beta: f32,
+        op: BinaryOpKind,
     },
 
     /// Transposed matvec (typical gradient-of-input for a Linear layer):
@@ -422,6 +576,11 @@ impl<'a> Op<'a> {
             Op::MatmulTN { .. } => "matmul_tn",
             Op::Matvec { .. } => "matvec",
             Op::MatvecResident { .. } => "matvec_resident",
+            Op::LayerNormResident { .. } => "layer_norm_resident",
+            Op::SoftmaxResident { .. } => "softmax_resident",
+            Op::ActivationResident { .. } => "activation_resident",
+            Op::GluResident { .. } => "glu_resident",
+            Op::OpTensorResident { .. } => "op_tensor_resident",
             Op::MatvecT { .. } => "matvec_t",
             Op::OuterProductAcc { .. } => "outer_product_acc",
             Op::LayerNormFwd { .. } => "layer_norm_fwd",

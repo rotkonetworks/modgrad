@@ -45,12 +45,18 @@ impl Backend for CpuBackend {
         // a specific weight layout that isn't trivially unpacked.
         // Future: port the GGUF Q4_K decode from modgrad-io.
         //
-        // CPU also declines `MatvecResident` — the operands are
-        // hip device pointers and CPU can't dereference them. Caller
-        // must downgrade to `Matvec` (host slices) for CPU dispatch.
+        // CPU also declines `MatvecResident` and the other Resident
+        // variants — the operands are hip device pointers and CPU can't
+        // dereference them. Callers must downgrade to the host-slice
+        // variants for CPU dispatch.
         match op {
             Op::Matvec { quant: QuantKind::Q4K, .. } => false,
             Op::MatvecResident { .. } => false,
+            Op::LayerNormResident { .. } => false,
+            Op::SoftmaxResident { .. } => false,
+            Op::ActivationResident { .. } => false,
+            Op::GluResident { .. } => false,
+            Op::OpTensorResident { .. } => false,
             _ => true,
         }
     }
@@ -82,6 +88,26 @@ impl Backend for CpuBackend {
             }),
             Op::MatvecResident { .. } => Err(BackendError::Unsupported {
                 op: "matvec_resident",
+                backend: "cpu",
+            }),
+            Op::LayerNormResident { .. } => Err(BackendError::Unsupported {
+                op: "layer_norm_resident",
+                backend: "cpu",
+            }),
+            Op::SoftmaxResident { .. } => Err(BackendError::Unsupported {
+                op: "softmax_resident",
+                backend: "cpu",
+            }),
+            Op::ActivationResident { .. } => Err(BackendError::Unsupported {
+                op: "activation_resident",
+                backend: "cpu",
+            }),
+            Op::GluResident { .. } => Err(BackendError::Unsupported {
+                op: "glu_resident",
+                backend: "cpu",
+            }),
+            Op::OpTensorResident { .. } => Err(BackendError::Unsupported {
+                op: "op_tensor_resident",
                 backend: "cpu",
             }),
             Op::MatvecT { d_out, weight, d_input, out_dim, in_dim } => {

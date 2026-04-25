@@ -39,7 +39,7 @@
 //! [`AdamWArgs`]: super::AdamWArgs
 //! [`SyncBackwardScatterArgs`]: super::SyncBackwardScatterArgs
 
-use super::op::{AdamWArgs, Op, QuantKind, SyncBackwardScatterArgs};
+use super::op::{ActivationMode, AdamWArgs, BinaryOpKind, Op, QuantKind, SyncBackwardScatterArgs};
 use super::BackendError;
 
 // ─── dense linear algebra ────────────────────────────────
@@ -128,6 +128,137 @@ pub unsafe fn matvec_resident(
         x_dev, weight_dev, bias_dev, out_dev, out_dim, in_dim,
     };
     super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident LayerNorm forward.
+/// See [`Op::LayerNormResident`](super::Op::LayerNormResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` and `y_dev` cover at least `n * normalized_size * 4` bytes.
+/// - `weight_dev` and `bias_dev` each cover `normalized_size * 4` bytes.
+/// - The pointers stay valid for the duration of this call.
+///
+/// CPU and other non-resident backends return `Unsupported`; callers
+/// must fall back to the host-slice [`layer_norm_fwd`] when only CPU
+/// dispatch is available.
+#[inline]
+pub unsafe fn layer_norm_resident(
+    x_dev: *const f32,
+    weight_dev: *const f32,
+    bias_dev: *const f32,
+    y_dev: *mut f32,
+    n: usize,
+    normalized_size: usize,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::LayerNormResident {
+        x_dev, weight_dev, bias_dev, y_dev, n, normalized_size, epsilon,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident row-wise softmax (or log-softmax).
+/// See [`Op::SoftmaxResident`](super::Op::SoftmaxResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` and `y_dev` cover at least `n_rows * row_len * 4` bytes.
+/// - `x_dev` and `y_dev` may alias (in-place softmax is permitted).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn softmax_resident(
+    x_dev: *const f32,
+    y_dev: *mut f32,
+    n_rows: usize,
+    row_len: usize,
+    log: bool,
+) -> Result<(), BackendError> {
+    let mut op = Op::SoftmaxResident { x_dev, y_dev, n_rows, row_len, log };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident element-wise activation forward.
+/// See [`Op::ActivationResident`](super::Op::ActivationResident) and
+/// [`ActivationMode`].
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` and `y_dev` cover at least `n * 4` bytes.
+/// - `x_dev` and `y_dev` may alias for non-`Silu` modes; `Silu` reads
+///   `x_dev` after writing `y_dev`, so they MUST be distinct buffers
+///   (or the alias is harmless because the read-after-write reads the
+///   original input that was just transformed in-place — the caller
+///   should not assume that's the case across MIOpen versions).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn activation_resident(
+    x_dev: *const f32,
+    y_dev: *mut f32,
+    n: usize,
+    mode: ActivationMode,
+) -> Result<(), BackendError> {
+    let mut op = Op::ActivationResident { x_dev, y_dev, n, mode };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident GLU forward.
+/// See [`Op::GluResident`](super::Op::GluResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` covers at least `n_rows * 2 * half_size * 4` bytes.
+/// - `y_dev` covers at least `n_rows * half_size * 4` bytes.
+/// - `x_dev` and `y_dev` are distinct buffers (GLU is not in-place).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn glu_resident(
+    x_dev: *const f32,
+    y_dev: *mut f32,
+    n_rows: usize,
+    half_size: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::GluResident { x_dev, y_dev, n_rows, half_size };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident binary element-wise op:
+/// `c = op(alpha1 * a, alpha2 * b) + beta * c`.
+/// See [`Op::OpTensorResident`](super::Op::OpTensorResident) and
+/// [`BinaryOpKind`].
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `a_dev`, `b_dev`, `c_dev` each cover at least `n * 4` bytes.
+/// - `c_dev` may alias `a_dev` or `b_dev` (read-modify-write is
+///   permitted by MIOpen; the dispatch is read-then-write per element).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn op_tensor_resident(
+    a_dev: *const f32,
+    b_dev: *const f32,
+    c_dev: *mut f32,
+    n: usize,
+    alpha1: f32,
+    alpha2: f32,
+    beta: f32,
+    op: BinaryOpKind,
+) -> Result<(), BackendError> {
+    let mut variant = Op::OpTensorResident {
+        a_dev, b_dev, c_dev, n, alpha1, alpha2, beta, op,
+    };
+    super::registry().dispatch(&mut variant)?;
     Ok(())
 }
 

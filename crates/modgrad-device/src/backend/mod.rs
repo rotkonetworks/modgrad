@@ -42,7 +42,7 @@ pub use vulkan::VulkanBackend;
 pub use rocm::RocmBackend;
 #[cfg(feature = "rocm")]
 pub use rocm::{HipBatch, HipBuffer};
-pub use op::{AdamWArgs, Op, QuantKind, SyncBackwardScatterArgs};
+pub use op::{ActivationMode, AdamWArgs, BinaryOpKind, Op, QuantKind, SyncBackwardScatterArgs};
 
 /// Kind of physical device a backend runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
