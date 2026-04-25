@@ -2722,6 +2722,7 @@ name = "modgrad-transformer"
 version = "0.1.0"
 dependencies = [
  "modgrad-compute",
+ "modgrad-device",
  "modgrad-traits",
  "rayon",
  "serde",

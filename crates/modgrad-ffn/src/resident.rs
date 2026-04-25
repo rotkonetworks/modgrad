@@ -55,7 +55,8 @@ use modgrad_compute::neuron::LinearResident;
 use modgrad_device::backend::{HipBatch, HipBuffer};
 use modgrad_device::backend::op::{ActivationMode, BinaryOpKind};
 use modgrad_device::backend::ops::{
-    activation_resident, layer_norm_resident, matvec_resident,
+    activation_backward_resident, activation_resident,
+    layer_norm_backward_resident, layer_norm_resident, matvec_resident,
     op_tensor_resident,
 };
 
@@ -285,6 +286,304 @@ impl FfnBlockResident {
         }
 
         Ok(())
+    }
+
+    /// Backward pass through the FFN block. Mirrors `forward_with_scratch`'s
+    /// dispatch chain in reverse.
+    ///
+    /// `dy_dev`: gradient w.r.t. output `[n_tokens × d_model]`.
+    /// `dx_dev`: receives `d/d(x)` `[n_tokens × d_model]`.
+    /// `scratch` must hold the activations populated by forward.
+    /// `bwd_scratch` is per-call gradient temporary storage.
+    /// `grads` accumulates dweight/dbias for gate/up/down + dgamma/dbeta
+    /// for the LayerNorm.
+    ///
+    /// **Single-token only** (`n_tokens == 1`) for this slice. The
+    /// matvec-per-row loop pattern in forward will need a matched
+    /// row-loop backward + outer-product accumulator for `n_tokens > 1`;
+    /// see slice 11 for the prefill backward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward(
+        &self,
+        batch: &HipBatch,
+        n_tokens: usize,
+        x_dev: &GpuVec,
+        dy_dev: &GpuVec,
+        scratch: &FfnBlockScratch,
+        bwd_scratch: &mut FfnBackwardScratch,
+        grads: &mut FfnBlockResidentGrads,
+        dx_dev: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        debug_assert_eq!(n_tokens, 1, "FfnBlockResident::backward currently only supports n_tokens=1");
+        debug_assert_eq!(x_dev.len(), self.d_model);
+        debug_assert_eq!(dy_dev.len(), self.d_model);
+        debug_assert_eq!(dx_dev.len(), self.d_model);
+
+        let _dy_buf = match dy_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let x_buf = match x_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+
+        // Stage 1: down backward — d_hidden = down.W^T · dy, dweight_down = dy ⊗ hidden.
+        // The down LinearResident has bias_dev (zero in test); LinearResident::backward
+        // writes dbias = dy regardless. We pre-allocate a hidden-sized
+        // d_hidden buffer in bwd_scratch.
+        let mut d_hidden = GpuVec::try_hip(self.hidden)?;
+        let mut hidden_view = GpuVec::try_hip(self.hidden)?;
+        // hidden_view is staged from scratch.hidden (device buffer not GpuVec).
+        // We need a GpuVec wrapping the same memory. The simplest path:
+        // D2D copy into a fresh GpuVec.
+        unsafe {
+            use std::os::raw::c_void;
+            hip_memcpy_d2d_local(
+                hip_buf_mut(&mut hidden_view).device_ptr(),
+                scratch.hidden.device_ptr() as *const c_void,
+                self.hidden * 4,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        self.down.backward(
+            batch, &hidden_view, dy_dev,
+            &mut d_hidden,
+            &mut grads.dweight_down,
+            &mut grads.dbias_down,
+        )?;
+
+        // Stage 2: SwiGLU split — d_silu = d_hidden * up_out, d_up = d_hidden * silu.
+        let n = self.hidden;
+        let d_hidden_buf = hip_buf_mut(&mut d_hidden).device_ptr() as *const f32;
+        unsafe {
+            op_tensor_resident(
+                d_hidden_buf,
+                scratch.up_out.device_ptr() as *const f32,
+                bwd_scratch.d_silu.device_ptr() as *mut f32,
+                n, 1.0, 1.0, 0.0, BinaryOpKind::Mul,
+            )?;
+        }
+        batch.note_dispatch()?;
+        unsafe {
+            op_tensor_resident(
+                d_hidden_buf,
+                scratch.silu.device_ptr() as *const f32,
+                bwd_scratch.d_up.device_ptr() as *mut f32,
+                n, 1.0, 1.0, 0.0, BinaryOpKind::Mul,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 3: SiLU backward.
+        // y = silu(gate); we have x = gate_out (forward input) and y = silu.
+        unsafe {
+            activation_backward_resident(
+                scratch.gate_out.device_ptr() as *const f32,
+                scratch.silu.device_ptr() as *const f32,
+                bwd_scratch.d_silu.device_ptr() as *const f32,
+                bwd_scratch.d_gate.device_ptr() as *mut f32,
+                n, ActivationMode::Silu,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 4 + 5: up + gate backward.
+        // forward: gate_out = gate.W · normed + gate.b, up_out = up.W · normed + up.b
+        // We need normed (forward input to gate/up). Stage from scratch.normed.
+        let mut normed_view = GpuVec::try_hip(self.d_model)?;
+        unsafe {
+            use std::os::raw::c_void;
+            hip_memcpy_d2d_local(
+                hip_buf_mut(&mut normed_view).device_ptr(),
+                scratch.normed.device_ptr() as *const c_void,
+                self.d_model * 4,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        let mut d_up_view = GpuVec::try_hip(self.hidden)?;
+        let mut d_gate_view = GpuVec::try_hip(self.hidden)?;
+        unsafe {
+            use std::os::raw::c_void;
+            hip_memcpy_d2d_local(
+                hip_buf_mut(&mut d_up_view).device_ptr(),
+                bwd_scratch.d_up.device_ptr() as *const c_void,
+                self.hidden * 4,
+            )?;
+            hip_memcpy_d2d_local(
+                hip_buf_mut(&mut d_gate_view).device_ptr(),
+                bwd_scratch.d_gate.device_ptr() as *const c_void,
+                self.hidden * 4,
+            )?;
+        }
+        batch.note_dispatch()?;
+        batch.note_dispatch()?;
+
+        let mut dx_from_up = GpuVec::try_hip(self.d_model)?;
+        let mut dx_from_gate = GpuVec::try_hip(self.d_model)?;
+        self.up.backward(
+            batch, &normed_view, &d_up_view,
+            &mut dx_from_up,
+            &mut grads.dweight_up,
+            &mut grads.dbias_up,
+        )?;
+        self.gate.backward(
+            batch, &normed_view, &d_gate_view,
+            &mut dx_from_gate,
+            &mut grads.dweight_gate,
+            &mut grads.dbias_gate,
+        )?;
+
+        // d_normed = dx_from_up + dx_from_gate
+        let mut d_normed = GpuVec::try_hip(self.d_model)?;
+        unsafe {
+            op_tensor_resident(
+                hip_buf_mut(&mut dx_from_up).device_ptr() as *const f32,
+                hip_buf_mut(&mut dx_from_gate).device_ptr() as *const f32,
+                hip_buf_mut(&mut d_normed).device_ptr() as *mut f32,
+                self.d_model, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 6: LayerNorm backward.
+        // forward: normed = (x - mean) / sqrt(var + eps) * gamma + beta
+        // We compute mean/rstd host-side from `x` (D2H), upload, then
+        // dispatch layer_norm_backward_resident. dgamma and dbeta
+        // accumulate into grads.dgamma_dev / dbeta_dev.
+        let mut x_host = vec![0.0f32; self.d_model];
+        x_buf.copy_to_host(&mut x_host).map_err(ResidencyError::Backend)?;
+
+        let mut mean_host = vec![0.0f32; n_tokens];
+        let mut rstd_host = vec![0.0f32; n_tokens];
+        for r in 0..n_tokens {
+            let row = &x_host[r * self.d_model..(r + 1) * self.d_model];
+            let m: f32 = row.iter().sum::<f32>() / self.d_model as f32;
+            let v: f32 = row.iter().map(|&x| (x - m).powi(2)).sum::<f32>() / self.d_model as f32;
+            mean_host[r] = m;
+            rstd_host[r] = 1.0 / (v + self.eps).sqrt();
+        }
+        bwd_scratch.mean.copy_from_host(&mean_host)?;
+        bwd_scratch.rstd.copy_from_host(&rstd_host)?;
+
+        // Zero dweight buffers (layer_norm_backward_resident accumulates).
+        let zeros_d = vec![0.0f32; self.d_model];
+        grads.dgamma_dev.copy_from_host(&zeros_d)?;
+        grads.dbeta_dev.copy_from_host(&zeros_d)?;
+
+        unsafe {
+            layer_norm_backward_resident(
+                x_buf.device_ptr() as *const f32,
+                hip_buf_mut(&mut d_normed).device_ptr() as *const f32,
+                self.ln_gamma_dev.device_ptr() as *const f32,
+                bwd_scratch.mean.device_ptr() as *const f32,
+                bwd_scratch.rstd.device_ptr() as *const f32,
+                hip_buf_mut(dx_dev).device_ptr() as *mut f32,
+                grads.dgamma_dev.device_ptr() as *mut f32,
+                grads.dbeta_dev.device_ptr() as *mut f32,
+                n_tokens, self.d_model,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        Ok(())
+    }
+}
+
+/// Per-call backward scratch for [`FfnBlockResident::backward`].
+pub struct FfnBackwardScratch {
+    /// `[n_tokens × hidden]`.
+    pub d_silu: HipBuffer,
+    /// `[n_tokens × hidden]`.
+    pub d_up: HipBuffer,
+    /// `[n_tokens × hidden]`.
+    pub d_gate: HipBuffer,
+    /// `[n_tokens]` — per-row mean (uploaded from host).
+    pub mean: HipBuffer,
+    /// `[n_tokens]` — per-row reciprocal stddev (uploaded from host).
+    pub rstd: HipBuffer,
+    cap_n_tokens: usize,
+    cap_d_model: usize,
+    cap_hidden: usize,
+}
+
+impl FfnBackwardScratch {
+    pub fn new(n_tokens: usize, d_model: usize, hidden: usize) -> Result<Self, ResidencyError> {
+        Ok(Self {
+            d_silu: HipBuffer::new(n_tokens * hidden * 4)?,
+            d_up: HipBuffer::new(n_tokens * hidden * 4)?,
+            d_gate: HipBuffer::new(n_tokens * hidden * 4)?,
+            mean: HipBuffer::new(n_tokens * 4)?,
+            rstd: HipBuffer::new(n_tokens * 4)?,
+            cap_n_tokens: n_tokens,
+            cap_d_model: d_model,
+            cap_hidden: hidden,
+        })
+    }
+    pub fn fits(&self, n_tokens: usize, d_model: usize, hidden: usize) -> bool {
+        n_tokens <= self.cap_n_tokens && d_model <= self.cap_d_model && hidden <= self.cap_hidden
+    }
+}
+
+/// Device-resident weight gradients for [`FfnBlockResident`].
+pub struct FfnBlockResidentGrads {
+    pub dgamma_dev: HipBuffer,
+    pub dbeta_dev: HipBuffer,
+    pub dweight_gate: GpuVec,
+    pub dbias_gate: GpuVec,
+    pub dweight_up: GpuVec,
+    pub dbias_up: GpuVec,
+    pub dweight_down: GpuVec,
+    pub dbias_down: GpuVec,
+}
+
+impl FfnBlockResidentGrads {
+    pub fn new(d_model: usize, hidden: usize) -> Result<Self, ResidencyError> {
+        Ok(Self {
+            dgamma_dev: HipBuffer::new(d_model * 4)?,
+            dbeta_dev: HipBuffer::new(d_model * 4)?,
+            dweight_gate: GpuVec::try_hip(hidden * d_model)?,
+            dbias_gate: GpuVec::try_hip(hidden)?,
+            dweight_up: GpuVec::try_hip(hidden * d_model)?,
+            dbias_up: GpuVec::try_hip(hidden)?,
+            dweight_down: GpuVec::try_hip(d_model * hidden)?,
+            dbias_down: GpuVec::try_hip(d_model)?,
+        })
+    }
+}
+
+/// Helper: HIP D2D memcpy.
+unsafe fn hip_memcpy_d2d_local(
+    dst: *mut std::os::raw::c_void,
+    src: *const std::os::raw::c_void,
+    bytes: usize,
+) -> Result<(), ResidencyError> {
+    use modgrad_device::backend::rocm::ffi;
+    const HIP_MEMCPY_DEVICE_TO_DEVICE: std::os::raw::c_int = 3;
+    let err = unsafe {
+        ffi::hipMemcpy(dst, src, bytes, HIP_MEMCPY_DEVICE_TO_DEVICE)
+    };
+    if err != 0 {
+        return Err(ResidencyError::Backend(
+            modgrad_device::backend::BackendError::Runtime(format!(
+                "hipMemcpy D2D ({bytes} bytes): {}", ffi::hip_err_str(err),
+            )),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn hip_buf_mut(g: &mut GpuVec) -> &mut HipBuffer {
+    match g {
+        GpuVec::Hip(b) => b,
+        _ => panic!("expected Hip variant"),
     }
 }
 
