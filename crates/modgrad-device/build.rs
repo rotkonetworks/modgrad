@@ -101,20 +101,39 @@ fn compile_hipcc_kernels(rocm: &str) {
 
     match status {
         Ok(s) if s.success() => {
-            // Link the .o directly into every binary. `rustc-link-arg`
-            // is positional and propagates to all final-link artefacts
-            // in this crate (lib, tests, examples) which is exactly
-            // what we need.
-            println!("cargo:rustc-link-arg={kernel_obj}");
-            // The .o references hipLaunchKernel / __hipRegisterFat...
-            // from libamdhip64. `cargo:rustc-link-lib` would only
-            // propagate to crates that link against the lib's
-            // `#[link]` attributes, missing the example/test binaries
-            // in the same package that don't take the rocm FFI code
-            // path (e.g. `examples/miopen_probe.rs`). Using the
-            // positional `rustc-link-arg=-lamdhip64` form pushes the
-            // dependency through to every final binary instead.
-            println!("cargo:rustc-link-arg=-lamdhip64");
+            // Archive the .o into a static lib so `rustc-link-lib`
+            // can be used. `rustc-link-arg=path/to/.o` only attaches
+            // to THIS crate's final-link artefacts and does NOT
+            // propagate to downstream crates that depend on
+            // modgrad-device — `cargo test -p modgrad-ctm` would
+            // then fail with `undefined symbol: launch_rms_norm`.
+            // `rustc-link-lib=static=<name>` propagates transitively
+            // through cargo's link-graph.
+            let kernel_lib = format!("{out_dir}/libmodgrad_kernels.a");
+            let ar_status = Command::new("ar")
+                .args(["rcs", &kernel_lib, &kernel_obj])
+                .status();
+            let ar_ok = matches!(ar_status, Ok(s) if s.success());
+            if !ar_ok {
+                println!(
+                    "cargo:warning=modgrad-device: failed to archive \
+                     {kernel_obj} into {kernel_lib} via `ar`; \
+                     RmsNormResident will return Unsupported."
+                );
+                return;
+            }
+            println!("cargo:rustc-link-search=native={out_dir}");
+            println!("cargo:rustc-link-lib=static=modgrad_kernels");
+            // The kernel .o references hipLaunchKernel /
+            // __hipRegisterFat... from libamdhip64. The
+            // `#[link(name="amdhip64")]` attribute in
+            // src/backend/rocm.rs propagates the dynamic-lib link
+            // request through cargo to dependents — but only for
+            // crates that pull in the rocm FFI code path.
+            // Examples like `miopen_probe` don't, so we also emit
+            // a dylib link here as a belt-and-braces. cargo
+            // propagates rustc-link-lib=dylib transitively.
+            println!("cargo:rustc-link-lib=dylib=amdhip64");
             println!("cargo:rustc-cfg=modgrad_hipcc_kernels");
         }
         Ok(s) => {
