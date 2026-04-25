@@ -28,6 +28,7 @@ members = [
     "examples/hebbian_sanity",
     "examples/pretrain_retina",
     "examples/bench_maze_resident",
+    "examples/bench_maze_resident_medium",
     "debugger",
     "extra/remu",
 ]
