@@ -65,9 +65,35 @@ cargo run -p mazes --release -- --size 21 --steps 5000 --seed 42
 cargo run -p mazes --release -- --brain --size 21 --steps 5000 --seed 42
 ```
 
-**GPU**: 25 hand-written RDNA3 assembly kernels (gfx1102 / RX 7600).
-no ROCm HIP, no CUDA — direct KFD dispatch. modgrad runs on consumer AMD.
-boot-probe verification per kernel before training starts.
+**GPU path** — resident dispatch over rocBLAS / HIP on AMD (gfx1102, RX 7600M XT)
+and cudarc on NVIDIA. Resident matvec/AdamW/RoPE keep weights on-device across
+training steps; measured 55× / 5.6× speedup at 1024×512 vs the host-bounce path.
+
+## running today
+
+Qwen2.5-0.5B inference on the resident runtime — loads safetensors, decodes
+coherent text:
+
+```bash
+cargo run -p qwen_chat --release --features rocm -- --model models/qwen2.5-0.5b
+```
+
+End-to-end training on the foundation-model stack — `lm_validate` proves the
+loop trains: 5.72 → 0.74 cross-entropy in 10 steps on real data.
+
+```bash
+cargo run -p lm_validate --release --features rocm
+```
+
+BLT (byte-latent transformer, [Pagnoni et al. 2024](https://arxiv.org/abs/2412.09871))
+scaffolding for byte-ifying Qwen2.5 — local encoder + cross-attention + latent +
+local decoder pipeline. Forward path lands in `modgrad-blt`; resident backward
+through cross-attention is the next slice.
+
+The architectural direction — making the cerebellum the LLM (Qwen2.5 → BLT,
+~82% of the brain's parameters) — is laid out in
+[`docs/BRAIN_ARCHITECTURE.md`](docs/BRAIN_ARCHITECTURE.md). The default 8-region
+preset today is the legacy small one used in the maze result above.
 
 ## SDK crates
 
@@ -76,17 +102,19 @@ the building blocks — use any of them independently:
 | crate | what it gives you |
 |-------|-------------------|
 | **modgrad-ctm** | single CTM (NLM traces, sync, MHA, U-Net synapse, full BPTT) + graph composition (N CTMs in a directed graph, embedding table, AdamW, NeuralComputer) + plural-alter system + Organism orchestrator |
-| **modgrad-compute** | `Linear`, ops, tensor, GPU batched dispatch |
-| **modgrad-codec** | `VisualRetina` (V1 fixed Gabors → V2/V4 Hebbian-learned cortex), VQ-VAE, AudioCodec, FSQ, n-gram hash |
-| **modgrad-ffn** | SwiGLU MLP language prior, frozen-LLM "cerebellum" for learned weighted blending across transformer layers |
+| **modgrad-compute** | `Linear`, ops, tensor, GPU batched dispatch, `GpuVec` resident buffers |
+| **modgrad-codec** | `VisualRetina` (V1 fixed Gabors → V2/V4 Hebbian-learned cortex), VQ-VAE, AudioCodec, FSQ, byte n-gram hash |
+| **modgrad-ffn** | SwiGLU MLP language prior + `FrozenCerebellum` trait for learned weighted blending across transformer layers |
 | **modgrad-data** | type-safe multimodal tokenization, mixed-modality streaming, lazy data loading |
-| **modgrad-device** | CPU / CUDA / AMD KFD backend abstraction — hand-written RDNA3 kernels for gfx1102 |
+| **modgrad-device** | CPU / CUDA (cudarc) / AMD ROCm (rocBLAS + HIP) backend abstraction; resident kernels (matvec, AdamW, RoPE, RMSNorm) |
+| **modgrad-transformer** | transformer blocks, MHA, RoPE, KV cache, `GptModelResident` (full residency), Qwen-class loader pipeline |
+| **modgrad-blt** | byte-latent transformer — entropy patcher, local encoder/decoder, patch-aware cross-attention, byteify recipe (Path B: Qwen2.5 → byte-level) |
+| **modgrad-substrate** | foundation-model substrate — Q4_K residency, streaming weight loaders, 7B-class targeting on 8 GB VRAM |
+| **modgrad-io** | telemetry streaming, wincode serialization, safetensors + ONNX + GGUF backends |
 | **modgrad-training** | AdamW, Adam, SGD optimizers + warmup/cosine schedulers + dream replay |
 | **modgrad-memory** | episodic memory with valence, content-addressable retrieval, retrieval priming |
 | **modgrad-persist** | wincode/JSON save/load, quantization (f32/f16/i8) |
-| **modgrad-transformer** | transformer blocks, MHA, RoPE, KV cache (for hybrid CTM+transformer models) |
 | **modgrad-traits** | core traits (`Brain`, `TokenInput`, `Encoder`, `LossFn`) |
-| **modgrad-io** | telemetry streaming, wincode serialization, ONNX/GGUF backends |
 
 ### bio-inspired modules (in modgrad-ctm)
 
@@ -147,6 +175,8 @@ isis devices
 
 ### isis brain regions
 
+The legacy small preset (used by the maze benchmark above):
+
 | region | neurons | memory | role |
 |--------|---------|--------|------|
 | input | 64 | 4 | perception + motor feedback |
@@ -157,6 +187,10 @@ isis devices
 | basal ganglia | 8 | 8 | value estimation |
 | insula | 8 | 4 | interoception |
 | hippocampus | 8 | 16 | episodic binding |
+
+The target preset mounts Qwen2.5-0.5B (and later BLT-byte-ified) as a frozen
+cerebellum, taking ~82% of the parameter budget — see
+[`docs/BRAIN_ARCHITECTURE.md`](docs/BRAIN_ARCHITECTURE.md).
 
 ## minictm
 
@@ -185,19 +219,22 @@ modgrad-debugger 127.0.0.1:4747
 ## building
 
 ```bash
-cargo build --release                      # CPU
-cargo build --release --features cuda      # NVIDIA GPU (via cudarc)
-cargo test --release
+cargo build --release                      # CPU only (default)
+cargo build --release --features cuda      # NVIDIA GPU (via cudarc, fallback dynamic loading)
+cargo build --release --features rocm      # AMD GPU (rocBLAS + HIP; requires libamdhip64 + libhipblas)
+cargo test  --release
 ```
 
-AMD RDNA3 GPU support is built into `modgrad-device` with no feature flag needed —
-hand-written KFD kernels load at runtime on gfx1102 hardware (Radeon RX 7600 and similar).
+ROCm is opt-in because `modgrad-device/rocm.rs` uses hardcoded `#[link]`
+attributes that hard-require the system libraries at link time. CUDA stays in
+the default set because cudarc dynamic-loads at runtime.
 
-requires rust 2024 edition.
+Requires rust 2024 edition.
 
 ## references
 
 - sakana AI CTM (arxiv 2505.05522) — continuous thought machine
+- pagnoni et al. (arxiv 2412.09871) — byte-latent transformer (modgrad-blt)
 - qwen3-VL (2025) — text timestamps for video
 - meta neural computers (2026) — the model as the running computer
 - chameleon (meta) — unified discrete token space for multimodal generation
