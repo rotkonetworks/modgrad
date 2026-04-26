@@ -31,6 +31,7 @@ members = [
     "examples/bench_maze_resident_medium",
     "examples/lm_validate",
     "examples/qwen_load_smoke",
+    "examples/qwen_chat",
     "debugger",
     "extra/remu",
 ]

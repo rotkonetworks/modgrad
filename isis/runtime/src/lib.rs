@@ -46,6 +46,10 @@ pub mod language_model;
 // `lm_trainer.rs` for slice-scope notes.
 pub mod lm_trainer;
 
+// Sampler — autoregressive decode driver, generic over `LanguageModel`.
+// See `sampler.rs`.
+pub mod sampler;
+
 /// Generate tokens from a NeuralComputer using the SDK inference runtime.
 pub fn generate_nc(
     nc: &mut modgrad_ctm::graph::NeuralComputer,

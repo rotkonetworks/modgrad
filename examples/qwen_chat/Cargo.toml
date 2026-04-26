@@ -1,0 +1,27 @@
+[package]
+name = "qwen_chat"
+version = "0.1.0"
+edition = "2024"
+description = "Path A demo: run Qwen2.5-0.5B inference on the resident GPU runtime via safetensors loader + Sampler service."
+
+[[bin]]
+name = "qwen_chat"
+path = "src/main.rs"
+
+[features]
+default = []
+rocm = [
+    "modgrad-io/rocm",
+    "modgrad-transformer/rocm",
+    "modgrad-compute/rocm",
+    "modgrad-device/rocm",
+    "isis-runtime/rocm",
+]
+
+[dependencies]
+modgrad-io          = { path = "../../crates/modgrad-io" }
+modgrad-transformer = { path = "../../crates/modgrad-transformer" }
+modgrad-compute     = { path = "../../crates/modgrad-compute" }
+modgrad-device      = { path = "../../crates/modgrad-device" }
+isis-runtime        = { path = "../../isis/runtime" }
+clap                = { version = "4", features = ["derive"] }

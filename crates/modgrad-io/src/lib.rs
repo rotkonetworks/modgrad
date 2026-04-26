@@ -13,6 +13,7 @@ pub mod dataloader;
 pub mod control;
 pub mod backend;
 pub mod safetensors;
+pub mod tokenizer;
 
 #[cfg(feature = "onnx")]
 pub mod inference;

@@ -3736,6 +3736,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen_chat"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "isis-runtime",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-io",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "qwen_load_smoke"
 version = "0.1.0"
 dependencies = [
