@@ -293,6 +293,7 @@ fn build_tiny_model_for_byte_level()
         max_seq_len: SeqLen::new(64),
         rope_base: 10000.0,
         qk_norm_scale: 1.0,
+        use_qk_norm: false,
         window_pattern: WindowPattern::Full,
         mlp_activation: MlpActivation::SwiGlu,
         layer_overrides: Vec::new(),
