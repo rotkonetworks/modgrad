@@ -126,8 +126,15 @@ pub struct GptConfig {
 
     /// RoPE base frequency (default: 100_000).
     pub rope_base: f32,
-    /// QK norm scale factor (default: 1.2).
+    /// QK norm scale factor (default: 1.2). Only used when
+    /// [`use_qk_norm`] is `true`.
     pub qk_norm_scale: f32,
+    /// Apply per-head RMSNorm to Q (and K) before scoring matvec
+    /// (Gemma3-style). Set `false` for Llama / Qwen2 / Mistral and
+    /// other architectures whose canonical attention does not
+    /// normalize Q/K. Default `true` for backward-compat with
+    /// existing Gemma-style models.
+    pub use_qk_norm: bool,
     /// Attention window pattern.
     pub window_pattern: WindowPattern,
     /// MLP activation type.
@@ -271,6 +278,7 @@ impl Default for GptConfig {
             max_seq_len: SeqLen::new(1024),
             rope_base: 100_000.0,
             qk_norm_scale: 1.2,
+            use_qk_norm: true,
             window_pattern: WindowPattern::Full,
             mlp_activation: MlpActivation::ReluSquared,
             layer_overrides: Vec::new(),

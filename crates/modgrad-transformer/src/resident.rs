@@ -134,6 +134,10 @@ pub struct AttentionResident {
     #[allow(dead_code)]
     qk_scale: f32,
     norm_eps: f32,
+    /// Apply per-head RMSNorm to Q/K (Gemma3-style). When `false`, Q
+    /// and K go to RoPE/scoring raw — used for Llama / Qwen2 / Mistral
+    /// architectures whose canonical attention does not normalize Q/K.
+    use_qk_norm: bool,
 }
 
 impl AttentionResident {
@@ -176,6 +180,7 @@ impl AttentionResident {
             kv_dim,
             qk_scale,
             norm_eps: config.norm_eps,
+            use_qk_norm: config.use_qk_norm,
         })
     }
 
@@ -231,31 +236,40 @@ impl AttentionResident {
         self.v_proj.forward(batch, x_dev, &mut scratch.v_proj)?;
 
         // Stage 2: per-head QK norm + scale (one MIOpen dispatch via
-        // `rms_norm_resident` whose `weight` baked in `qk_scale`).
-        unsafe {
-            rms_norm_resident(
-                hip_buf(&scratch.q_proj)?.device_ptr() as *const f32,
-                self.qk_norm_weight_dev.device_ptr() as *const f32,
-                hip_buf(&scratch.q_normed)?.device_ptr() as *mut f32,
-                self.num_heads, self.head_dim, self.norm_eps,
-            )?;
+        // `rms_norm_resident` whose `weight` baked in `qk_scale`). Skipped
+        // for Llama/Qwen2-style architectures (`use_qk_norm = false`); the
+        // raw Q/K projections feed directly into RoPE.
+        if self.use_qk_norm {
+            unsafe {
+                rms_norm_resident(
+                    hip_buf(&scratch.q_proj)?.device_ptr() as *const f32,
+                    self.qk_norm_weight_dev.device_ptr() as *const f32,
+                    hip_buf(&scratch.q_normed)?.device_ptr() as *mut f32,
+                    self.num_heads, self.head_dim, self.norm_eps,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                rms_norm_resident(
+                    hip_buf(&scratch.k_proj)?.device_ptr() as *const f32,
+                    self.qk_norm_weight_dev.device_ptr() as *const f32,
+                    hip_buf(&scratch.k_normed)?.device_ptr() as *mut f32,
+                    self.num_kv_heads, self.head_dim, self.norm_eps,
+                )?;
+            }
+            batch.note_dispatch()?;
         }
-        batch.note_dispatch()?;
-        unsafe {
-            rms_norm_resident(
-                hip_buf(&scratch.k_proj)?.device_ptr() as *const f32,
-                self.qk_norm_weight_dev.device_ptr() as *const f32,
-                hip_buf(&scratch.k_normed)?.device_ptr() as *mut f32,
-                self.num_kv_heads, self.head_dim, self.norm_eps,
-            )?;
-        }
-        batch.note_dispatch()?;
 
-        // Stage 3: D2H Q-normed and K-normed, apply RoPE host-side,
-        // re-upload. ~0.5-2 µs round-trip per host_dim×n_heads. RoPE
-        // residency is a separate slice.
-        scratch.q_normed.copy_to_host(&mut scratch.q_normed_host);
-        scratch.k_normed.copy_to_host(&mut scratch.k_normed_host);
+        // Stage 3: D2H Q-and-K (post-norm if enabled, raw otherwise),
+        // apply RoPE host-side, re-upload into the q_normed/k_normed
+        // slots that the rest of the pipeline reads from.
+        if self.use_qk_norm {
+            scratch.q_normed.copy_to_host(&mut scratch.q_normed_host);
+            scratch.k_normed.copy_to_host(&mut scratch.k_normed_host);
+        } else {
+            scratch.q_proj.copy_to_host(&mut scratch.q_normed_host);
+            scratch.k_proj.copy_to_host(&mut scratch.k_normed_host);
+        }
         for h in 0..self.num_heads {
             rope.apply(
                 &mut scratch.q_normed_host[h * self.head_dim..(h + 1) * self.head_dim],

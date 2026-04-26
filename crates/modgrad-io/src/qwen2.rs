@@ -98,10 +98,10 @@ pub fn qwen2_5_0_5b_config(max_seq: usize) -> GptConfig {
         mlp_dim: MlpDim::new(QWEN2_5_0_5B_MLP_DIM),
         max_seq_len: SeqLen::new(max_seq),
         rope_base: QWEN2_5_0_5B_ROPE_BASE,
-        // Qwen2 has no QK norm. We set scale to 1.0 so the resident
-        // RMSNorm-with-weight-1.0 only normalises (does not also scale).
-        // See module-level discrepancy notes.
+        // Qwen2 has no QK norm — disable it via `use_qk_norm: false`.
+        // The `qk_norm_scale` is then unused (kept at default 1.0).
         qk_norm_scale: 1.0,
+        use_qk_norm: false,
         window_pattern: WindowPattern::Full,
         mlp_activation: MlpActivation::SwiGlu,
         layer_overrides: Vec::new(),
