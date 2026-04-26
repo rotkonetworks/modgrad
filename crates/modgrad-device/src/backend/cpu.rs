@@ -63,6 +63,7 @@ impl Backend for CpuBackend {
             Op::RmsNormBackwardResident { .. } => false,
             Op::DequantQ4KResident { .. } => false,
             Op::AdamWResident { .. } => false,
+            Op::RopeBackwardResident { .. } => false,
             Op::LayerNormResident { .. } => false,
             Op::SoftmaxResident { .. } => false,
             Op::ActivationResident { .. } => false,
@@ -148,6 +149,10 @@ impl Backend for CpuBackend {
             }),
             Op::AdamWResident { .. } => Err(BackendError::Unsupported {
                 op: "adamw_resident",
+                backend: "cpu",
+            }),
+            Op::RopeBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "rope_backward_resident",
                 backend: "cpu",
             }),
             Op::LayerNormResident { .. } => Err(BackendError::Unsupported {

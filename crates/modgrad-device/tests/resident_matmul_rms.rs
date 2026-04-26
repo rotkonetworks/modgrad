@@ -96,6 +96,34 @@ fn host_rms_norm(x: &[f32], weight: &[f32], out: &mut [f32], n: usize, hidden: u
     }
 }
 
+/// Host RoPE backward — the reference the GPU kernel must match.
+/// Per pair `(i, i+half)`:
+///   `dx_pre[i]      =  dx_post[i] * cos[i] + dx_post[i+half] * sin[i]`
+///   `dx_pre[i+half] = -dx_post[i] * sin[i] + dx_post[i+half] * cos[i]`
+fn host_rope_backward(
+    dx_post: &[f32],
+    cos_tab: &[f32],
+    sin_tab: &[f32],
+    dx_pre: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+) {
+    let half = head_dim / 2;
+    assert_eq!(cos_tab.len(), half);
+    assert_eq!(sin_tab.len(), half);
+    for h in 0..num_heads {
+        let off = h * head_dim;
+        for i in 0..half {
+            let dl = dx_post[off + i];
+            let dr = dx_post[off + i + half];
+            let c = cos_tab[i];
+            let s = sin_tab[i];
+            dx_pre[off + i]        = dl * c + dr * s;
+            dx_pre[off + i + half] = -dl * s + dr * c;
+        }
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────
 
 #[test]
@@ -248,4 +276,82 @@ fn rms_norm_resident_matches_host() {
     let mut got = vec![0.0f32; n * hidden];
     y_buf.copy_to_host(&mut got).unwrap();
     assert_close(&got, &expected, "rms_norm_resident");
+}
+
+#[test]
+fn rope_backward_resident_matches_host() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("rope_backward_resident: no ROCm runtime; skipping");
+        return;
+    };
+    // Same hipcc-archive gate as RmsNormResident — the kernel ships in
+    // the shared `libmodgrad_kernels.a`.
+    let probe = Op::RopeBackwardResident {
+        dx_post_dev: std::ptr::null(),
+        cos_dev: std::ptr::null(),
+        sin_dev: std::ptr::null(),
+        dx_pre_dev: std::ptr::null_mut(),
+        num_heads: 1,
+        head_dim: 2,
+    };
+    if !be.supports(&probe) {
+        eprintln!("rope_backward_resident: hipcc kernel not built; skipping");
+        return;
+    }
+
+    // Realistic-shape config: 4 heads × head_dim 64 (half_dim = 32),
+    // covers the in-warp path. Deterministic ramp-and-sine inputs so
+    // any divergence is reproducible.
+    let num_heads = 4;
+    let head_dim = 64;
+    let half = head_dim / 2;
+
+    let dx_post: Vec<f32> = (0..num_heads * head_dim)
+        .map(|i| ((i as f32) * 0.017).sin() * 0.9 + 0.1)
+        .collect();
+    // Treat these like a RoPE cos/sin row — the kernel only cares
+    // that they form an orthogonal rotation per pair, but for
+    // correctness we just need consistent inputs.
+    let angles: Vec<f32> = (0..half).map(|i| 0.1 + i as f32 * 0.07).collect();
+    let cos_tab: Vec<f32> = angles.iter().map(|a| a.cos()).collect();
+    let sin_tab: Vec<f32> = angles.iter().map(|a| a.sin()).collect();
+
+    let mut expected = vec![0.0f32; num_heads * head_dim];
+    host_rope_backward(&dx_post, &cos_tab, &sin_tab, &mut expected, num_heads, head_dim);
+
+    let _batch = HipBatch::new();
+    let dx_post_buf = upload(&dx_post).unwrap();
+    let cos_buf = upload(&cos_tab).unwrap();
+    let sin_buf = upload(&sin_tab).unwrap();
+    let dx_pre_buf = alloc_out(num_heads * head_dim).unwrap();
+
+    let mut op = Op::RopeBackwardResident {
+        dx_post_dev: dx_post_buf.device_ptr() as *const f32,
+        cos_dev: cos_buf.device_ptr() as *const f32,
+        sin_dev: sin_buf.device_ptr() as *const f32,
+        dx_pre_dev: dx_pre_buf.device_ptr() as *mut f32,
+        num_heads,
+        head_dim,
+    };
+    be.dispatch(&mut op).expect("rope_backward_resident dispatch");
+
+    let mut got = vec![0.0f32; num_heads * head_dim];
+    dx_pre_buf.copy_to_host(&mut got).unwrap();
+    assert_close(&got, &expected, "rope_backward_resident");
+
+    // In-place case: source and destination point at the same buffer.
+    // Kernel must read both halves of each pair before writing either.
+    let inplace_buf = upload(&dx_post).unwrap();
+    let mut inplace_op = Op::RopeBackwardResident {
+        dx_post_dev: inplace_buf.device_ptr() as *const f32,
+        cos_dev: cos_buf.device_ptr() as *const f32,
+        sin_dev: sin_buf.device_ptr() as *const f32,
+        dx_pre_dev: inplace_buf.device_ptr() as *mut f32,
+        num_heads,
+        head_dim,
+    };
+    be.dispatch(&mut inplace_op).expect("rope_backward_resident in-place dispatch");
+    let mut got_inplace = vec![0.0f32; num_heads * head_dim];
+    inplace_buf.copy_to_host(&mut got_inplace).unwrap();
+    assert_close(&got_inplace, &expected, "rope_backward_resident_inplace");
 }

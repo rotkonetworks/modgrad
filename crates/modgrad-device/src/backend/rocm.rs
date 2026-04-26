@@ -425,6 +425,20 @@ pub mod ffi {
             n_neurons: c_int,
             half_size: c_int,
         ) -> hipError_t;
+
+        // RoPE backward (rotary-embedding adjoint). `dx_post` and
+        // `dx_pre` are `[num_heads, head_dim]` row-major; `cos` and
+        // `sin` are length-`head_dim/2` (already indexed at the
+        // matched forward's position). In-place is supported
+        // (dx_post == dx_pre). See `kernels/rope_backward.hip`.
+        pub fn launch_rope_backward(
+            dx_post: *const f32,
+            cos_tab: *const f32,
+            sin_tab: *const f32,
+            dx_pre: *mut f32,
+            num_heads: c_int,
+            head_dim: c_int,
+        ) -> hipError_t;
     }
 
     /// Convert a hipError_t into a human-readable String.
@@ -1059,6 +1073,8 @@ impl Backend for RocmBackend {
                 // per-neuron MIOpen GLU dispatch loop in the CTM
                 // forward path with a single launch.
                 Op::PerNeuronGluBatchedResident { .. } => rms_norm_kernel_present(),
+                // RoPE backward lives in the same archive — same gate.
+                Op::RopeBackwardResident { .. } => rms_norm_kernel_present(),
                 Op::MatmulNN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 Op::MatmulNT { m, k, n, .. }
@@ -1177,6 +1193,13 @@ impl Backend for RocmBackend {
                     *w_dev, *g_dev, *m_dev, *v_dev, *n,
                     *lr, *beta1, *beta2, *eps, *weight_decay,
                     *bc1_inv, *bc2_inv,
+                ),
+                Op::RopeBackwardResident {
+                    dx_post_dev, cos_dev, sin_dev, dx_pre_dev,
+                    num_heads, head_dim,
+                } => self.rope_backward_resident_f32(
+                    *dx_post_dev, *cos_dev, *sin_dev, *dx_pre_dev,
+                    *num_heads, *head_dim,
                 ),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
@@ -2200,6 +2223,61 @@ impl RocmBackend {
     ) -> Result<(), BackendError> {
         Err(BackendError::Unsupported {
             op: "per_neuron_glu_batched_resident",
+            backend: "rocm",
+        })
+    }
+
+    /// Resident RoPE backward via the custom hipcc kernel built by
+    /// `build.rs`. Rotary-embedding adjoint: rotates the gradient by
+    /// the negated angle so the chain rule passes through the
+    /// orthogonal forward rotation cleanly.
+    ///
+    /// Caller invariant: `supports()` already confirmed
+    /// `rms_norm_kernel_present()` (the same archive contains every
+    /// hipcc-built kernel). We re-check here so a supports/dispatch
+    /// race surfaces as a loud `Unsupported` rather than a missing-
+    /// symbol link error.
+    #[cfg(modgrad_hipcc_kernels)]
+    #[allow(clippy::too_many_arguments)]
+    fn rope_backward_resident_f32(
+        &self,
+        dx_post_dev: *const f32,
+        cos_dev: *const f32,
+        sin_dev: *const f32,
+        dx_pre_dev: *mut f32,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), BackendError> {
+        let num_heads_i32 = as_i32(num_heads, "num_heads")?;
+        let head_dim_i32 = as_i32(head_dim, "head_dim")?;
+        let err = unsafe {
+            ffi::launch_rope_backward(
+                dx_post_dev, cos_dev, sin_dev, dx_pre_dev,
+                num_heads_i32, head_dim_i32,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_rope_backward(num_heads={num_heads}, head_dim={head_dim}): {}",
+                ffi::hip_err_str(err),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(modgrad_hipcc_kernels))]
+    #[allow(clippy::too_many_arguments)]
+    fn rope_backward_resident_f32(
+        &self,
+        _dx_post_dev: *const f32,
+        _cos_dev: *const f32,
+        _sin_dev: *const f32,
+        _dx_pre_dev: *mut f32,
+        _num_heads: usize,
+        _head_dim: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported {
+            op: "rope_backward_resident",
             backend: "rocm",
         })
     }

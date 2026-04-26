@@ -430,6 +430,39 @@ pub enum Op<'a> {
         eps: f32,
     },
 
+    /// **Device-resident** RoPE backward (rotary-embedding adjoint).
+    ///
+    /// Forward: per pair `(x_pre[i], x_pre[i+half])`,
+    /// `x_post[i]      = x_pre[i] * cos[i] - x_pre[i+half] * sin[i]`
+    /// `x_post[i+half] = x_pre[i] * sin[i] + x_pre[i+half] * cos[i]`.
+    ///
+    /// Backward: rotate the gradient by the negated angle (rotation
+    /// matrices are orthogonal, so the adjoint flips the sign of `sin`):
+    /// `dx_pre[i]      =  dx_post[i] * cos[i] + dx_post[i+half] * sin[i]`
+    /// `dx_pre[i+half] = -dx_post[i] * sin[i] + dx_post[i+half] * cos[i]`
+    ///
+    /// Layout: `dx_post` and `dx_pre` are each `[num_heads, head_dim]`
+    /// row-major where `head_dim = 2 * half_dim`. `cos` and `sin` are
+    /// each length-`half_dim`, indexed at the position used by the
+    /// matched forward (caller slices into the precomputed
+    /// `RotaryEmbedding` cos/sin tables).
+    ///
+    /// In-place is supported (`dx_post == dx_pre`): the kernel reads
+    /// both halves of each pair before writing either.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. Routes to the custom
+    /// hipcc kernel compiled by `build.rs`; CPU and other non-resident
+    /// backends return `Unsupported`.
+    RopeBackwardResident {
+        dx_post_dev: *const f32,
+        cos_dev: *const f32,
+        sin_dev: *const f32,
+        dx_pre_dev: *mut f32,
+        num_heads: usize,
+        head_dim: usize,
+    },
+
     /// **Device-resident** LayerNorm forward — affine variant matching
     /// PyTorch `nn.LayerNorm(elementwise_affine=True)`.
     ///
@@ -976,6 +1009,7 @@ impl<'a> Op<'a> {
             Op::DequantQ4KResident { .. } => "dequant_q4k_resident",
             Op::RmsNormResident { .. } => "rms_norm_resident",
             Op::RmsNormBackwardResident { .. } => "rms_norm_backward_resident",
+            Op::RopeBackwardResident { .. } => "rope_backward_resident",
             Op::LayerNormResident { .. } => "layer_norm_resident",
             Op::SoftmaxResident { .. } => "softmax_resident",
             Op::ActivationResident { .. } => "activation_resident",

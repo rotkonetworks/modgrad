@@ -401,6 +401,36 @@ pub unsafe fn rms_norm_backward_resident(
     Ok(())
 }
 
+/// Device-resident RoPE backward (rotary-embedding adjoint).
+/// See [`Op::RopeBackwardResident`](super::Op::RopeBackwardResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `dx_post_dev` and `dx_pre_dev` each cover at least
+///   `num_heads * head_dim * 4` bytes (row-major `[num_heads, head_dim]`).
+/// - `cos_dev` and `sin_dev` each cover at least `(head_dim / 2) * 4`
+///   bytes — the cos/sin lookup for the matched forward's position.
+/// - `head_dim` is even.
+/// - In-place dispatch is permitted (`dx_post_dev == dx_pre_dev`); the
+///   kernel reads both halves of each pair before writing either.
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn rope_backward_resident(
+    dx_post_dev: *const f32,
+    cos_dev: *const f32,
+    sin_dev: *const f32,
+    dx_pre_dev: *mut f32,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::RopeBackwardResident {
+        dx_post_dev, cos_dev, sin_dev, dx_pre_dev, num_heads, head_dim,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident LayerNorm forward.
 /// See [`Op::LayerNormResident`](super::Op::LayerNormResident).
 ///

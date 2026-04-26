@@ -57,7 +57,7 @@ use modgrad_device::backend::op::{ActivationMode, BinaryOpKind};
 use modgrad_device::backend::ops::{
     activation_backward_resident, activation_resident,
     matmul_resident_nn, matmul_resident_tn, matvec_resident,
-    op_tensor_resident, rms_norm_resident,
+    op_tensor_resident, rms_norm_resident, rope_backward_resident,
     softmax_backward_resident, softmax_resident,
 };
 
@@ -463,6 +463,11 @@ pub struct AttentionBackwardScratch {
     pub dx_from_q: GpuVec,
     pub dx_from_k: GpuVec,
     pub dx_from_v: GpuVec,
+    /// Cos/sin lookup for the matched-forward's position, uploaded
+    /// fresh per backward call. Each is length `head_dim / 2`. Used
+    /// by the resident RoPE backward dispatch on Q.
+    pub cos_dev: GpuVec,
+    pub sin_dev: GpuVec,
     /// Host scratch for the RMSNorm + RoPE backward (which run on host
     /// for parity with forward's host RoPE).
     pub q_normed_host: Vec<f32>,
@@ -487,6 +492,7 @@ impl AttentionBackwardScratch {
         max_seq: usize,
     ) -> Result<Self, ResidencyError> {
         let model_dim = num_heads * head_dim;
+        let half_dim = head_dim / 2;
         Ok(Self {
             d_head_out: GpuVec::try_hip(model_dim)?,
             d_softmax: GpuVec::try_hip(num_heads * max_seq)?,
@@ -498,6 +504,8 @@ impl AttentionBackwardScratch {
             dx_from_q: GpuVec::try_hip(model_dim)?,
             dx_from_k: GpuVec::try_hip(model_dim)?,
             dx_from_v: GpuVec::try_hip(model_dim)?,
+            cos_dev: GpuVec::try_hip(half_dim)?,
+            sin_dev: GpuVec::try_hip(half_dim)?,
             q_normed_host: vec![0.0f32; model_dim],
             d_q_normed_host: vec![0.0f32; model_dim],
             k_normed_host: vec![0.0f32; kv_dim],
@@ -732,23 +740,49 @@ impl AttentionResident {
             }
         }
 
-        // Stage 6: host-side RoPE backward + RMSNorm backward for current
-        // K and Q. Forward did:
+        // Stage 6: RoPE backward + RMSNorm backward for current K and Q.
+        // Forward did:
         //   k_proj  → rms_norm(qk_scale)  → k_normed_pre_rope
         //   k_normed_pre_rope (per kv_head) → RoPE → k_normed (cached)
         //   q_proj  → rms_norm(qk_scale)  → q_normed_pre_rope
         //   q_normed_pre_rope (per head)  → RoPE → q_normed (used for scoring)
         //
-        // For Q we have d_q_normed (post-RoPE). For K we have
-        // d_k_current_post_rope. Undo RoPE then undo RMSNorm.
+        // For Q we have d_q_normed on device (post-RoPE). For K we
+        // have d_k_current_post_rope on host (built above by the
+        // cross-GQA-head reduction). Undo RoPE then undo RMSNorm.
+        //
+        // RoPE adjoint per pair (i, i+half_dim):
+        //   forward: (a, b) → (a*c - b*s, a*s + b*c)
+        //   adjoint: (da, db) → (da*c + db*s, -da*s + db*c)
+        //
+        // Q runs RoPE backward GPU-side (resident). The kernel writes
+        // back into the same device buffer in-place so the existing
+        // D2H below picks up the pre-RoPE gradient ready for the host
+        // RMSNorm backward step. Avoids the host-side per-pair loop
+        // that previously sat between the D2H and RMSNorm backward.
+        bwd.cos_dev.copy_from(rope.cos_at(position));
+        bwd.sin_dev.copy_from(rope.sin_at(position));
+        let d_q_normed_dev_ptr = hip_buf(&bwd.d_q_normed)?.device_ptr() as *mut f32;
+        unsafe {
+            rope_backward_resident(
+                d_q_normed_dev_ptr as *const f32,
+                hip_buf(&bwd.cos_dev)?.device_ptr() as *const f32,
+                hip_buf(&bwd.sin_dev)?.device_ptr() as *const f32,
+                d_q_normed_dev_ptr,
+                num_heads, head_dim,
+            )?;
+        }
+        batch.note_dispatch()?;
         let mut d_q_normed_host = vec![0.0f32; model_dim];
         bwd.d_q_normed.copy_to_host(&mut d_q_normed_host);
 
-        // RoPE backward: rotate by negative angle (Givens rotation
-        // adjoint = transpose). Per pair (i, i+half_dim):
-        //   forward: (a, b) → (a*c - b*s, a*s + b*c)
-        //   adjoint: (da, db) → (da*c + db*s, -da*s + db*c)
-        rope_backward(rope, &mut d_q_normed_host, head_dim, num_heads, position);
+        // K stays host: the cross-GQA-head reduction above produced
+        // d_k_current_post_rope as a host vec, so a host adjoint loop
+        // is the natural fit. Routing K through the GPU kernel would
+        // wrap the per-position 16-256 floats with H2D + dispatch +
+        // D2H — net negative until the GQA reduction itself moves
+        // device-side. The kernel is wired and tested for K's shape;
+        // a follow-up slice can move both stages together.
         rope_backward(rope, &mut d_k_current_post_rope, head_dim, num_kv_heads, position);
 
         // RMSNorm backward (constant scale `qk_scale`, no learnable gamma).
