@@ -2559,6 +2559,7 @@ dependencies = [
 name = "modgrad-blt"
 version = "0.1.0"
 dependencies = [
+ "isis-runtime",
  "modgrad-codec",
  "modgrad-compute",
  "modgrad-device",

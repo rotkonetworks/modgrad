@@ -12,7 +12,14 @@ modgrad-compute     = { path = "../modgrad-compute" }
 modgrad-transformer = { path = "../modgrad-transformer" }
 modgrad-codec       = { path = "../modgrad-codec" }
 modgrad-io          = { path = "../modgrad-io" }
-serde               = { version = "1", features = ["derive"] }
+# `isis-runtime` carries the `LanguageModel` trait that
+# `model::BltModel` implements (Option (A) in the brief: bytes → token
+# IDs, patcher computed inline). The dep is `optional = true` so the
+# crate compiles default-feature (no rocm) without dragging the runtime
+# in; the `rocm` feature gate lights it up alongside the resident BLT
+# components.
+isis-runtime       = { path = "../../isis/runtime", optional = true, default-features = false }
+serde              = { version = "1", features = ["derive"] }
 
 [features]
 default = []
@@ -24,4 +31,6 @@ rocm = [
     "modgrad-compute/rocm",
     "modgrad-transformer/rocm",
     "modgrad-io/rocm",
+    "dep:isis-runtime",
+    "isis-runtime/rocm",
 ]
