@@ -191,6 +191,18 @@ impl BlockGrads {
         for (g, dg) in block.ln_gamma.iter_mut().zip(&self.d_gamma) { *g -= lr * dg; }
         for (b, db) in block.ln_beta.iter_mut().zip(&self.d_beta) { *b -= lr * db; }
     }
+
+    /// Element-wise accumulate `other`'s gradients into `self`.
+    /// Used by the resident `RegionalBrain::backward_cached_resident`
+    /// path to merge per-tick `BlockGrads` from a region's
+    /// `ctm_backward_resident` into the outer `RegionalGradients`
+    /// accumulator.
+    fn add_from(&mut self, other: &BlockGrads) {
+        for (d, s) in self.d_weight.iter_mut().zip(&other.d_weight) { *d += *s; }
+        for (d, s) in self.d_bias.iter_mut().zip(&other.d_bias) { *d += *s; }
+        for (d, s) in self.d_gamma.iter_mut().zip(&other.d_gamma) { *d += *s; }
+        for (d, s) in self.d_beta.iter_mut().zip(&other.d_beta) { *d += *s; }
+    }
 }
 
 fn block_forward_cached(block: &SynapseBlock, x: &[f32]) -> (Vec<f32>, BlockCache) {
@@ -223,7 +235,7 @@ fn block_backward(
 
 // ─── SynapseUNet ───────────────────────────────────────────
 
-struct UNetCache {
+pub(crate) struct UNetCache {
     first: BlockCache,
     downs: Vec<BlockCache>,
     ups: Vec<BlockCache>,
@@ -270,9 +282,85 @@ impl UNetGrads {
             for (b, d) in unet.skip_ln_beta[i].iter_mut().zip(db) { *b -= lr * d; }
         }
     }
+
+    /// Element-wise accumulate `other`'s per-block gradients into
+    /// `self`. Used by `RegionalBrain::backward_cached_resident` to
+    /// merge per-tick per-region `UNetGrads` from
+    /// `ctm_backward_resident` into the outer `RegionalGradients`
+    /// accumulator. Path B for the resident U-Net backward depends
+    /// on this — without it, U-Net weight grads would still be
+    /// dropped at the outer-merge step.
+    pub fn add_from(&mut self, other: &UNetGrads) {
+        debug_assert_eq!(self.downs.len(), other.downs.len());
+        debug_assert_eq!(self.ups.len(), other.ups.len());
+        debug_assert_eq!(self.skip_d_gamma.len(), other.skip_d_gamma.len());
+        self.first.add_from(&other.first);
+        for (d, s) in self.downs.iter_mut().zip(&other.downs) { d.add_from(s); }
+        for (u, s) in self.ups.iter_mut().zip(&other.ups) { u.add_from(s); }
+        for (g, s) in self.skip_d_gamma.iter_mut().zip(&other.skip_d_gamma) {
+            for (a, b) in g.iter_mut().zip(s) { *a += *b; }
+        }
+        for (g, s) in self.skip_d_beta.iter_mut().zip(&other.skip_d_beta) {
+            for (a, b) in g.iter_mut().zip(s) { *a += *b; }
+        }
+    }
+
+    /// Diagnostic: L2 norm across every weight/bias/gamma/beta
+    /// gradient buffer in this U-Net accumulator. Used by the
+    /// resident-backward regression tests to catch the
+    /// "U-Net grads regress to zero" bug — a passing forward
+    /// followed by `unet_backward` must drive this above zero.
+    pub fn l2_norm(&self) -> f32 {
+        let mut sumsq: f64 = 0.0;
+        let mut acc = |s: &[f32]| {
+            for &x in s { sumsq += (x as f64) * (x as f64); }
+        };
+        acc(&self.first.d_weight); acc(&self.first.d_bias);
+        acc(&self.first.d_gamma); acc(&self.first.d_beta);
+        for d in &self.downs {
+            acc(&d.d_weight); acc(&d.d_bias);
+            acc(&d.d_gamma); acc(&d.d_beta);
+        }
+        for u in &self.ups {
+            acc(&u.d_weight); acc(&u.d_bias);
+            acc(&u.d_gamma); acc(&u.d_beta);
+        }
+        for g in &self.skip_d_gamma { acc(g); }
+        for b in &self.skip_d_beta { acc(b); }
+        (sumsq as f32).sqrt()
+    }
+
+    /// Diagnostic: per-block weight gradient slices, in the order
+    /// `first.d_weight, first.d_bias, first.d_gamma, first.d_beta,
+    /// down[0].d_weight, ..., up[n-1].d_beta, skip_d_gamma[0], ...,
+    /// skip_d_beta[n-1]`. Used by the resident vs host backward
+    /// parity tests to compare per-block gradient magnitudes within
+    /// FP tolerance.
+    pub fn flat_weight_grads(&self) -> Vec<f32> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&self.first.d_weight);
+        v.extend_from_slice(&self.first.d_bias);
+        v.extend_from_slice(&self.first.d_gamma);
+        v.extend_from_slice(&self.first.d_beta);
+        for d in &self.downs {
+            v.extend_from_slice(&d.d_weight);
+            v.extend_from_slice(&d.d_bias);
+            v.extend_from_slice(&d.d_gamma);
+            v.extend_from_slice(&d.d_beta);
+        }
+        for u in &self.ups {
+            v.extend_from_slice(&u.d_weight);
+            v.extend_from_slice(&u.d_bias);
+            v.extend_from_slice(&u.d_gamma);
+            v.extend_from_slice(&u.d_beta);
+        }
+        for g in &self.skip_d_gamma { v.extend_from_slice(g); }
+        for b in &self.skip_d_beta { v.extend_from_slice(b); }
+        v
+    }
 }
 
-fn unet_forward_cached(unet: &SynapseUNet, x: &[f32]) -> (Vec<f32>, UNetCache) {
+pub(crate) fn unet_forward_cached(unet: &SynapseUNet, x: &[f32]) -> (Vec<f32>, UNetCache) {
     let n_blocks = unet.down_blocks.len();
     let (first_out, first_cache) = block_forward_cached(&unet.first_projection, x);
 
@@ -307,7 +395,7 @@ fn unet_forward_cached(unet: &SynapseUNet, x: &[f32]) -> (Vec<f32>, UNetCache) {
         down_outs, pre_skip_ln, skip_ln_caches })
 }
 
-fn unet_backward(
+pub(crate) fn unet_backward(
     unet: &SynapseUNet, d_out: &[f32], cache: &UNetCache, grads: &mut UNetGrads,
 ) -> Vec<f32> {
     let n_blocks = unet.down_blocks.len();
