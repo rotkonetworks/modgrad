@@ -20,6 +20,8 @@ models/*.onnx.data
 
 # Training text data
 train_*.txt
+climbmix_*.txt
+val_held_out.txt
 staged_curriculum.txt
 curriculum.txt
 

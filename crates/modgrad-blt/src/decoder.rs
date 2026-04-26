@@ -32,7 +32,7 @@ use modgrad_transformer::resident::{
 use modgrad_transformer::rope::RotaryEmbedding;
 use modgrad_transformer::tensor::Tensor2;
 
-use crate::cross_attn::{CrossAttention, CrossAttnConfig, CrossAttnScratch};
+use crate::cross_attn::{CrossAttention, CrossAttnConfig, CrossAttnDirection, CrossAttnScratch};
 use crate::encoder::LocalEncoderConfig;
 
 // ─── Config ──────────────────────────────────────────────────
@@ -171,14 +171,15 @@ impl LocalDecoder {
         let cross_cfg = CrossAttnConfig {
             byte_dim,
             patch_dim: config.patch_dim,
-            n_heads: config.n_heads.max(1),
+            num_heads: config.n_heads.max(1),
             head_dim: (config.patch_dim / config.n_heads.max(1)).max(1),
             norm_eps: config.norm_eps,
-            max_seq_len: config.max_seq_len,
+            direction: CrossAttnDirection::Decoder,
         };
         let mut cross_attns = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            cross_attns.push(CrossAttention::new(&cross_cfg)?);
+        for li in 0..n_layers {
+            let seed = 0xDEC0_DE42_u64 ^ ((li as u64) << 16) ^ (byte_dim as u64);
+            cross_attns.push(CrossAttention::new(&cross_cfg, seed)?);
         }
 
         let byte_kv_cache = KvCacheResident::new(
@@ -408,7 +409,19 @@ impl LocalDecoderScratch {
             )?,
             attn_scratch: AttentionScratch::new(n_heads, head_dim, kv_dim, max_seq)?,
             mlp_scratch: SwigluScratch::new(byte_dim, mlp_dim)?,
-            cross_scratch: CrossAttnScratch::new(byte_dim, config.patch_dim, max_seq)?,
+            cross_scratch: CrossAttnScratch::new(
+                &CrossAttnConfig {
+                    byte_dim,
+                    patch_dim: config.patch_dim,
+                    num_heads: config.n_heads.max(1),
+                    head_dim: (config.patch_dim / config.n_heads.max(1)).max(1),
+                    norm_eps: config.norm_eps,
+                    direction: CrossAttnDirection::Decoder,
+                },
+                /* max_kv_len = */ max_seq,
+                /* max_n_bytes = */ max_seq,
+                /* max_n_patches = */ max_seq,
+            )?,
         })
     }
 }
