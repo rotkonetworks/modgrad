@@ -2556,6 +2556,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "modgrad-blt"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-io",
+ "modgrad-traits",
+ "modgrad-transformer",
+ "serde",
+]
+
+[[package]]
 name = "modgrad-codec"
 version = "0.1.0"
 dependencies = [

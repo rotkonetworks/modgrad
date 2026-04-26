@@ -1,0 +1,27 @@
+[package]
+name = "modgrad-blt"
+version = "0.1.0"
+edition = "2024"
+description = "Byte Latent Transformer — hierarchical byte-level model with entropy-based dynamic patching. Reference: Pagnoni et al., 'Byte Latent Transformer: Patches Scale Better Than Tokens', 2024."
+license = "MIT"
+
+[dependencies]
+modgrad-traits      = { path = "../modgrad-traits" }
+modgrad-device      = { path = "../modgrad-device" }
+modgrad-compute     = { path = "../modgrad-compute" }
+modgrad-transformer = { path = "../modgrad-transformer" }
+modgrad-codec       = { path = "../modgrad-codec" }
+modgrad-io          = { path = "../modgrad-io" }
+serde               = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+# Enables the device-resident BLT components (cross-attn, encoder,
+# decoder, model assembly, trainer, byte-ification recipe). Propagates
+# to compute / device / transformer / io as needed.
+rocm = [
+    "modgrad-device/rocm",
+    "modgrad-compute/rocm",
+    "modgrad-transformer/rocm",
+    "modgrad-io/rocm",
+]
