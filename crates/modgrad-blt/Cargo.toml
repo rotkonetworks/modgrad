@@ -12,14 +12,14 @@ modgrad-compute     = { path = "../modgrad-compute" }
 modgrad-transformer = { path = "../modgrad-transformer" }
 modgrad-codec       = { path = "../modgrad-codec" }
 modgrad-io          = { path = "../modgrad-io" }
-# `isis-runtime` carries the `LanguageModel` trait that
-# `model::BltModel` implements (Option (A) in the brief: bytes → token
-# IDs, patcher computed inline). The dep is `optional = true` so the
-# crate compiles default-feature (no rocm) without dragging the runtime
-# in; the `rocm` feature gate lights it up alongside the resident BLT
+# isis-runtime supplies `LanguageModel` (consumed by `BltModel` and the
+# BLT trainer), `AdamWBuf` / `LmTrainerConfig` / `LmTrainer::clip_grads`
+# (the resident optimizer plumbing the BLT trainer drives), and is
+# `optional` so default-feature builds (no rocm) don't drag the runtime
+# in. The `rocm` feature gate lights it up alongside the resident BLT
 # components.
-isis-runtime       = { path = "../../isis/runtime", optional = true, default-features = false }
-serde              = { version = "1", features = ["derive"] }
+isis-runtime        = { path = "../../isis/runtime", default-features = false, optional = true }
+serde               = { version = "1", features = ["derive"] }
 
 [features]
 default = []
