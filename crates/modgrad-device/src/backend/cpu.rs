@@ -60,11 +60,14 @@ impl Backend for CpuBackend {
             Op::MatmulResidentBf16Tn { .. } => false,
             Op::MatvecResidentBf16 { .. } => false,
             Op::RmsNormResident { .. } => false,
+            Op::RmsNormBackwardResident { .. } => false,
             Op::DequantQ4KResident { .. } => false,
+            Op::AdamWResident { .. } => false,
             Op::LayerNormResident { .. } => false,
             Op::SoftmaxResident { .. } => false,
             Op::ActivationResident { .. } => false,
             Op::GluResident { .. } => false,
+            Op::PerNeuronGluBatchedResident { .. } => false,
             Op::OpTensorResident { .. } => false,
             Op::LayerNormBackwardResident { .. } => false,
             Op::SoftmaxBackwardResident { .. } => false,
@@ -135,8 +138,16 @@ impl Backend for CpuBackend {
                 op: "rms_norm_resident",
                 backend: "cpu",
             }),
+            Op::RmsNormBackwardResident { .. } => Err(BackendError::Unsupported {
+                op: "rms_norm_backward_resident",
+                backend: "cpu",
+            }),
             Op::DequantQ4KResident { .. } => Err(BackendError::Unsupported {
                 op: "dequant_q4k_resident",
+                backend: "cpu",
+            }),
+            Op::AdamWResident { .. } => Err(BackendError::Unsupported {
+                op: "adamw_resident",
                 backend: "cpu",
             }),
             Op::LayerNormResident { .. } => Err(BackendError::Unsupported {
@@ -153,6 +164,10 @@ impl Backend for CpuBackend {
             }),
             Op::GluResident { .. } => Err(BackendError::Unsupported {
                 op: "glu_resident",
+                backend: "cpu",
+            }),
+            Op::PerNeuronGluBatchedResident { .. } => Err(BackendError::Unsupported {
+                op: "per_neuron_glu_batched_resident",
                 backend: "cpu",
             }),
             Op::OpTensorResident { .. } => Err(BackendError::Unsupported {

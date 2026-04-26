@@ -35,6 +35,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed=kernels/rms_norm.hip");
     println!("cargo:rerun-if-changed=kernels/dequant_q4k.hip");
+    println!("cargo:rerun-if-changed=kernels/per_neuron_glu_batched.hip");
 
     // Declare the custom cfg so rustc (1.80+ checking) doesn't warn.
     println!("cargo:rustc-check-cfg=cfg(modgrad_hipcc_kernels)");
@@ -79,7 +80,13 @@ fn compile_hipcc_kernels(rocm: &str) {
     // archive them all into a single static lib that propagates via
     // `rustc-link-lib=static=`. Adding a new kernel is just dropping
     // a new file into `kernels/` and a `rerun-if-changed=` line above.
-    let kernel_sources = ["kernels/rms_norm.hip", "kernels/dequant_q4k.hip"];
+    let kernel_sources = [
+        "kernels/rms_norm.hip",
+        "kernels/rms_norm_backward.hip",
+        "kernels/dequant_q4k.hip",
+        "kernels/per_neuron_glu_batched.hip",
+        "kernels/adamw.hip",
+    ];
 
     let mut object_files: Vec<String> = Vec::with_capacity(kernel_sources.len());
     for src in kernel_sources {

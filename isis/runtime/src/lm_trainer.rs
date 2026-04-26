@@ -24,12 +24,12 @@
 //!      per-`Linear` grad buffers are *overwritten* per call, so we
 //!      download to host accumulators after each backward and sum
 //!      across positions.
-//!   3. **AdamW + re-upload.** AdamW updates each parameter's host
-//!      master; we re-upload to the resident weight buffer via
-//!      `HipBuffer::copy_from_host`. Master weights are downloaded
-//!      from the resident model on first `train_step` (since
-//!      `LinearResident` has no host-master field) and then live on
-//!      the trainer.
+//!   3. **Resident AdamW.** Each parameter's `weight_dev` is updated
+//!      in place via `Op::AdamWResident` — a custom hipcc kernel that
+//!      mutates `w`, `m`, `v` on device. No host master, no D2H/H2D
+//!      round-trip on the weight. The grad accumulator still lives on
+//!      the host (one H2D per param per step into a per-param resident
+//!      scratch); making it resident is a follow-up slice.
 //!
 //! ### Embedding-grad sparsity caveat
 //!
@@ -59,7 +59,7 @@ use std::collections::HashMap;
 #[cfg(feature = "rocm")]
 use modgrad_compute::backend::{GpuVec, ResidencyError};
 #[cfg(feature = "rocm")]
-use modgrad_device::backend::{HipBatch, AdamWArgs};
+use modgrad_device::backend::HipBatch;
 #[cfg(feature = "rocm")]
 use modgrad_transformer::loss::cross_entropy;
 #[cfg(feature = "rocm")]
@@ -115,23 +115,44 @@ impl Default for LmTrainerConfig {
     }
 }
 
-// ─── AdamW per-parameter state ───────────────────────────────
+// ─── AdamW per-parameter state (resident) ────────────────────
 
-/// Per-`Linear` AdamW first/second moment buffers + step counter.
+/// Per-`Linear` AdamW state — moments + grad scratch live on device.
+///
+/// The fp32 master weight does NOT live here; for `LinearResident`
+/// (pure-fp32, the only `LanguageModel` impl wired today) the device
+/// `weight_dev` IS the master, so AdamW updates it in place via
+/// `Op::AdamWResident`. The grad scratch `g_dev` is owned by this
+/// struct so we don't reallocate per training step.
 ///
 /// Why a sibling type instead of using `modgrad_transformer::optim::adamw::AdamW`:
 /// the transformer's `AdamW` carries lr/beta/etc as fields, expecting
 /// one optimizer per parameter group — that bloats the trainer's
 /// `HashMap` (every entry duplicates the same hyperparameters). Here
-/// we keep only the per-parameter *state* (m, v, t) and read the
-/// hyperparameters from the trainer's `LmTrainerConfig` once per
-/// step. Same numerics as `optim::adamw::AdamW::step`.
+/// we keep only the per-parameter *state* (m_dev, v_dev, g_dev, t) and
+/// read the hyperparameters from the trainer's `LmTrainerConfig` once
+/// per step.
+///
+/// **bf16 master note.** If a future `LanguageModel` wraps
+/// `LinearResidentBf16` (fp32 host master + bf16 device weight), the
+/// resident path here is wrong: `weight_dev` is bf16, not fp32, so the
+/// kernel would corrupt it. That model would need a separate
+/// `AdamWBufBf16` carrying a resident *fp32* master alongside the bf16
+/// `weight_dev`, plus a `sync_from_master` post-step. Today's
+/// `GptModelResident` is pure-fp32, so this complication does not
+/// apply.
 #[cfg(feature = "rocm")]
 pub struct AdamWBuf {
-    /// First moment estimates (per-element).
-    pub m: Vec<f32>,
-    /// Second moment estimates (per-element).
-    pub v: Vec<f32>,
+    /// First moment estimates — fp32, length `n`, resident on device.
+    pub m_dev: GpuVec,
+    /// Second moment estimates — fp32, length `n`, resident on device.
+    pub v_dev: GpuVec,
+    /// Per-step grad scratch — fp32, length `n`, resident on device.
+    /// Owned here so the trainer can upload the host-accumulated grad
+    /// into a stable buffer once per step instead of reallocating.
+    pub g_dev: GpuVec,
+    /// Element count (for the resident dispatch's `n` parameter).
+    pub n: usize,
     /// Step counter — bumped before each AdamW update so bias
     /// correction starts at t=1 (not 0, which would NaN the first
     /// step's `bc1`/`bc2`).
@@ -140,46 +161,75 @@ pub struct AdamWBuf {
 
 #[cfg(feature = "rocm")]
 impl AdamWBuf {
-    /// Allocate buffers for a parameter of `n` elements. m and v
-    /// start at zero; t starts at zero.
-    pub fn zeros(n: usize) -> Self {
-        Self { m: vec![0.0; n], v: vec![0.0; n], t: 0 }
+    /// Allocate moment + grad buffers for a parameter of `n`
+    /// elements, resident on device. m and v are zero-initialised;
+    /// g is left uninitialised (callers always upload before
+    /// dispatch); t starts at zero.
+    pub fn zeros(n: usize) -> Result<Self, ResidencyError> {
+        let mut m_dev = GpuVec::try_hip(n)?;
+        let mut v_dev = GpuVec::try_hip(n)?;
+        let g_dev = GpuVec::try_hip(n)?;
+        // Zero m and v via a single H2D — needed because hipMalloc
+        // doesn't zero, and AdamW reads m[i]/v[i] before the first
+        // write. g is overwritten before each read so no init needed.
+        let zeros = vec![0.0f32; n];
+        m_dev.copy_from(&zeros);
+        v_dev.copy_from(&zeros);
+        Ok(Self { m_dev, v_dev, g_dev, n, t: 0 })
     }
 
-    /// Apply one AdamW update step. `params` is the host fp32 master;
-    /// `grads` is the gradient (same length). The trainer's caller
-    /// is responsible for re-uploading after this call (the trainer
-    /// uses `HipBuffer::copy_from_host` on the matching resident
-    /// weight buffer; a future bf16 path would re-quantise via
-    /// `LinearResidentBf16::sync_from_master`).
+    /// Apply one AdamW update step against a device weight buffer.
+    /// Pulls grads from `host_grad` (the trainer's per-step accumulator),
+    /// uploads them to `g_dev`, and dispatches `Op::AdamWResident` so
+    /// `weight_dev` / `m_dev` / `v_dev` all update on device with no
+    /// further D2H/H2D round-trip.
     ///
-    /// Routes through `modgrad-device`'s `ops::adamw` so the kernel
-    /// path is the same as `RegionalAdamW`'s — there is exactly one
-    /// AdamW implementation, with one place for bug-fixes.
-    pub fn step(
+    /// `weight_dev` is the model's own resident weight — the dispatch
+    /// mutates it in place, which is exactly the residency invariant
+    /// we want (the model's `weight_dev` IS the AdamW master).
+    pub fn step_resident(
         &mut self,
-        params: &mut [f32],
-        grads: &mut [f32],
+        weight_dev: &modgrad_device::backend::HipBuffer,
+        host_grad: &[f32],
         cfg: &LmTrainerConfig,
-    ) {
-        debug_assert_eq!(params.len(), grads.len());
-        debug_assert_eq!(params.len(), self.m.len());
+    ) -> Result<(), ResidencyError> {
+        debug_assert_eq!(host_grad.len(), self.n,
+            "AdamWBuf::step_resident: grad len {} != alloc {}", host_grad.len(), self.n);
+        // Upload accumulated host grad into the resident scratch.
+        self.g_dev.copy_from(host_grad);
         self.t += 1;
         let bc1 = 1.0 - cfg.beta1.powi(self.t as i32);
         let bc2 = 1.0 - cfg.beta2.powi(self.t as i32);
-        modgrad_device::backend::ops::adamw(AdamWArgs {
-            w: params,
-            g: grads,
-            m: &mut self.m,
-            v: &mut self.v,
-            lr: cfg.lr,
-            beta1: cfg.beta1,
-            beta2: cfg.beta2,
-            eps: cfg.eps,
-            weight_decay: cfg.weight_decay,
-            bc1_inv: 1.0 / bc1,
-            bc2_inv: 1.0 / bc2,
-        }).expect("adamw dispatch");
+        let m_buf = match &mut self.m_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let v_buf = match &mut self.v_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        let g_buf = match &self.g_dev {
+            GpuVec::Hip(b) => b,
+            other => return Err(ResidencyError::WrongVariant {
+                expected: "Hip", got: other.variant_name(),
+            }),
+        };
+        unsafe {
+            modgrad_device::backend::ops::adamw_resident(
+                weight_dev.device_ptr() as *mut f32,
+                g_buf.device_ptr() as *const f32,
+                m_buf.device_ptr() as *mut f32,
+                v_buf.device_ptr() as *mut f32,
+                self.n,
+                cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                1.0 / bc1, 1.0 / bc2,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -195,17 +245,23 @@ impl AdamWBuf {
 #[cfg(feature = "rocm")]
 pub struct LmTrainer<M: LanguageModel> {
     model: M,
-    /// Per-parameter AdamW state, indexed by stable string key
-    /// (e.g. `"block.0.wq"`, `"lm_head"`). Lazily populated on the
-    /// first `train_step` call once we know the model shape.
+    /// Per-parameter AdamW state (resident moments + grad scratch),
+    /// indexed by stable string key (e.g. `"block.0.wq"`, `"lm_head"`).
+    /// Lazily populated on the first `train_step` call once we know
+    /// the model shape.
+    ///
+    /// No parallel host-master HashMap: `GptModelResident::LinearResident`
+    /// is pure-fp32 device-resident, so its `weight_dev` IS the AdamW
+    /// master. `Op::AdamWResident` updates `weight_dev` in place via a
+    /// custom hipcc kernel — eliminating the per-param D2H/host-AdamW/H2D
+    /// round-trip the prior host-AdamW path forced (one residency leak
+    /// per parameter per step, which dominated wall-clock at scale).
+    /// See [`AdamWBuf::step_resident`] for the dispatch.
+    ///
+    /// Param keys (`block.{li}.{wq,wk,wv,wo,gate,up,down}`, `embed`,
+    /// `lm_head`) match the modgrad-ctm convention so a future
+    /// serializer can checkpoint either trainer with the same schema.
     adamw: HashMap<String, AdamWBuf>,
-    /// Per-parameter host fp32 master weights, parallel to `adamw`.
-    /// `GptModelResident::LinearResident` does not retain a host master
-    /// (it's pure-fp32 device-resident), so the trainer downloads each
-    /// weight on first `train_step` and keeps the master here. AdamW
-    /// updates the master in place; the trainer then re-uploads to the
-    /// resident weight buffer.
-    masters: HashMap<String, Vec<f32>>,
     /// Resident KV cache reused across `train_step` calls. Allocated
     /// at construction with capacity = max(seq_len of any future
     /// micro_batch) — for now equal to `config.seq_len`. Reset
@@ -244,7 +300,6 @@ impl<M: LanguageModel> LmTrainer<M> {
         Ok(Self {
             model,
             adamw: HashMap::new(),
-            masters: HashMap::new(),
             kv_cache,
             bwd_state: None,
             loss_history: Vec::new(),
@@ -351,8 +406,13 @@ impl LmTrainer<GptModelResident> {
     ///      positions). The double forward is the cost of the
     ///      single-token backward signature; multi-token resident
     ///      backward is a follow-up slice.
-    ///   4. AdamW on the host master copies, then re-upload to the
-    ///      resident weight buffers.
+    ///   4. Resident AdamW directly on each `Linear`'s `weight_dev`.
+    ///      A single `Op::AdamWResident` dispatch per parameter mutates
+    ///      the device weight + moment buffers in place — no per-param
+    ///      D2H/H2D round-trip on the weight. The grad still travels
+    ///      H2D once per param (the per-position grad accumulator
+    ///      lives on the host); making the accumulator resident is the
+    ///      next slice.
     ///
     /// Errors propagate `ResidencyError` from any GPU op.
     pub fn train_step(
@@ -371,12 +431,15 @@ impl LmTrainer<GptModelResident> {
         let n_layers = self.model.n_layers();
         let d_model = self.model.d_model();
 
-        // ─── Stage 0: lazy alloc of master weights, AdamW state, bwd
-        // state. First train_step downloads every `Linear`'s weight to
-        // host (the resident model has no host master). Subsequent
-        // calls find the masters already populated and skip download.
-        if self.masters.is_empty() {
-            self.lazy_init_masters_and_state()?;
+        // ─── Stage 0: lazy alloc of resident AdamW state + bwd state.
+        // First train_step allocates per-param resident moment + grad
+        // scratch buffers (zero-initialised). Subsequent calls find the
+        // state already populated and skip allocation.
+        //
+        // No host-master download: `LinearResident::weight_dev` is the
+        // master, and `Op::AdamWResident` mutates it in place each step.
+        if self.adamw.is_empty() {
+            self.lazy_init_state()?;
         }
 
         // ─── Stage 1: reset cache. set_seq_len(0) only — every block's
@@ -419,9 +482,9 @@ impl LmTrainer<GptModelResident> {
         let keys = param_keys(n_layers);
         let mut grad_acc: HashMap<String, Vec<f32>> = HashMap::with_capacity(keys.len());
         for k in &keys {
-            let n = self.masters.get(k)
-                .expect("master populated by lazy_init")
-                .len();
+            let n = self.adamw.get(k)
+                .expect("AdamW state populated by lazy_init")
+                .n;
             grad_acc.insert(k.clone(), vec![0.0f32; n]);
         }
 
@@ -477,66 +540,58 @@ impl LmTrainer<GptModelResident> {
         self.bwd_state = Some(bwd);
         result?;
 
-        // ─── Stage 4: optional grad-norm clip + AdamW + re-upload.
+        // ─── Stage 4: optional grad-norm clip + resident AdamW.
+        //
+        // Resident dispatch eliminates the per-parameter D2H/H2D weight
+        // round-trip the prior host-AdamW path forced. The grad still
+        // travels host→device once per param per step (single H2D per
+        // param), but the weight stays resident across the whole loop.
+        // Removing the per-position grad download is the next slice.
         if self.config.grad_clip > 0.0 {
             let mut slices: Vec<&mut [f32]> =
                 grad_acc.values_mut().map(|v| v.as_mut_slice()).collect();
             Self::clip_grads(&mut slices, self.config.grad_clip);
         }
 
-        // Take masters out so we can call &mut self.model.embed_dev /
-        // .blocks while iterating. Restore at end.
-        let mut masters = std::mem::take(&mut self.masters);
-        let upload_result: Result<(), ResidencyError> = (|| {
-            for k in &keys {
-                let buf = self.adamw.get_mut(k)
-                    .expect("AdamW state populated by lazy_init");
-                let master = masters.get_mut(k)
-                    .expect("master populated by lazy_init");
-                let grad = grad_acc.get_mut(k)
-                    .expect("grad accumulator populated above");
-                buf.step(master.as_mut_slice(), grad.as_mut_slice(), &self.config);
-                Self::upload_master_to_model(
-                    &mut self.model, k, master.as_slice(), n_layers,
-                )?;
-            }
-            Ok(())
-        })();
-        self.masters = masters;
-        upload_result?;
+        for k in &keys {
+            let grad = grad_acc.get(k)
+                .expect("grad accumulator populated above");
+            // Borrow each AdamWBuf entry separately from the model so
+            // we hold a single &mut into adamw and a single &mut into
+            // model at the same time. Looking up by string per step is
+            // cheap (HashMap<String, _> hash on a short key).
+            let weight_dev = Self::weight_dev_for_key(&self.model, k, n_layers);
+            let buf = self.adamw.get_mut(k)
+                .expect("AdamW state populated by lazy_init");
+            buf.step_resident(weight_dev, grad.as_slice(), &self.config)?;
+        }
         let _ = d_model;
 
         Ok(loss)
     }
 
-    /// First-call setup — download every weight to host masters,
-    /// allocate matching AdamW state, allocate the backward state.
-    /// Idempotent guard: caller checks `masters.is_empty()`.
-    fn lazy_init_masters_and_state(&mut self) -> Result<(), ResidencyError> {
+    /// First-call setup — allocate the resident AdamW state (one
+    /// `AdamWBuf` per `Linear` plus the embedding table) and the
+    /// backward state. Idempotent guard: caller checks
+    /// `adamw.is_empty()`.
+    ///
+    /// Each `AdamWBuf::zeros(n)` performs three `hipMalloc`s
+    /// (`m_dev`, `v_dev`, `g_dev`) and two zero H2Ds (m, v). For a
+    /// 2-layer tiny test config that's 14 + 2 = 16 hipMallocs at
+    /// startup; for a real foundation model it's ~7 × n_layers + 2,
+    /// still a one-time cost amortised over the whole run.
+    fn lazy_init_state(&mut self) -> Result<(), ResidencyError> {
         let n_layers = self.model.n_layers();
         let d_model = self.model.d_model();
         let vocab = self.model.vocab_size();
 
-        // Inline downloads — keeping a free-function helper would need
-        // mutable access to two HashMaps in self while immutably
-        // borrowing self.model, which the borrow-checker (rightly)
-        // refuses. Inlining keeps the borrow scopes tight.
-        let download = |adamw: &mut HashMap<String, AdamWBuf>,
-                            masters: &mut HashMap<String, Vec<f32>>,
-                            key: &str,
-                            buf: &modgrad_device::backend::HipBuffer,
-                            n: usize|
-            -> Result<(), ResidencyError> {
-            let mut host = vec![0.0f32; n];
-            buf.copy_to_host(&mut host)?;
-            adamw.insert(key.to_string(), AdamWBuf::zeros(n));
-            masters.insert(key.to_string(), host);
+        let mut alloc = |key: &str, n: usize| -> Result<(), ResidencyError> {
+            self.adamw.insert(key.to_string(), AdamWBuf::zeros(n)?);
             Ok(())
         };
 
         // Embedding: [vocab × d_model].
-        download(&mut self.adamw, &mut self.masters,
-            "embed", &self.model.embed_dev, vocab * d_model)?;
+        alloc("embed", vocab * d_model)?;
 
         // Per-block linears.
         for li in 0..n_layers {
@@ -544,39 +599,57 @@ impl LmTrainer<GptModelResident> {
             let attn = &block.attn;
             let mlp = &block.mlp;
             let mlp_dim = mlp.mlp_dim();
-
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.wq"),
-                &attn.q_proj.weight_dev, attn.model_dim * attn.model_dim)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.wk"),
-                &attn.k_proj.weight_dev, attn.kv_dim * attn.model_dim)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.wv"),
-                &attn.v_proj.weight_dev, attn.kv_dim * attn.model_dim)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.wo"),
-                &attn.o_proj.weight_dev, attn.model_dim * attn.model_dim)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.gate"),
-                &mlp.gate.weight_dev, mlp_dim * d_model)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.up"),
-                &mlp.up.weight_dev, mlp_dim * d_model)?;
-            download(&mut self.adamw, &mut self.masters,
-                &format!("block.{li}.down"),
-                &mlp.down.weight_dev, d_model * mlp_dim)?;
+            let mm = attn.model_dim * attn.model_dim;
+            let kv_m = attn.kv_dim * attn.model_dim;
+            alloc(&format!("block.{li}.wq"), mm)?;
+            alloc(&format!("block.{li}.wk"), kv_m)?;
+            alloc(&format!("block.{li}.wv"), kv_m)?;
+            alloc(&format!("block.{li}.wo"), mm)?;
+            alloc(&format!("block.{li}.gate"), mlp_dim * d_model)?;
+            alloc(&format!("block.{li}.up"), mlp_dim * d_model)?;
+            alloc(&format!("block.{li}.down"), d_model * mlp_dim)?;
         }
 
         // LM head: [vocab × d_model].
-        download(&mut self.adamw, &mut self.masters,
-            "lm_head", &self.model.lm_head.weight_dev, vocab * d_model)?;
+        alloc("lm_head", vocab * d_model)?;
 
         // Backward state.
         let state = LanguageModel::alloc_backward_state(&self.model, &self.kv_cache)?;
         self.bwd_state = Some(state);
 
         Ok(())
+    }
+
+    /// Look up the model's resident weight buffer for a given param
+    /// key. Companion to `param_keys` — the inverse mapping. Used by
+    /// the resident AdamW dispatch to mutate `weight_dev` in place.
+    fn weight_dev_for_key<'a>(
+        model: &'a GptModelResident,
+        key: &str,
+        n_layers: usize,
+    ) -> &'a modgrad_device::backend::HipBuffer {
+        if key == "embed" {
+            return &model.embed_dev;
+        }
+        if key == "lm_head" {
+            return &model.lm_head.weight_dev;
+        }
+        let rest = key.strip_prefix("block.").expect("block key shape");
+        let mut parts = rest.splitn(2, '.');
+        let li: usize = parts.next().unwrap().parse().expect("block index");
+        let slot = parts.next().unwrap();
+        debug_assert!(li < n_layers, "{key}: block index out of range");
+        let block = &model.blocks[li];
+        match slot {
+            "wq" => &block.attn.q_proj.weight_dev,
+            "wk" => &block.attn.k_proj.weight_dev,
+            "wv" => &block.attn.v_proj.weight_dev,
+            "wo" => &block.attn.o_proj.weight_dev,
+            "gate" => &block.mlp.gate.weight_dev,
+            "up" => &block.mlp.up.weight_dev,
+            "down" => &block.mlp.down.weight_dev,
+            other => panic!("LmTrainer::weight_dev_for_key: unknown slot {other}"),
+        }
     }
 
     /// Add the resident-state's per-`Linear` grad buffers (this
@@ -655,42 +728,6 @@ impl LmTrainer<GptModelResident> {
         }
     }
 
-    /// Re-upload a host master into its matching device weight buffer.
-    /// `key` is the same string used as the AdamW / master key.
-    fn upload_master_to_model(
-        model: &mut GptModelResident,
-        key: &str,
-        master: &[f32],
-        n_layers: usize,
-    ) -> Result<(), ResidencyError> {
-        if key == "embed" {
-            model.embed_dev.copy_from_host(master)?;
-            return Ok(());
-        }
-        if key == "lm_head" {
-            model.lm_head.weight_dev.copy_from_host(master)?;
-            return Ok(());
-        }
-        // block.{li}.{slot}
-        let rest = key.strip_prefix("block.").expect("block key shape");
-        let mut parts = rest.splitn(2, '.');
-        let li: usize = parts.next().unwrap().parse().expect("block index");
-        let slot = parts.next().unwrap();
-        debug_assert!(li < n_layers, "{key}: block index out of range");
-
-        let block = &mut model.blocks[li];
-        match slot {
-            "wq" => block.attn.q_proj.weight_dev.copy_from_host(master)?,
-            "wk" => block.attn.k_proj.weight_dev.copy_from_host(master)?,
-            "wv" => block.attn.v_proj.weight_dev.copy_from_host(master)?,
-            "wo" => block.attn.o_proj.weight_dev.copy_from_host(master)?,
-            "gate" => block.mlp.gate.weight_dev.copy_from_host(master)?,
-            "up" => block.mlp.up.weight_dev.copy_from_host(master)?,
-            "down" => block.mlp.down.weight_dev.copy_from_host(master)?,
-            other => panic!("LmTrainer::upload_master: unknown slot {other}"),
-        }
-        Ok(())
-    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────
@@ -892,27 +929,43 @@ mod tests {
         assert!((d[1] - 0.1).abs() < 1e-9);
     }
 
-    /// `AdamWBuf::step` updates m, v, and t, and reduces the
-    /// magnitude of `params` for a positive-mean gradient. Pure
-    /// numerical check, single update, with CPU-side fp32 only.
+    /// `AdamWBuf::step_resident` updates the device weight + moments
+    /// in place, and bumps `t`. After one step against a
+    /// positive-mean gradient, the weight magnitude shrinks (AdamW
+    /// with decoupled weight decay nudges it toward zero), and the
+    /// moment buffers carry non-zero state (download to verify).
+    /// Requires a HIP-capable device — same gating macro as the smoke
+    /// test below.
     #[test]
-    fn adamw_buf_step_basic() {
-        let mut buf = AdamWBuf::zeros(4);
-        let mut params = vec![1.0f32, 1.0, 1.0, 1.0];
-        let mut grads = vec![0.5f32, 0.5, 0.5, 0.5];
+    fn adamw_buf_step_resident_basic() {
+        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        skip_if_no_gpu!();
+        let mut buf = AdamWBuf::zeros(4).expect("alloc resident adamw buf");
+        // Resident weight starts at 1.0 across the board.
+        let weight_buf = modgrad_device::backend::HipBuffer::new(4 * 4)
+            .expect("alloc weight");
+        weight_buf.copy_from_host(&[1.0f32, 1.0, 1.0, 1.0]).expect("upload weight");
+        let grads = [0.5f32, 0.5, 0.5, 0.5];
         let cfg = LmTrainerConfig::default();
-        buf.step(&mut params, &mut grads, &cfg);
+        buf.step_resident(&weight_buf, &grads, &cfg).expect("resident adamw");
         assert_eq!(buf.t, 1, "t bumped");
-        // After one step, params should be slightly less than 1 (gradient
-        // points away from zero, so AdamW with weight decay nudges them
-        // smaller).
-        for &p in &params {
+
+        // Weight should have shrunk from 1.0 toward zero, but only
+        // slightly with the default tiny lr / wd.
+        let mut weight_host = [0.0f32; 4];
+        weight_buf.copy_to_host(&mut weight_host).expect("download weight");
+        for &p in &weight_host {
             assert!(p < 1.0 && p > 0.99,
                 "param after one tiny AdamW step should be just under 1.0, got {p}");
         }
-        // Moments should have absorbed the gradient.
-        for &m in &buf.m { assert!(m > 0.0, "first moment populated"); }
-        for &v in &buf.v { assert!(v > 0.0, "second moment populated"); }
+
+        // First / second moments should carry the absorbed gradient.
+        let mut m_host = [0.0f32; 4];
+        let mut v_host = [0.0f32; 4];
+        buf.m_dev.copy_to_host(&mut m_host);
+        buf.v_dev.copy_to_host(&mut v_host);
+        for &m in &m_host { assert!(m > 0.0, "first moment populated"); }
+        for &v in &v_host { assert!(v > 0.0, "second moment populated"); }
     }
 
     /// End-to-end smoke test: build a tiny GptModelResident, wrap in

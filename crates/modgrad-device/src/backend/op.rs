@@ -390,6 +390,46 @@ pub enum Op<'a> {
         eps: f32,
     },
 
+    /// **Device-resident** RMSNorm backward. Pairs with
+    /// [`Op::RmsNormResident`] to keep the final-RMSNorm gradient on
+    /// device — eliminates the host-bounce that
+    /// `GptModelResident::backward` used to do (D2H input + H2D grad
+    /// every step).
+    ///
+    /// Math (per row, with N = `hidden`):
+    ///   rstd  = 1 / sqrt(mean(x^2) + eps)
+    ///   S     = Σ_c (dy[c] * x[c] * weight[c])
+    ///   dx[c] = (weight[c] * dy[c] - x[c] * S * rstd^2 / N) * rstd
+    ///
+    /// Per-feature gamma gradient (summed across rows):
+    ///   dweight[c] = Σ_r (dy[r, c] * x[r, c] * rstd[r])
+    ///
+    /// `dweight_dev` may be NULL when the caller doesn't need the
+    /// gamma gradient (frozen-norm path); the dispatch elides the
+    /// second kernel launch in that case. When non-NULL, the kernel
+    /// **accumulates** into `dweight_dev` — caller zeros beforehand if
+    /// a fresh gradient is desired (matches MIOpen LayerNorm backward
+    /// convention).
+    ///
+    /// Layout: `x_dev`, `dy_dev`, `dx_dev` are `[n, hidden]` row-major;
+    /// `weight_dev` and (optional) `dweight_dev` are length-`hidden`.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. CPU and other non-
+    /// resident backends return `Unsupported`.
+    RmsNormBackwardResident {
+        x_dev: *const f32,
+        dy_dev: *const f32,
+        weight_dev: *const f32,
+        dx_dev: *mut f32,
+        /// Optional gamma gradient accumulator; pass `null_mut()` to
+        /// skip the dweight pass entirely.
+        dweight_dev: *mut f32,
+        n: usize,
+        hidden: usize,
+        eps: f32,
+    },
+
     /// **Device-resident** LayerNorm forward — affine variant matching
     /// PyTorch `nn.LayerNorm(elementwise_affine=True)`.
     ///
@@ -468,6 +508,34 @@ pub enum Op<'a> {
         x_dev: *const f32,
         y_dev: *mut f32,
         n_rows: usize,
+        half_size: usize,
+    },
+
+    /// **Device-resident** per-neuron batched GLU forward.
+    ///
+    /// One launch covering `n_neurons` neurons whose per-neuron layout
+    /// is value-then-gate interleaved WITHIN each neuron — NOT MIOpen's
+    /// `dim=0` split. For each neuron `n` and channel `i`:
+    ///
+    /// `y[n, i] = x[n, i] * sigmoid(x[n, half_size + i])`
+    ///
+    /// where `x` is `[n_neurons, 2 * half_size]` row-major and `y` is
+    /// `[n_neurons, half_size]` row-major.
+    ///
+    /// Replaces the per-neuron `Op::GluResident` loop in the CTM
+    /// forward path (`crates/modgrad-ctm/src/forward.rs`); MIOpen's
+    /// solver only splits along the leading axis so it cannot batch
+    /// the per-neuron interleaved layout in a single call. Routed
+    /// through a custom hipcc kernel
+    /// (`kernels/per_neuron_glu_batched.hip`).
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. CPU and other non-
+    /// resident backends return `Unsupported`.
+    PerNeuronGluBatchedResident {
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_neurons: usize,
         half_size: usize,
     },
 
@@ -725,6 +793,51 @@ pub enum Op<'a> {
     /// AdamW update. See [`AdamWArgs`] for field semantics.
     AdamW(AdamWArgs<'a>),
 
+    /// **Device-resident** AdamW update.
+    ///
+    /// Math (decoupled-weight-decay AdamW), per element:
+    ///
+    /// ```text
+    /// m_t   = beta1 * m_{t-1} + (1 - beta1) * g
+    /// v_t   = beta2 * v_{t-1} + (1 - beta2) * g * g
+    /// m_hat = m_t / (1 - beta1^t)         (== m_t * bc1_inv)
+    /// v_hat = v_t / (1 - beta2^t)         (== v_t * bc2_inv)
+    /// w_t   = w_{t-1} - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * w_{t-1})
+    /// ```
+    ///
+    /// `w_dev`, `g_dev`, `m_dev`, `v_dev` all point at length-`n` fp32
+    /// element buffers. The kernel updates `w_dev`, `m_dev`, `v_dev` in
+    /// place; `g_dev` is read-only.
+    ///
+    /// `bc1_inv` / `bc2_inv` are the bias-correction reciprocals
+    /// `1 / (1 - beta1^t)` / `1 / (1 - beta2^t)`, computed by the
+    /// caller once per training step (matches the host-side
+    /// [`Op::AdamW`] contract — same arithmetic, identical numerics).
+    ///
+    /// Used by `LmTrainer` (and any future foundation-model trainer) to
+    /// eliminate the per-parameter D2H / host-AdamW / H2D round-trip
+    /// that the host `AdamW` path forces.
+    ///
+    /// Lifetime contract: caller guarantees the device pointers remain
+    /// valid for the duration of the dispatch. Backends without a
+    /// hipcc-built AdamW kernel (CPU, KFD, vulkan, hip without hipcc)
+    /// return `Unsupported` and the caller must fall back to the host
+    /// `Op::AdamW` path.
+    AdamWResident {
+        w_dev: *mut f32,
+        g_dev: *const f32,
+        m_dev: *mut f32,
+        v_dev: *mut f32,
+        n: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1_inv: f32,
+        bc2_inv: f32,
+    },
+
     // ─── CTM-specific (no library equivalent) ────────────────
 
     /// SuperLinear (Neuron-Level MLP) forward: per-neuron matvec over
@@ -862,10 +975,12 @@ impl<'a> Op<'a> {
             Op::MatvecResidentBf16 { .. } => "matvec_resident_bf16",
             Op::DequantQ4KResident { .. } => "dequant_q4k_resident",
             Op::RmsNormResident { .. } => "rms_norm_resident",
+            Op::RmsNormBackwardResident { .. } => "rms_norm_backward_resident",
             Op::LayerNormResident { .. } => "layer_norm_resident",
             Op::SoftmaxResident { .. } => "softmax_resident",
             Op::ActivationResident { .. } => "activation_resident",
             Op::GluResident { .. } => "glu_resident",
+            Op::PerNeuronGluBatchedResident { .. } => "per_neuron_glu_batched_resident",
             Op::OpTensorResident { .. } => "op_tensor_resident",
             Op::LayerNormBackwardResident { .. } => "layer_norm_backward_resident",
             Op::SoftmaxBackwardResident { .. } => "softmax_backward_resident",
@@ -885,6 +1000,7 @@ impl<'a> Op<'a> {
             Op::ReduceL2Sq { .. } => "reduce_l2_sq",
             Op::SgdUpdate { .. } => "sgd_update",
             Op::AdamW(_) => "adamw",
+            Op::AdamWResident { .. } => "adamw_resident",
             Op::SuperLinearFwd { .. } => "superlinear_fwd",
             Op::SuperLinearBwdDw { .. } => "superlinear_bwd_dw",
             Op::SuperLinearBwdDx { .. } => "superlinear_bwd_dx",

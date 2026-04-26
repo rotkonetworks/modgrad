@@ -260,13 +260,15 @@ fn ctm_forward_with_kv(
 // matvec too so scores never round-trip; either subsumes the
 // current upload/download bracket around the softmax dispatch.
 //
-// **NLM per-neuron GLU now resident.** Stage1 produces a device
-// `[d * 2*h]` block; we issue `d` `glu_resident` dispatches (one
-// per neuron) writing into a device `[d * h]` GLU output buffer,
-// then optionally feed that directly into stage2 + a second
-// per-neuron GLU loop. The whole NLM pipeline stays on device;
-// only the final activated state downloads back to host where
-// sync_update consumes it.
+// **NLM per-neuron GLU now resident and batched.** Stage1 produces
+// a device `[d * 2*h]` block; a single
+// `per_neuron_glu_batched_resident` dispatch (custom hipcc kernel)
+// writes into a device `[d * h]` GLU output buffer, then optionally
+// feeds that directly into stage2 + a second batched GLU dispatch.
+// The whole NLM pipeline stays on device; only the final activated
+// state downloads back to host where sync_update consumes it.
+// Replacing the previous N-call MIOpen GLU loop drops `2*d` MIOpen
+// dispatches per CTM tick to 2 hipcc launches.
 
 #[cfg(feature = "rocm")]
 use modgrad_compute::backend::{GpuVec, ResidencyError};
@@ -814,21 +816,27 @@ pub fn ctm_forward_resident(
 
         // ── NLM forward: trace → activated, fully resident. ──
         // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out_dev.
-        // Per-neuron GLU dispatch loop writes into nlm_s1_glu_dev.
-        // If stage2 is Some: stage2 (resident SuperLinear) reads
-        // nlm_s1_glu_dev → nlm_s2_out_dev, then a second per-neuron
-        // GLU dispatch loop writes nlm_s2_glu_dev. Final activated
-        // is the only host download.
+        // A single per-neuron-batched GLU dispatch (custom hipcc
+        // kernel) writes into nlm_s1_glu_dev. If stage2 is Some:
+        // stage2 (resident SuperLinear) reads nlm_s1_glu_dev →
+        // nlm_s2_out_dev, then a second batched GLU dispatch writes
+        // nlm_s2_glu_dev. Final activated is the only host download.
         nlm_in_dev.copy_from(&state.trace);
         cache.nlm_stage1.forward(batch, &nlm_in_dev, &mut nlm_s1_out_dev)?;
 
-        // Per-neuron GLU on stage1 output. Each neuron's slice in
-        // nlm_s1_out_dev is `[2*s1_half]` — laid out as the values
-        // half followed by the gates half WITHIN that neuron — which
-        // matches MIOpen's dim=0 GLU layout when viewed as a single
-        // [2, s1_half, 1, 1] tensor (`n_rows = 1, half_size = s1_half`).
-        // n_neurons (= d) dispatches per stage; same cadence as the
-        // SuperLinearResident matvec loop above.
+        // Per-neuron GLU on stage1 output, batched into a single
+        // dispatch. Each neuron's slice in nlm_s1_out_dev is
+        // `[2*s1_half]` — values half followed by gates half
+        // WITHIN that neuron. MIOpen's GLU solver only splits along
+        // the leading axis (`src/solver/glu/forward_glu.cpp`), so the
+        // per-neuron interleaved layout cannot be batched in one
+        // MIOpen call; the custom hipcc kernel
+        // (`crates/modgrad-device/kernels/per_neuron_glu_batched.hip`)
+        // handles the interleaved layout in one launch and replaces
+        // the previous `d`-call MIOpen loop. Total threads launched =
+        // `d * s1_half`. The debug_assert pins `out_per == 2 * s1_half`
+        // — the kernel derives the per-neuron stride from `2 * half_size`.
+        debug_assert_eq!(w.nlm_stage1.out_per, 2 * s1_half);
         {
             let s1_out_base = match &nlm_s1_out_dev {
                 GpuVec::Hip(b) => b.device_ptr() as *const f32,
@@ -838,17 +846,12 @@ pub fn ctm_forward_resident(
                 GpuVec::Hip(b) => b.device_ptr() as *mut f32,
                 _ => unreachable!("hip alloc"),
             };
-            let s1_in_stride = w.nlm_stage1.out_per; // 2 * s1_half
-            for n in 0..d {
-                unsafe {
-                    modgrad_device::backend::ops::glu_resident(
-                        s1_out_base.add(n * s1_in_stride),
-                        s1_glu_base.add(n * s1_half),
-                        1, s1_half,
-                    )?;
-                }
-                batch.note_dispatch()?;
+            unsafe {
+                modgrad_device::backend::ops::per_neuron_glu_batched_resident(
+                    s1_out_base, s1_glu_base, d, s1_half,
+                )?;
             }
+            batch.note_dispatch()?;
         }
 
         // ── Cache: D2H stage1 raw output (BEFORE per-neuron GLU). ──
@@ -902,8 +905,11 @@ pub fn ctm_forward_resident(
                 h
             };
 
-            // Per-neuron GLU on stage2 output, same pattern as stage1.
+            // Per-neuron GLU on stage2 output, same pattern as
+            // stage1: one batched dispatch into the custom hipcc
+            // kernel rather than `d` MIOpen calls.
             let s2_half = s2_weights.out_per / 2;
+            debug_assert_eq!(s2_weights.out_per, 2 * s2_half);
             let s2_glu_dev = nlm_s2_glu_dev.as_mut()
                 .expect("s2 glu buffer allocated when stage2 present");
             {
@@ -915,17 +921,12 @@ pub fn ctm_forward_resident(
                     GpuVec::Hip(b) => b.device_ptr() as *mut f32,
                     _ => unreachable!("hip alloc"),
                 };
-                let s2_in_stride = s2_weights.out_per;
-                for n in 0..d {
-                    unsafe {
-                        modgrad_device::backend::ops::glu_resident(
-                            s2_out_base.add(n * s2_in_stride),
-                            s2_glu_base.add(n * s2_half),
-                            1, s2_half,
-                        )?;
-                    }
-                    batch.note_dispatch()?;
+                unsafe {
+                    modgrad_device::backend::ops::per_neuron_glu_batched_resident(
+                        s2_out_base, s2_glu_base, d, s2_half,
+                    )?;
                 }
+                batch.note_dispatch()?;
             }
             batch.flush()?;
             let mut activated_host = vec![0.0f32; d * s2_half];
@@ -1076,35 +1077,25 @@ pub fn ctm_forward_resident(
 // Synapse U-Net BACKWARD GAP — DOCUMENTED REGRESSION.
 //
 // `SynapseUNetResident::forward` is monolithic (no per-block
-// intermediate cache exposed). Two paths exist for resident
-// backward through the U-Net:
-//   (a) Reconstruct host intermediates via `unet_forward_cached` on
-//       the saved `pre_syn`, run host `unet_backward`. This is the
-//       slice's intended path BUT both helpers (and the `UNetGrads`
-//       inner fields) are private to `train.rs`. With the slice
-//       constraint of "do not modify train.rs", the import is not
-//       reachable from here.
-//   (b) Extend `SynapseUNetResident::forward_cached` to expose
-//       per-block buffers — separate slice.
+// intermediate cache exposed). Of the two repair paths:
+//   (a) Extend `SynapseUNetResident::forward_cached` to expose
+//       per-block buffers — significant resident-dispatch refactor;
+//       deferred.
+//   (b) Promote `train::unet_forward_cached` / `train::unet_backward`
+//       (and `UNetCache`) to `pub(crate)`, then call them from here
+//       on the saved `tc.pre_syn`, accumulating into
+//       `grads.unet` — this is the path taken.
 //
-// Effect on this function: U-Net WEIGHT GRADIENTS regress to zero
-// in the returned `CtmGradients.unet`. The cross-tick BPTT chain
-// remains correct because we still propagate `d_pre_syn = synapse
-// pseudo-inverse * d_pre_act` via a host-only forward+backward of
-// the U-Net using a LOCAL cache structure — the shape of d_pre_syn
-// is the load-bearing artefact for cross-tick gradient flow.
-// MHA, NLM, q_proj, output_proj, sync, decay, kv_proj gradients
-// are all populated normally. Test asserts non-U-Net fields match
-// host within 1e-3 FP.
+// Path B trades one extra host-side U-Net forward per tick for
+// minimal-surface code and the existing battle-tested host backward
+// math. The cross-tick BPTT chain (`d_pre_syn` propagation) was
+// already correct; this fix adds full weight/bias/gamma/beta
+// gradient accumulation into `CtmGradients.unet`.
 //
-// When option (b) lands, this function will:
-//   - Take `cache.tick_caches[t].unet_blocks` (new field)
-//   - Dispatch each block's backward via the resident
-//     `Op::LayerNormBackwardResident` / `Op::ActivationBackwardResident`
-//     pair already shipped in Part 1
-//   - Accumulate U-Net weight grads through the (private at-time-of-
-//     write) `UNetGrads::add` interface — promotion of which is the
-//     unblocking dependency.
+// Path A remains a future option if the per-tick host U-Net forward
+// becomes a measurable bottleneck. The contract this function
+// exposes (`grads.unet` populated) does not depend on which path
+// computes the cache.
 
 /// Result of `ctm_backward_resident` — gradients plus the
 /// cross-tick observable propagation needed by the outer brain
@@ -1112,7 +1103,9 @@ pub fn ctm_forward_resident(
 #[cfg(feature = "rocm")]
 pub struct RegionBackwardResultResident {
     /// Per-region weight gradients (matches host `RegionBackwardResult.grads`).
-    /// **U-Net grads are zero** — see module-level GAP doc.
+    /// All fields including `grads.unet` are populated — the U-Net
+    /// regression documented in earlier slices is FIXED via Path B
+    /// (see module-level doc).
     pub grads: crate::train::CtmGradients,
     /// Gradient w.r.t. observation tokens fed in (per-token, flat).
     /// Length `cache.n_tokens * raw_dim`.
@@ -1193,14 +1186,18 @@ pub fn ctm_backward_resident(
         let mut d_pre_act = vec![0.0f32; d];
         for n in 0..d { d_pre_act[n] = d_trace[n * m + m - 1]; }
 
-        // ── Synapse U-Net backward (LOCAL — see GAP doc). ──
-        // We need d_pre_syn (gradient w.r.t. the U-Net input) so the
-        // cross-tick chain is intact. Weight gradients into U-Net's
-        // private fields are NOT updated here; they regress to zero.
-        // The local backward accumulates into a discarded local
-        // accumulator and returns d_pre_syn.
-        let d_pre_syn = local_unet_forward_backward(
-            &w.synapse, &tc.pre_syn, &d_pre_act,
+        // ── Synapse U-Net backward (Path B — host re-cache). ──
+        // Reconstruct per-block intermediates host-side via the now
+        // pub(crate) `train::unet_forward_cached`, then run
+        // `train::unet_backward` directly into `grads.unet`. Weight,
+        // bias, gamma, beta gradients all accumulate correctly; the
+        // returned `d_pre_syn` keeps the cross-tick BPTT chain intact.
+        // (See module-level GAP doc for why Path B vs Path A.)
+        let (_unet_out, unet_cache) = crate::train::unet_forward_cached(
+            &w.synapse, &tc.pre_syn,
+        );
+        let d_pre_syn = crate::train::unet_backward(
+            &w.synapse, &d_pre_act, &unet_cache, &mut grads.unet,
         );
 
         let d_attn_out = &d_pre_syn[..d_in];
@@ -1498,223 +1495,6 @@ fn mha_backward_resident(
     }
 
     (d_q_in, d_kv_tokens)
-}
-
-/// Local U-Net forward+backward to recover d_pre_syn.
-///
-/// **U-Net WEIGHT GRADIENTS ARE NOT COMPUTED HERE** — see
-/// module-level GAP doc. The local accumulators are discarded;
-/// only `d_pre_syn` (the gradient w.r.t. the U-Net input) is
-/// returned, because the cross-tick BPTT chain depends on it.
-///
-/// This function is the slice's regression line. Promoting it to
-/// real U-Net weight gradients needs either the train.rs helpers
-/// to gain `pub(crate)` exposure (option a in the PART B brief)
-/// or a `SynapseUNetResident::forward_cached` that exposes per-
-/// block intermediates (option b).
-#[cfg(feature = "rocm")]
-fn local_unet_forward_backward(
-    unet: &crate::synapse::SynapseUNet,
-    pre_syn: &[f32],
-    d_pre_act: &[f32],
-) -> Vec<f32> {
-    // Forward pass (host) to recover per-block intermediates via
-    // public SynapseBlock fields. Each block: y = SiLU(LN(W·x + b)).
-    // We save the pre-activation per block (after Linear and LN
-    // in-affine, before SiLU) so the SiLU backward has its `pre`.
-    let n_blocks = unet.down_blocks.len();
-    let first = &unet.first_projection;
-    let (first_out, first_pre_silu, first_normed, first_inv_std) =
-        local_block_forward(first, pre_syn);
-
-    let mut down_outs = vec![first_out.clone()];
-    let mut down_pre_silus = vec![first_pre_silu];
-    let mut down_normeds = vec![first_normed];
-    let mut down_inv_stds = vec![first_inv_std];
-    for i in 0..n_blocks {
-        let blk = &unet.down_blocks[i];
-        let x = down_outs.last().unwrap().clone();
-        let (out, pre_silu, normed, inv_std) = local_block_forward(blk, &x);
-        down_outs.push(out);
-        down_pre_silus.push(pre_silu);
-        down_normeds.push(normed);
-        down_inv_stds.push(inv_std);
-    }
-
-    let mut current = down_outs[n_blocks].clone();
-    let mut up_pre_silus: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
-    let mut up_normeds: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
-    let mut up_inv_stds: Vec<f32> = Vec::with_capacity(n_blocks);
-    let mut skip_normeds: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
-    let mut skip_inv_stds: Vec<f32> = Vec::with_capacity(n_blocks);
-    let mut up_inputs: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
-    let mut up_outs_pre_skip: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
-    for i in 0..n_blocks {
-        let up_idx = n_blocks - 1 - i;
-        up_inputs.push(current.clone());
-        let blk = &unet.up_blocks[up_idx];
-        let (up_out, pre_silu, normed, inv_std) = local_block_forward(blk, &current);
-        up_pre_silus.push(pre_silu);
-        up_normeds.push(normed);
-        up_inv_stds.push(inv_std);
-        // Skip add
-        let mut sum: Vec<f32> = up_out.iter().zip(&down_outs[up_idx])
-            .map(|(&a, &b)| a + b).collect();
-        up_outs_pre_skip.push(sum.clone());
-        // Skip LN
-        let (sum_after, normed, inv_std) = local_affine_ln_forward(
-            &mut sum, &unet.skip_ln_gamma[up_idx], &unet.skip_ln_beta[up_idx],
-        );
-        skip_normeds.push(normed);
-        skip_inv_stds.push(inv_std);
-        current = sum_after;
-    }
-    let _final = current;
-
-    // Backward.
-    let mut d_current = d_pre_act.to_vec();
-    let mut d_skip_for_down: Vec<Option<Vec<f32>>> = vec![None; n_blocks + 1];
-    for j in 0..n_blocks {
-        let fwd_i = n_blocks - 1 - j;
-        let gamma_idx = j;
-        let cache_i = fwd_i;
-        // Skip LN backward
-        let d_sum = local_affine_ln_backward(
-            &d_current, &skip_normeds[cache_i], skip_inv_stds[cache_i],
-            &unet.skip_ln_gamma[gamma_idx],
-        );
-        // Skip side branch: gradient onto down_outs[gamma_idx]
-        d_skip_for_down[gamma_idx] = Some(d_sum.clone());
-        // Up block backward
-        d_current = local_block_backward(
-            &unet.up_blocks[gamma_idx], &d_sum,
-            &up_inputs[cache_i],
-            &up_normeds[cache_i], up_inv_stds[cache_i],
-            &up_pre_silus[cache_i],
-        );
-    }
-
-    // Down path backward
-    for i in (0..n_blocks).rev() {
-        // The down-block output went into down_outs[i+1]; its forward
-        // input was down_outs[i]. We need d_current (= grad at
-        // down_outs[i+1]) to flow through the down block back to
-        // d at down_outs[i].
-        d_current = local_block_backward(
-            &unet.down_blocks[i], &d_current,
-            &down_outs[i],
-            &down_normeds[i + 1], down_inv_stds[i + 1],
-            &down_pre_silus[i + 1],
-        );
-        if let Some(ref extra) = d_skip_for_down[i] {
-            for (c, e) in d_current.iter_mut().zip(extra) { *c += e; }
-        }
-    }
-
-    // First projection backward
-    let d_first_in = local_block_backward(
-        &unet.first_projection, &d_current,
-        pre_syn,
-        &down_normeds[0], down_inv_stds[0],
-        &down_pre_silus[0],
-    );
-    d_first_in
-}
-
-/// Forward of one SynapseBlock. Returns (post-silu output,
-/// pre-silu, normed, inv_std).
-#[cfg(feature = "rocm")]
-fn local_block_forward(
-    block: &crate::synapse::SynapseBlock,
-    x: &[f32],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32) {
-    // Linear
-    let lin_out = block.linear.forward(x);
-    let mut y = lin_out;
-    // Affine LN
-    let (out, normed, inv_std) = local_affine_ln_forward(
-        &mut y, &block.ln_gamma, &block.ln_beta,
-    );
-    // SiLU (in-place would be nice; we keep `out` separately for
-    // clarity)
-    let pre_silu = out.clone();
-    let mut silu_out = out;
-    for v in silu_out.iter_mut() {
-        let s = 1.0 / (1.0 + (-*v).exp());
-        *v = *v * s;
-    }
-    (silu_out, pre_silu, normed, inv_std)
-}
-
-/// Backward of one SynapseBlock. Discards weight/bias/gamma/beta
-/// gradients (regression — see GAP doc). Returns d_input.
-#[cfg(feature = "rocm")]
-fn local_block_backward(
-    block: &crate::synapse::SynapseBlock,
-    d_out: &[f32],
-    block_input: &[f32],
-    normed: &[f32], inv_std: f32,
-    pre_silu: &[f32],
-) -> Vec<f32> {
-    // SiLU backward
-    let mut d_after_ln = vec![0.0f32; d_out.len()];
-    modgrad_device::backend::ops::silu_bwd(d_out, pre_silu, &mut d_after_ln)
-        .expect("silu_bwd");
-    // Affine LN backward — discards d_gamma/d_beta locally.
-    let d_after_lin = local_affine_ln_backward(
-        &d_after_ln, normed, inv_std, &block.ln_gamma,
-    );
-    // Linear backward — discards d_weight/d_bias locally.
-    let mut discarded_dw = vec![0.0f32; block.linear.weight.len()];
-    let mut discarded_db = vec![0.0f32; block.linear.bias.len()];
-    let mut d_input = vec![0.0f32; block.linear.in_dim];
-    let lin_cache = crate::train::LinearCache { input: block_input.to_vec() };
-    crate::train::linear_backward(
-        &block.linear, &d_after_lin, &lin_cache,
-        &mut discarded_dw, &mut discarded_db,
-        &mut d_input,
-    );
-    let _ = discarded_dw;
-    let _ = discarded_db;
-    d_input
-}
-
-/// Affine LayerNorm forward — pure host scalar. Returns
-/// (output, normalized, inv_std). Mirrors `train::affine_ln_forward`.
-#[cfg(feature = "rocm")]
-fn local_affine_ln_forward(
-    x: &mut Vec<f32>, gamma: &[f32], beta: &[f32],
-) -> (Vec<f32>, Vec<f32>, f32) {
-    let n = x.len() as f32;
-    let mean: f32 = x.iter().sum::<f32>() / n;
-    let var: f32 = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-    let inv_std = 1.0 / (var + 1e-5).sqrt();
-    let mut normed = Vec::with_capacity(x.len());
-    let mut out = Vec::with_capacity(x.len());
-    for i in 0..x.len() {
-        let nm = (x[i] - mean) * inv_std;
-        normed.push(nm);
-        out.push(gamma[i] * nm + beta[i]);
-    }
-    (out, normed, inv_std)
-}
-
-/// Affine LayerNorm backward — pure host scalar. Returns d_input.
-/// d_gamma / d_beta are not accumulated locally (see GAP doc).
-/// Mirrors `train::affine_ln_backward`.
-#[cfg(feature = "rocm")]
-fn local_affine_ln_backward(
-    d_out: &[f32], normed: &[f32], inv_std: f32, gamma: &[f32],
-) -> Vec<f32> {
-    let n = d_out.len();
-    let nf = n as f32;
-    let d_norm: Vec<f32> = (0..n).map(|i| d_out[i] * gamma[i]).collect();
-    let mean_dn: f32 = d_norm.iter().sum::<f32>() / nf;
-    let mean_dn_xhat: f32 = d_norm.iter().zip(normed)
-        .map(|(&d, &x)| d * x).sum::<f32>() / nf;
-    (0..n).map(|i| {
-        inv_std * (d_norm[i] - mean_dn - normed[i] * mean_dn_xhat)
-    }).collect()
 }
 
 // ─── Episodic memory bridge ────────────────────────────────

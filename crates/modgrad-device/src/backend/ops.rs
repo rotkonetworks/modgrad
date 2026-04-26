@@ -369,6 +369,38 @@ pub unsafe fn rms_norm_resident(
     Ok(())
 }
 
+/// Device-resident RMSNorm backward.
+/// See [`Op::RmsNormBackwardResident`](super::Op::RmsNormBackwardResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev`, `dy_dev`, `dx_dev` each cover at least `n * hidden * 4` bytes.
+/// - `weight_dev` covers at least `hidden * 4` bytes.
+/// - `dweight_dev` is either NULL (skip dweight) or covers at least
+///   `hidden * 4` bytes.
+/// - The pointers stay valid for the duration of this call.
+///
+/// `dweight_dev` is **accumulated into** when non-NULL; caller zeros
+/// before the call if a fresh gradient is desired.
+#[inline]
+pub unsafe fn rms_norm_backward_resident(
+    x_dev: *const f32,
+    dy_dev: *const f32,
+    weight_dev: *const f32,
+    dx_dev: *mut f32,
+    dweight_dev: *mut f32,
+    n: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::RmsNormBackwardResident {
+        x_dev, dy_dev, weight_dev, dx_dev, dweight_dev, n, hidden, eps,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident LayerNorm forward.
 /// See [`Op::LayerNormResident`](super::Op::LayerNormResident).
 ///
@@ -465,6 +497,36 @@ pub unsafe fn glu_resident(
     half_size: usize,
 ) -> Result<(), BackendError> {
     let mut op = Op::GluResident { x_dev, y_dev, n_rows, half_size };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident per-neuron batched GLU forward.
+/// See [`Op::PerNeuronGluBatchedResident`](super::Op::PerNeuronGluBatchedResident).
+///
+/// One launch covering `n_neurons` neurons whose per-neuron layout
+/// is value-then-gate interleaved WITHIN each neuron. Replaces the
+/// per-neuron `glu_resident` loop in `crates/modgrad-ctm/src/forward.rs`
+/// with a single dispatch.
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev` covers at least `n_neurons * 2 * half_size * 4` bytes
+///   (per-neuron `[v_0..v_half, g_0..g_half]` layout).
+/// - `y_dev` covers at least `n_neurons * half_size * 4` bytes.
+/// - `x_dev` and `y_dev` are distinct buffers (GLU is not in-place).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn per_neuron_glu_batched_resident(
+    x_dev: *const f32,
+    y_dev: *mut f32,
+    n_neurons: usize,
+    half_size: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::PerNeuronGluBatchedResident {
+        x_dev, y_dev, n_neurons, half_size,
+    };
     super::registry().dispatch(&mut op)?;
     Ok(())
 }
@@ -726,6 +788,49 @@ pub fn sgd_update(w: &mut [f32], g: &[f32], lr: f32) -> Result<(), BackendError>
 #[inline]
 pub fn adamw(args: AdamWArgs<'_>) -> Result<(), BackendError> {
     let mut op = Op::AdamW(args);
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident AdamW update.
+/// See [`Op::AdamWResident`](super::Op::AdamWResident).
+///
+/// All four buffers (`w_dev`, `g_dev`, `m_dev`, `v_dev`) are length-`n`
+/// fp32 device pointers. `w_dev`, `m_dev`, `v_dev` are updated in
+/// place; `g_dev` is read-only. `bc1_inv` / `bc2_inv` are the
+/// bias-correction reciprocals `1/(1 - beta^t)` (caller-computed once
+/// per step).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - Each of `w_dev`, `g_dev`, `m_dev`, `v_dev` covers at least `n * 4` bytes.
+/// - `w_dev`, `m_dev`, `v_dev` may not alias `g_dev` (read/write hazard).
+/// - The pointers stay valid for the duration of this call.
+///
+/// Backends without a hipcc-built AdamW kernel return `Unsupported`;
+/// callers must fall back to the host-slice [`adamw`] when only CPU
+/// dispatch is available.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn adamw_resident(
+    w_dev: *mut f32,
+    g_dev: *const f32,
+    m_dev: *mut f32,
+    v_dev: *mut f32,
+    n: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    bc1_inv: f32,
+    bc2_inv: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::AdamWResident {
+        w_dev, g_dev, m_dev, v_dev, n,
+        lr, beta1, beta2, eps, weight_decay, bc1_inv, bc2_inv,
+    };
     super::registry().dispatch(&mut op)?;
     Ok(())
 }

@@ -279,6 +279,77 @@ fn glu_resident_matches_cpu() {
     assert_close(&got, &expected, "glu_resident");
 }
 
+/// Per-neuron batched GLU vs N separate MIOpen GLU calls.
+///
+/// Reproduces the per-neuron loop pattern from
+/// `crates/modgrad-ctm/src/forward.rs` against the new batched
+/// kernel. Each neuron's input slab is `[2 * half]` (value half then
+/// gate half). The reference path issues one `Op::GluResident`
+/// per neuron with `n_rows=1`; the batched path issues a single
+/// `Op::PerNeuronGluBatchedResident`.
+///
+/// Tolerance: 1e-3 absolute / relative — same as `glu_resident_matches_cpu`.
+/// MIOpen's GLU and the custom kernel both compute
+/// `v * sigmoid(g)` in f32; divergence is bit-for-bit-identical when
+/// `expf` matches, well below 1e-3 in practice.
+#[test]
+fn per_neuron_glu_batched_matches_n_miopen_calls() {
+    let Some(be) = RocmBackend::try_new() else {
+        eprintln!("per_neuron_glu_batched: no ROCm runtime; skipping");
+        return;
+    };
+    // Mirrors the CTM stage1 shape (d_model, half_size) for a
+    // small test brain: 7 neurons, 24-wide half. Odd-prime-ish to
+    // catch off-by-one in tail handling.
+    let n_neurons = 7;
+    let half = 24;
+    let total_in = n_neurons * 2 * half;
+    let total_out = n_neurons * half;
+
+    // Per-neuron interleaved layout: for each neuron, value half
+    // followed by gate half. Differs from MIOpen's dim=0 layout —
+    // matches the CTM forward path.
+    let x: Vec<f32> = (0..total_in)
+        .map(|i| ((i as f32 * 0.07).cos() + 0.3) * 1.4)
+        .collect();
+
+    let _batch = HipBatch::new();
+    let x_buf = upload(&x).unwrap();
+
+    // ─── Reference: N separate MIOpen GLU calls ──────────────
+    // Same pattern as the previous per-neuron loop in forward.rs
+    // — `n_rows=1, half_size=half` per call, per-neuron stride
+    // `2*half` on input, `half` on output.
+    let ref_buf = alloc_out(total_out).unwrap();
+    let x_base = x_buf.device_ptr() as *const f32;
+    let ref_base = ref_buf.device_ptr() as *mut f32;
+    for n in 0..n_neurons {
+        let mut op = Op::GluResident {
+            x_dev: unsafe { x_base.add(n * 2 * half) },
+            y_dev: unsafe { ref_base.add(n * half) },
+            n_rows: 1,
+            half_size: half,
+        };
+        be.dispatch(&mut op).expect("glu_resident (per-neuron) dispatch");
+    }
+    let mut ref_host = vec![0.0f32; total_out];
+    ref_buf.copy_to_host(&mut ref_host).unwrap();
+
+    // ─── Batched path: single dispatch over all neurons ──────
+    let batched_buf = alloc_out(total_out).unwrap();
+    let mut op = Op::PerNeuronGluBatchedResident {
+        x_dev: x_buf.device_ptr() as *const f32,
+        y_dev: batched_buf.device_ptr() as *mut f32,
+        n_neurons,
+        half_size: half,
+    };
+    be.dispatch(&mut op).expect("per_neuron_glu_batched_resident dispatch");
+    let mut batched_host = vec![0.0f32; total_out];
+    batched_buf.copy_to_host(&mut batched_host).unwrap();
+
+    assert_close(&batched_host, &ref_host, "per_neuron_glu_batched vs N MIOpen calls");
+}
+
 #[test]
 fn op_tensor_resident_matches_cpu() {
     let Some(be) = RocmBackend::try_new() else {

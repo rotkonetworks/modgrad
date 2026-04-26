@@ -392,6 +392,39 @@ pub mod ffi {
             n_blocks: c_int,
             fp32_out: *mut f32,
         ) -> hipError_t;
+
+        // AdamW (decoupled-weight-decay) optimizer step. One thread per
+        // element; updates `w`, `m`, `v` in place. `bc1_inv` / `bc2_inv`
+        // are the bias-correction reciprocals computed by the caller
+        // once per training step. See `kernels/adamw.hip`.
+        pub fn launch_adamw(
+            w: *mut f32,
+            g: *const f32,
+            m: *mut f32,
+            v: *mut f32,
+            n: c_int,
+            lr: f32,
+            beta1: f32,
+            beta2: f32,
+            eps: f32,
+            weight_decay: f32,
+            bc1_inv: f32,
+            bc2_inv: f32,
+        ) -> hipError_t;
+
+        // Per-neuron batched GLU forward. Replaces the per-neuron
+        // `miopenGLUForward` loop in the CTM forward path. `x` is
+        // `[n_neurons, 2 * half_size]` row-major (value half then
+        // gate half within each neuron); `y` is
+        // `[n_neurons, half_size]` row-major. Total launched threads
+        // = `n_neurons * half_size`. See
+        // `kernels/per_neuron_glu_batched.hip`.
+        pub fn launch_per_neuron_glu_batched(
+            x: *const f32,
+            y: *mut f32,
+            n_neurons: c_int,
+            half_size: c_int,
+        ) -> hipError_t;
     }
 
     /// Convert a hipError_t into a human-readable String.
@@ -1018,6 +1051,14 @@ impl Backend for RocmBackend {
                 // Q4_K_M dequant lives in the same hipcc-compiled
                 // archive as RmsNormResident — same gate.
                 Op::DequantQ4KResident { .. } => rms_norm_kernel_present(),
+                // AdamWResident kernel ships in the same hipcc archive —
+                // same gate.
+                Op::AdamWResident { .. } => rms_norm_kernel_present(),
+                // Per-neuron batched GLU forward — custom hipcc kernel
+                // (`kernels/per_neuron_glu_batched.hip`). Replaces the
+                // per-neuron MIOpen GLU dispatch loop in the CTM
+                // forward path with a single launch.
+                Op::PerNeuronGluBatchedResident { .. } => rms_norm_kernel_present(),
                 Op::MatmulNN { m, k, n, .. }
                     if *m >= 64 && *k >= 64 && *n >= 64 => true,
                 Op::MatmulNT { m, k, n, .. }
@@ -1128,6 +1169,15 @@ impl Backend for RocmBackend {
                 } => self.dequant_q4k_resident_f32(
                     *q4k_dev, *fp32_dev, *n_blocks,
                 ),
+                Op::AdamWResident {
+                    w_dev, g_dev, m_dev, v_dev, n,
+                    lr, beta1, beta2, eps, weight_decay,
+                    bc1_inv, bc2_inv,
+                } => self.adamw_resident_f32(
+                    *w_dev, *g_dev, *m_dev, *v_dev, *n,
+                    *lr, *beta1, *beta2, *eps, *weight_decay,
+                    *bc1_inv, *bc2_inv,
+                ),
                 Op::MatmulNN {
                     a, b, out, bias, m, k, n,
                 } => {
@@ -1189,6 +1239,11 @@ impl Backend for RocmBackend {
                     x_dev, y_dev, n_rows, half_size,
                 } => self.glu_resident_f32(
                     *x_dev, *y_dev, *n_rows, *half_size,
+                ),
+                Op::PerNeuronGluBatchedResident {
+                    x_dev, y_dev, n_neurons, half_size,
+                } => self.per_neuron_glu_batched_resident_f32(
+                    *x_dev, *y_dev, *n_neurons, *half_size,
                 ),
                 Op::OpTensorResident {
                     a_dev, b_dev, c_dev, n,
@@ -2025,6 +2080,126 @@ impl RocmBackend {
     ) -> Result<(), BackendError> {
         Err(BackendError::Unsupported {
             op: "dequant_q4k_resident",
+            backend: "rocm",
+        })
+    }
+
+    /// Resident AdamW step via the custom hipcc kernel built by
+    /// `build.rs`. Updates `w`, `m`, `v` in place on device — same
+    /// arithmetic as the host CPU `Op::AdamW` path
+    /// (`crates/modgrad-device/src/backend/cpu.rs::adamw`), bit-for-bit
+    /// modulo float-add ordering inside the kernel.
+    ///
+    /// Caller invariant: `supports()` already confirmed
+    /// `rms_norm_kernel_present()`. Re-checking here surfaces a
+    /// supports/dispatch race as a loud `Unsupported` rather than a
+    /// missing-symbol link error at runtime.
+    #[cfg(modgrad_hipcc_kernels)]
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_resident_f32(
+        &self,
+        w_dev: *mut f32,
+        g_dev: *const f32,
+        m_dev: *mut f32,
+        v_dev: *mut f32,
+        n: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1_inv: f32,
+        bc2_inv: f32,
+    ) -> Result<(), BackendError> {
+        let n_i32 = as_i32(n, "n")?;
+        let err = unsafe {
+            ffi::launch_adamw(
+                w_dev, g_dev, m_dev, v_dev, n_i32,
+                lr, beta1, beta2, eps, weight_decay,
+                bc1_inv, bc2_inv,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_adamw(n={n}): {}",
+                ffi::hip_err_str(err),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(modgrad_hipcc_kernels))]
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_resident_f32(
+        &self,
+        _w_dev: *mut f32,
+        _g_dev: *const f32,
+        _m_dev: *mut f32,
+        _v_dev: *mut f32,
+        _n: usize,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _eps: f32,
+        _weight_decay: f32,
+        _bc1_inv: f32,
+        _bc2_inv: f32,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported {
+            op: "adamw_resident",
+            backend: "rocm",
+        })
+    }
+
+    /// Dispatch the per-neuron batched GLU kernel. `x_dev` is
+    /// `[n_neurons, 2 * half_size]` row-major (value half then gate
+    /// half within each neuron); `y_dev` receives
+    /// `[n_neurons, half_size]` row-major. Replaces the per-neuron
+    /// `miopenGLUForward` loop in `crates/modgrad-ctm/src/forward.rs`
+    /// with a single kernel launch sized to
+    /// `n_neurons * half_size` threads (256 per block).
+    ///
+    /// MIOpen's GLU solver only splits along the leading axis, so the
+    /// per-neuron interleaved layout (value then gate WITHIN each
+    /// neuron) cannot be batched in one MIOpen call — a custom kernel
+    /// is required, not just a perf win.
+    ///
+    /// Caller invariant: `supports()` already confirmed the hipcc
+    /// archive is present. Re-checking here surfaces a
+    /// supports/dispatch race as a loud `Unsupported` rather than a
+    /// link-time missing-symbol crash.
+    #[cfg(modgrad_hipcc_kernels)]
+    fn per_neuron_glu_batched_resident_f32(
+        &self,
+        x_dev: *const f32,
+        y_dev: *mut f32,
+        n_neurons: usize,
+        half_size: usize,
+    ) -> Result<(), BackendError> {
+        let n_i32 = as_i32(n_neurons, "n_neurons")?;
+        let h_i32 = as_i32(half_size, "half_size")?;
+        let err = unsafe {
+            ffi::launch_per_neuron_glu_batched(x_dev, y_dev, n_i32, h_i32)
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_per_neuron_glu_batched(n_neurons={n_neurons}, half_size={half_size}): {}",
+                ffi::hip_err_str(err),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(modgrad_hipcc_kernels))]
+    fn per_neuron_glu_batched_resident_f32(
+        &self,
+        _x_dev: *const f32,
+        _y_dev: *mut f32,
+        _n_neurons: usize,
+        _half_size: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported {
+            op: "per_neuron_glu_batched_resident",
             backend: "rocm",
         })
     }
