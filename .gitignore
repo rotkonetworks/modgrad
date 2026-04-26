@@ -4,6 +4,24 @@
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 
+# Root-level scratch — nothing buildable should live at the repo root.
+# Real bins/tests belong inside a crate under crates/ or examples/.
+/test_*.rs
+/bench_*.rs
+/serve.rs
+/scratch_*.rs
+/tmp_*.rs
+
+# Root-level artifact catch-all (anchored to repo root, not subdirs).
+# Subdirs that legitimately ship .json/.csv/.txt are not affected.
+/*.bin
+/*.opt.bin
+/*.opt.json
+/*.csv
+/*.tsv
+/*.log
+/*.txt
+
 # Models (large ONNX files)
 models/*.onnx
 models/*.onnx.data

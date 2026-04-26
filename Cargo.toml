@@ -48,39 +48,6 @@ license = "MIT"
 name = "modgrad"
 path = "src/lib.rs"
 
-[[bin]]
-name = "bench_gpu"
-path = "bench_gpu.rs"
-
-[[bin]]
-name = "test_q4k"
-path = "test_q4k.rs"
-
-[[bin]]
-name = "test_gguf"
-path = "test_gguf.rs"
-
-[[bin]]
-name = "serve"
-path = "serve.rs"
-
-[[bin]]
-name = "test_candle"
-path = "test_candle.rs"
-
-[[bin]]
-name = "test_gemma4"
-path = "test_gemma4.rs"
-
-[[bin]]
-name = "test_gemma4_candle"
-path = "test_gemma4_candle.rs"
-
-[[test]]
-name = "test_remu"
-path = "test_remu.rs"
-harness = false
-
 [features]
 # Runtime default: CUDA only (cudarc uses fallback-dynamic-loading, so it
 # builds on any host regardless of whether CUDA is installed). AMD ROCm
