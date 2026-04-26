@@ -12,9 +12,13 @@ pub mod telemetry_transport;
 pub mod dataloader;
 pub mod control;
 pub mod backend;
+pub mod safetensors;
 
 #[cfg(feature = "onnx")]
 pub mod inference;
 
 #[cfg(feature = "gguf")]
 pub mod gguf;
+
+#[cfg(feature = "rocm")]
+pub mod qwen2;

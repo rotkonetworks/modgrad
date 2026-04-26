@@ -2338,6 +2338,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "lm_validate"
+version = "0.1.0"
+dependencies = [
+ "isis-runtime",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-traits",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2648,7 +2659,10 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "half",
+ "modgrad-compute",
+ "modgrad-device",
  "modgrad-persist",
+ "modgrad-transformer",
  "ort",
  "quinn",
  "rcgen",
@@ -3719,6 +3733,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "qwen_load_smoke"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-io",
+ "modgrad-transformer",
 ]
 
 [[package]]

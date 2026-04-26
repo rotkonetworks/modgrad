@@ -8,10 +8,17 @@ license = "MIT"
 [features]
 onnx = ["dep:ort"]
 gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# Enables the safetensors loader for HF-format models (Qwen2, Llama, ...)
+# and the device-resident upload path (`qwen2.rs`).  The resident upload
+# requires `modgrad-transformer/rocm`, which propagates to compute/device.
+rocm = ["modgrad-transformer/rocm", "modgrad-compute/rocm", "modgrad-device/rocm"]
 telemetry = ["dep:quinn", "dep:rustls", "dep:tokio", "dep:rcgen"]
 
 [dependencies]
 modgrad-persist = { path = "../modgrad-persist" }
+modgrad-transformer = { path = "../modgrad-transformer" }
+modgrad-compute = { path = "../modgrad-compute" }
+modgrad-device = { path = "../modgrad-device" }
 serde = { version = "1", features = ["derive"] }
 wincode = "0.5"
 wincode-derive = "0.4"

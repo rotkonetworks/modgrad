@@ -30,6 +30,7 @@ members = [
     "examples/bench_maze_resident",
     "examples/bench_maze_resident_medium",
     "examples/lm_validate",
+    "examples/qwen_load_smoke",
     "debugger",
     "extra/remu",
 ]

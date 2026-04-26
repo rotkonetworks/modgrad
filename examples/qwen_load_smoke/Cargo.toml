@@ -1,0 +1,24 @@
+[package]
+name = "qwen_load_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Smoke test: load Qwen2.5-0.5B safetensors into a GptModelResident and run a single forward pass; print top-10 logits + sanity stats."
+
+[[bin]]
+name = "qwen_load_smoke"
+path = "src/main.rs"
+
+[features]
+default = []
+rocm = [
+    "modgrad-io/rocm",
+    "modgrad-transformer/rocm",
+    "modgrad-compute/rocm",
+    "modgrad-device/rocm",
+]
+
+[dependencies]
+modgrad-io          = { path = "../../crates/modgrad-io" }
+modgrad-transformer = { path = "../../crates/modgrad-transformer" }
+modgrad-compute     = { path = "../../crates/modgrad-compute" }
+modgrad-device      = { path = "../../crates/modgrad-device" }
