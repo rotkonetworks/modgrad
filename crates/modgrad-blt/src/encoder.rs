@@ -33,12 +33,17 @@ use modgrad_transformer::kv_cache_resident::KvCacheResident;
 use modgrad_transformer::mlp::{Mlp, MlpWeights, SwigluMlp, SwigluWeights};
 use modgrad_transformer::residual::ResidualLambdas;
 use modgrad_transformer::resident::{
-    AttentionScratch, SwigluScratch, TransformerBlockResident, TransformerBlockScratch,
+    AttentionBackwardScratch, AttentionResidentGrads, AttentionScratch,
+    SwigluBackwardScratch, SwigluResidentGrads, SwigluScratch,
+    TransformerBlockResident, TransformerBlockScratch,
 };
 use modgrad_transformer::rope::RotaryEmbedding;
 use modgrad_transformer::tensor::Tensor2;
 
-use crate::cross_attn::{CrossAttention, CrossAttnConfig, CrossAttnDirection, CrossAttnScratch};
+use crate::cross_attn::{
+    cross_attn_encoder_backward, CrossAttention, CrossAttnBwdCache,
+    CrossAttnConfig, CrossAttnDirection, CrossAttnGrads, CrossAttnScratch,
+};
 
 // ─── Config ──────────────────────────────────────────────────
 
@@ -520,6 +525,455 @@ fn copy_byte_rep_to_hidden(
     Ok(())
 }
 
+// ─── Backward — grads, cache, forward_for_backward, backward ────
+
+/// Per-layer device-resident weight gradient bundle for [`LocalEncoder`].
+///
+/// Mirrors the model: each byte transformer layer has the standard
+/// attention + SwiGLU resident grad pair (re-used from
+/// `modgrad-transformer`), plus a [`CrossAttnGrads`] for the per-layer
+/// cross-attention bridge. The byte embedding gradient is sparse —
+/// only the rows corresponding to bytes seen in the call get non-zero
+/// values — but we hold the full `[256 × byte_dim]` slab for parity
+/// with `GptBackwardState::d_embed`.
+pub struct LocalEncoderGrads {
+    /// One per byte transformer layer.
+    pub attn_grads: Vec<AttentionResidentGrads>,
+    /// One per byte transformer layer (SwiGLU MLP).
+    pub mlp_grads: Vec<SwigluResidentGrads>,
+    /// One per byte layer (each layer has its own cross-attn bridge).
+    pub cross_attn_grads: Vec<CrossAttnGrads>,
+    /// `[256 × byte_dim]` row-major. Sparse: row `b` accumulates the
+    /// gradient for byte id `b`.
+    pub d_byte_embed: GpuVec,
+    byte_dim: usize,
+}
+
+impl LocalEncoderGrads {
+    /// Allocate fresh zero grads for the given encoder.
+    pub fn zeros_for(encoder: &LocalEncoder) -> Result<Self, ResidencyError> {
+        let n_layers = encoder.n_layers();
+        let byte_dim = encoder.byte_dim();
+        let n_heads = encoder.config.n_heads.max(1);
+        let head_dim = encoder.config.head_dim.max(1);
+        let kv_dim = n_heads * head_dim;
+        let mlp_dim = encoder.config.mlp_dim;
+
+        let mut attn_grads = Vec::with_capacity(n_layers);
+        let mut mlp_grads = Vec::with_capacity(n_layers);
+        let mut cross_attn_grads = Vec::with_capacity(n_layers);
+        let cross_cfg = CrossAttnConfig {
+            byte_dim,
+            patch_dim: encoder.patch_dim(),
+            num_heads: n_heads,
+            head_dim: (encoder.patch_dim() / n_heads).max(1),
+            norm_eps: encoder.config.norm_eps,
+            direction: CrossAttnDirection::Encoder,
+        };
+        for _ in 0..n_layers {
+            attn_grads.push(AttentionResidentGrads::new(byte_dim, kv_dim)?);
+            mlp_grads.push(SwigluResidentGrads::new(byte_dim, mlp_dim)?);
+            cross_attn_grads.push(CrossAttnGrads::zeros_for_config(&cross_cfg)?);
+        }
+        let d_byte_embed = GpuVec::try_hip(256 * byte_dim)?;
+        Ok(Self { attn_grads, mlp_grads, cross_attn_grads, d_byte_embed, byte_dim })
+    }
+
+    /// Reset every accumulator to zero.
+    pub fn zero_resident(&mut self, batch: &HipBatch) -> Result<(), ResidencyError> {
+        // Attn / MLP grads: re-allocate-style zero via H2D upload.
+        // TODO(blt-bwd): replace with `memset_resident` once exposed.
+        for g in &mut self.attn_grads {
+            zero_gpuvec(&mut g.dweight_q)?;
+            zero_gpuvec(&mut g.dbias_q)?;
+            zero_gpuvec(&mut g.dweight_k)?;
+            zero_gpuvec(&mut g.dbias_k)?;
+            zero_gpuvec(&mut g.dweight_v)?;
+            zero_gpuvec(&mut g.dbias_v)?;
+            zero_gpuvec(&mut g.dweight_o)?;
+            zero_gpuvec(&mut g.dbias_o)?;
+        }
+        for g in &mut self.mlp_grads {
+            zero_gpuvec(&mut g.dweight_gate)?;
+            zero_gpuvec(&mut g.dbias_gate)?;
+            zero_gpuvec(&mut g.dweight_up)?;
+            zero_gpuvec(&mut g.dbias_up)?;
+            zero_gpuvec(&mut g.dweight_down)?;
+            zero_gpuvec(&mut g.dbias_down)?;
+        }
+        for g in &mut self.cross_attn_grads {
+            g.zero_resident(batch)?;
+        }
+        let zeros = vec![0.0f32; 256 * self.byte_dim];
+        self.d_byte_embed.copy_from(&zeros);
+        Ok(())
+    }
+}
+
+/// Per-call backward cache for [`LocalEncoder::forward_for_backward`].
+///
+/// Holds one [`TransformerBlockScratch`] per (layer, byte position) so
+/// each token's per-layer activations are recoverable in backward.
+/// (The reference `GptBackwardState` reuses one scratch per layer
+/// because it processes one token; the encoder iterates over many
+/// bytes per layer so we need per-byte scratch.) It also retains a
+/// [`CrossAttnBwdCache`] per layer for the cross-attention bridge.
+pub struct LocalEncoderBwdCache {
+    /// `[n_layers][n_bytes]` block scratch (per-byte forward
+    /// activations: attn_input, attn_normed, attn_out, mlp_input,
+    /// mlp_normed, mlp_out, plus the saved q/k/v/scores/head/silu
+    /// snapshots).
+    pub block_scratches: Vec<Vec<TransformerBlockScratch>>,
+    /// One cross-attn cache per layer.
+    pub cross_caches: Vec<CrossAttnBwdCache>,
+    /// `[n_bytes × byte_dim]` host snapshot of the augmented embedding
+    /// after stage 1 (byte embed + n-gram). Used by backward to know
+    /// what the input to layer 0's attention was so the byte-embed
+    /// gradient can be scattered correctly.
+    pub augmented_input_host: Vec<f32>,
+    /// `[n_bytes]` byte ids for the current call (for scattering the
+    /// embedding gradient).
+    pub byte_ids: Vec<u8>,
+    /// `[n_layers][n_bytes × byte_dim]` host snapshot of the byte_reps
+    /// at each layer's *output*. Layer 0 reads `augmented_input_host`,
+    /// layer 1 reads `layer_outputs[0]`, etc.
+    pub layer_outputs_host: Vec<Vec<f32>>,
+    cap_n_bytes: usize,
+}
+
+impl LocalEncoderBwdCache {
+    pub fn new(
+        encoder: &LocalEncoder,
+        max_n_patches: usize,
+    ) -> Result<Self, ResidencyError> {
+        let n_layers = encoder.n_layers();
+        let byte_dim = encoder.byte_dim();
+        let n_heads = encoder.config.n_heads.max(1);
+        let head_dim = encoder.config.head_dim.max(1);
+        let kv_dim = n_heads * head_dim;
+        let mlp_dim = encoder.config.mlp_dim;
+        let max_seq = encoder.config.max_seq_len;
+        let cross_cfg = CrossAttnConfig {
+            byte_dim,
+            patch_dim: encoder.patch_dim(),
+            num_heads: n_heads,
+            head_dim: (encoder.patch_dim() / n_heads).max(1),
+            norm_eps: encoder.config.norm_eps,
+            direction: CrossAttnDirection::Encoder,
+        };
+
+        let mut block_scratches = Vec::with_capacity(n_layers);
+        let mut cross_caches = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let mut layer_scratches = Vec::with_capacity(max_seq);
+            for _ in 0..max_seq {
+                layer_scratches.push(TransformerBlockScratch::with_dims(
+                    byte_dim, kv_dim, mlp_dim, n_heads * max_seq,
+                )?);
+            }
+            block_scratches.push(layer_scratches);
+            cross_caches.push(CrossAttnBwdCache::new(
+                &cross_cfg,
+                /* max_n_queries = */ max_n_patches,
+                /* max_kv_len    = */ max_seq,
+            )?);
+        }
+        Ok(Self {
+            block_scratches,
+            cross_caches,
+            augmented_input_host: vec![0.0; max_seq * byte_dim],
+            byte_ids: vec![0u8; max_seq],
+            layer_outputs_host: vec![vec![0.0; max_seq * byte_dim]; n_layers],
+            cap_n_bytes: max_seq,
+        })
+    }
+}
+
+impl LocalEncoder {
+    /// Forward pass that additionally populates `cache` for backward.
+    ///
+    /// Same semantics as [`LocalEncoder::forward`]; the only differences
+    /// are (a) per-byte block forward uses `forward_for_backward` so
+    /// activations are saved into `cache.block_scratches[li][t]`, and
+    /// (b) the cross-attention bridge uses
+    /// [`CrossAttention::forward_encoder_for_backward`] so the cross-
+    /// attn cache is populated for the per-layer backward call.
+    pub fn forward_for_backward(
+        &mut self,
+        batch: &HipBatch,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut LocalEncoderScratch,
+        cache: &mut LocalEncoderBwdCache,
+        patch_reps_out: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        let n_bytes = bytes.len();
+        let n_patches = boundaries.len().saturating_sub(1);
+        let byte_dim = self.config.byte_dim;
+        let patch_dim = self.config.patch_dim;
+        debug_assert!(n_bytes <= cache.cap_n_bytes);
+        debug_assert_eq!(patch_reps_out.len(), n_patches * patch_dim);
+
+        // Stage 1: byte embed + n-gram augmentation (host).
+        let mut byte_embed_table = vec![0.0f32; 256 * byte_dim];
+        self.byte_embed_dev.copy_to_host(&mut byte_embed_table)?;
+        let augmented = self.ngram.embed_bytes(bytes, &byte_embed_table, byte_dim);
+        cache.augmented_input_host[..n_bytes * byte_dim]
+            .copy_from_slice(&augmented[..n_bytes * byte_dim]);
+        cache.byte_ids[..n_bytes].copy_from_slice(bytes);
+
+        // Stage 2: byte transformer with per-byte forward_for_backward.
+        let mut hidden_dev = GpuVec::try_hip(byte_dim)?;
+        let x0_dev = GpuVec::try_hip(byte_dim)?;
+        upload_byte_reps(&augmented, n_bytes, byte_dim, &mut scratch.byte_reps)?;
+
+        for (li, (block, cross)) in self.byte_layers.iter()
+            .zip(self.cross_attns.iter()).enumerate() {
+            for t in 0..n_bytes {
+                copy_byte_rep_to_hidden(
+                    &scratch.byte_reps, t, byte_dim, &mut hidden_dev,
+                )?;
+                batch.note_dispatch()?;
+
+                block.forward_for_backward(
+                    batch,
+                    &mut hidden_dev,
+                    &x0_dev,
+                    &mut self.byte_kv_cache,
+                    t,
+                    &self.rope,
+                    &mut scratch.attn_scratch,
+                    &mut scratch.mlp_scratch,
+                    &mut cache.block_scratches[li][t],
+                )?;
+
+                copy_hidden_to_byte_rep(
+                    &hidden_dev, t, byte_dim, &mut scratch.byte_reps,
+                )?;
+                batch.note_dispatch()?;
+            }
+
+            // Snapshot this layer's byte_reps to the host cache so
+            // backward can stage the upstream gradient against the
+            // matching forward state.
+            let layer_out = &mut cache.layer_outputs_host[li][..n_bytes * byte_dim];
+            scratch.byte_reps.copy_to_host(layer_out);
+
+            cross.forward_encoder_for_backward(
+                batch,
+                &scratch.byte_reps,
+                boundaries,
+                &mut scratch.cross_scratch,
+                &mut cache.cross_caches[li],
+                patch_reps_out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backward pass.
+    ///
+    /// `d_patch_reps`: upstream gradient on the encoder's output
+    /// `[n_patches × patch_dim]`.
+    ///
+    /// Walks every layer's cross-attention backward (accumulating into
+    /// `grads.cross_attn_grads[li]`), folds the result with the
+    /// upstream byte-side gradient, then walks each transformer block
+    /// backward in reverse byte order, accumulating per-layer attn /
+    /// mlp grads. The byte-embed gradient (sparse, per-byte-id) is
+    /// scattered into `grads.d_byte_embed` row-by-row.
+    ///
+    /// Note on shape contracts: per-layer cross-attn backward writes
+    /// `+=` into the byte-side gradient buffer. Across layers we
+    /// process the cross-attn back-prop first (using each layer's
+    /// snapshotted `byte_reps`), accumulate into a single per-layer
+    /// `d_byte_in` buffer, then the block backward extends that with
+    /// the gradient flowing through the transformer block.
+    pub fn backward(
+        &mut self,
+        batch: &HipBatch,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut LocalEncoderScratch,
+        bwd_scratch: &mut LocalEncoderBackwardScratch,
+        cache: &LocalEncoderBwdCache,
+        d_patch_reps: &GpuVec,
+        grads: &mut LocalEncoderGrads,
+    ) -> Result<(), ResidencyError> {
+        let n_bytes = bytes.len();
+        let n_patches = boundaries.len().saturating_sub(1);
+        let byte_dim = self.config.byte_dim;
+        let patch_dim = self.config.patch_dim;
+
+        debug_assert_eq!(d_patch_reps.len(), n_patches * patch_dim);
+
+        // Per-layer running gradient w.r.t. byte_reps at this layer's
+        // input. Initialised to zero each time.
+        let zero_byte_reps = vec![0.0f32; n_bytes * byte_dim];
+
+        // Walk layers in reverse so the gradient flowing into each
+        // layer's input becomes the upstream for the next-shallower
+        // layer.
+        let n_layers = self.byte_layers.len();
+        let mut d_layer_input = GpuVec::try_hip(n_bytes * byte_dim)?;
+        // Initial upstream into the deepest layer's cross-attn output:
+        // d_patch_reps. The cross-attn at every layer writes into the
+        // *same* `patch_reps_out` (no residual chain across layers in
+        // the current encoder); only the deepest layer's gradient flows
+        // back through its cross-attn. Earlier layers' cross-attn
+        // outputs were overwritten by later layers, so their gradient
+        // is zero at the cross-attn level. This matches the
+        // `LocalEncoder::forward` pattern where every layer overwrites
+        // patch_reps_out and the final write is the only one observed.
+        // TODO(blt-bwd): if a future revision adds per-layer skip
+        // connections from cross-attn to model output, this needs to
+        // accumulate across all `li`.
+        for li in (0..n_layers).rev() {
+            d_layer_input.copy_from(&zero_byte_reps);
+            let last_layer = li == n_layers - 1;
+            if last_layer {
+                cross_attn_encoder_backward(
+                    batch,
+                    &self.cross_attns[li],
+                    /* byte_reps */ &scratch.byte_reps, // unused: cache holds the values
+                    boundaries,
+                    &cache.cross_caches[li],
+                    d_patch_reps,
+                    &mut grads.cross_attn_grads[li],
+                    &mut d_layer_input,
+                    &mut scratch.cross_scratch,
+                )?;
+            }
+
+            // Block backward — reverse byte order so each token's KV-
+            // cache view is consistent with the forward-time state at
+            // that position. The host-side `d_layer_input` slab feeds
+            // the per-byte backward via `bwd_scratch.dy_per_byte`.
+            let mut d_layer_input_host = vec![0.0f32; n_bytes * byte_dim];
+            d_layer_input.copy_to_host(&mut d_layer_input_host);
+
+            for t in (0..n_bytes).rev() {
+                bwd_scratch.dy_per_byte.copy_from(
+                    &d_layer_input_host[t * byte_dim..(t + 1) * byte_dim],
+                );
+                self.byte_layers[li].backward(
+                    batch,
+                    &mut bwd_scratch.dy_per_byte,
+                    None,
+                    &mut self.byte_kv_cache,
+                    t,
+                    &self.rope,
+                    &mut scratch.attn_scratch,
+                    &mut bwd_scratch.attn_bwd,
+                    &mut scratch.mlp_scratch,
+                    &mut bwd_scratch.mlp_bwd,
+                    &mut bwd_scratch.block_scratch_replay,
+                    &mut grads.attn_grads[li],
+                    &mut grads.mlp_grads[li],
+                    /* recompute = */ true,
+                )?;
+                // After backward, dy_per_byte holds dx for this byte.
+                let mut dx_host = vec![0.0f32; byte_dim];
+                bwd_scratch.dy_per_byte.copy_to_host(&mut dx_host);
+                d_layer_input_host[t * byte_dim..(t + 1) * byte_dim]
+                    .copy_from_slice(&dx_host);
+            }
+            // d_layer_input_host now holds d/d(layer_input). For the
+            // shallower layer this becomes the upstream into its
+            // cross-attn-output buffer; for layer 0 this is the byte-
+            // embed gradient.
+            if li > 0 {
+                d_layer_input.copy_from(&d_layer_input_host);
+                // The cross-attn at layer (li-1) has already been
+                // skipped (cross_attn output is overwritten by later
+                // layers). The `d_layer_input` here is the gradient
+                // flowing through layer li's block back to layer
+                // (li-1)'s block output. We hand it off via
+                // `bwd_scratch.d_byte_carry`.
+                bwd_scratch.d_byte_carry.copy_from(&d_layer_input_host);
+            } else {
+                // Layer 0: scatter into d_byte_embed by byte id.
+                scatter_byte_embed_grad(
+                    &d_layer_input_host, &cache.byte_ids[..n_bytes],
+                    n_bytes, byte_dim,
+                    &mut grads.d_byte_embed,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-call backward scratch for [`LocalEncoder::backward`]. Holds the
+/// transient per-byte gradient buffers, one block-scratch replay slot
+/// (used in the activation-checkpointing path), and the shared
+/// attention / MLP backward scratches.
+pub struct LocalEncoderBackwardScratch {
+    /// `[byte_dim]` — per-byte rolling gradient (in-and-out of block.backward).
+    pub dy_per_byte: GpuVec,
+    /// `[n_bytes × byte_dim]` — staging for the layer-to-layer carry.
+    pub d_byte_carry: GpuVec,
+    /// Single replay slot for the per-byte block backward. The encoder
+    /// uses recompute mode (the per-byte cache holds only the per-byte
+    /// `attn_input` snapshot; the rest is regenerated on demand).
+    pub block_scratch_replay: TransformerBlockScratch,
+    pub attn_bwd: AttentionBackwardScratch,
+    pub mlp_bwd: SwigluBackwardScratch,
+}
+
+impl LocalEncoderBackwardScratch {
+    pub fn new(config: &LocalEncoderConfig) -> Result<Self, ResidencyError> {
+        let byte_dim = config.byte_dim;
+        let n_heads = config.n_heads.max(1);
+        let head_dim = config.head_dim.max(1);
+        let kv_dim = n_heads * head_dim;
+        let mlp_dim = config.mlp_dim;
+        let max_seq = config.max_seq_len;
+        Ok(Self {
+            dy_per_byte: GpuVec::try_hip(byte_dim)?,
+            d_byte_carry: GpuVec::try_hip(max_seq * byte_dim)?,
+            block_scratch_replay: TransformerBlockScratch::with_dims(
+                byte_dim, kv_dim, mlp_dim, n_heads * max_seq,
+            )?,
+            attn_bwd: AttentionBackwardScratch::new(n_heads, head_dim, kv_dim, max_seq)?,
+            mlp_bwd: SwigluBackwardScratch::new(byte_dim, mlp_dim)?,
+        })
+    }
+}
+
+/// Scatter `d_input[t, :]` into `d_byte_embed[byte_ids[t], :]` for each
+/// byte position `t`. Multiple positions sharing the same byte id sum
+/// into the same row.
+fn scatter_byte_embed_grad(
+    d_input_host: &[f32],
+    byte_ids: &[u8],
+    n_bytes: usize,
+    byte_dim: usize,
+    d_byte_embed: &mut GpuVec,
+) -> Result<(), ResidencyError> {
+    let mut d_embed_host = vec![0.0f32; 256 * byte_dim];
+    d_byte_embed.copy_to_host(&mut d_embed_host);
+    for t in 0..n_bytes {
+        let id = byte_ids[t] as usize;
+        let src = &d_input_host[t * byte_dim..(t + 1) * byte_dim];
+        let dst = &mut d_embed_host[id * byte_dim..(id + 1) * byte_dim];
+        for i in 0..byte_dim {
+            dst[i] += src[i];
+        }
+    }
+    d_byte_embed.copy_from(&d_embed_host);
+    Ok(())
+}
+
+/// Zero a `GpuVec::Hip` slab. Uses a host upload until a resident
+/// memset op is exposed.
+fn zero_gpuvec(g: &mut GpuVec) -> Result<(), ResidencyError> {
+    let n = g.len();
+    let zeros = vec![0.0f32; n];
+    g.copy_from(&zeros);
+    Ok(())
+}
+
 /// D2D copy `hidden_dev[..byte_dim]` → `byte_reps[t * byte_dim..]`.
 fn copy_hidden_to_byte_rep(
     hidden_dev: &GpuVec,
@@ -559,4 +1013,107 @@ fn copy_hidden_to_byte_rep(
         ));
     }
     Ok(())
+}
+
+// ─── Tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the local encoder backward path. Builds a tiny
+    /// encoder, drives `forward_for_backward` then `backward`, and
+    /// asserts the gradient buffers are finite and non-zero.
+    ///
+    /// Skipped without a real HIP device — the `try_hip` allocator
+    /// returns Err which the test treats as "no device, skip".
+    #[test]
+    fn local_encoder_backward_smoke() {
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() { return; }
+
+        const BYTE_DIM: usize = 8;
+        const PATCH_DIM: usize = 8;
+        const N_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const MLP_DIM: usize = 16;
+        const N_BYTES: usize = 8;
+        const N_PATCHES: usize = 2;
+        const MAX_SEQ: usize = 16;
+
+        let cfg = LocalEncoderConfig {
+            n_layers: 1,
+            byte_dim: BYTE_DIM,
+            patch_dim: PATCH_DIM,
+            n_heads: N_HEADS,
+            head_dim: HEAD_DIM,
+            mlp_dim: MLP_DIM,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: MAX_SEQ,
+            ngram_min_n: 3,
+            ngram_max_n: 4,
+            ngram_vocab_per_n: 16,
+        };
+
+        let mut encoder = match LocalEncoder::new(cfg.clone()) {
+            Ok(e) => e, Err(_) => return,
+        };
+        let mut scratch = match LocalEncoderScratch::new(&cfg) {
+            Ok(s) => s, Err(_) => return,
+        };
+        let mut bwd_scratch = match LocalEncoderBackwardScratch::new(&cfg) {
+            Ok(s) => s, Err(_) => return,
+        };
+        let mut cache = match LocalEncoderBwdCache::new(&encoder, N_PATCHES) {
+            Ok(c) => c, Err(_) => return,
+        };
+        let mut grads = match LocalEncoderGrads::zeros_for(&encoder) {
+            Ok(g) => g, Err(_) => return,
+        };
+
+        let batch = HipBatch::new();
+        let _ = grads.zero_resident(&batch);
+
+        let bytes: Vec<u8> = (0..N_BYTES as u8).collect();
+        let boundaries = vec![0, 4, N_BYTES];
+        let mut patch_reps_out = match GpuVec::try_hip(N_PATCHES * PATCH_DIM) {
+            Ok(v) => v, Err(_) => return,
+        };
+
+        encoder.byte_kv_cache.reset();
+        encoder.forward_for_backward(
+            &batch, &bytes, &boundaries, &mut scratch, &mut cache, &mut patch_reps_out,
+        ).expect("forward_for_backward");
+
+        // Synthetic upstream gradient.
+        let d_patch_host: Vec<f32> = (0..N_PATCHES * PATCH_DIM)
+            .map(|i| ((i as f32) * 0.01) - 0.05).collect();
+        let mut d_patch_reps = match GpuVec::try_hip(N_PATCHES * PATCH_DIM) {
+            Ok(v) => v, Err(_) => return,
+        };
+        d_patch_reps.copy_from(&d_patch_host);
+
+        encoder.backward(
+            &batch, &bytes, &boundaries, &mut scratch, &mut bwd_scratch,
+            &cache, &d_patch_reps, &mut grads,
+        ).expect("encoder backward");
+        batch.flush().expect("flush");
+
+        // Spot-check finiteness on the cross-attn weight grads + byte
+        // embed grad. Non-zero on at least one of them is enough — the
+        // exact magnitude is the integration-test territory.
+        let inner = N_HEADS * HEAD_DIM;
+        let mut dwq = vec![0.0f32; inner * BYTE_DIM];
+        grads.cross_attn_grads[0].dweight_q.copy_to_host(&mut dwq);
+        let mut sumsq = 0.0f32;
+        for &v in &dwq {
+            assert!(v.is_finite(), "cross-attn dweight_q non-finite");
+            sumsq += v * v;
+        }
+        assert!(sumsq > 0.0, "cross-attn dweight_q should be non-zero");
+
+        let mut d_embed = vec![0.0f32; 256 * BYTE_DIM];
+        grads.d_byte_embed.copy_to_host(&mut d_embed);
+        for &v in &d_embed { assert!(v.is_finite(), "d_byte_embed non-finite"); }
+    }
 }

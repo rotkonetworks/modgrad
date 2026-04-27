@@ -37,11 +37,19 @@ use modgrad_transformer::config::{
 use modgrad_transformer::dims::*;
 use modgrad_transformer::kv_cache_resident::KvCacheResident;
 use modgrad_transformer::resident::{
-    AttentionScratch, GptModelResident, SwigluScratch, TransformerBlockScratch,
+    AttentionBackwardScratch, AttentionResidentGrads, AttentionScratch,
+    GptModelResident, SwigluBackwardScratch, SwigluResidentGrads, SwigluScratch,
+    TransformerBlockScratch,
 };
 
-use crate::decoder::{LocalDecoder, LocalDecoderConfig, LocalDecoderScratch};
-use crate::encoder::{LocalEncoder, LocalEncoderConfig, LocalEncoderScratch};
+use crate::decoder::{
+    LocalDecoder, LocalDecoderBwdCache, LocalDecoderConfig, LocalDecoderGrads,
+    LocalDecoderScratch,
+};
+use crate::encoder::{
+    LocalEncoder, LocalEncoderBackwardScratch, LocalEncoderBwdCache,
+    LocalEncoderConfig, LocalEncoderGrads, LocalEncoderScratch,
+};
 
 /// Hyperparameters for the latent transformer (`GptConfig` slice with
 /// only the relevant fields exposed). The latent operates over patch
@@ -306,6 +314,413 @@ impl BltModel {
         // fresh BltModel per call so this is a courtesy — production
         // training will need a `reset_caches` method.
 
+        Ok(())
+    }
+
+    /// Forward over a full byte sequence, populating `state` with the
+    /// per-patch / per-layer activations the matching [`Self::backward`]
+    /// needs. Sequence-level — does not fit the per-position
+    /// `LanguageModel` trait shape (which is why the trait impl below
+    /// keeps `forward_for_backward_position` returning a
+    /// `WrongVariant` error). A future `BltTrainer<BltModel>` will call
+    /// this method directly.
+    pub fn forward_for_backward(
+        &mut self,
+        batch: &HipBatch,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut BltScratch,
+        state: &mut BltBackwardState,
+        byte_logits_out: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        let n_bytes = bytes.len();
+        let n_patches = boundaries.len().saturating_sub(1);
+        let patch_dim = self.config.latent.patch_dim;
+
+        debug_assert_eq!(byte_logits_out.len(), n_bytes * 256);
+        debug_assert!(n_patches > 0);
+        debug_assert!(n_patches <= self.config.latent.max_patches);
+        debug_assert_eq!(boundaries[0], 0);
+        debug_assert_eq!(boundaries[boundaries.len() - 1], n_bytes);
+
+        self.encoder.byte_kv_cache.reset();
+        self.latent_kv_cache.reset();
+        self.decoder.byte_kv_cache.reset();
+
+        // Stage 1: encoder forward-for-backward.
+        let mut patch_reps_view = GpuVec::try_hip(n_patches * patch_dim)?;
+        self.encoder.forward_for_backward(
+            batch,
+            bytes,
+            boundaries,
+            &mut scratch.encoder,
+            &mut state.encoder_cache,
+            &mut patch_reps_view,
+        )?;
+
+        // Stage 2: latent forward — per-patch through the block stack
+        // with per-(patch, layer) activation snapshots into
+        // `state.latent_block_scratches[p][li]`.
+        for p in 0..n_patches {
+            copy_slab_to_dense(&patch_reps_view, p, patch_dim, &mut scratch.latent.hidden)?;
+            batch.note_dispatch()?;
+            copy_slab_to_dense(&patch_reps_view, p, patch_dim, &mut scratch.latent.x0)?;
+            batch.note_dispatch()?;
+
+            for (li, block) in self.latent.blocks.iter().enumerate() {
+                block.forward_for_backward(
+                    batch,
+                    &mut scratch.latent.hidden,
+                    &scratch.latent.x0,
+                    &mut self.latent_kv_cache,
+                    p,
+                    &self.latent.rope,
+                    &mut state.latent_attn_scratch,
+                    &mut state.latent_mlp_scratch,
+                    &mut state.latent_block_scratches[p][li],
+                )?;
+            }
+
+            // Capture pre-final-norm hidden state for patch p (host
+            // slab) so the host-side final-norm backward can read it.
+            scratch.latent.hidden.copy_to_host(
+                &mut state.latent_pre_norm_per_patch_host
+                    [p * patch_dim..(p + 1) * patch_dim],
+            );
+
+            unsafe {
+                rms_norm_resident(
+                    hip_buf(&scratch.latent.hidden)?.device_ptr() as *const f32,
+                    self.latent_final_norm_weight_dev.device_ptr() as *const f32,
+                    hip_buf(&scratch.latent.normed)?.device_ptr() as *mut f32,
+                    1, patch_dim, self.config.latent.norm_eps,
+                )?;
+            }
+            batch.note_dispatch()?;
+
+            copy_dense_to_slab(
+                &scratch.latent.normed, p, patch_dim, &mut scratch.patch_reps,
+            )?;
+            batch.note_dispatch()?;
+        }
+
+        let mut patch_reps_for_decoder = GpuVec::try_hip(n_patches * patch_dim)?;
+        copy_d2d(&scratch.patch_reps, &mut patch_reps_for_decoder, n_patches * patch_dim)?;
+
+        // Stage 3: decoder forward-for-backward.
+        self.decoder.forward_for_backward(
+            batch,
+            &patch_reps_for_decoder,
+            boundaries,
+            Some(&scratch.encoder.byte_reps),
+            &mut scratch.decoder,
+            &mut state.decoder_cache,
+            byte_logits_out,
+        )?;
+
+        Ok(())
+    }
+
+    /// Backward pass for a sequence-level forward. Mirrors the chain
+    /// in [`Self::forward_for_backward`] in reverse: decoder, latent,
+    /// encoder. Weight gradients accumulate into the matching `*_grads`
+    /// fields of `state`; per-stage activation buffers are read from
+    /// `state.*_cache` / `state.latent_block_scratches`.
+    pub fn backward(
+        &mut self,
+        batch: &HipBatch,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut BltScratch,
+        state: &mut BltBackwardState,
+        d_byte_logits: &GpuVec,
+    ) -> Result<(), ResidencyError> {
+        let n_bytes = bytes.len();
+        let n_patches = boundaries.len().saturating_sub(1);
+        let patch_dim = self.config.latent.patch_dim;
+        let n_layers = self.latent.num_layers();
+
+        debug_assert_eq!(d_byte_logits.len(), n_bytes * 256);
+        debug_assert!(n_patches > 0);
+        debug_assert!(n_patches <= self.config.latent.max_patches);
+
+        // Zero inter-stage gradient buffers.
+        zero_gpuvec_full(&mut state.d_patch_reps_post_latent)?;
+        zero_gpuvec_full(&mut state.d_patch_reps_pre_latent)?;
+
+        // Stage 1: decoder backward.
+        // TODO(blt-bwd): drop the seed-byte-rep gradient path. The
+        // encoder's `backward()` API doesn't yet accept an extra-seed
+        // upstream input; routing the d_seed gradient back through the
+        // encoder's last-layer byte_reps is a follow-up wire-up.
+        self.decoder.backward(
+            batch,
+            boundaries,
+            &mut state.decoder_cache,
+            d_byte_logits,
+            &mut state.decoder_grads,
+            &mut state.d_patch_reps_post_latent,
+            None,
+            &mut scratch.decoder,
+        )?;
+
+        // Stage 2: latent backward.
+        //
+        // Forward at patch p: hidden_p = patch_reps[p]; for each layer
+        // li, block.forward(hidden_p) writes K/V[layer=li, pos=p] and
+        // updates hidden_p; final-norm produces post-latent
+        // patch_reps[p]. After all patches the latent KV cache holds
+        // positions 0..n_patches.
+        //
+        // Backward at patch p (reverse): start from
+        // d_patch_reps_post_latent[p], walk final-norm backward (host),
+        // then walk layers in reverse, restoring saved per-(patch,
+        // layer) attn/mlp activations into the shared scratch before
+        // each block.backward (matching GptModelResident::backward).
+        // The KV cache stays at post-forward seq_len = n_patches; each
+        // block.backward at position p reads K/V[0..=p] independently
+        // of subsequent positions, so no truncation is needed.
+        let mut dy_dev = GpuVec::try_hip(patch_dim)?;
+        let mut d_pre_norm_dev = GpuVec::try_hip(patch_dim)?;
+
+        let mut d_post_norm_host = vec![0.0f32; patch_dim];
+        let mut pre_norm_host = vec![0.0f32; patch_dim];
+        let mut d_pre_norm_host = vec![0.0f32; patch_dim];
+        let mut dweight_final_norm_host = vec![0.0f32; patch_dim];
+
+        for p in (0..n_patches).rev() {
+            // Final-norm backward (host) for patch p.
+            copy_slab_to_dense(
+                &state.d_patch_reps_post_latent, p, patch_dim, &mut dy_dev,
+            )?;
+            batch.note_dispatch()?;
+            dy_dev.copy_to_host(&mut d_post_norm_host);
+            pre_norm_host.copy_from_slice(
+                &state.latent_pre_norm_per_patch_host
+                    [p * patch_dim..(p + 1) * patch_dim],
+            );
+            host_rms_norm_backward(
+                &pre_norm_host, &d_post_norm_host, &mut d_pre_norm_host,
+                patch_dim, 1.0, self.config.latent.norm_eps,
+            );
+            host_accumulate_rmsnorm_dweight(
+                &pre_norm_host, &d_post_norm_host, &mut dweight_final_norm_host,
+                patch_dim, self.config.latent.norm_eps,
+            );
+            d_pre_norm_dev.copy_from(&d_pre_norm_host);
+
+            // Block stack backward (reverse). For each li, restore
+            // per-(p, li) saved activations into shared scratch then
+            // block.backward.
+            for li in (0..n_layers).rev() {
+                let block = &self.latent.blocks[li];
+                restore_block_scratch_to_shared(
+                    batch,
+                    &state.latent_block_scratches[p][li],
+                    &mut state.latent_attn_scratch,
+                    &mut state.latent_mlp_scratch,
+                    self.latent_kv_cache.max_seq_len(),
+                    block,
+                )?;
+
+                block.backward(
+                    batch,
+                    &mut d_pre_norm_dev,
+                    None,
+                    &mut self.latent_kv_cache,
+                    p,
+                    &self.latent.rope,
+                    &mut state.latent_attn_scratch,
+                    &mut state.latent_attn_bwd,
+                    &mut state.latent_mlp_scratch,
+                    &mut state.latent_mlp_bwd,
+                    &mut state.latent_block_scratches[p][li],
+                    &mut state.latent_attn_grads[li],
+                    &mut state.latent_mlp_grads[li],
+                    /* recompute = */ false,
+                )?;
+            }
+
+            // d_pre_norm_dev now holds d/d(latent input at patch p) —
+            // the gradient flowing back through layer 0.
+            copy_dense_to_slab(
+                &d_pre_norm_dev, p, patch_dim, &mut state.d_patch_reps_pre_latent,
+            )?;
+            batch.note_dispatch()?;
+        }
+
+        // Fold the host-accumulated final-norm scale grad onto the
+        // device accumulator (single H2D + add).
+        let mut tmp = GpuVec::try_hip(patch_dim)?;
+        tmp.copy_from(&dweight_final_norm_host);
+        unsafe {
+            use modgrad_device::backend::op::BinaryOpKind;
+            use modgrad_device::backend::ops::op_tensor_resident;
+            op_tensor_resident(
+                hip_buf(&state.d_latent_final_norm_weight)?.device_ptr() as *const f32,
+                hip_buf(&tmp)?.device_ptr() as *const f32,
+                hip_buf_mut(&mut state.d_latent_final_norm_weight)?.device_ptr() as *mut f32,
+                patch_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        // Stage 3: encoder backward.
+        self.encoder.backward(
+            batch,
+            bytes,
+            boundaries,
+            &mut scratch.encoder,
+            &mut state.encoder_bwd_scratch,
+            &state.encoder_cache,
+            &state.d_patch_reps_pre_latent,
+            &mut state.encoder_grads,
+        )?;
+
+        Ok(())
+    }
+}
+
+// ─── Backward state ──────────────────────────────────────────
+
+/// Caller-owned per-step backward state for [`BltModel`].
+///
+/// One allocation per training run; `forward_for_backward` repopulates
+/// per call. `zero_resident` resets weight-grad accumulators across
+/// micro-batches.
+pub struct BltBackwardState {
+    pub encoder_grads: LocalEncoderGrads,
+    pub encoder_cache: LocalEncoderBwdCache,
+    pub encoder_bwd_scratch: LocalEncoderBackwardScratch,
+
+    // Latent — per-patch activation snapshots + per-layer grads.
+    pub latent_attn_grads: Vec<AttentionResidentGrads>,
+    pub latent_mlp_grads: Vec<SwigluResidentGrads>,
+    pub latent_block_scratches: Vec<Vec<TransformerBlockScratch>>,
+    pub latent_attn_scratch: AttentionScratch,
+    pub latent_attn_bwd: AttentionBackwardScratch,
+    pub latent_mlp_scratch: SwigluScratch,
+    pub latent_mlp_bwd: SwigluBackwardScratch,
+    /// Host snapshot of pre-final-norm latent hidden state per patch:
+    /// `[max_patches × patch_dim]`. Captured at end of latent forward.
+    pub latent_pre_norm_per_patch_host: Vec<f32>,
+    /// `[patch_dim]` — accumulator for the latent's final RMSNorm
+    /// scale grad. Final-norm scale is host-managed (matches the
+    /// resident-path convention of all-ones scale during training).
+    pub d_latent_final_norm_weight: GpuVec,
+
+    pub decoder_grads: LocalDecoderGrads,
+    pub decoder_cache: LocalDecoderBwdCache,
+
+    /// `[max_patches × patch_dim]` — d/d(decoder K/V input = latent
+    /// output). Filled by `decoder.backward`, consumed by latent
+    /// backward.
+    pub d_patch_reps_post_latent: GpuVec,
+    /// `[max_patches × patch_dim]` — d/d(latent input = encoder
+    /// output). Filled by latent backward, consumed by encoder
+    /// backward.
+    pub d_patch_reps_pre_latent: GpuVec,
+}
+
+impl BltBackwardState {
+    /// Allocate every gradient + activation buffer for one BLT training
+    /// loop. Sized to the model's max patches / max bytes so the same
+    /// state is reusable across calls of varying length.
+    pub fn new(model: &BltModel) -> Result<Self, ResidencyError> {
+        let cfg = &model.config;
+        let pd = cfg.latent.patch_dim;
+        let n_layers = model.latent.num_layers();
+        let max_patches = cfg.latent.max_patches;
+        let n_heads = cfg.latent.n_heads.max(1);
+        let head_dim = cfg.latent.head_dim.max(1);
+        let kv_dim = n_heads * head_dim;
+        let mlp_dim = cfg.latent.mlp_dim;
+
+        let encoder_grads = LocalEncoderGrads::zeros_for(&model.encoder)?;
+        let encoder_cache = LocalEncoderBwdCache::new(&model.encoder, max_patches)?;
+        let encoder_bwd_scratch = LocalEncoderBackwardScratch::new(&cfg.encoder)?;
+
+        let mut latent_attn_grads = Vec::with_capacity(n_layers);
+        let mut latent_mlp_grads = Vec::with_capacity(n_layers);
+        let mut latent_block_scratches: Vec<Vec<TransformerBlockScratch>> =
+            Vec::with_capacity(max_patches);
+        for _ in 0..n_layers {
+            latent_attn_grads.push(AttentionResidentGrads::new(pd, kv_dim)?);
+            latent_mlp_grads.push(SwigluResidentGrads::new(pd, mlp_dim)?);
+        }
+        // [n_patches][n_layers] — outer indexed by patch, inner by layer
+        // (matches the reverse-loop pattern in `backward`).
+        for _ in 0..max_patches {
+            let mut per_patch = Vec::with_capacity(n_layers);
+            for _ in 0..n_layers {
+                per_patch.push(TransformerBlockScratch::with_dims(
+                    pd, kv_dim, mlp_dim, n_heads * max_patches,
+                )?);
+            }
+            latent_block_scratches.push(per_patch);
+        }
+        let latent_attn_scratch =
+            AttentionScratch::new(n_heads, head_dim, kv_dim, max_patches)?;
+        let latent_attn_bwd =
+            AttentionBackwardScratch::new(n_heads, head_dim, kv_dim, max_patches)?;
+        let latent_mlp_scratch = SwigluScratch::new(pd, mlp_dim)?;
+        let latent_mlp_bwd = SwigluBackwardScratch::new(pd, mlp_dim)?;
+
+        let latent_pre_norm_per_patch_host = vec![0.0f32; max_patches * pd];
+        let d_latent_final_norm_weight = GpuVec::try_hip(pd)?;
+
+        let decoder_grads = LocalDecoderGrads::zeros(&model.decoder)?;
+        let decoder_cache = LocalDecoderBwdCache::new(&model.decoder)?;
+
+        let d_patch_reps_post_latent = GpuVec::try_hip(max_patches * pd)?;
+        let d_patch_reps_pre_latent = GpuVec::try_hip(max_patches * pd)?;
+
+        Ok(Self {
+            encoder_grads,
+            encoder_cache,
+            encoder_bwd_scratch,
+            latent_attn_grads,
+            latent_mlp_grads,
+            latent_block_scratches,
+            latent_attn_scratch,
+            latent_attn_bwd,
+            latent_mlp_scratch,
+            latent_mlp_bwd,
+            latent_pre_norm_per_patch_host,
+            d_latent_final_norm_weight,
+            decoder_grads,
+            decoder_cache,
+            d_patch_reps_post_latent,
+            d_patch_reps_pre_latent,
+        })
+    }
+
+    /// Reset every weight-grad accumulator + inter-stage gradient
+    /// buffer to zero. Caller drives once per train step.
+    pub fn zero_resident(&mut self, batch: &HipBatch) -> Result<(), ResidencyError> {
+        self.encoder_grads.zero_resident(batch)?;
+        self.decoder_grads.zero_resident(batch)?;
+        for g in self.latent_attn_grads.iter_mut() {
+            zero_gpuvec_full(&mut g.dweight_q)?;
+            zero_gpuvec_full(&mut g.dbias_q)?;
+            zero_gpuvec_full(&mut g.dweight_k)?;
+            zero_gpuvec_full(&mut g.dbias_k)?;
+            zero_gpuvec_full(&mut g.dweight_v)?;
+            zero_gpuvec_full(&mut g.dbias_v)?;
+            zero_gpuvec_full(&mut g.dweight_o)?;
+            zero_gpuvec_full(&mut g.dbias_o)?;
+        }
+        for g in self.latent_mlp_grads.iter_mut() {
+            zero_gpuvec_full(&mut g.dweight_gate)?;
+            zero_gpuvec_full(&mut g.dbias_gate)?;
+            zero_gpuvec_full(&mut g.dweight_up)?;
+            zero_gpuvec_full(&mut g.dbias_up)?;
+            zero_gpuvec_full(&mut g.dweight_down)?;
+            zero_gpuvec_full(&mut g.dbias_down)?;
+        }
+        zero_gpuvec_full(&mut self.d_latent_final_norm_weight)?;
+        zero_gpuvec_full(&mut self.d_patch_reps_post_latent)?;
+        zero_gpuvec_full(&mut self.d_patch_reps_pre_latent)?;
         Ok(())
     }
 }
@@ -623,6 +1038,143 @@ fn copy_dense_to_slab(
     Ok(())
 }
 
+/// Zero a `GpuVec::Hip` over its full capacity. H2D upload because the
+/// device backend does not yet expose a resident memset — the buffers
+/// involved are small (≤ KBs in practice for the latent grad bundle).
+fn zero_gpuvec_full(g: &mut GpuVec) -> Result<(), ResidencyError> {
+    let n = g.len();
+    let zeros = vec![0.0f32; n];
+    g.copy_from(&zeros);
+    Ok(())
+}
+
+/// Restore the per-(patch, layer) snapshotted attn/mlp activations
+/// from a [`TransformerBlockScratch`] into the shared
+/// `attn_scratch` / `mlp_scratch` that `block.backward` reads.
+///
+/// Mirrors the pattern in `GptModelResident::backward` (which copies
+/// from `state.block_scratches[li].saved_*` into `state.attn_scratch.*`
+/// before each block.backward call).
+fn restore_block_scratch_to_shared(
+    batch: &HipBatch,
+    block_scratch: &TransformerBlockScratch,
+    attn_scratch: &mut AttentionScratch,
+    mlp_scratch: &mut SwigluScratch,
+    max_seq: usize,
+    block: &modgrad_transformer::resident::TransformerBlockResident,
+) -> Result<(), ResidencyError> {
+    let model_dim = block.attn.model_dim;
+    let kv_dim = block.attn.kv_dim;
+    let num_heads = block.attn.num_heads;
+    let mlp_dim = block.mlp.mlp_dim();
+
+    unsafe fn d2d(
+        dst: *mut std::os::raw::c_void,
+        src: *const std::os::raw::c_void,
+        n_bytes: usize,
+    ) -> Result<(), ResidencyError> {
+        use modgrad_device::backend::rocm::ffi;
+        // `3` = hipMemcpyDeviceToDevice — the HIP enum value that
+        // matches `HIP_D2D` constant used elsewhere in this file.
+        let err = unsafe { ffi::hipMemcpy(dst, src, n_bytes, 3) };
+        if err != 0 {
+            return Err(ResidencyError::Backend(
+                modgrad_device::backend::BackendError::Runtime(format!(
+                    "restore_block_scratch D2D: {}", ffi::hip_err_str(err),
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    unsafe {
+        d2d(
+            hip_buf_mut(&mut attn_scratch.q_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_q_proj)?.device_ptr() as *const _,
+            model_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut attn_scratch.k_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_k_proj)?.device_ptr() as *const _,
+            kv_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut attn_scratch.v_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_v_proj)?.device_ptr() as *const _,
+            kv_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut attn_scratch.q_normed)?.device_ptr(),
+            hip_buf(&block_scratch.saved_q_normed)?.device_ptr() as *const _,
+            model_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut attn_scratch.scores_tight)?.device_ptr(),
+            hip_buf(&block_scratch.saved_scores_tight)?.device_ptr() as *const _,
+            num_heads * max_seq * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut attn_scratch.head_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_head_out)?.device_ptr() as *const _,
+            model_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut mlp_scratch.gate_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_gate_out)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut mlp_scratch.up_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_up_out)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut mlp_scratch.silu)?.device_ptr(),
+            hip_buf(&block_scratch.saved_silu)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        )?;
+        d2d(
+            hip_buf_mut(&mut mlp_scratch.hidden)?.device_ptr(),
+            hip_buf(&block_scratch.saved_hidden)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        )?;
+    }
+    for _ in 0..10 { batch.note_dispatch()?; }
+    Ok(())
+}
+
+/// Host-side RMSNorm backward, single row, scalar `scale`. Mirrors the
+/// formula in `decoder::rms_norm_backward_host` / the resident path's
+/// `rms_norm_backward_per_head`.
+fn host_rms_norm_backward(
+    x: &[f32], dy: &[f32], dx: &mut [f32],
+    head_dim: usize, scale: f32, eps: f32,
+) {
+    let n = head_dim as f32;
+    let mean_sq: f32 = x.iter().take(head_dim).map(|&v| v * v).sum::<f32>() / n;
+    let rms = (mean_sq + eps).sqrt();
+    let inv_rms = 1.0 / rms;
+    let inv_rms_sq = inv_rms * inv_rms;
+    let acc: f32 = x.iter().take(head_dim).zip(dy.iter().take(head_dim))
+        .map(|(&a, &b)| a * b).sum();
+    for i in 0..head_dim {
+        dx[i] = scale * inv_rms * (dy[i] - x[i] * acc * inv_rms_sq / n);
+    }
+}
+
+/// Accumulate `dweight += dy * x / rms(x)` per component, host-side.
+fn host_accumulate_rmsnorm_dweight(
+    x: &[f32], dy: &[f32],
+    dweight: &mut [f32], head_dim: usize, eps: f32,
+) {
+    let n = head_dim as f32;
+    let mean_sq: f32 = x.iter().take(head_dim).map(|&v| v * v).sum::<f32>() / n;
+    let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+    for i in 0..head_dim {
+        dweight[i] += dy[i] * x[i] * inv_rms;
+    }
+}
+
 // ─── LanguageModel impl ──────────────────────────────────────
 //
 // Option (A) from the brief: we expose `BltModel` as a `LanguageModel`
@@ -633,9 +1185,17 @@ fn copy_dense_to_slab(
 // unused — BLT bytes don't carry an absolute-position notion outside
 // the byte stream itself.
 //
-// Implementation is gated on noah's cross-attn landing (the trait uses
-// the full forward path, so a stubbed cross-attn produces zero logits).
-// We still wire the impl so `LmTrainer<BltModel>` type-checks today.
+// **Per-position backward intentionally unsupported.** The
+// `LanguageModel` trait's `forward_for_backward_position` /
+// `backward_position` are autoregressive per-token entry points;
+// BLT processes patches as a unit (a forward needs the full byte
+// sequence + patch boundaries), so those methods return
+// `ResidencyError::WrongVariant`. The sequence-level backward lives
+// on [`BltModel::forward_for_backward`] / [`BltModel::backward`]
+// directly — a future `BltTrainer<BltModel>` will call those instead
+// of going through the trait. `BackwardState` and
+// `alloc_backward_state` are still wired so a downstream caller can
+// allocate the per-step state via the trait.
 
 #[cfg(feature = "rocm")]
 impl isis_runtime::language_model::LanguageModel for BltModel {
@@ -685,14 +1245,13 @@ impl isis_runtime::language_model::LanguageModel for BltModel {
         Ok(())
     }
 
-    type BackwardState = ();
+    type BackwardState = BltBackwardState;
 
     fn alloc_backward_state(
         &self,
         _kv_cache: &KvCacheResident,
     ) -> Result<Self::BackwardState, ResidencyError> {
-        // Backward chain is a follow-up slice — see module docs.
-        Ok(())
+        BltBackwardState::new(self)
     }
 
     fn forward_for_backward_position(
@@ -705,8 +1264,8 @@ impl isis_runtime::language_model::LanguageModel for BltModel {
         _logits_out: &mut GpuVec,
     ) -> Result<(), ResidencyError> {
         Err(ResidencyError::WrongVariant {
-            expected: "BltModel backward (follow-up slice)",
-            got: "called forward_for_backward_position on BltModel",
+            expected: "BltModel sequence-level backward (call BltModel::forward_for_backward)",
+            got: "per-position not supported",
         })
     }
 
@@ -720,8 +1279,8 @@ impl isis_runtime::language_model::LanguageModel for BltModel {
         _d_logits: &GpuVec,
     ) -> Result<(), ResidencyError> {
         Err(ResidencyError::WrongVariant {
-            expected: "BltModel backward (follow-up slice)",
-            got: "called backward_position on BltModel",
+            expected: "BltModel sequence-level backward (call BltModel::backward)",
+            got: "per-position not supported",
         })
     }
 }
@@ -853,6 +1412,41 @@ mod tests {
         bad2.encoder.n_heads = 1;
         bad2.encoder.head_dim = 16;
         assert!(bad2.validate().is_err(), "byte_dim mismatch must reject");
+    }
+
+    #[test]
+    fn blt_backward_state_alloc_and_zero() {
+        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let model = BltModel::new(config).expect("BltModel::new");
+        let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+
+        // Per-layer counts match the model.
+        assert_eq!(state.latent_attn_grads.len(), model.latent.num_layers());
+        assert_eq!(state.latent_mlp_grads.len(), model.latent.num_layers());
+        // Per-patch outer × per-layer inner block-scratch grid.
+        let max_patches = model.config.latent.max_patches;
+        assert_eq!(state.latent_block_scratches.len(), max_patches);
+        for per_patch in state.latent_block_scratches.iter() {
+            assert_eq!(per_patch.len(), model.latent.num_layers());
+        }
+        // Inter-stage gradient buffers.
+        let pd = model.config.latent.patch_dim;
+        assert_eq!(state.d_patch_reps_post_latent.len(), max_patches * pd);
+        assert_eq!(state.d_patch_reps_pre_latent.len(), max_patches * pd);
+        // Final-norm scale grad shape.
+        assert_eq!(state.d_latent_final_norm_weight.len(), pd);
+        // Pre-norm host slab.
+        assert_eq!(state.latent_pre_norm_per_patch_host.len(), max_patches * pd);
+
+        // zero_resident must succeed without panicking.
+        let batch = HipBatch::new();
+        state.zero_resident(&batch).expect("BltBackwardState::zero_resident");
+        let _ = batch.flush();
     }
 }
 
