@@ -1,0 +1,18 @@
+[package]
+name = "blt_lifecycle"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end BLT lifecycle: train, save, load, generate. Demonstrates the checkpoint primitive preserves model behavior."
+
+[[bin]]
+name = "blt_lifecycle"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-blt        = { path = "../../crates/modgrad-blt", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+
+[features]
+default = []
