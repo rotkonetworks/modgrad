@@ -20,6 +20,27 @@
 use serde::{Deserialize, Serialize};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
+// ─── Modality tag ───────────────────────────────────────────
+
+/// Modality tag for a token's cache row. Shadows
+/// `modgrad-data::Modality` (CONTRACT: keep in sync with
+/// `modgrad-data::Modality` if/when it lands there — if you add a
+/// variant here, mirror it there).
+///
+/// Defined here rather than imported because `modgrad-ctm` should
+/// stay lean and free of upstream-data dependencies. A future slice
+/// can de-duplicate by re-exporting one side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modality {
+    Byte,
+    Delimiter,
+    ImageVq,
+    AudioVq,
+    Timestamp,
+    Action,
+    Other,
+}
+
 // ─── Cache ──────────────────────────────────────────────────
 
 /// Cached hidden states from ALL layers of a frozen cerebellum.
@@ -35,6 +56,11 @@ pub struct CerebellumCache {
     pub n_positions: usize,
     /// Number of layers.
     pub n_layers: usize,
+    /// Optional per-position modality tag. Length must equal
+    /// `n_positions` when `Some`. `None` means modality is unknown /
+    /// not tracked (the pre-multimodal default; existing callers do
+    /// not need updating beyond initialising this field to `None`).
+    pub modalities: Option<Vec<Modality>>,
 }
 
 impl CerebellumCache {
@@ -83,14 +109,26 @@ impl CerebellumCache {
 
     /// Empty cache (no cerebellum active).
     pub fn empty() -> Self {
-        Self { hidden_states: Vec::new(), hidden_dim: 0, n_positions: 0, n_layers: 0 }
+        Self {
+            hidden_states: Vec::new(),
+            hidden_dim: 0,
+            n_positions: 0,
+            n_layers: 0,
+            modalities: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool { self.n_positions == 0 }
 
     /// Single-layer cache (backward compat with old encode_context).
     pub fn single_layer(hidden_states: Vec<f32>, hidden_dim: usize, n_positions: usize) -> Self {
-        Self { hidden_states, hidden_dim, n_positions, n_layers: 1 }
+        Self {
+            hidden_states,
+            hidden_dim,
+            n_positions,
+            n_layers: 1,
+            modalities: None,
+        }
     }
 }
 
@@ -360,6 +398,120 @@ pub fn blended_hidden_at(
     }
 }
 
+// ─── Modality-aware pooling ────────────────────────────────
+
+/// Pool the cache rows belonging to a given modality, then project to
+/// cortex space via the layer-blended projection.
+///
+/// **Pooling choice.** Mean-pool: simplest non-degenerate aggregation
+/// across a variable-length range. Max-pool or learned-attention
+/// pooling are deliberate future extensions; a fresh slice should not
+/// presuppose them.
+///
+/// **Modality-untagged caches** (`cache.modalities == None`) fall
+/// through to all-positions pooling — equivalent to position-agnostic
+/// blending across the whole cache. This preserves the pre-multimodal
+/// API: callers that never set modality tags get a sensible default
+/// without touching their code.
+///
+/// Returns `false` and zero-fills `out` if no positions match the
+/// requested modality (e.g. a context window that contains no image
+/// tokens). The zero-fill is the safe default — downstream cortex
+/// regions can treat the missing modality as "no signal" without
+/// branching.
+pub fn cerebellum_modality_pool(
+    cache: &CerebellumCache,
+    proj: &CerebProjection,
+    modality: Modality,
+    out: &mut [f32],
+) -> bool {
+    let cortex_dim = proj.cortex_dim;
+    if cache.is_empty() {
+        out[..cortex_dim].fill(0.0);
+        return false;
+    }
+
+    let mean_hidden = mean_blended_hidden_for_modality(cache, proj, modality);
+    let matched = match &cache.modalities {
+        Some(tags) => tags.iter().any(|m| *m == modality),
+        // Untagged cache: every position counts as a match.
+        None => cache.n_positions > 0,
+    };
+
+    if !matched {
+        out[..cortex_dim].fill(0.0);
+        return false;
+    }
+
+    proj.project_out_into(&mean_hidden, out);
+    true
+}
+
+/// Per-modality blended hidden vector — the mean of the layer-blended
+/// hidden states across all positions matching `modality`. Returns
+/// `vec![0.0; hidden_dim]` if no position matches.
+///
+/// Used by gradient computation, which needs the pre-projection
+/// vector to backprop through `CerebProjection::backward_out`.
+///
+/// `None`-tagged caches fall through to all-positions averaging,
+/// matching the fallback semantics in `cerebellum_modality_pool`.
+pub fn blended_hidden_for_modality(
+    cache: &CerebellumCache,
+    proj: &CerebProjection,
+    modality: Modality,
+) -> Vec<f32> {
+    mean_blended_hidden_for_modality(cache, proj, modality)
+}
+
+/// Internal: compute the mean of `blend_layers(p, weights)` over all
+/// positions matching `modality`. Returns a zero vector if no match.
+///
+/// Implementation note: we sum into a single accumulator buffer so
+/// the hidden_dim allocation is one Vec, not one per position. Layer
+/// blend uses the existing `blend_layers_into` to keep the dispatch
+/// pattern consistent with `cerebellum_at_position`.
+fn mean_blended_hidden_for_modality(
+    cache: &CerebellumCache,
+    proj: &CerebProjection,
+    modality: Modality,
+) -> Vec<f32> {
+    let d = cache.hidden_dim;
+    if d == 0 || cache.n_positions == 0 {
+        return vec![0.0f32; d];
+    }
+
+    let weights = if cache.n_layers > 1 {
+        proj.layer_weights()
+    } else {
+        // Single-layer cache: blend reduces to identity at layer 0.
+        vec![1.0f32]
+    };
+
+    let mut acc = vec![0.0f32; d];
+    let mut tmp = vec![0.0f32; d];
+    let mut count: usize = 0;
+
+    for p in 0..cache.n_positions {
+        let matches = cache
+            .modalities
+            .as_ref()
+            .map(|m| m.get(p).copied() == Some(modality))
+            .unwrap_or(true);
+        if !matches { continue; }
+        cache.blend_layers_into(p, &weights, &mut tmp);
+        for i in 0..d { acc[i] += tmp[i]; }
+        count += 1;
+    }
+
+    if count == 0 {
+        return vec![0.0f32; d];
+    }
+    let inv = 1.0 / count as f32;
+    for v in acc.iter_mut() { *v *= inv; }
+    acc
+}
+
 // ─── Random expansion cerebellum ───────────────────────────
 
 /// Biological cerebellum: frozen random sparse projection (granule cells).
@@ -502,6 +654,7 @@ mod tests {
             hidden_dim: d,
             n_positions: n_pos,
             n_layers,
+            modalities: None,
         };
 
         // Layer 0, pos 0 should be [1,1,1,1]
@@ -545,6 +698,7 @@ mod tests {
         }
         let cache = CerebellumCache {
             hidden_states: data, hidden_dim: d, n_positions: n_pos, n_layers,
+            modalities: None,
         };
         let proj = CerebProjection::with_layers(4, 4, 4, 2);
         let mut out = vec![0.0f32; 4];
@@ -566,6 +720,115 @@ mod tests {
             for j in 0..16 {
                 assert_eq!(d_w[i * 16 + j], d_cortex[i] * hidden[j]);
             }
+        }
+    }
+
+    #[test]
+    fn modality_pool_separates_text_image() {
+        // n_layers=2, n_positions=4, hidden_dim=4.
+        // Layer-major layout: first 16 floats (layer 0 across 4 positions)
+        // then 16 more (layer 1 across 4 positions).
+        // Positions 0,1 → Modality::Byte (text), values +1.0.
+        // Positions 2,3 → Modality::ImageVq (image), values -1.0.
+        let mut data = Vec::with_capacity(2 * 4 * 4);
+        for _layer in 0..2 {
+            // positions 0,1: +1.0
+            data.extend(vec![1.0f32; 2 * 4]);
+            // positions 2,3: -1.0
+            data.extend(vec![-1.0f32; 2 * 4]);
+        }
+        assert_eq!(data.len(), 32);
+
+        let cache = CerebellumCache {
+            hidden_states: data,
+            hidden_dim: 4,
+            n_positions: 4,
+            n_layers: 2,
+            modalities: Some(vec![
+                Modality::Byte,
+                Modality::Byte,
+                Modality::ImageVq,
+                Modality::ImageVq,
+            ]),
+        };
+        let proj = CerebProjection::with_layers(4, 4, 4, 2);
+
+        let mut byte_out = vec![0.0; 4];
+        let matched = cerebellum_modality_pool(&cache, &proj, Modality::Byte, &mut byte_out);
+        assert!(matched);
+
+        let mut image_out = vec![0.0; 4];
+        let matched_img = cerebellum_modality_pool(&cache, &proj, Modality::ImageVq, &mut image_out);
+        assert!(matched_img);
+
+        // Byte mean is +1.0 base, image mean is -1.0 base; the same
+        // projection applied to opposite-sign vectors must produce
+        // measurably different outputs.
+        let diff: f32 = byte_out
+            .iter()
+            .zip(image_out.iter())
+            .map(|(b, i)| (b - i).abs())
+            .sum();
+        assert!(diff > 1e-3, "byte vs image projections should differ; got diff={diff}");
+    }
+
+    #[test]
+    fn modality_pool_returns_false_on_no_match() {
+        // 1 layer × 2 positions × 4 hidden = 8 floats.
+        let cache = CerebellumCache {
+            hidden_states: vec![1.0; 8],
+            hidden_dim: 4,
+            n_positions: 2,
+            n_layers: 1,
+            modalities: Some(vec![Modality::Byte, Modality::Byte]),
+        };
+        let proj = CerebProjection::with_layers(4, 4, 4, 1);
+        let mut out = vec![1.0; 4];
+        let matched = cerebellum_modality_pool(&cache, &proj, Modality::ImageVq, &mut out);
+        assert!(!matched);
+        // out should have been zero-filled.
+        for &v in &out { assert_eq!(v, 0.0); }
+    }
+
+    #[test]
+    fn modality_none_falls_back_to_all_positions() {
+        // 1 layer × 3 positions × 4 hidden = 12 floats. Untagged cache
+        // (modalities = None) should pool over every position
+        // regardless of the requested modality. We compare against the
+        // explicit "tag everything as Byte" cache: outputs must match.
+        let data: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
+        let proj = CerebProjection::with_layers(4, 4, 4, 1);
+
+        let cache_untagged = CerebellumCache {
+            hidden_states: data.clone(),
+            hidden_dim: 4,
+            n_positions: 3,
+            n_layers: 1,
+            modalities: None,
+        };
+        let cache_all_byte = CerebellumCache {
+            hidden_states: data,
+            hidden_dim: 4,
+            n_positions: 3,
+            n_layers: 1,
+            modalities: Some(vec![Modality::Byte; 3]),
+        };
+
+        let mut out_untagged = vec![0.0; 4];
+        let mut out_tagged = vec![0.0; 4];
+        let m1 = cerebellum_modality_pool(
+            &cache_untagged, &proj, Modality::ImageVq, &mut out_untagged,
+        );
+        let m2 = cerebellum_modality_pool(
+            &cache_all_byte, &proj, Modality::Byte, &mut out_tagged,
+        );
+        assert!(m1, "untagged cache should report a match (fallback path)");
+        assert!(m2);
+
+        // The two outputs should be identical: same data, same
+        // pooling, same projection.
+        for (a, b) in out_untagged.iter().zip(out_tagged.iter()) {
+            assert!((a - b).abs() < 1e-6, "untagged fallback diverged from all-Byte case: {a} vs {b}");
         }
     }
 }

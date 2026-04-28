@@ -235,6 +235,7 @@ impl crate::cerebellum::FrozenCerebellum for FrozenTransformer {
             hidden_dim: d,
             n_positions: seq_len,
             n_layers,
+            modalities: None,
         }
     }
 

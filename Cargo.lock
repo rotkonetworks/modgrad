@@ -2801,6 +2801,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "multimodal_smoke"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-data",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "naga"
 version = "24.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

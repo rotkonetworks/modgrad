@@ -149,6 +149,7 @@ impl FrozenCerebellum for QwenCerebellum {
                 hidden_dim: d,
                 n_positions: 0,
                 n_layers,
+                modalities: None,
             };
         }
         debug_assert!(
@@ -256,6 +257,7 @@ impl FrozenCerebellum for QwenCerebellum {
             hidden_dim: d,
             n_positions: n,
             n_layers,
+            modalities: None,
         }
     }
 

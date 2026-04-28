@@ -24,6 +24,7 @@ members = [
     "examples/dream_bench",
     "examples/dream_gallery",
     "examples/maze_viz",
+    "examples/multimodal_smoke",
     "examples/retina_viz",
     "examples/filter_viz",
     "examples/hebbian_sanity",

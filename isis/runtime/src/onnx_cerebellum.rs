@@ -114,6 +114,7 @@ impl FrozenCerebellum for OnnxCerebellum {
                 hidden_dim: d,
                 n_positions: seq_len,
                 n_layers: self.n_layers,
+                modalities: None,
             })
         })();
 
