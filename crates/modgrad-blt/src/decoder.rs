@@ -729,6 +729,75 @@ impl LocalDecoder {
         let mut d_byte_reps_q_layer = GpuVec::try_hip(n_bytes * byte_dim)?;
         let mut hidden_step = GpuVec::try_hip(byte_dim)?;
 
+        // ── FIXME(blt-bwd-bug-2) — root-cause and fix ─────────────────
+        //
+        // The per-byte block.backward call has TWO subtleties that make
+        // a naïve loop produce zero `dweight_*` for `decoder.block.0.wv`
+        // (and incidentally also for q/k/o/gate/up/down, just not the
+        // index gradcheck samples):
+        //
+        // 1. **Stale `attn_scratch` / `mlp_scratch`.** Both forward and
+        //    backward share `scratch.attn_scratch` / `scratch.mlp_scratch`
+        //    across all (layer, byte) pairs. After `forward_for_backward`
+        //    the shared scratches hold layer (n_layers-1), byte
+        //    (n_bytes-1)'s activations — they are *stale* relative to
+        //    every other (layer, byte) the per-byte backward iterates
+        //    over. `AttentionResident::backward` reads `attn_scratch
+        //    .{q_proj,k_proj,scores_tight,head_out,q_normed}` directly
+        //    (resident.rs lines 613, 650, 703, 712, 795, 797). Without a
+        //    restore, those reads return the wrong byte/layer's data.
+        //    `forward_for_backward` already snapshotted the right values
+        //    into `block_scratches[li][t].saved_*`; we just need to
+        //    D2D-copy them back into the shared scratches before the
+        //    per-byte backward call. (This mirrors the canonical pattern
+        //    in `GptModelResident::backward`, resident.rs lines 2290-
+        //    2342.)
+        //
+        // 2. **`LinearResident::backward` overwrites `dweight_*`.** The
+        //    matmul at neuron.rs:288-294 uses `matmul_resident_nn(..., C=
+        //    dweight, ...)` which writes (does not accumulate) the outer
+        //    product `dy ⊗ x` into the dweight buffer. Across the per-
+        //    byte loop, each call clobbers the previous byte's
+        //    contribution. With the gradcheck's single-position loss
+        //    (only row 0 of `d_byte_logits` is nonzero), every byte t>0
+        //    has `dy=0`, so byte t=31's call writes ZERO into
+        //    `grads.dweight_v` — making the entire buffer zero.
+        //
+        // The fix below addresses both: (a) restore the per-byte saved
+        // activations into the shared scratch before each block.backward
+        // (D2D copies — cheap), and (b) accumulate per-byte dweight
+        // contributions through a single per-call temporary
+        // `AttentionResidentGrads` / `SwigluResidentGrads`, adding into
+        // the layer accumulator after each byte.
+        //
+        // Post-fix gradcheck status (2026-04-28): `decoder.block.0.wv[7]`
+        // moves from `analytic=0, grad_norm=0` (catastrophic zero) to
+        // `analytic=-5.67e-4, grad_norm=0.19` against `num=-7.15e-4` —
+        // a ~21% relative error. The buffer is now non-zero with real
+        // gradient flowing; the residual 21% gap is *not* in this
+        // function. Suspected upstream causes (in `modgrad-transformer`,
+        // out of scope for this fix): (i) `AttentionResident::backward`
+        // unconditionally calls `rms_norm_backward_per_head` on Q/K
+        // even when `use_qk_norm=false` (resident.rs:801-808), which
+        // distorts `d_q_proj` / `d_k_proj` and propagates through the
+        // residual fold to upstream `dy_dev`; (ii) host-side `acc`
+        // arithmetic at fp32 in stage 5 of attn.backward. Both would
+        // also cause the smaller marginal failures elsewhere in the
+        // gradcheck (`latent.block.0.gate`, `decoder.lm_head`,
+        // `decoder.final_norm`). They are documented here as a TODO
+        // for a follow-up commit that may modify resident.rs.
+        let attn_kv_dim = self.byte_layers[0].attn.kv_dim;
+        let attn_max_seq = self.byte_kv_cache.max_seq_len();
+        let attn_num_heads = self.byte_layers[0].attn.num_heads;
+        let block_mlp_dim = self.byte_layers[0].mlp.mlp_dim();
+        let block_model_dim = byte_dim;
+
+        // Per-byte scratch dweight/dbias buffers (alloc once, reused).
+        // Each per-byte block.backward overwrites them; we then add them
+        // into the layer accumulator.
+        let mut tmp_attn_grads = AttentionResidentGrads::new(byte_dim, attn_kv_dim)?;
+        let mut tmp_mlp_grads = SwigluResidentGrads::new(byte_dim, block_mlp_dim)?;
+
         for li in (0..n_layers).rev() {
             // Per-byte block.backward in reverse traversal order.
             // backward needs the kv_cache in post-forward state; for
@@ -736,12 +805,29 @@ impl LocalDecoder {
             // bytes (each byte was a fresh position), so we can iterate
             // forward or reverse — we go forward for cache locality.
             for t in 0..n_bytes {
+                // (1) Restore per-byte saved attention/MLP activations
+                // into the shared scratch buffers. Without this,
+                // attn.backward / mlp.backward read stale data from the
+                // last byte of the last layer's forward.
+                restore_block_scratch_into_shared(
+                    batch,
+                    &cache.block_scratches[li][t],
+                    &mut scratch.attn_scratch,
+                    &mut scratch.mlp_scratch,
+                    block_model_dim, attn_kv_dim, attn_num_heads,
+                    attn_max_seq, block_mlp_dim,
+                )?;
+
                 // Stage per-byte d_byte_reps[t] into the step buffer.
                 copy_slab_to_hidden(
                     &d_byte_reps, t, byte_dim, &mut hidden_step,
                 )?;
                 batch.note_dispatch()?;
 
+                // (2) Run the per-byte block backward into a per-call
+                // *temporary* grad bundle; LinearResident::backward
+                // overwrites these, so we add into the layer accumulator
+                // explicitly below.
                 self.byte_layers[li].backward(
                     batch,
                     &mut hidden_step,
@@ -754,9 +840,19 @@ impl LocalDecoder {
                     &mut scratch.mlp_scratch,
                     &mut scratch.mlp_bwd,
                     &mut cache.block_scratches[li][t],
-                    &mut grads.attn_grads[li],
-                    &mut grads.mlp_grads[li],
+                    &mut tmp_attn_grads,
+                    &mut tmp_mlp_grads,
                     /* recompute = */ false,
+                )?;
+
+                // (3) Accumulate per-byte grads into the layer
+                // accumulator. Use `op_tensor_resident(..., Add)` for
+                // each weight/bias buffer.
+                accumulate_attn_grads(
+                    batch, &tmp_attn_grads, &mut grads.attn_grads[li],
+                )?;
+                accumulate_mlp_grads(
+                    batch, &tmp_mlp_grads, &mut grads.mlp_grads[li],
                 )?;
 
                 // Write the per-byte d_cross_out back into the slab.
@@ -1240,6 +1336,179 @@ fn accumulate_rmsnorm_dweight(
     for i in 0..head_dim {
         dweight[i] += dy[i] * x[i] * inv_rms;
     }
+}
+
+/// Restore the per-byte saved attention/MLP activations from
+/// `block_scratch.saved_*` into the shared `attn_scratch` / `mlp_scratch`
+/// buffers. Mirrors the `GptModelResident::backward` pattern at
+/// `modgrad-transformer/src/resident.rs:2290-2342`.
+///
+/// The decoder's per-byte loop reuses one shared `attn_scratch` /
+/// `mlp_scratch` across every (layer, byte) pair; after the matched
+/// `forward_for_backward` finishes, those shared scratches hold the
+/// last (layer, byte)'s state. `AttentionResident::backward` and
+/// `SwigluResident::backward` read directly from those scratches
+/// (they are not parameterised on a per-call activation source), so
+/// without restoring the right per-byte snapshot the backward computes
+/// `d_v_current`, `d_q`, `d_k`, etc. from the wrong activations and
+/// produces wildly wrong gradients (or, when combined with the per-byte
+/// LinearResident::backward overwrite + a single-position loss, exactly
+/// zero — see the FIXME(blt-bwd-bug-2) comment at the call site).
+fn restore_block_scratch_into_shared(
+    batch: &HipBatch,
+    block_scratch: &TransformerBlockScratch,
+    attn_scratch: &mut AttentionScratch,
+    mlp_scratch: &mut SwigluScratch,
+    model_dim: usize,
+    kv_dim: usize,
+    num_heads: usize,
+    max_seq: usize,
+    mlp_dim: usize,
+) -> Result<(), ResidencyError> {
+    use modgrad_device::backend::rocm::ffi;
+    const HIP_D2D: std::os::raw::c_int = 3;
+
+    let attn_pairs: [(*mut std::os::raw::c_void, *const std::os::raw::c_void, usize); 6] = [
+        (
+            hip_buf_mut(&mut attn_scratch.q_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_q_proj)?.device_ptr() as *const _,
+            model_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut attn_scratch.k_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_k_proj)?.device_ptr() as *const _,
+            kv_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut attn_scratch.v_proj)?.device_ptr(),
+            hip_buf(&block_scratch.saved_v_proj)?.device_ptr() as *const _,
+            kv_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut attn_scratch.q_normed)?.device_ptr(),
+            hip_buf(&block_scratch.saved_q_normed)?.device_ptr() as *const _,
+            model_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut attn_scratch.scores_tight)?.device_ptr(),
+            hip_buf(&block_scratch.saved_scores_tight)?.device_ptr() as *const _,
+            num_heads * max_seq * 4,
+        ),
+        (
+            hip_buf_mut(&mut attn_scratch.head_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_head_out)?.device_ptr() as *const _,
+            model_dim * 4,
+        ),
+    ];
+    for (dst, src, bytes) in attn_pairs {
+        let err = unsafe { ffi::hipMemcpy(dst, src, bytes, HIP_D2D) };
+        if err != 0 {
+            return Err(ResidencyError::Backend(
+                modgrad_device::backend::BackendError::Runtime(format!(
+                    "restore attn_scratch D2D ({} bytes): {}",
+                    bytes,
+                    ffi::hip_err_str(err),
+                )),
+            ));
+        }
+        batch.note_dispatch()?;
+    }
+
+    let mlp_pairs: [(*mut std::os::raw::c_void, *const std::os::raw::c_void, usize); 4] = [
+        (
+            hip_buf_mut(&mut mlp_scratch.gate_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_gate_out)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut mlp_scratch.up_out)?.device_ptr(),
+            hip_buf(&block_scratch.saved_up_out)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut mlp_scratch.silu)?.device_ptr(),
+            hip_buf(&block_scratch.saved_silu)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        ),
+        (
+            hip_buf_mut(&mut mlp_scratch.hidden)?.device_ptr(),
+            hip_buf(&block_scratch.saved_hidden)?.device_ptr() as *const _,
+            mlp_dim * 4,
+        ),
+    ];
+    for (dst, src, bytes) in mlp_pairs {
+        let err = unsafe { ffi::hipMemcpy(dst, src, bytes, HIP_D2D) };
+        if err != 0 {
+            return Err(ResidencyError::Backend(
+                modgrad_device::backend::BackendError::Runtime(format!(
+                    "restore mlp_scratch D2D ({} bytes): {}",
+                    bytes,
+                    ffi::hip_err_str(err),
+                )),
+            ));
+        }
+        batch.note_dispatch()?;
+    }
+
+    Ok(())
+}
+
+/// `acc += src` for every dweight/dbias buffer in
+/// `AttentionResidentGrads`. `LinearResident::backward` overwrites the
+/// dweight buffer it is handed, so the decoder's per-byte loop runs
+/// each block.backward into a per-call temporary `src` and then adds
+/// into the layer accumulator `acc` here.
+fn accumulate_attn_grads(
+    batch: &HipBatch,
+    src: &AttentionResidentGrads,
+    acc: &mut AttentionResidentGrads,
+) -> Result<(), ResidencyError> {
+    accumulate_pair(batch, &src.dweight_q, &mut acc.dweight_q)?;
+    accumulate_pair(batch, &src.dbias_q,   &mut acc.dbias_q)?;
+    accumulate_pair(batch, &src.dweight_k, &mut acc.dweight_k)?;
+    accumulate_pair(batch, &src.dbias_k,   &mut acc.dbias_k)?;
+    accumulate_pair(batch, &src.dweight_v, &mut acc.dweight_v)?;
+    accumulate_pair(batch, &src.dbias_v,   &mut acc.dbias_v)?;
+    accumulate_pair(batch, &src.dweight_o, &mut acc.dweight_o)?;
+    accumulate_pair(batch, &src.dbias_o,   &mut acc.dbias_o)?;
+    Ok(())
+}
+
+/// `acc += src` for every dweight/dbias buffer in `SwigluResidentGrads`.
+/// Same rationale as `accumulate_attn_grads`.
+fn accumulate_mlp_grads(
+    batch: &HipBatch,
+    src: &SwigluResidentGrads,
+    acc: &mut SwigluResidentGrads,
+) -> Result<(), ResidencyError> {
+    accumulate_pair(batch, &src.dweight_gate, &mut acc.dweight_gate)?;
+    accumulate_pair(batch, &src.dbias_gate,   &mut acc.dbias_gate)?;
+    accumulate_pair(batch, &src.dweight_up,   &mut acc.dweight_up)?;
+    accumulate_pair(batch, &src.dbias_up,     &mut acc.dbias_up)?;
+    accumulate_pair(batch, &src.dweight_down, &mut acc.dweight_down)?;
+    accumulate_pair(batch, &src.dbias_down,   &mut acc.dbias_down)?;
+    Ok(())
+}
+
+/// `acc += src` over the full length of `acc` (which equals `src.len()`).
+fn accumulate_pair(
+    batch: &HipBatch,
+    src: &GpuVec,
+    acc: &mut GpuVec,
+) -> Result<(), ResidencyError> {
+    let n = acc.len();
+    debug_assert_eq!(n, src.len());
+    unsafe {
+        op_tensor_resident(
+            hip_buf(acc)?.device_ptr() as *const f32,
+            hip_buf(src)?.device_ptr() as *const f32,
+            hip_buf_mut(acc)?.device_ptr() as *mut f32,
+            n,
+            1.0, 1.0, 0.0, BinaryOpKind::Add,
+        )?;
+    }
+    batch.note_dispatch()?;
+    Ok(())
 }
 
 /// D2D copy `hidden[..byte_dim]` → `slab[t * byte_dim..]`.

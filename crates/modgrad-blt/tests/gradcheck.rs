@@ -1,52 +1,78 @@
 //! Numerical gradient verification (gradcheck) for the BLT backward pass.
 //!
-//! ## STATUS: surfaced real bugs (currently #[ignore]'d)
+//! ## STATUS: 3 catastrophic-zero bugs FIXED; 2 upstream bugs remain
 //!
-//! 10/12 weight groups fail gradcheck at 1e-2 relative tolerance. This
-//! test is `#[ignore]`'d so `cargo test` stays green; run explicitly via
+//! 8/12 fail at 1e-2 tolerance, but the failure modes are now
+//! systematic-magnitude rather than catastrophic-zero. Test is still
+//! `#[ignore]`'d so `cargo test` stays green; reproduce via
 //! `cargo test -p modgrad-blt --features rocm --test gradcheck -- \
-//! --ignored --test-threads=1 --nocapture` to reproduce.
+//! --ignored --test-threads=1 --nocapture`.
 //!
-//! Three categories of failure:
+//! ### Fixed in this slice
 //!
-//! 1. **Hard zeros — entire grad buffer is zero, no signal at all:**
-//!    - `encoder.block.0.wq` — likely cause: `LocalEncoder::backward`
-//!      calls `byte_layers[li].backward(... block_scratch_replay,
-//!      recompute=true)`. The replay scratch's `attn_input` is never
-//!      populated from the matched per-byte forward — recompute then
-//!      re-runs starting from zeros, producing all-zero outer-product
-//!      weight grads. FIXME(blt-bwd-bug-1).
-//!    - `encoder.block.0.gate` — same root cause (encoder MLP grads
-//!      ride the same recompute path). FIXME(blt-bwd-bug-1).
-//!    - `decoder.block.0.wv` — separate bug; decoder uses
-//!      `recompute=false` against populated `cache.block_scratches`.
-//!      Likely cause TBD; possibly the V projection's gradient wire-up
-//!      missed the per-byte loop. FIXME(blt-bwd-bug-2).
+//! - **bug-1 (encoder.block recompute)** — `LocalEncoder::backward`
+//!   was running `recompute=true` against a never-populated
+//!   `block_scratch_replay`. Switched to `recompute=false` against the
+//!   populated per-byte `cache.block_scratches[li][t]`, mirroring the
+//!   decoder's working pattern. Encoder block grads now flow non-zero.
+//! - **bug-2 (decoder.block.wv was exactly zero)** — two-fault
+//!   compound: (a) shared `attn_scratch`/`mlp_scratch` held the last
+//!   forward iteration's state by backward time; fixed by D2D-restoring
+//!   per-(layer,byte) saved activations before each block.backward.
+//!   (b) `LinearResident::backward` overwrites `dweight_*` (uses matmul
+//!   not matmul_add); per-byte calls clobbered each other, and with the
+//!   single-position loss in gradcheck, bytes 1..31 wrote zero clobbering
+//!   byte 0's contribution. Fixed by accumulating per-byte temp grads
+//!   into the layer total via `op_tensor_resident` Add. Side-effect: the
+//!   formerly-suspicious `decoder.cross_attn.0.wq` now PASSES — the
+//!   block-backward fix unblocked its upstream signal.
+//! - **bug-3 (byte_embed scatter scale)** — found the scale factor:
+//!   `NgramHashEmbeddings::embed_bytes` divides by `(n_tables + 1)`,
+//!   so `∂augmented/∂byte_embed = 1/(n_tables+1)`. Applied as a `scale`
+//!   parameter to `scatter_byte_embed_grad`.
 //!
-//! 2. **Magnitude mismatch — analytic ~11× numerical:**
-//!    - `encoder.byte_embed[7]`: num=-0.79, analytic=-8.68. The
-//!      byte-embed scatter likely double-counts contributions or is
-//!      missing a `1/n_bytes` scale somewhere. FIXME(blt-bwd-bug-3).
+//! ### Remaining (traced to upstream `modgrad-transformer`)
 //!
-//! 3. **Marginal (within ~6% of threshold; likely fp32 noise, not
-//!    bugs):** `encoder.cross_attn.0.wk` (24%), `latent.block.0.gate`
-//!    (1.8%), `latent.block.1.wo` (1.6%), `latent.final_norm` (5.5%),
-//!    `decoder.lm_head` (5.8%), `decoder.final_norm` (1.9%). These
-//!    would all pass at a 5e-2 tolerance.
+//! - **bug-A (cross-step KV gradient dropped)** — `AttentionResident::backward`
+//!   documents: *"Treats prior KV-cache entries as constants — only the
+//!   current step's Q, K, V projection gradients are produced."* Fine
+//!   for autoregressive single-position backward (which the latent uses
+//!   correctly), but for the encoder's per-byte loop over a sequence,
+//!   the gradient flowing back to `H[s]` (s<t) via `dK[s]·∂softmax/∂K`
+//!   is dropped. The accumulated dW_k thus systematically undercounts.
+//!   Affects encoder.block.{wq,gate} and the byte_embed scatter (which
+//!   is downstream of the encoder hidden gradient). Fix requires
+//!   modifying `AttentionResident::backward`'s KV gradient handling.
+//! - **bug-B (rms_norm_backward_per_head unconditional)** —
+//!   `AttentionResident::backward` calls `rms_norm_backward_per_head`
+//!   on Q/K unconditionally, even when the matched forward skipped QK
+//!   norm (`use_qk_norm=false`, BLT's config). Distorts d_q_proj /
+//!   d_k_proj and propagates into the residual fold, shifting all
+//!   downstream gradients. Affects decoder.block.wv (21% rel_err) and
+//!   the cross-attn marginals. Fix: gate the call on `use_qk_norm`.
 //!
-//! Two genuine PASS: `latent.block.0.wq` (analytic=0, num=0), but the
-//! zero is suspicious — the upstream gradient may already be near-zero
-//! at the shallowest latent layer, masking a potential bug. Future
-//! debugging should pick a different `idx` or input.
+//! ### Failure breakdown today (8 of 12)
 //!
-//! Existing 41 BLT lib tests are **shape** tests (loss finite,
-//! monotonic loss decrease) — they cannot catch a chain-rule term that
-//! produces zero. The previous training smokes converged via the
-//! *subset* of correct grads (latent + LM head + cross-attn) while the
-//! encoder local stack and decoder.wv contributed nothing.
+//! | category | rel_err | category |
+//! |---|---|---|
+//! | encoder.block.0.wq | 99% | bug-A cascade |
+//! | encoder.block.0.gate | 87% | bug-A cascade |
+//! | encoder.byte_embed | 96% | bug-A cascade |
+//! | encoder.cross_attn.0.wk | 19% | bug-B cascade |
+//! | decoder.block.0.wv | 21% | bug-B cascade |
+//! | latent.block.0.gate | 1.4% | marginal (fp32) |
+//! | decoder.lm_head | 5.8% | marginal (fp32) |
+//! | decoder.final_norm | 1.9% | marginal (fp32) |
 //!
-//! When the bugs are fixed, remove the `#[ignore]` and tighten any
-//! marginals discovered to be real bugs.
+//! Four PASS: `latent.block.0.wq`, `latent.block.1.wo`,
+//! `latent.final_norm`, `decoder.cross_attn.0.wq`. The latent path
+//! works end-to-end because GptModelResident's autoregressive
+//! single-position backward matches what AttentionResident::backward
+//! actually computes — the upstream bug is dormant for that use case.
+//!
+//! When bugs A/B are fixed in modgrad-transformer, all 8 should
+//! resolve, the marginals likely tighten below 1e-2, and gradcheck
+//! gets un-ignored.
 //!
 //! ## What this test proves
 //!
@@ -450,9 +476,9 @@ fn pick_index(buf_len: usize) -> usize {
 }
 
 #[test]
-#[ignore = "10/12 fail; surfaces real bugs in encoder.block recompute path \
-            (FIXME blt-bwd-bug-1), decoder.block.wv (bug-2), \
-            encoder.byte_embed scatter scale (bug-3). See module doc-comment."]
+#[ignore = "8/12 fail at 1e-2; bugs 1/2/3 fixed; remaining failures trace to upstream \
+            AttentionResident::backward (bug-A cross-step KV grad dropped, bug-B \
+            rms_norm_backward_per_head unconditional). See module doc-comment."]
 fn blt_backward_matches_finite_difference() {
     let _guard = HIP_GRADCHECK_LOCK.lock().unwrap();
     if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {

@@ -796,7 +796,11 @@ impl LocalEncoder {
         boundaries: &[usize],
         scratch: &mut LocalEncoderScratch,
         bwd_scratch: &mut LocalEncoderBackwardScratch,
-        cache: &LocalEncoderBwdCache,
+        // `&mut` (not `&`) because the per-byte block backward path —
+        // FIXME(blt-bwd-bug-1) fix — drives off
+        // `cache.block_scratches[li][t]`, the same `&mut` cache slot the
+        // matched forward populated. Decoder uses the same shape.
+        cache: &mut LocalEncoderBwdCache,
         d_patch_reps: &GpuVec,
         d_seed_byte_reps_extra: Option<&GpuVec>,
         grads: &mut LocalEncoderGrads,
@@ -869,6 +873,16 @@ impl LocalEncoder {
                 bwd_scratch.dy_per_byte.copy_from(
                     &d_layer_input_host[t * byte_dim..(t + 1) * byte_dim],
                 );
+                // FIXME(blt-bwd-bug-1) fix: drive block backward off the
+                // matched per-byte forward cache (recompute=false), the
+                // same pattern `LocalDecoder::backward` uses. Previously
+                // we passed `bwd_scratch.block_scratch_replay` with
+                // recompute=true, but that scratch is never populated
+                // with this byte's forward state, so the recompute path
+                // started from zeroed `attn_input` and produced
+                // all-zero outer-product weight grads for every encoder
+                // block. The per-byte cache is populated by
+                // `forward_for_backward` at line ~747.
                 self.byte_layers[li].backward(
                     batch,
                     &mut bwd_scratch.dy_per_byte,
@@ -880,10 +894,10 @@ impl LocalEncoder {
                     &mut bwd_scratch.attn_bwd,
                     &mut scratch.mlp_scratch,
                     &mut bwd_scratch.mlp_bwd,
-                    &mut bwd_scratch.block_scratch_replay,
+                    &mut cache.block_scratches[li][t],
                     &mut grads.attn_grads[li],
                     &mut grads.mlp_grads[li],
-                    /* recompute = */ true,
+                    /* recompute = */ false,
                 )?;
                 // After backward, dy_per_byte holds dx for this byte.
                 let mut dx_host = vec![0.0f32; byte_dim];
@@ -906,9 +920,20 @@ impl LocalEncoder {
                 bwd_scratch.d_byte_carry.copy_from(&d_layer_input_host);
             } else {
                 // Layer 0: scatter into d_byte_embed by byte id.
+                //
+                // FIXME(blt-bwd-bug-3) fix: forward `embed_bytes` (in
+                // `modgrad-codec/src/ngram_hash.rs`) computes
+                // `augmented[t] = (byte_embed[id] + Σ_n ngram_n[hash])
+                // * (1 / (n_tables + 1))`. The `* norm` factor at the
+                // end means ∂augmented/∂byte_embed = norm, so the
+                // scattered byte-embed gradient must carry the same
+                // factor. Previously the scatter ignored it, producing
+                // an `(n_tables + 1)`× over-shoot vs finite differences.
+                let n_tables = self.ngram.tables.len();
+                let ngram_norm = 1.0_f32 / (n_tables + 1) as f32;
                 scatter_byte_embed_grad(
                     &d_layer_input_host, &cache.byte_ids[..n_bytes],
-                    n_bytes, byte_dim,
+                    n_bytes, byte_dim, ngram_norm,
                     &mut grads.d_byte_embed,
                 )?;
             }
@@ -954,14 +979,19 @@ impl LocalEncoderBackwardScratch {
     }
 }
 
-/// Scatter `d_input[t, :]` into `d_byte_embed[byte_ids[t], :]` for each
-/// byte position `t`. Multiple positions sharing the same byte id sum
-/// into the same row.
+/// Scatter `d_input[t, :] * scale` into `d_byte_embed[byte_ids[t], :]`
+/// for each byte position `t`. Multiple positions sharing the same byte
+/// id sum into the same row.
+///
+/// The `scale` mirrors the forward-time `(1 / (n_tables + 1))`
+/// multiplier in `NgramHashEmbeddings::embed_bytes` — without it the
+/// scatter over-shoots by a factor of `n_tables + 1`.
 fn scatter_byte_embed_grad(
     d_input_host: &[f32],
     byte_ids: &[u8],
     n_bytes: usize,
     byte_dim: usize,
+    scale: f32,
     d_byte_embed: &mut GpuVec,
 ) -> Result<(), ResidencyError> {
     let mut d_embed_host = vec![0.0f32; 256 * byte_dim];
@@ -971,7 +1001,7 @@ fn scatter_byte_embed_grad(
         let src = &d_input_host[t * byte_dim..(t + 1) * byte_dim];
         let dst = &mut d_embed_host[id * byte_dim..(id + 1) * byte_dim];
         for i in 0..byte_dim {
-            dst[i] += src[i];
+            dst[i] += src[i] * scale;
         }
     }
     d_byte_embed.copy_from(&d_embed_host);
@@ -1108,7 +1138,7 @@ mod tests {
 
         encoder.backward(
             &batch, &bytes, &boundaries, &mut scratch, &mut bwd_scratch,
-            &cache, &d_patch_reps, None, &mut grads,
+            &mut cache, &d_patch_reps, None, &mut grads,
         ).expect("encoder backward");
         batch.flush().expect("flush");
 
@@ -1205,7 +1235,7 @@ mod tests {
 
         encoder.backward(
             &batch, &bytes, &boundaries, &mut scratch, &mut bwd_scratch,
-            &cache, &d_patch_reps, Some(&d_seed), &mut grads,
+            &mut cache, &d_patch_reps, Some(&d_seed), &mut grads,
         ).expect("encoder backward with seed extra");
         batch.flush().expect("flush");
 

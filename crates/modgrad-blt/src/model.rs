@@ -609,7 +609,7 @@ impl BltModel {
             boundaries,
             &mut scratch.encoder,
             &mut state.encoder_bwd_scratch,
-            &state.encoder_cache,
+            &mut state.encoder_cache,
             &state.d_patch_reps_pre_latent,
             Some(&state.d_seed_byte_reps),
             &mut state.encoder_grads,
