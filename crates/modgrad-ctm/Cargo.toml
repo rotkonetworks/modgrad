@@ -8,9 +8,17 @@ license = "MIT"
 [features]
 # Plumb backend features through to modgrad-device so downstream
 # binaries can turn on GPU backends via a single feature on this crate.
+# `rocm` also lights up the `QwenCerebellum` adapter that wraps a
+# device-resident `GptModelResident` as a `FrozenCerebellum` — that's
+# why `modgrad-transformer` joins the gate as an optional dep.
 default = []
 kfd = ["modgrad-device/kfd"]
-rocm = ["modgrad-device/rocm", "modgrad-compute/rocm"]
+rocm = [
+    "modgrad-device/rocm",
+    "modgrad-compute/rocm",
+    "dep:modgrad-transformer",
+    "modgrad-transformer/rocm",
+]
 cuda = ["modgrad-device/cuda"]
 gpu = ["modgrad-device/gpu"]
 
@@ -20,6 +28,11 @@ modgrad-compute = { path = "../modgrad-compute" }
 modgrad-device = { path = "../modgrad-device" }
 modgrad-persist = { path = "../modgrad-persist" }
 modgrad-memory = { path = "../modgrad-memory" }
+# Optional: pulled in by the `rocm` feature for `QwenCerebellum`. The
+# adapter wraps `GptModelResident` (resident transformer stack) as a
+# `FrozenCerebellum`. Default builds don't link against modgrad-transformer
+# at all — keeps non-rocm consumers lean.
+modgrad-transformer = { path = "../modgrad-transformer", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wincode = "0.5"

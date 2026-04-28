@@ -1122,6 +1122,171 @@ impl RegionalConfig {
     pub fn four_region_multimodal(embed_dim: usize, ticks: usize) -> Self {
         Self::four_region(embed_dim, VOCAB_MULTIMODAL, ticks)
     }
+
+    /// Cerebellum-dominant 8-region brain (v2). Mirrors `eight_region`'s
+    /// connection graph but with asymmetric sizing — cortex regions stay
+    /// small, cerebellum is the parameter-budget anchor (intended to back
+    /// onto a `FrozenCerebellum` LLM at runtime, e.g. Qwen2.5-0.5B).
+    ///
+    /// Per `docs/BRAIN_ARCHITECTURE.md` §4-5 / open call (a) ratified:
+    /// the cerebellum is a SIBLING SERVICE, so the region's regional
+    /// weights are a small adapter / projection placeholder; the actual
+    /// LLM is mounted through the `FrozenCerebellum` trait at runtime
+    /// and consulted by orchestration outside the regional iteration.
+    /// The CTM-side cerebellum region is intentionally tiny — its job
+    /// is to be the mount point in the connection graph, not to do the
+    /// language-modeling itself.
+    ///
+    /// Connection topology is the canonical eight-edge cortical loop
+    /// from `docs/BRAIN_ARCHITECTURE.md` §2:
+    /// ```text
+    ///   motor       → input          (carries observation)
+    ///   input       → attention
+    ///   attention   → output
+    ///   output      → motor
+    ///   motor       → cerebellum     (carries observation — prompt seam)
+    ///   output      → basal_ganglia
+    ///   hippocampus → insula
+    ///   {input, attention, output, motor} → hippocampus
+    /// ```
+    /// Cycles are intentional — the cortical loop is closed.
+    ///
+    /// `obs_dim` sets the input observation dimensionality.
+    /// `out_dims` sets the motor / output region's action-vocab width.
+    /// `ticks` sets the number of CTM ticks per token.
+    pub fn eight_region_v2(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        // ── Region indices (canonical 8-region order; see arch doc §1) ──
+        const INPUT: usize         = 0;
+        const ATTENTION: usize     = 1;
+        const OUTPUT: usize        = 2;
+        const MOTOR: usize         = 3;
+        const CEREBELLUM: usize    = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize        = 6;
+        const HIPPOCAMPUS: usize   = 7;
+
+        // ── Sizing (ARCHITECTURE.md §4 cerebellum-dominant column) ──
+        // Cortex regions: small encoder / router / decoder / effector,
+        // each ~10M-class when wired into a real input-projection +
+        // SuperLinear stack. Subcortical regions: tiny gating heads.
+        // Cerebellum: a 32×32 placeholder — the real ~494M Qwen2.5-0.5B
+        // is mounted via FrozenCerebellum at runtime (sibling service).
+        // Hippocampus: slightly larger for episodic KV recall.
+        //
+        // Future tuning: edit these constants in one place.
+        // CtmConfig::region(name, d_model, d_input, memory_length, ...).
+        // "d_model" is the per-region neuron / activation width — the
+        // numbers in the BRAIN_ARCHITECTURE.md §4 table refer to this.
+        const CORTEX_D_MODEL: usize  = 128; // ARCHITECTURE.md §4 — small cortex (~10M class)
+        const CORTEX_MEMORY: usize   = 32;
+
+        const SUBCORT_D_MODEL: usize = 32;  // basal_ganglia, insula (~5M class)
+        const SUBCORT_MEMORY: usize  = 16;
+
+        // ARCHITECTURE.md §5 — placeholder; real LLM lives in
+        // FrozenCerebellum, so this region's CTM stays small.
+        const CEREB_D_MODEL: usize   = 32;
+        const CEREB_MEMORY: usize    = 16;
+
+        const HIPPO_D_MODEL: usize   = 64;  // ARCHITECTURE.md §4 — episodic KV (~50M class)
+        const HIPPO_MEMORY: usize    = 32;
+
+        // d_input wired to obs_dim (matches `eight_region` shape; the
+        // inter-region synapses do their own projection on top).
+        let d = obs_dim;
+
+        let regions = vec![
+            // ── Cortex: encoder / router / decoder / effector ─────────
+            CtmConfig::region("input", CORTEX_D_MODEL, d, CORTEX_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", CORTEX_D_MODEL, d, CORTEX_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", CORTEX_D_MODEL, d, CORTEX_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", CORTEX_D_MODEL, d, CORTEX_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+
+            // ── Cerebellum: LLM mount-point placeholder (§5) ──────────
+            // Stays small because the cerebellum's actual signal comes
+            // through the FrozenCerebellum service, not this CTM tick.
+            CtmConfig::region("cerebellum", CEREB_D_MODEL, d, CEREB_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+
+            // ── Subcortical gating heads (§4 ~5M class) ───────────────
+            CtmConfig::region("basal_ganglia", SUBCORT_D_MODEL, d, SUBCORT_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", SUBCORT_D_MODEL, d, SUBCORT_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+
+            // ── Hippocampus: episodic KV (§4 ~50M class) ──────────────
+            CtmConfig::region("hippocampus", HIPPO_D_MODEL, d, HIPPO_MEMORY, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        // ── Connection graph: ARCHITECTURE.md §2 table (8 edges) ──────
+        // Cycles are intentional (cortical loop is closed). Two edges
+        // carry the raw observation: motor→input (action-conditioned
+        // perception) and motor→cerebellum (the prompt seam).
+        let connections = vec![
+            // edge 0: motor → input — action-conditioned next-frame perception
+            Connection { from: vec![MOTOR], to: INPUT,
+                receives_observation: true, observation_scale: 0 },
+            // edge 1: input → attention — salience selection
+            Connection { from: vec![INPUT], to: ATTENTION,
+                receives_observation: false, observation_scale: 0 },
+            // edge 2: attention → output — selected representation → decision
+            Connection { from: vec![ATTENTION], to: OUTPUT,
+                receives_observation: false, observation_scale: 0 },
+            // edge 3: output → motor — decision → effector
+            Connection { from: vec![OUTPUT], to: MOTOR,
+                receives_observation: false, observation_scale: 0 },
+            // edge 4: motor → cerebellum — action + observation → LLM input (prompt seam, §2)
+            Connection { from: vec![MOTOR], to: CEREBELLUM,
+                receives_observation: true, observation_scale: 0 },
+            // edge 5: output → basal_ganglia — decision gating
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA,
+                receives_observation: false, observation_scale: 0 },
+            // edge 6: hippocampus → insula — memory → salience
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA,
+                receives_observation: false, observation_scale: 0 },
+            // edge 7: {input, attention, output, motor} → hippocampus — cortical activity → episodic memory
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS,
+                receives_observation: false, observation_scale: 0 },
+        ];
+
+        // n_global_sync sized to total cortex+sub d_model, capped at
+        // 256 — small brain, so a 1024-cap (as in `eight_region`) is
+        // overkill and would just be clamped to the sum anyway.
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(256);
+
+        Self {
+            regions,
+            region_names: names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync,
+            out_dims,
+            raw_obs_dim: obs_dim,
+            obs_scale_dims: vec![obs_dim],
+            aux_losses: AuxLossConfig::default(),
+            // No router by default — the cerebellum-dominant brain
+            // routes through its connection topology + the
+            // FrozenCerebellum sibling service. A learned router can
+            // be enabled per-experiment by post-construction edit.
+            router: None,
+            // cereb_mode left at default (Ctm); orchestration outside
+            // RegionalConfig is responsible for swapping in a
+            // FrozenCerebellum-backed mode when the LLM is mounted.
+            cereb_mode: Default::default(),
+        }
+    }
 }
 
 // ─── Weights ───────────────────────────────────────────────
@@ -5338,6 +5503,103 @@ impl NeuralComputer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `eight_region_v2` mounts the canonical 8-region topology with
+    /// cerebellum-dominant intent. This test pins the regional shape
+    /// and the connection-graph table from `docs/BRAIN_ARCHITECTURE.md`
+    /// §2 so the architectural commitment can't silently drift.
+    #[test]
+    fn eight_region_v2_shape() {
+        let cfg = RegionalConfig::eight_region_v2(128, 64, 16);
+
+        // Eight regions, in canonical order.
+        assert_eq!(cfg.regions.len(), 8);
+        assert_eq!(cfg.region_names.len(), 8);
+        let expected_names = [
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ];
+        for (i, want) in expected_names.iter().enumerate() {
+            assert_eq!(cfg.region_names[i], *want,
+                "region {i} name mismatch: got {} want {want}",
+                cfg.region_names[i]);
+        }
+
+        // Cerebellum region exists as a small-but-nonzero placeholder
+        // (sibling-service architecture: real LLM lives in
+        // FrozenCerebellum, not here).
+        let cereb_idx = cfg.region_names.iter()
+            .position(|n| n == "cerebellum")
+            .expect("eight_region_v2 must have a cerebellum region");
+        let cereb = &cfg.regions[cereb_idx];
+        assert!(cereb.d_model > 0,
+            "cerebellum region must be non-empty (it's the LLM mount point)");
+        assert!(cereb.d_model <= 64,
+            "cerebellum CTM placeholder should stay small (≤64 d_model); \
+             actual LLM is mounted via FrozenCerebellum. got {}",
+            cereb.d_model);
+
+        // Cortex regions should be small (per arch doc §4).
+        for name in ["input", "attention", "output", "motor"] {
+            let idx = cfg.region_names.iter().position(|n| n == name).unwrap();
+            assert!(cfg.regions[idx].d_model <= 128,
+                "cortex region {name} should be small in v2; got d_model={}",
+                cfg.regions[idx].d_model);
+        }
+
+        // Connection graph: ARCHITECTURE.md §2 — exactly 8 edges.
+        assert_eq!(cfg.connections.len(), 8,
+            "ARCHITECTURE.md §2 specifies 8 connection edges");
+
+        // Resolve indices by name (don't rely on hard-coded constants).
+        let idx_of = |name: &str| cfg.region_names.iter()
+            .position(|n| n == name).unwrap();
+        let i_input         = idx_of("input");
+        let i_attention     = idx_of("attention");
+        let i_output        = idx_of("output");
+        let i_motor         = idx_of("motor");
+        let i_cerebellum    = idx_of("cerebellum");
+        let i_basal_ganglia = idx_of("basal_ganglia");
+        let i_insula        = idx_of("insula");
+        let i_hippocampus   = idx_of("hippocampus");
+
+        // Helper: does the edge `from = froms, to = to` exist with the
+        // expected observation flag?
+        let has_edge = |froms: &[usize], to: usize, obs: bool| -> bool {
+            cfg.connections.iter().any(|c|
+                c.to == to
+                && c.from.len() == froms.len()
+                && froms.iter().all(|f| c.from.contains(f))
+                && c.receives_observation == obs
+            )
+        };
+
+        // Each row of ARCHITECTURE.md §2:
+        assert!(has_edge(&[i_motor], i_input, true),
+            "edge 0: motor → input (carries observation)");
+        assert!(has_edge(&[i_input], i_attention, false),
+            "edge 1: input → attention");
+        assert!(has_edge(&[i_attention], i_output, false),
+            "edge 2: attention → output");
+        assert!(has_edge(&[i_output], i_motor, false),
+            "edge 3: output → motor");
+        assert!(has_edge(&[i_motor], i_cerebellum, true),
+            "edge 4: motor → cerebellum (carries observation — prompt seam)");
+        assert!(has_edge(&[i_output], i_basal_ganglia, false),
+            "edge 5: output → basal_ganglia");
+        assert!(has_edge(&[i_hippocampus], i_insula, false),
+            "edge 6: hippocampus → insula");
+        assert!(has_edge(
+            &[i_input, i_attention, i_output, i_motor],
+            i_hippocampus,
+            false,
+        ), "edge 7: {{input, attention, output, motor}} → hippocampus");
+
+        // Public arg semantics.
+        assert_eq!(cfg.raw_obs_dim, 128);
+        assert_eq!(cfg.out_dims, 64);
+        assert_eq!(cfg.outer_ticks, 16);
+    }
 
     /// `backward_with_input_grad` returns the same region/weight grads
     /// as the trait `backward`, plus a non-zero `d_observation` of

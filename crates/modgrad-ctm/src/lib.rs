@@ -35,6 +35,13 @@ pub mod cerebellum;
 /// splitting requires a bridge module across crates — deferred until needed.
 /// For trainable transformers, use the rest of `modgrad-transformer`.
 pub mod frozen_transformer;
+/// Device-resident `FrozenCerebellum` adapter wrapping
+/// `GptModelResident` (Qwen2.5-class transformer). Only available with
+/// `--features rocm` because it depends on the resident transformer
+/// stack in `modgrad-transformer`. See module docs for the layout
+/// contract and the explicit "no `forward()`" panic.
+#[cfg(feature = "rocm")]
+pub mod qwen_cerebellum;
 /// Red-team validation: attack primitives with corresponding defenses.
 /// Every attack function has a defense counterpart in bio/ or plural.
 /// This is penetration testing tooling, not weaponization.

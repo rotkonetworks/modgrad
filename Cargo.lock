@@ -2621,6 +2621,7 @@ dependencies = [
  "modgrad-memory",
  "modgrad-persist",
  "modgrad-traits",
+ "modgrad-transformer",
  "rayon",
  "serde",
  "serde_json",
