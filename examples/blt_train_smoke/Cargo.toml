@@ -1,0 +1,18 @@
+[package]
+name = "blt_train_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end smoke test: tiny BLT model trains; asserts loss decreases."
+
+[[bin]]
+name = "blt_train_smoke"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-blt        = { path = "../../crates/modgrad-blt", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+
+[features]
+default = []

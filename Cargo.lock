@@ -316,6 +316,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blt_train_smoke"
+version = "0.1.0"
+dependencies = [
+ "modgrad-blt",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
