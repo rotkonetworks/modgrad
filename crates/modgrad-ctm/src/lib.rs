@@ -30,6 +30,13 @@ pub mod curriculum;
 pub mod plural;
 pub mod organism;
 pub mod cerebellum;
+/// Sibling-service wrapper that mounts a `FrozenCerebellum` outside
+/// the regional iteration. The cerebellum-region in `eight_region_v2`
+/// stays a small placeholder; the heavy LLM compute happens in
+/// `CerebellumService` once per context window, and the cortex reads
+/// projections of the per-layer hidden cache per-tick. See
+/// `docs/BRAIN_ARCHITECTURE.md` §7 (option **(b)**).
+pub mod cerebellum_service;
 /// Minimal frozen transformer loader for external LLMs (safetensors).
 /// Stays here because it impls the `cerebellum::FrozenCerebellum` trait;
 /// splitting requires a bridge module across crates — deferred until needed.

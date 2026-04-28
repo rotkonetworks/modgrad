@@ -1,0 +1,18 @@
+[package]
+name = "eight_region_v2_brain_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end smoke: build eight_region_v2 brain, mount QwenCerebellum as a sibling service, run regional forward, prove the cortex consults the cerebellum (delta L2 > 0)."
+
+[[bin]]
+name = "eight_region_v2_brain_smoke"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm        = { path = "../../crates/modgrad-ctm", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+
+[features]
+default = []

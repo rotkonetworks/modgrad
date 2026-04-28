@@ -25,6 +25,33 @@ use crate::forward::ctm_forward;
 use crate::train::{Ctm, CtmCache, backward_from_activated};
 use modgrad_traits::{Brain, LossFn, TokenInput};
 
+/// Merge primitive for connection synapses with multiple incoming
+/// edges to the same target region.
+///
+/// **Choice: elementwise add** (not concat-then-down). Add keeps the
+/// synapse Linear sized to a single source's d_input, lets the brain
+/// gain new edges without re-allocating weights, and matches the
+/// "signals sum at the postsynaptic site" biological default.
+/// Concat-then-down would force every multi-source target to grow its
+/// input by `Σ source dims` and re-train the down-projection from
+/// scratch — too invasive for this slice.
+///
+/// Used by every regional forward path (training and inference, host
+/// and resident). When the target slot is empty (first incoming edge
+/// to this region this tick), assign-by-move; otherwise add
+/// elementwise. Length mismatches are guarded — we only add over
+/// `min(slot.len(), projected.len())`, so a malformed graph degrades
+/// gracefully rather than panicking the brain.
+#[inline]
+fn merge_into_region_obs(slot: &mut Vec<f32>, projected: Vec<f32>) {
+    if slot.is_empty() {
+        *slot = projected;
+    } else {
+        let n = slot.len().min(projected.len());
+        for i in 0..n { slot[i] += projected[i]; }
+    }
+}
+
 // ─── Unified token space ──────────────────────────────────
 
 // ── Token layout ──────────────────────────────────────────
@@ -1228,10 +1255,22 @@ impl RegionalConfig {
             "cerebellum", "basal_ganglia", "insula", "hippocampus",
         ].into_iter().map(String::from).collect();
 
-        // ── Connection graph: ARCHITECTURE.md §2 table (8 edges) ──────
+        // ── Connection graph: ARCHITECTURE.md §2 table (9 edges) ──────
         // Cycles are intentional (cortical loop is closed). Two edges
         // carry the raw observation: motor→input (action-conditioned
         // perception) and motor→cerebellum (the prompt seam).
+        //
+        // **Edge 8 (cerebellum→attention)** is the architectural
+        // commitment from arch doc §2 ("the first concrete cerebellum-
+        // output edge to add is likely cerebellum → attention — LLM
+        // prediction biases what to look at"). At runtime, a
+        // [`CerebellumService`] supplies the SOURCE signal for this
+        // edge from its per-layer hidden cache (projected to the
+        // cerebellum d_model); when no service is plumbed, the source
+        // falls back to the placeholder cerebellum-region's CTM
+        // output. Either way the synapse sees a cortex-dim source +
+        // attention-dim target, so wiring is uniform with the rest of
+        // the connection graph.
         let connections = vec![
             // edge 0: motor → input — action-conditioned next-frame perception
             Connection { from: vec![MOTOR], to: INPUT,
@@ -1256,6 +1295,10 @@ impl RegionalConfig {
                 receives_observation: false, observation_scale: 0 },
             // edge 7: {input, attention, output, motor} → hippocampus — cortical activity → episodic memory
             Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS,
+                receives_observation: false, observation_scale: 0 },
+            // edge 8: cerebellum → attention — LLM prediction biases salience selection
+            // (sibling-service signal injected by `CerebellumService` at runtime).
+            Connection { from: vec![CEREBELLUM], to: ATTENTION,
                 receives_observation: false, observation_scale: 0 },
         ];
 
@@ -1712,8 +1755,11 @@ pub fn regional_forward(
             }
             obs
         } else {
-            // Fixed connections (backward compatible)
+            // Fixed connections (backward compatible). Multiple incoming
+            // edges to the same target region are merged additively
+            // (`merge_into_region_obs`) — see that helper's doc.
             (0..n_regions).into_par_iter().map(|r| {
+                let mut slot: Vec<f32> = Vec::new();
                 for (ci, conn) in cfg.connections.iter().enumerate() {
                     if conn.to == r {
                         let mut src = Vec::new();
@@ -1723,10 +1769,11 @@ pub fn regional_forward(
                         if conn.receives_observation {
                             src.extend_from_slice(observation);
                         }
-                        return w.connection_synapses[ci].forward(&src);
+                        let projected = w.connection_synapses[ci].forward(&src);
+                        merge_into_region_obs(&mut slot, projected);
                     }
                 }
-                obs_projected.clone()
+                if slot.is_empty() { obs_projected.clone() } else { slot }
             }).collect()
         };
 
@@ -1794,6 +1841,205 @@ pub fn regional_forward(
                 }
             }
             _ => {}
+        }
+    }
+
+    let ticks_used = predictions.len();
+    RegionalOutput {
+        predictions,
+        global_sync: gs_buf,
+        region_activations: state.region_outputs.clone(),
+        exit_lambdas,
+        ticks_used,
+    }
+}
+
+/// Service-aware forward variant — the cortex actually CONSULTS the
+/// cerebellum (per `docs/BRAIN_ARCHITECTURE.md` §7, sibling-service
+/// option **(b)**) instead of treating its placeholder CTM region as
+/// the only signal source.
+///
+/// **Architectural decision (documented at the orchestration site):**
+/// the cerebellum is a sibling service mounted via
+/// [`crate::cerebellum_service::CerebellumService`] and consulted
+/// per-tick by opt-in cortex regions; the cerebellum-region in
+/// `eight_region_v2`'s graph remains a small placeholder. Heavy LLM
+/// compute happens in the service's `set_context` once per context
+/// window; per-tick reads are cheap projections.
+///
+/// **What changes vs `regional_forward`:** for every connection edge
+/// whose source is the cerebellum region (e.g. the new
+/// `cerebellum → attention` edge in `eight_region_v2`), the source
+/// activation is replaced by the service-cache read at `position` —
+/// projected to the cerebellum-region d_model via the service's
+/// internal `CerebProjection`. The synapse Linear sees the same
+/// per-source dimension it always saw, so weights are wire-compatible.
+///
+/// **Read pattern:** position-based ([`CerebellumService::read_at`]).
+/// Multimodal pooling is a separate consumption pattern; a region
+/// that wants modality-pooled signal can call `read_modality`
+/// directly off the service. Documented at the call site below.
+///
+/// `position`: token index into the service's encoded sequence.
+/// Typically the per-byte / per-token position of the current outer
+/// step; for context windows shorter than `cfg.outer_ticks`, the
+/// caller is responsible for clamping (the service zero-fills
+/// out-of-range reads).
+pub fn regional_forward_with_service(
+    w: &RegionalWeights,
+    state: &mut RegionalState,
+    observation: &[f32],
+    service: &crate::cerebellum_service::CerebellumService,
+    position: usize,
+) -> RegionalOutput {
+    let cfg = &w.config;
+    let n_regions = cfg.regions.len();
+    let mut predictions = Vec::with_capacity(cfg.outer_ticks);
+    let mut exit_lambdas: Vec<f32> = Vec::new();
+    let mut exit_cdf = 0.0f32;
+    let mut survival = 1.0f32;
+
+    let mut obs_projected = vec![0.0f32; w.obs_proj.out_dim];
+    w.obs_proj.forward_into(observation, &mut obs_projected);
+    let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+    let mut all_act_buf = vec![0.0f32; total_neurons];
+    let n_sync = cfg.n_global_sync;
+    let mut gs_buf = vec![0.0f32; n_sync];
+    let mut pred_buf = vec![0.0f32; cfg.out_dims];
+
+    // ── Service signal: project the cache at `position` into the
+    // cerebellum region's d_model ONCE per call (not per tick — the
+    // cache doesn't change inside this call). The cortex regions then
+    // see this signal as the SOURCE for any edge whose `from` includes
+    // the cerebellum region. The synapse weights stay sized for the
+    // cerebellum d_model, which is what the service projects to.
+    let cereb_idx = cfg.region_names.iter()
+        .position(|n| n.contains("cerebellum"))
+        .unwrap_or(4);
+    let cereb_d_model = w.regions[cereb_idx].config.d_model;
+    let mut service_signal = vec![0.0f32; service.cortex_dim().max(cereb_d_model)];
+    if service.n_positions() > 0 {
+        // `read_at` writes service.cortex_dim() floats; we sized the
+        // buffer to accommodate that. The caller's contract is that
+        // service.cortex_dim() == cereb_d_model — that's the wire
+        // matching the cerebellum-region's placeholder. Any mismatch
+        // here is a configuration bug; we truncate-or-zero-pad rather
+        // than panic so a misconfigured service degrades the signal
+        // gracefully (cortex still runs, just gets less useful input).
+        service.read_at(position, &mut service_signal);
+    }
+    // Trim to exactly cereb_d_model so downstream synapse-source
+    // sizing is unambiguous (synapses are sized to the source region's
+    // d_model, not the service's possibly-larger cortex_dim).
+    service_signal.truncate(cereb_d_model);
+    if service_signal.len() < cereb_d_model {
+        service_signal.resize(cereb_d_model, 0.0);
+    }
+
+    for outer_tick in 0..cfg.outer_ticks {
+        std::mem::swap(&mut state.region_outputs, &mut state.prev_outputs);
+        let prev_outputs = &state.prev_outputs;
+
+        // Phase A: Build observations. Same shape as `regional_forward`,
+        // but with one twist: when an edge's `from` slice contains the
+        // cerebellum region, we substitute the service signal for the
+        // cerebellum portion of the source vector. Multiple incoming
+        // edges to the same target region merge additively (see
+        // `merge_into_region_obs`).
+        let region_obs: Vec<Vec<f32>> = if let Some(ref router) = w.router {
+            // Router path: the router treats the regional outputs as
+            // opaque sources. Service injection is a no-op here for
+            // v0 — router-routed brains don't consume the cerebellum
+            // service yet (separate slice; opens once we know how the
+            // router should weight a frozen-LLM signal).
+            let global_sync: Vec<f32> = (0..cfg.n_global_sync)
+                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
+                .collect();
+            let (routed, _cache) = router.forward(
+                outer_tick, &global_sync, &prev_outputs, false,
+            );
+            routed
+        } else {
+            (0..n_regions).into_par_iter().map(|r| {
+                let mut slot: Vec<f32> = Vec::new();
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    if conn.to == r {
+                        let mut src = Vec::new();
+                        for &from_idx in &conn.from {
+                            if from_idx == cereb_idx {
+                                // Sibling-service signal: the cortex
+                                // reads the LLM's per-layer hidden
+                                // cache at `position`, NOT the
+                                // placeholder CTM's tick output.
+                                src.extend_from_slice(&service_signal);
+                            } else {
+                                src.extend_from_slice(&prev_outputs[from_idx]);
+                            }
+                        }
+                        if conn.receives_observation {
+                            src.extend_from_slice(observation);
+                        }
+                        let projected = w.connection_synapses[ci].forward(&src);
+                        merge_into_region_obs(&mut slot, projected);
+                    }
+                }
+                if slot.is_empty() { obs_projected.clone() } else { slot }
+            }).collect()
+        };
+
+        // Phase B: Run regions (same parallel pattern as
+        // `regional_forward`).
+        let mut states_vec: Vec<CtmState> = std::mem::take(&mut state.region_states);
+        let results: Vec<Vec<f32>> = states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
+            let d_input = w.regions[r].config.d_input;
+            let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
+            });
+            rs.activated.clone()
+        }).collect();
+        state.region_states = states_vec;
+
+        for r in 0..n_regions {
+            state.region_outputs[r] = results[r].clone();
+        }
+
+        {
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = state.region_outputs[r].len();
+                all_act_buf[offset..offset + d].copy_from_slice(&state.region_outputs[r]);
+                offset += d;
+            }
+        }
+
+        for i in 0..n_sync {
+            let l = w.global_sync_left[i];
+            let r = w.global_sync_right[i];
+            if l < all_act_buf.len() && r < all_act_buf.len() {
+                let pw = all_act_buf[l] * all_act_buf[r];
+                let decay = (-w.global_decay[i].clamp(0.0, 15.0)).exp();
+                state.global_alpha[i] = decay * state.global_alpha[i] + pw;
+                state.global_beta[i] = decay * state.global_beta[i] + 1.0;
+            }
+        }
+
+        for i in 0..n_sync {
+            gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
+        }
+
+        w.output_proj.forward_into(&gs_buf, &mut pred_buf);
+        predictions.push(pred_buf.clone());
+
+        if let crate::config::ExitStrategy::AdaptiveGate { threshold, .. } = &cfg.exit_strategy {
+            if let Some(ref gate) = w.outer_exit_gate {
+                let gate_logit = gate.forward(&gs_buf);
+                let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+                exit_lambdas.push(lambda);
+                let p_exit = lambda * survival;
+                exit_cdf += p_exit;
+                survival *= 1.0 - lambda;
+                if exit_cdf > *threshold { break; }
+            }
         }
     }
 
@@ -2447,7 +2693,7 @@ pub fn regional_train_step(
                 }
                 connection_inputs.push(src.clone());
                 let projected = w.connection_synapses[ci].forward(&src);
-                region_obs[conn.to] = projected;
+                merge_into_region_obs(&mut region_obs[conn.to], projected);
             }
             for r in 0..n_regions {
                 if region_obs[r].is_empty() {
@@ -3002,7 +3248,7 @@ fn regional_train_step_inner(
                 }
                 connection_inputs.push(src.clone());
                 let projected = w.connection_synapses[ci].forward(&src);
-                region_obs[conn.to] = projected;
+                merge_into_region_obs(&mut region_obs[conn.to], projected);
             }
             for r in 0..n_regions {
                 if region_obs[r].is_empty() {
@@ -4109,7 +4355,7 @@ impl RegionalBrain {
                     }
                     connection_inputs.push(src.clone());
                     let projected = weights.connection_synapses[ci].forward(&src);
-                    region_obs[conn.to] = projected;
+                    merge_into_region_obs(&mut region_obs[conn.to], projected);
                 }
                 for r in 0..n_regions {
                     if region_obs[r].is_empty() {
@@ -4371,7 +4617,7 @@ impl RegionalBrain {
                     GpuVec::Hip(buf) => buf.copy_to_host(&mut projected)?,
                     _ => unreachable!("hip alloc"),
                 }
-                region_obs[conn.to] = projected;
+                merge_into_region_obs(&mut region_obs[conn.to], projected);
             }
             for r in 0..n_regions {
                 if region_obs[r].is_empty() {
@@ -4827,7 +5073,7 @@ impl modgrad_traits::Brain for RegionalBrain {
                     }
                     connection_inputs.push(src.clone());
                     let projected = weights.connection_synapses[ci].forward(&src);
-                    region_obs[conn.to] = projected;
+                    merge_into_region_obs(&mut region_obs[conn.to], projected);
                 }
                 for r in 0..n_regions {
                     if region_obs[r].is_empty() {
@@ -5547,9 +5793,11 @@ mod tests {
                 cfg.regions[idx].d_model);
         }
 
-        // Connection graph: ARCHITECTURE.md §2 — exactly 8 edges.
-        assert_eq!(cfg.connections.len(), 8,
-            "ARCHITECTURE.md §2 specifies 8 connection edges");
+        // Connection graph: ARCHITECTURE.md §2 — 8 base edges + 1
+        // cerebellum→attention sibling-service edge (the first concrete
+        // cerebellum-output edge per arch doc §2 closing paragraph).
+        assert_eq!(cfg.connections.len(), 9,
+            "ARCHITECTURE.md §2 specifies 8 base edges + 1 cerebellum→attention edge");
 
         // Resolve indices by name (don't rely on hard-coded constants).
         let idx_of = |name: &str| cfg.region_names.iter()
@@ -5594,6 +5842,8 @@ mod tests {
             i_hippocampus,
             false,
         ), "edge 7: {{input, attention, output, motor}} → hippocampus");
+        assert!(has_edge(&[i_cerebellum], i_attention, false),
+            "edge 8: cerebellum → attention (sibling-service signal)");
 
         // Public arg semantics.
         assert_eq!(cfg.raw_obs_dim, 128);
