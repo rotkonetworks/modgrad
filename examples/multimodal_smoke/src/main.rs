@@ -1,18 +1,26 @@
-//! Proof-of-life: text + image VQ codes flow through `UnifiedTokenizer`
-//! → `QwenCerebellum` (per-layer hidden cache) → modality-aware cortex
-//! projection via `cerebellum_modality_pool`. Two pooled cortex vectors
-//! (one per modality, Byte vs ImageVq) come out measurably distinct.
+//! Proof-of-life: text + image VQ codes + audio VQ codes flow through
+//! `UnifiedTokenizer` → `QwenCerebellum` (per-layer hidden cache) →
+//! modality-aware cortex projection via `cerebellum_modality_pool`.
+//! Three pooled cortex vectors (one per modality: Byte vs ImageVq vs
+//! AudioVq) come out measurably distinct in all three pairwise
+//! comparisons, proving the modality framework scales beyond the
+//! original two-way text/image slice.
 //!
 //! For this binary to fail, one of: the unified-token offset table,
 //! the per-position modality tagging, the resident transformer forward,
 //! the per-layer cache layout, or the modality-aware mean-pool +
-//! `project_out` matvec dispatch would have to be broken. HIP is
-//! required at runtime — the binary exits cleanly with status 0 on
-//! hosts without a HIP device.
+//! `project_out` matvec dispatch would have to be broken. A regression
+//! that makes audio and image indistinguishable (e.g. the embedding
+//! lookup or the modality-aware pooling collapsing those two VQ
+//! ranges) shows up as the `image/audio` pair sliding under the
+//! threshold. HIP is required at runtime — the binary exits cleanly
+//! with status 0 on hosts without a HIP device.
 //!
 //! The deterministic seed `0xC0DE_FACE` drives both the synthetic 8×8
-//! image grid and the transformer weight init; the L2-distance
-//! assertion is reproducible against that seed.
+//! image grid and the transformer weight init; the audio VQ stand-in
+//! uses a clearly-distinct seed transform (`0xDEAD_BEEF` per index) so
+//! image and audio codes cannot trivially collide. The pairwise
+//! L2-distance assertion is reproducible against that seed.
 //!
 //! Run:
 //!   cargo run --release -p multimodal_smoke
@@ -47,7 +55,7 @@ const SEED: u64 = 0xC0DE_FACE;
 
 // ── Tiny LLM dims ───────────────────────────────────────────────
 // vocab=152000 (NOT 256!) because the unified token range parks
-// image-VQ codes at offset 140008..144104 — the embed table must
+// audio-VQ codes at offsets 144104..148200 — the embed table must
 // cover those high-offset slots. 152000 × 32 × 4B ≈ 19 MB, fine.
 const VOCAB_SIZE: usize = 152_000;
 const MODEL_DIM: usize = 32;
@@ -56,6 +64,9 @@ const NUM_KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 8;
 const NUM_LAYERS: usize = 3;
 const MLP_DIM: usize = 64;
+// The 22-token sequence (10 byte + 4 delim + 4 imvq + 4 auvq) needs
+// at least 22 slots; 32 was already enough but we keep the existing
+// budget explicit so future modality additions are obvious.
 const MAX_SEQ_LEN: usize = 32;
 const ROPE_BASE: f32 = 10_000.0;
 const NORM_EPS: f32 = 1e-5;
@@ -64,15 +75,20 @@ const NORM_EPS: f32 = 1e-5;
 const CORTEX_DIM: usize = 64;
 
 // ── Sequence layout ─────────────────────────────────────────────
-//   "describe: " (10 bytes) + <img> + 4 image VQ codes + </img>
+//   "describe: " (10 bytes)
+//   <img> + 4 image VQ codes + </img>
+//   <aud> + 4 audio VQ codes + </aud>
 const PROMPT: &[u8] = b"describe: ";
-const N_IMAGE_CODES: usize = 4;
-const SEQ_LEN: usize = PROMPT.len() + 1 + N_IMAGE_CODES + 1; // 16
+const N_IMAGE_VQ: usize = 4;
+const N_AUDIO_VQ: usize = 4;
+// 10 prompt + (1 open + 4 imvq + 1 close) + (1 open + 4 auvq + 1 close)
+const SEQ_LEN: usize =
+    PROMPT.len() + 1 + N_IMAGE_VQ + 1 + 1 + N_AUDIO_VQ + 1; // 22
 
-// ── L2-distance threshold for the modality-discrimination
-// assertion. Below this would mean the two pooled cortex vectors
-// are essentially identical — a degenerate seam.
-const L2_MIN: f32 = 1e-2;
+// ── L2-distance threshold for the pairwise modality-discrimination
+// assertion. Below this would mean two pooled cortex vectors are
+// essentially identical — a degenerate seam.
+const THRESHOLD: f32 = 1e-2;
 
 /// Map `modgrad-data`'s `Modality` into `modgrad-ctm`'s `Modality`.
 /// They are kept as parallel enums (per the cerebellum-side comment)
@@ -106,8 +122,8 @@ fn tag(m: CerebModality) -> &'static str {
 /// sum each quadrant, mod 4096 → 4 image VQ codes (u16).
 /// The goal here is just to produce 4 distinct image-VQ token IDs;
 /// a real VQ-VAE round-trip is a future slice.
-fn fake_vq_encode(grid: &[f32; 64]) -> [u16; N_IMAGE_CODES] {
-    let mut sums = [0.0f32; N_IMAGE_CODES];
+fn fake_image_vq_encode(grid: &[f32; 64]) -> [u16; N_IMAGE_VQ] {
+    let mut sums = [0.0f32; N_IMAGE_VQ];
     // 8×8 layout: (row, col) → grid[row*8 + col]
     // Quadrants: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
     for row in 0..8 {
@@ -116,13 +132,36 @@ fn fake_vq_encode(grid: &[f32; 64]) -> [u16; N_IMAGE_CODES] {
             sums[q] += grid[row * 8 + col];
         }
     }
-    let mut codes = [0u16; N_IMAGE_CODES];
-    for q in 0..N_IMAGE_CODES {
+    let mut codes = [0u16; N_IMAGE_VQ];
+    for q in 0..N_IMAGE_VQ {
         // Scale to a wide integer so distinct quadrant sums likely
         // fall on distinct mod-4096 buckets. The seed makes this
         // reproducible.
         let scaled = (sums[q].abs() * 1_000_000.0) as u64;
         codes[q] = (scaled % 4096) as u16;
+    }
+    codes
+}
+
+/// Stand-in for a real audio VQ-VAE / mel-codec: derive 4 audio codes
+/// from the same deterministic image grid via a clearly DIFFERENT
+/// transform from `fake_image_vq_encode`, so the test isn't trivially
+/// symmetric. For each audio index i, we sum the entire grid (so we
+/// don't reuse the per-quadrant sums) and mix in `i * 0xDEAD_BEEF`.
+/// The `0xDEAD_BEEF` constant is chosen to be visibly distinct from
+/// the `1_000_000` decimal scale used for image codes.
+///
+/// A real audio VQ encoder is a future slice; this just produces 4
+/// distinct AudioVq token IDs that are unlikely to collide with the
+/// 4 image codes.
+fn fake_audio_vq_encode(grid: &[f32; 64]) -> [u16; N_AUDIO_VQ] {
+    // Whole-grid scalar — distinct from any per-quadrant quantity.
+    let total: f32 = grid.iter().sum();
+    let base = (total.abs() * 7919.0) as u64; // 7919 = a small prime, not 1_000_000
+    let mut codes = [0u16; N_AUDIO_VQ];
+    for i in 0..N_AUDIO_VQ {
+        let mixed = base.wrapping_add((i as u64).wrapping_mul(0xDEAD_BEEF));
+        codes[i] = (mixed % 4096) as u16;
     }
     codes
 }
@@ -198,17 +237,26 @@ fn main() {
     let grid = build_grid(&mut rng);
 
     // ── 2. "VQ-encode" via deterministic quadrant hashing ───────
-    let image_codes = fake_vq_encode(&grid);
+    let image_codes = fake_image_vq_encode(&grid);
+    let audio_codes = fake_audio_vq_encode(&grid);
     println!(
         "multimodal_smoke: synthetic image VQ codes (stand-in for real VQ-VAE) = {:?}",
         image_codes,
     );
+    println!(
+        "multimodal_smoke: synthetic audio VQ codes (stand-in for real audio codec) = {:?}",
+        audio_codes,
+    );
     // Sanity: codes are in valid VQ range.
     for &c in &image_codes {
-        assert!((c as i64) < 4096, "VQ code {} >= codebook size 4096", c);
+        assert!((c as i64) < 4096, "image VQ code {} >= codebook size 4096", c);
+    }
+    for &c in &audio_codes {
+        assert!((c as i64) < 4096, "audio VQ code {} >= codebook size 4096", c);
     }
 
     // ── 3. Build unified token sequence ────────────────────────
+    //   describe:  + <img> imvq×4 </img> + <aud> auvq×4 </aud>
     let tokenizer = UnifiedTokenizer::for_qwen2_5();
     let mut tokens: Vec<i64> = Vec::with_capacity(SEQ_LEN);
     for &b in PROMPT {
@@ -219,6 +267,11 @@ fn main() {
         tokens.push(tokenizer.encode_image_vq(c));
     }
     tokens.push(tokenizer.encode_delimiter(Delimiter::ImgClose));
+    tokens.push(tokenizer.encode_delimiter(Delimiter::AudOpen));
+    for &c in &audio_codes {
+        tokens.push(tokenizer.encode_audio_vq(c));
+    }
+    tokens.push(tokenizer.encode_delimiter(Delimiter::AudClose));
     assert_eq!(
         tokens.len(),
         SEQ_LEN,
@@ -240,17 +293,19 @@ fn main() {
         println!("  [{:2}] {:>7}  {}", i, t, tag(m));
     }
 
-    // Layout sanity-check: 10 Byte, 1 Delim, 4 ImageVq, 1 Delim.
+    // Layout sanity-check: 10 Byte, 4 Delim, 4 ImageVq, 4 AudioVq.
     let n_byte = modalities.iter().filter(|&&m| m == CerebModality::Byte).count();
     let n_delim = modalities.iter().filter(|&&m| m == CerebModality::Delimiter).count();
     let n_image = modalities.iter().filter(|&&m| m == CerebModality::ImageVq).count();
+    let n_audio = modalities.iter().filter(|&&m| m == CerebModality::AudioVq).count();
     println!(
-        "multimodal_smoke: per-modality counts → Byte={}, Delim={}, ImageVq={}",
-        n_byte, n_delim, n_image,
+        "multimodal_smoke: per-modality counts → Byte={}, Delim={}, ImageVq={}, AudioVq={}",
+        n_byte, n_delim, n_image, n_audio,
     );
     assert_eq!(n_byte, PROMPT.len(), "expected {} Byte tokens, got {}", PROMPT.len(), n_byte);
-    assert_eq!(n_delim, 2, "expected 2 Delimiter tokens, got {}", n_delim);
-    assert_eq!(n_image, N_IMAGE_CODES, "expected {} ImageVq tokens, got {}", N_IMAGE_CODES, n_image);
+    assert_eq!(n_delim, 4, "expected 4 Delimiter tokens, got {}", n_delim);
+    assert_eq!(n_image, N_IMAGE_VQ, "expected {} ImageVq tokens, got {}", N_IMAGE_VQ, n_image);
+    assert_eq!(n_audio, N_AUDIO_VQ, "expected {} AudioVq tokens, got {}", N_AUDIO_VQ, n_audio);
 
     // ── 5. Build a tiny GptModelResident ────────────────────────
     let config = GptConfig {
@@ -389,11 +444,19 @@ fn main() {
         cerebellum_modality_pool(&cache, &proj, CerebModality::ImageVq, &mut image_out);
     assert!(matched_image, "ImageVq-modality pool reported no matches; cache.modalities tag suspect");
 
+    let mut audio_out = vec![0.0f32; CORTEX_DIM];
+    let matched_audio =
+        cerebellum_modality_pool(&cache, &proj, CerebModality::AudioVq, &mut audio_out);
+    assert!(matched_audio, "AudioVq-modality pool reported no matches; cache.modalities tag suspect");
+
     for (i, &v) in text_out.iter().enumerate() {
         assert!(v.is_finite(), "non-finite text cortex output at idx {}: {}", i, v);
     }
     for (i, &v) in image_out.iter().enumerate() {
         assert!(v.is_finite(), "non-finite image cortex output at idx {}: {}", i, v);
+    }
+    for (i, &v) in audio_out.iter().enumerate() {
+        assert!(v.is_finite(), "non-finite audio cortex output at idx {}: {}", i, v);
     }
 
     // ── 8. Per-layer variance signatures ────────────────────────
@@ -407,9 +470,15 @@ fn main() {
         .enumerate()
         .filter_map(|(i, &m)| if m == CerebModality::ImageVq { Some(i) } else { None })
         .collect();
+    let audio_positions: Vec<usize> = modalities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &m)| if m == CerebModality::AudioVq { Some(i) } else { None })
+        .collect();
 
     let byte_var = variance_signature(&cache, &byte_positions);
     let image_var = variance_signature(&cache, &image_positions);
+    let audio_var = variance_signature(&cache, &audio_positions);
     println!(
         "multimodal_smoke: per-layer variance (Byte positions {:?}): {:?}",
         byte_positions, byte_var,
@@ -418,32 +487,49 @@ fn main() {
         "multimodal_smoke: per-layer variance (ImageVq positions {:?}): {:?}",
         image_positions, image_var,
     );
-
-    // ── 9. The hdevalence assertion ─────────────────────────────
-    // A degenerate run where text and image tokens hit the model
-    // identically would produce nearly-equal cortex vectors. With
-    // distinct embeddings + per-layer hidden states diverging across
-    // the two contiguous token regions, the L2 distance must clear
-    // the threshold.
-    let dist = l2(&text_out, &image_out);
     println!(
-        "multimodal_smoke: L2(text_cortex, image_cortex) = {:.6} (threshold > {})",
-        dist, L2_MIN,
+        "multimodal_smoke: per-layer variance (AudioVq positions {:?}): {:?}",
+        audio_positions, audio_var,
     );
-    assert!(
-        dist > L2_MIN,
-        "cortex projections collapsed: L2 = {:.6} <= {} — text and image regions are indistinguishable",
-        dist, L2_MIN,
-    );
+
+    // ── 9. The hdevalence assertion: 3-way pairwise ─────────────
+    // A degenerate run where any two of the three modalities hit the
+    // model identically would produce nearly-equal cortex vectors. The
+    // most plausible regression — the embedding lookup or modality-
+    // aware pooling treating ImageVq and AudioVq token ranges
+    // identically — surfaces here as the image/audio pair sliding
+    // under THRESHOLD.
+    let l2_text_image = l2(&text_out, &image_out);
+    let l2_text_audio = l2(&text_out, &audio_out);
+    let l2_image_audio = l2(&image_out, &audio_out);
+    println!("multimodal_smoke: L2 distance matrix (pairwise):");
+    println!("  L2(text,  image) = {:.4}", l2_text_image);
+    println!("  L2(text,  audio) = {:.4}", l2_text_audio);
+    println!("  L2(image, audio) = {:.4}", l2_image_audio);
 
     // Also assert each pooled output is non-trivially non-zero.
     let text_max = text_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     let image_max = image_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    let audio_max = audio_out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     assert!(text_max > 0.0, "text cortex projection collapsed to all-zeros");
     assert!(image_max > 0.0, "image cortex projection collapsed to all-zeros");
+    assert!(audio_max > 0.0, "audio cortex projection collapsed to all-zeros");
+
+    let pairs = [
+        ("text/image", l2_text_image),
+        ("text/audio", l2_text_audio),
+        ("image/audio", l2_image_audio),
+    ];
+    let min_l2 = pairs.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+    assert!(
+        min_l2 > THRESHOLD,
+        "all 3 modalities should produce distinguishable projections; \
+         min pairwise L2 = {min_l2:.4} (threshold {THRESHOLD}) — \
+         pairs: {pairs:?}",
+    );
 
     println!(
-        "PASS: text/image cortex projections distinguishable (L2 distance = {:.4})",
-        dist,
+        "PASS: text/image/audio cortex projections all pairwise-distinguishable (min L2 = {:.4})",
+        min_l2,
     );
 }
