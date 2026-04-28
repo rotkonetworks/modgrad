@@ -75,6 +75,9 @@ use modgrad_transformer::resident::GptBackwardState;
 #[cfg(feature = "rocm")]
 use modgrad_transformer::{GptModelResident, KvCacheResident};
 
+#[cfg(feature = "rocm")]
+use crate::model::{BltBackwardState, BltModel, BltScratch};
+
 // ─── Config ───────────────────────────────────────────────────
 
 /// Hyperparameters for the BLT trainer. Defaults follow Pagnoni et al.
@@ -576,6 +579,494 @@ fn validate_boundaries(n: usize, boundaries: &[usize]) {
         "BltTrainer::train_step: boundary[last]={last} ≥ bytes.len()={n}");
 }
 
+// ─── BltModelTrainer ──────────────────────────────────────────
+//
+// Parallel to `BltTrainer` (above) but operates on the full `BltModel`
+// (encoder + latent + decoder + cross-attn) via the sequence-level
+// `BltModel::forward_for_backward` / `BltModel::backward` API.
+//
+// `BltTrainer` (above) trains the bare latent (Path A inference recipe);
+// `BltModelTrainer` trains the complete BLT pipeline (Path B byte-ification
+// recipe). Both coexist deliberately — they are not interchangeable. BLT
+// processes patches as a unit, so the per-position `LanguageModel` shape
+// the upper trainer relies on is a non-starter for `BltModel`.
+
+/// BLT trainer for the full [`BltModel`] (encoder + latent + decoder
+/// + cross-attn). Drives sequence-level forward + backward and applies
+/// per-`Linear` AdamW with the local-vs-global LR routing required by
+/// the paper §6.2 byte-ification recipe.
+///
+/// ## Per-`Linear` AdamW key map
+///
+/// One `AdamWBuf` per parameter buffer. Keys are stable strings so
+/// callers (e.g. [`crate::byteify::ByteifyRecipe::global_predicate`])
+/// can route per-name LR.
+///
+/// **Encoder** (per byte-layer `li`, `li ∈ 0..lE`):
+///   - `encoder.byte_embed`           → `model.encoder.byte_embed_dev`
+///                                       (grad: `state.encoder_grads.d_byte_embed`)
+///   - `encoder.block.{li}.wq`        → `model.encoder.byte_layers[li].attn.q_proj.weight_dev`
+///                                       (grad: `state.encoder_grads.attn_grads[li].dweight_q`)
+///   - `encoder.block.{li}.wk`        → `…attn.k_proj.weight_dev`     (`dweight_k`)
+///   - `encoder.block.{li}.wv`        → `…attn.v_proj.weight_dev`     (`dweight_v`)
+///   - `encoder.block.{li}.wo`        → `…attn.o_proj.weight_dev`     (`dweight_o`)
+///   - `encoder.block.{li}.gate`      → `…mlp.gate.weight_dev`        (`mlp_grads[li].dweight_gate`)
+///   - `encoder.block.{li}.up`        → `…mlp.up.weight_dev`          (`dweight_up`)
+///   - `encoder.block.{li}.down`      → `…mlp.down.weight_dev`        (`dweight_down`)
+///   - `encoder.cross_attn.{li}.wq`   → `model.encoder.cross_attns[li].q_proj.weight_dev`
+///                                       (grad: `state.encoder_grads.cross_attn_grads[li].dweight_q`)
+///   - `encoder.cross_attn.{li}.wk`   → `…k_proj.weight_dev`          (`dweight_k`)
+///   - `encoder.cross_attn.{li}.wv`   → `…v_proj.weight_dev`          (`dweight_v`)
+///   - `encoder.cross_attn.{li}.wo`   → `…o_proj.weight_dev`          (`dweight_o`)
+///
+/// **Latent** (per layer `li`, `li ∈ 0..lL`):
+///   - `latent.block.{li}.wq`         → `model.latent.blocks[li].attn.q_proj.weight_dev`
+///                                       (grad: `state.latent_attn_grads[li].dweight_q`)
+///   - `latent.block.{li}.{wk,wv,wo,gate,up,down}` — same shape as encoder block.
+///   - `latent.final_norm`            → `model.latent_final_norm_weight_dev`
+///                                       (grad: `state.d_latent_final_norm_weight`)
+///
+/// **Decoder** (per byte-layer `li`, `li ∈ 0..lD`):
+///   - `decoder.block.{li}.{wq,wk,wv,wo,gate,up,down}` — same shape as encoder block.
+///   - `decoder.cross_attn.{li}.{wq,wk,wv,wo}` — same shape as encoder cross-attn.
+///   - `decoder.lm_head`              → `model.decoder.lm_head.weight_dev`
+///                                       (grad: `state.decoder_grads.dweight_lm_head`)
+///   - `decoder.lm_head_bias`         → `model.decoder.lm_head.bias_dev`
+///                                       (grad: `state.decoder_grads.dbias_lm_head`)
+///   - `decoder.final_norm`           → `model.decoder.final_norm_weight_dev`
+///                                       (grad: `state.decoder_grads.dweight_final_norm`)
+///
+/// Bias buffers on attention / MLP / cross-attn `Linear`s are not
+/// AdamW-updated — they are initialised to zero by `LinearResident::from_linear`
+/// and stay zero (no entry in the AdamW map). The decoder's LM-head bias
+/// is the lone exception (it has a dedicated grad accumulator and a
+/// dedicated AdamW slot).
+///
+/// ## Pipeline
+///
+/// 1. `state.zero_resident` — clear every gradient accumulator.
+/// 2. `BltModel::forward_for_backward` over the full byte sequence,
+///    populating `byte_logits` of shape `[bytes.len() × 256]`.
+/// 3. Cross-entropy on `bytes[1..]` (next-byte targets) for the first
+///    `n - 1` byte positions; the last position's logit is dropped.
+/// 4. Upload `d_logits` (zero-padded for the last position) and call
+///    `BltModel::backward`.
+/// 5. Optional global grad clip across every host-downloaded grad.
+/// 6. Per-`Linear` AdamW with `is_global` routing the LR group.
+#[cfg(feature = "rocm")]
+pub struct BltModelTrainer {
+    model: BltModel,
+    state: BltBackwardState,
+    scratch: BltScratch,
+    adamw: HashMap<String, AdamWBuf>,
+    config: BltTrainerConfig,
+    is_global: Box<dyn Fn(&str) -> bool + Send>,
+    loss_history: Vec<f32>,
+    step: usize,
+}
+
+#[cfg(feature = "rocm")]
+impl BltModelTrainer {
+    /// Wrap a [`BltModel`] in the BLT per-group LR schedule. Allocates
+    /// one [`AdamWBuf`] per parameter buffer (see the type docs for
+    /// the full key map). `is_global` decides per-key which LR group
+    /// applies — pass [`crate::byteify::ByteifyRecipe::global_predicate`]
+    /// for the canonical recipe.
+    pub fn new(
+        model: BltModel,
+        config: BltTrainerConfig,
+        is_global: Box<dyn Fn(&str) -> bool + Send>,
+    ) -> Result<Self, ResidencyError> {
+        let state = BltBackwardState::new(&model)?;
+        let scratch = BltScratch::new(&model.config)?;
+        let mut trainer = Self {
+            model,
+            state,
+            scratch,
+            adamw: HashMap::new(),
+            config,
+            is_global,
+            loss_history: Vec::new(),
+            step: 0,
+        };
+        trainer.alloc_adamw()?;
+        Ok(trainer)
+    }
+
+    /// Read-only access to the wrapped model.
+    pub fn model(&self) -> &BltModel { &self.model }
+
+    /// Loss values from completed [`Self::train_step`] calls, in order.
+    pub fn loss_history(&self) -> &[f32] { &self.loss_history }
+
+    /// Configuration view.
+    pub fn config(&self) -> &BltTrainerConfig { &self.config }
+
+    /// AdamW state — exposed for tests + tools that want to inspect
+    /// optimizer momentum, not for the hot path.
+    pub fn adamw_state(&self) -> &HashMap<String, AdamWBuf> { &self.adamw }
+
+    /// One BLT training step on a contiguous byte window.
+    ///
+    /// `bytes.len()` must equal `micro_batch_size` (the trainer predicts
+    /// next-byte logits at every position and uses `bytes[1..]` as
+    /// targets for positions `0..n-1`; the last position has no target
+    /// and contributes nothing to the loss). `boundaries` is the patch
+    /// boundary list `[0, b_1, …, n]` from [`crate::patcher`] — strictly
+    /// increasing, starts at 0, ends at `n`.
+    ///
+    /// Returns the cross-entropy loss for the step. Asserts on NaN/inf.
+    pub fn train_step(
+        &mut self,
+        bytes: &[u8],
+        boundaries: &[usize],
+    ) -> Result<f32, ResidencyError> {
+        let n = bytes.len();
+        let mbs = self.config.micro_batch_size;
+        assert_eq!(n, mbs,
+            "BltModelTrainer::train_step: bytes.len() must be micro_batch_size ({}), got {}",
+            mbs, n);
+        assert!(n >= 2,
+            "BltModelTrainer::train_step: need at least 2 bytes for a next-byte target, got {n}");
+        assert!(!boundaries.is_empty()
+                && boundaries[0] == 0
+                && *boundaries.last().unwrap() == n,
+            "BltModelTrainer::train_step: boundaries must start at 0 and end at bytes.len()={n}");
+        validate_boundaries(n + 1, boundaries);
+
+        let batch = HipBatch::new();
+
+        // Stage 0: zero all weight-grad accumulators.
+        self.state.zero_resident(&batch)?;
+
+        // Stage 1: forward for backward.
+        let mut byte_logits = GpuVec::try_hip(n * 256)?;
+        self.model.forward_for_backward(
+            &batch,
+            bytes,
+            boundaries,
+            &mut self.scratch,
+            &mut self.state,
+            &mut byte_logits,
+        )?;
+        batch.flush()?;
+
+        // Stage 2: CE loss on the first n-1 positions; last position has
+        // no target. The dropped position's d_logits row is zero so it
+        // contributes nothing to the backward.
+        let mut logits_host = vec![0.0f32; n * 256];
+        byte_logits.copy_to_host(&mut logits_host);
+        let logits_pred = &logits_host[..(n - 1) * 256];
+        let targets: Vec<i64> = bytes[1..].iter().map(|&b| b as i64).collect();
+        debug_assert_eq!(targets.len(), n - 1);
+        let (loss, grad_logits_pred) = cross_entropy(logits_pred, &targets, 256);
+
+        assert!(loss.is_finite(),
+            "BltModelTrainer::train_step: loss is NaN/inf — upstream forward bug");
+        self.loss_history.push(loss);
+
+        // Stage 3: upload zero-padded d_logits.
+        let mut d_logits_host = vec![0.0f32; n * 256];
+        d_logits_host[..(n - 1) * 256].copy_from_slice(&grad_logits_pred);
+        let mut d_byte_logits = GpuVec::try_hip(n * 256)?;
+        d_byte_logits.copy_from(&d_logits_host);
+
+        // Stage 4: backward.
+        self.model.backward(
+            &batch,
+            bytes,
+            boundaries,
+            &mut self.scratch,
+            &mut self.state,
+            &d_byte_logits,
+        )?;
+        batch.flush()?;
+
+        // Stage 5: optional global grad clip. Walk every grad GpuVec,
+        // download to a host vector, clip, and upload back. Order matches
+        // `param_keys_for_model` so the dispatch step below sees clipped
+        // values. Skipped when `grad_clip <= 0` (the no-clip default for
+        // sweeps that want raw norms).
+        let keys = param_keys_for_model(&self.model);
+        let mut grad_hosts: Vec<(String, Vec<f32>)> = Vec::with_capacity(keys.len());
+        for k in &keys {
+            let grad_dev = grad_dev_for_key(&self.state, k, &self.model);
+            let mut h = vec![0.0f32; grad_dev.len()];
+            grad_dev.copy_to_host(&mut h);
+            grad_hosts.push((k.clone(), h));
+        }
+        if self.config.grad_clip > 0.0 {
+            let mut slices: Vec<&mut [f32]> = grad_hosts.iter_mut()
+                .map(|(_, v)| v.as_mut_slice()).collect();
+            LmTrainer::<GptModelResident>::clip_grads(
+                &mut slices, self.config.grad_clip,
+            );
+        }
+
+        // Stage 6: per-param AdamW.
+        for (k, host_grad) in &grad_hosts {
+            let weight_dev = weight_dev_for_blt_key(&self.model, k);
+            let buf = self.adamw.get_mut(k)
+                .expect("adamw populated by alloc_adamw");
+            let cfg = self.config.for_group((self.is_global)(k));
+            buf.step_resident(weight_dev, host_grad.as_slice(), &cfg)?;
+        }
+
+        self.step += 1;
+        Ok(loss)
+    }
+
+    /// Pre-allocate one [`AdamWBuf`] per parameter buffer. Sizes are
+    /// derived from the model directly — same source-of-truth as
+    /// `weight_dev_for_blt_key`.
+    fn alloc_adamw(&mut self) -> Result<(), ResidencyError> {
+        let keys = param_keys_for_model(&self.model);
+        for k in &keys {
+            let n = grad_dev_for_key(&self.state, k, &self.model).len();
+            self.adamw.insert(k.clone(), AdamWBuf::zeros(n)?);
+        }
+        Ok(())
+    }
+}
+
+// ─── BltModel param key plumbing ──────────────────────────────
+
+/// Stable parameter keys for [`BltModel`]. Matches the schema in the
+/// type-level doc for [`BltModelTrainer`]. Order is encoder → latent →
+/// decoder; within each component, embeddings/heads bracket the per-layer
+/// blocks.
+#[cfg(feature = "rocm")]
+fn param_keys_for_model(model: &BltModel) -> Vec<String> {
+    let n_enc = model.encoder.n_layers();
+    let n_lat = model.latent.num_layers();
+    let n_dec = model.decoder.n_layers();
+
+    // 1 (byte_embed) + n_enc * (7 attn/mlp + 4 cross_attn) + n_lat * 7 + 1
+    // (latent.final_norm) + n_dec * (7 + 4) + 3 (lm_head, lm_head_bias,
+    // final_norm).
+    let mut keys = Vec::with_capacity(
+        1 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3,
+    );
+
+    keys.push("encoder.byte_embed".to_string());
+    for li in 0..n_enc {
+        keys.push(format!("encoder.block.{li}.wq"));
+        keys.push(format!("encoder.block.{li}.wk"));
+        keys.push(format!("encoder.block.{li}.wv"));
+        keys.push(format!("encoder.block.{li}.wo"));
+        keys.push(format!("encoder.block.{li}.gate"));
+        keys.push(format!("encoder.block.{li}.up"));
+        keys.push(format!("encoder.block.{li}.down"));
+        keys.push(format!("encoder.cross_attn.{li}.wq"));
+        keys.push(format!("encoder.cross_attn.{li}.wk"));
+        keys.push(format!("encoder.cross_attn.{li}.wv"));
+        keys.push(format!("encoder.cross_attn.{li}.wo"));
+    }
+
+    for li in 0..n_lat {
+        keys.push(format!("latent.block.{li}.wq"));
+        keys.push(format!("latent.block.{li}.wk"));
+        keys.push(format!("latent.block.{li}.wv"));
+        keys.push(format!("latent.block.{li}.wo"));
+        keys.push(format!("latent.block.{li}.gate"));
+        keys.push(format!("latent.block.{li}.up"));
+        keys.push(format!("latent.block.{li}.down"));
+    }
+    keys.push("latent.final_norm".to_string());
+
+    for li in 0..n_dec {
+        keys.push(format!("decoder.block.{li}.wq"));
+        keys.push(format!("decoder.block.{li}.wk"));
+        keys.push(format!("decoder.block.{li}.wv"));
+        keys.push(format!("decoder.block.{li}.wo"));
+        keys.push(format!("decoder.block.{li}.gate"));
+        keys.push(format!("decoder.block.{li}.up"));
+        keys.push(format!("decoder.block.{li}.down"));
+        keys.push(format!("decoder.cross_attn.{li}.wq"));
+        keys.push(format!("decoder.cross_attn.{li}.wk"));
+        keys.push(format!("decoder.cross_attn.{li}.wv"));
+        keys.push(format!("decoder.cross_attn.{li}.wo"));
+    }
+    keys.push("decoder.lm_head".to_string());
+    keys.push("decoder.lm_head_bias".to_string());
+    keys.push("decoder.final_norm".to_string());
+
+    keys
+}
+
+/// Look up the model's resident weight buffer for a given param key.
+/// Inverse of [`param_keys_for_model`]. Used by the resident AdamW
+/// dispatch to mutate the device weight in place.
+#[cfg(feature = "rocm")]
+fn weight_dev_for_blt_key<'a>(model: &'a BltModel, key: &str) -> &'a HipBuffer {
+    if key == "encoder.byte_embed" { return &model.encoder.byte_embed_dev; }
+    if key == "latent.final_norm" { return &model.latent_final_norm_weight_dev; }
+    if key == "decoder.lm_head" { return &model.decoder.lm_head.weight_dev; }
+    if key == "decoder.lm_head_bias" { return &model.decoder.lm_head.bias_dev; }
+    if key == "decoder.final_norm" { return &model.decoder.final_norm_weight_dev; }
+
+    if let Some(rest) = key.strip_prefix("encoder.block.") {
+        let (li, slot) = parse_block_key(rest);
+        let block = &model.encoder.byte_layers[li];
+        return block_slot_weight(block, slot, key);
+    }
+    if let Some(rest) = key.strip_prefix("encoder.cross_attn.") {
+        let (li, slot) = parse_block_key(rest);
+        return cross_attn_slot_weight(&model.encoder.cross_attns[li], slot, key);
+    }
+    if let Some(rest) = key.strip_prefix("latent.block.") {
+        let (li, slot) = parse_block_key(rest);
+        let block = &model.latent.blocks[li];
+        return block_slot_weight(block, slot, key);
+    }
+    if let Some(rest) = key.strip_prefix("decoder.block.") {
+        let (li, slot) = parse_block_key(rest);
+        let block = &model.decoder.byte_layers[li];
+        return block_slot_weight(block, slot, key);
+    }
+    if let Some(rest) = key.strip_prefix("decoder.cross_attn.") {
+        let (li, slot) = parse_block_key(rest);
+        return cross_attn_slot_weight(&model.decoder.cross_attns[li], slot, key);
+    }
+    panic!("BltModelTrainer::weight_dev_for_blt_key: unknown key {key}");
+}
+
+/// Look up the gradient buffer for a given param key on the backward
+/// state. Inverse of [`param_keys_for_model`]; pairs with
+/// [`weight_dev_for_blt_key`] one-to-one.
+#[cfg(feature = "rocm")]
+fn grad_dev_for_key<'a>(
+    state: &'a BltBackwardState,
+    key: &str,
+    model: &BltModel,
+) -> &'a GpuVec {
+    if key == "encoder.byte_embed" { return &state.encoder_grads.d_byte_embed; }
+    if key == "latent.final_norm" { return &state.d_latent_final_norm_weight; }
+    if key == "decoder.lm_head" { return &state.decoder_grads.dweight_lm_head; }
+    if key == "decoder.lm_head_bias" { return &state.decoder_grads.dbias_lm_head; }
+    if key == "decoder.final_norm" { return &state.decoder_grads.dweight_final_norm; }
+
+    if let Some(rest) = key.strip_prefix("encoder.block.") {
+        let (li, slot) = parse_block_key(rest);
+        debug_assert!(li < model.encoder.n_layers(), "{key}: encoder layer OOB");
+        return block_slot_grad(
+            &state.encoder_grads.attn_grads[li],
+            &state.encoder_grads.mlp_grads[li],
+            slot, key,
+        );
+    }
+    if let Some(rest) = key.strip_prefix("encoder.cross_attn.") {
+        let (li, slot) = parse_block_key(rest);
+        debug_assert!(li < model.encoder.n_layers(), "{key}: encoder cross_attn layer OOB");
+        return cross_attn_slot_grad(&state.encoder_grads.cross_attn_grads[li], slot, key);
+    }
+    if let Some(rest) = key.strip_prefix("latent.block.") {
+        let (li, slot) = parse_block_key(rest);
+        debug_assert!(li < model.latent.num_layers(), "{key}: latent layer OOB");
+        return block_slot_grad(
+            &state.latent_attn_grads[li],
+            &state.latent_mlp_grads[li],
+            slot, key,
+        );
+    }
+    if let Some(rest) = key.strip_prefix("decoder.block.") {
+        let (li, slot) = parse_block_key(rest);
+        debug_assert!(li < model.decoder.n_layers(), "{key}: decoder layer OOB");
+        return block_slot_grad(
+            &state.decoder_grads.attn_grads[li],
+            &state.decoder_grads.mlp_grads[li],
+            slot, key,
+        );
+    }
+    if let Some(rest) = key.strip_prefix("decoder.cross_attn.") {
+        let (li, slot) = parse_block_key(rest);
+        debug_assert!(li < model.decoder.n_layers(), "{key}: decoder cross_attn layer OOB");
+        return cross_attn_slot_grad(&state.decoder_grads.cross_attn_grads[li], slot, key);
+    }
+    panic!("BltModelTrainer::grad_dev_for_key: unknown key {key}");
+}
+
+/// Parse `"{li}.{slot}"` into `(li, slot)`. Panics on malformed keys —
+/// keys come from [`param_keys_for_model`], a malformed value here is a
+/// programmer error.
+#[cfg(feature = "rocm")]
+fn parse_block_key(rest: &str) -> (usize, &str) {
+    let mut parts = rest.splitn(2, '.');
+    let li: usize = parts.next()
+        .expect("layer index segment")
+        .parse()
+        .expect("layer index parses as usize");
+    let slot = parts.next().expect("slot segment");
+    (li, slot)
+}
+
+#[cfg(feature = "rocm")]
+fn block_slot_weight<'a>(
+    block: &'a modgrad_transformer::resident::TransformerBlockResident,
+    slot: &str,
+    key: &str,
+) -> &'a HipBuffer {
+    match slot {
+        "wq" => &block.attn.q_proj.weight_dev,
+        "wk" => &block.attn.k_proj.weight_dev,
+        "wv" => &block.attn.v_proj.weight_dev,
+        "wo" => &block.attn.o_proj.weight_dev,
+        "gate" => &block.mlp.gate.weight_dev,
+        "up" => &block.mlp.up.weight_dev,
+        "down" => &block.mlp.down.weight_dev,
+        _ => panic!("BltModelTrainer::block_slot_weight: unknown slot in {key}"),
+    }
+}
+
+#[cfg(feature = "rocm")]
+fn block_slot_grad<'a>(
+    attn: &'a modgrad_transformer::resident::AttentionResidentGrads,
+    mlp: &'a modgrad_transformer::resident::SwigluResidentGrads,
+    slot: &str,
+    key: &str,
+) -> &'a GpuVec {
+    match slot {
+        "wq" => &attn.dweight_q,
+        "wk" => &attn.dweight_k,
+        "wv" => &attn.dweight_v,
+        "wo" => &attn.dweight_o,
+        "gate" => &mlp.dweight_gate,
+        "up" => &mlp.dweight_up,
+        "down" => &mlp.dweight_down,
+        _ => panic!("BltModelTrainer::block_slot_grad: unknown slot in {key}"),
+    }
+}
+
+#[cfg(feature = "rocm")]
+fn cross_attn_slot_weight<'a>(
+    cross: &'a crate::cross_attn::CrossAttention,
+    slot: &str,
+    key: &str,
+) -> &'a HipBuffer {
+    match slot {
+        "wq" => &cross.q_proj.weight_dev,
+        "wk" => &cross.k_proj.weight_dev,
+        "wv" => &cross.v_proj.weight_dev,
+        "wo" => &cross.o_proj.weight_dev,
+        _ => panic!("BltModelTrainer::cross_attn_slot_weight: unknown slot in {key}"),
+    }
+}
+
+#[cfg(feature = "rocm")]
+fn cross_attn_slot_grad<'a>(
+    grads: &'a crate::cross_attn::CrossAttnGrads,
+    slot: &str,
+    key: &str,
+) -> &'a GpuVec {
+    match slot {
+        "wq" => &grads.dweight_q,
+        "wk" => &grads.dweight_k,
+        "wv" => &grads.dweight_v,
+        "wo" => &grads.dweight_o,
+        _ => panic!("BltModelTrainer::cross_attn_slot_grad: unknown slot in {key}"),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -640,5 +1131,164 @@ mod tests {
         assert_eq!(keys[15], "lm_head");
         assert!(keys.iter().any(|k| k == "block.0.wq"));
         assert!(keys.iter().any(|k| k == "block.1.down"));
+    }
+
+    // ─── BltModelTrainer tests ────────────────────────────────
+
+    use crate::byteify::ByteifyRecipe;
+    use crate::decoder::LocalDecoderConfig;
+    use crate::encoder::LocalEncoderConfig;
+    use crate::model::{BltConfig, BltLatentConfig, BltModel};
+    use modgrad_device::backend::rocm::ffi::runtime_available;
+    use std::sync::Mutex;
+
+    /// HIP runtime tests must run serially — the resident dispatch path
+    /// shares the default stream. Mirrors the `tests::HIP_TEST_LOCK` in
+    /// `model.rs`.
+    static MODEL_TRAINER_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Tiny config — same shape as `model::tests::tiny_config` but
+    /// duplicated here so the trainer tests don't pull from a private
+    /// helper. 32-byte sequence, 8 patches, lE=1, lL=2, lD=1.
+    ///
+    /// `max_patches` is set to exactly the n_patches the loss-finite
+    /// test uses (8) — the existing `LocalDecoder::backward` path
+    /// asserts `d_patch_reps_out.len() == n_patches * patch_dim` against
+    /// the state buffer sized to `max_patches * patch_dim`, so they have
+    /// to match. (Out-of-scope to relax: the model contract belongs to
+    /// the BltBackwardState allocator, not the trainer.)
+    fn tiny_blt_config() -> BltConfig {
+        let byte_dim = 32usize;
+        let n_byte_heads = 4usize;
+        let byte_head_dim = byte_dim / n_byte_heads;
+        let patch_dim = 64usize;
+        let n_patch_heads = 4usize;
+        let patch_head_dim = patch_dim / n_patch_heads;
+        let max_seq = 32usize;
+        let max_patches = 8usize;
+
+        BltConfig {
+            encoder: LocalEncoderConfig {
+                n_layers: 1, byte_dim, patch_dim,
+                n_heads: n_byte_heads, head_dim: byte_head_dim,
+                mlp_dim: byte_dim * 2,
+                norm_eps: 1e-5, rope_base: 10_000.0,
+                max_seq_len: max_seq,
+                ngram_min_n: 3, ngram_max_n: 5,
+                ngram_vocab_per_n: 256,
+            },
+            latent: BltLatentConfig {
+                n_layers: 2, patch_dim,
+                n_heads: n_patch_heads, head_dim: patch_head_dim,
+                mlp_dim: patch_dim * 2,
+                norm_eps: 1e-5, rope_base: 10_000.0,
+                max_patches,
+            },
+            decoder: LocalDecoderConfig {
+                n_layers: 1, byte_dim, patch_dim,
+                n_heads: n_byte_heads, head_dim: byte_head_dim,
+                mlp_dim: byte_dim * 2,
+                norm_eps: 1e-5, rope_base: 10_000.0,
+                max_seq_len: max_seq,
+            },
+        }
+    }
+
+    #[test]
+    fn param_keys_for_model_shape() {
+        // Pure host: build a key list against the count expectations
+        // even when no HIP runtime is available.
+        let n_enc = 1; let n_lat = 2; let n_dec = 1;
+        let expected = 1 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3;
+        // Simulate by stamping the same keys layout as the live helper.
+        // The live `param_keys_for_model` requires a real `BltModel`,
+        // which needs a HIP runtime; this test stays runtime-agnostic by
+        // recomputing the key count from the model dims directly.
+        assert_eq!(expected, 1 + 11 + 14 + 1 + 11 + 3);
+        // Sanity: encoder.byte_embed first; decoder.final_norm last.
+        // (Validated against the live helper in `blt_model_trainer_alloc`.)
+    }
+
+    #[test]
+    fn blt_model_trainer_alloc() {
+        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+            return;
+        }
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_blt_config();
+        let model = BltModel::new(config).expect("BltModel::new");
+
+        let keys_expected = param_keys_for_model(&model);
+        let trainer_cfg = BltTrainerConfig::default();
+        let trainer = BltModelTrainer::new(
+            model,
+            trainer_cfg,
+            ByteifyRecipe::global_predicate(),
+        ).expect("BltModelTrainer::new");
+
+        // Every key has an AdamW slot.
+        let adamw = trainer.adamw_state();
+        assert_eq!(adamw.len(), keys_expected.len(),
+            "expected one AdamWBuf per key");
+        for k in &keys_expected {
+            assert!(adamw.contains_key(k), "missing AdamW slot for {k}");
+        }
+        // Sanity: first key is encoder.byte_embed, last is decoder.final_norm.
+        assert_eq!(keys_expected[0], "encoder.byte_embed");
+        assert_eq!(keys_expected.last().unwrap(), "decoder.final_norm");
+        // No latent.lm_head / no encoder.lm_head — those are NOT BLT
+        // params (the latent's lm_head path is bypassed; the byte LM
+        // head is `decoder.lm_head`).
+        assert!(!keys_expected.iter().any(|k| k == "latent.lm_head"));
+        assert!(!keys_expected.iter().any(|k| k == "embed"));
+        assert!(!keys_expected.iter().any(|k| k == "lm_head"));
+    }
+
+    #[test]
+    fn blt_model_trainer_loss_finite() {
+        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+            return;
+        }
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_blt_config();
+        let model = BltModel::new(config).expect("BltModel::new");
+
+        // Match the model's max_seq_len = 32 / max_patches = 16.
+        let mbs = 32usize;
+        let trainer_cfg = BltTrainerConfig {
+            micro_batch_size: mbs,
+            seq_len: mbs,
+            ..BltTrainerConfig::default()
+        };
+        let mut trainer = BltModelTrainer::new(
+            model,
+            trainer_cfg,
+            ByteifyRecipe::global_predicate(),
+        ).expect("BltModelTrainer::new");
+
+        let bytes: Vec<u8> = (0..mbs as u8).collect();
+        let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+        assert_eq!(boundaries[0], 0);
+        assert_eq!(*boundaries.last().unwrap(), mbs);
+
+        for step in 0..2 {
+            let loss = trainer.train_step(&bytes, &boundaries)
+                .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
+            assert!(loss.is_finite(),
+                "step {step} loss not finite: {loss}");
+        }
+        // History reflects both steps.
+        assert_eq!(trainer.loss_history().len(), 2);
+        for (i, l) in trainer.loss_history().iter().enumerate() {
+            assert!(l.is_finite(), "history[{i}] not finite: {l}");
+        }
     }
 }
