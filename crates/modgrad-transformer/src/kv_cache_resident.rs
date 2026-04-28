@@ -295,17 +295,14 @@ fn zero_hip_buffer(buf: &HipBuffer, n_floats: usize) -> Result<(), ResidencyErro
 
 #[cfg(test)]
 mod tests {
+    //! Shared lock: `modgrad_device::test_lock::hip_test_lock()` —
+    //! serialises HIP runtime tests across the workspace.
     use super::*;
     use modgrad_device::backend::rocm::ffi::runtime_available;
-    use std::sync::Mutex;
-
-    /// Serialise HIP runtime tests — see the matching note in
-    /// `crate::resident::tests`.
-    static HIP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn kv_cache_alloc_zero_init() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -331,7 +328,7 @@ mod tests {
 
     #[test]
     fn kv_cache_write_and_read() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;

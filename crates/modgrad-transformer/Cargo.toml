@@ -23,3 +23,10 @@ __service_integration = []
 # Propagates through to compute + device crates so `LinearResident`,
 # `GpuVec::Hip`, and the resident MIOpen ops are available.
 rocm = ["modgrad-compute/rocm", "modgrad-device/rocm"]
+
+# Tests in this crate share a process-wide HIP serialization mutex with
+# other downstream crates (see `modgrad-device::test_lock::hip_test_lock`).
+# The `test-utils` feature only flips on for `cargo test`, so production
+# builds via the `[dependencies]` modgrad-device entry above are untouched.
+[dev-dependencies]
+modgrad-device = { path = "../modgrad-device", features = ["test-utils"] }

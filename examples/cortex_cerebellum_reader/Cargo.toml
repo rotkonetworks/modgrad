@@ -1,0 +1,19 @@
+[package]
+name = "cortex_cerebellum_reader"
+version = "0.1.0"
+edition = "2024"
+description = "Proof-of-life: a synthetic cortex region consumes the cerebellum cache via cerebellum_modality_pool and produces modality-distinguishing outputs."
+
+[[bin]]
+name = "cortex_cerebellum_reader"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm        = { path = "../../crates/modgrad-ctm", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-data       = { path = "../../crates/modgrad-data" }
+
+[features]
+default = []

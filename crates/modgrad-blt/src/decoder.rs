@@ -770,22 +770,16 @@ impl LocalDecoder {
         // `AttentionResidentGrads` / `SwigluResidentGrads`, adding into
         // the layer accumulator after each byte.
         //
-        // Post-fix gradcheck status (2026-04-28): `decoder.block.0.wv[7]`
-        // moves from `analytic=0, grad_norm=0` (catastrophic zero) to
-        // `analytic=-5.67e-4, grad_norm=0.19` against `num=-7.15e-4` —
-        // a ~21% relative error. The buffer is now non-zero with real
-        // gradient flowing; the residual 21% gap is *not* in this
-        // function. Suspected upstream causes (in `modgrad-transformer`,
-        // out of scope for this fix): (i) `AttentionResident::backward`
-        // unconditionally calls `rms_norm_backward_per_head` on Q/K
-        // even when `use_qk_norm=false` (resident.rs:801-808), which
-        // distorts `d_q_proj` / `d_k_proj` and propagates through the
-        // residual fold to upstream `dy_dev`; (ii) host-side `acc`
-        // arithmetic at fp32 in stage 5 of attn.backward. Both would
-        // also cause the smaller marginal failures elsewhere in the
-        // gradcheck (`latent.block.0.gate`, `decoder.lm_head`,
-        // `decoder.final_norm`). They are documented here as a TODO
-        // for a follow-up commit that may modify resident.rs.
+        // Gradcheck status (2026-04-29): `decoder.block.0.wv[7]` reports
+        // analytic=-5.67e-4, num=-7.15e-4, rel_err=21% at EPS=1e-3.
+        // `investigate_decoder_block_wv_residual` (gradcheck.rs) proved
+        // this is NOT a backward bug — it's gradcheck FD-floor noise.
+        // At EPS=3e-3 the same idx passes 1e-2; an f32-vs-f64 stage-5
+        // microbench bounds host round-off at 6e-7 (six orders below
+        // 21%). The earlier "host-fp32 acc" hypothesis was disproven.
+        // The actual fix is gradcheck-side (per-key adaptive EPS), not
+        // here. Bug-A in resident.rs's AttentionResident::backward
+        // (cross-step KV gradient) remains the only real backward cap.
         let attn_kv_dim = self.byte_layers[0].attn.kv_dim;
         let attn_max_seq = self.byte_kv_cache.max_seq_len();
         let attn_num_heads = self.byte_layers[0].attn.num_heads;

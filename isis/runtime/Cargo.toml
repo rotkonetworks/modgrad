@@ -43,3 +43,10 @@ ort = { version = "2.0.0-rc.12", optional = true }
 
 # Conic solver for SDP (Angeris bound, tight)
 clarabel = { version = "0.11", optional = true, default-features = false }
+
+# Tests in this crate share a process-wide HIP serialization mutex with
+# other downstream crates (see `modgrad-device::test_lock::hip_test_lock`).
+# The `test-utils` feature only flips on for `cargo test`, so production
+# builds via the `[dependencies]` modgrad-device entry above are untouched.
+[dev-dependencies]
+modgrad-device = { path = "../../crates/modgrad-device", features = ["test-utils"] }

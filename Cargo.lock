@@ -743,6 +743,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex_cerebellum_reader"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-data",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

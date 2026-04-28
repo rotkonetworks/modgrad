@@ -2543,16 +2543,13 @@ const _: fn(LayerIdx) = |_| {};
 
 #[cfg(test)]
 mod tests {
+    //! Shared lock: `modgrad_device::test_lock::hip_test_lock()` —
+    //! HIP runtime tests must run serially. Multiple concurrent
+    //! matvec_resident dispatches share the default stream, and
+    //! composite ops like SiLU's three-stage Logistic+Mul+Mul interleave
+    //! across tests in unpredictable ways.
     use super::*;
     use modgrad_device::backend::rocm::ffi::runtime_available;
-    use std::sync::Mutex;
-
-    /// HIP runtime tests must run serially — see the matching note in
-    /// `modgrad-ffn/src/resident.rs` for the rationale (multiple
-    /// concurrent matvec_resident dispatches share the default stream,
-    /// composite ops like SiLU's three-stage Logistic+Mul+Mul interleave
-    /// across tests in unpredictable ways).
-    static HIP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     use crate::attention::{AttentionWeights, CausalSelfAttention};
     use crate::block::TransformerBlock;
@@ -2765,7 +2762,7 @@ mod tests {
 
     #[test]
     fn gpt_model_resident_decode_matches_host() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -2833,7 +2830,7 @@ mod tests {
 
     #[test]
     fn attention_resident_matches_host_one_token() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -2912,7 +2909,7 @@ mod tests {
 
     #[test]
     fn swiglu_resident_matches_host() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -2975,7 +2972,7 @@ mod tests {
     /// while keeping the attention math reproducible.
     #[test]
     fn gpt_model_resident_backward_matches_host() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;

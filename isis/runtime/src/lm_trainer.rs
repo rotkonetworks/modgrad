@@ -735,6 +735,11 @@ impl LmTrainer<GptModelResident> {
 #[cfg(test)]
 #[cfg(feature = "rocm")]
 mod tests {
+    //! Shared lock: `modgrad_device::test_lock::hip_test_lock()` —
+    //! HIP runtime tests share the device; serialize them so kernel
+    //! dispatch from concurrent `cargo test` workers doesn't interleave
+    //! on the default stream. Same lock pattern as
+    //! `modgrad-transformer/src/resident.rs`.
     use super::*;
     use modgrad_device::backend::rocm::ffi::runtime_available;
     use modgrad_transformer::config::{
@@ -753,13 +758,6 @@ mod tests {
     use modgrad_transformer::rope::RotaryEmbedding;
     use modgrad_transformer::smear::{Inference, Smear, SmearWeights, Training};
     use modgrad_transformer::GptModelResident;
-    use std::sync::Mutex;
-
-    /// HIP runtime tests share the device with each other; serialize
-    /// them so kernel dispatch from concurrent `cargo test` workers
-    /// doesn't interleave on the default stream. Same lock pattern as
-    /// `modgrad-transformer/src/resident.rs`.
-    static HIP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Tiny config — 2 layers, d_model=128, 4 heads, vocab=256.
     /// Mirrors `tiny_config` in modgrad-transformer's resident tests
@@ -786,6 +784,7 @@ mod tests {
             logit_cap: 0.0,
             recurrent_steps: 1,
             has_exit_gate: false,
+            use_qk_norm: false,
             value_embed: ValueEmbedConfig::default(),
             residual: ResidualConfig {
                 resid_start: 1.0, resid_end: 1.0,
@@ -938,7 +937,7 @@ mod tests {
     /// test below.
     #[test]
     fn adamw_buf_step_resident_basic() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         skip_if_no_gpu!();
         let mut buf = AdamWBuf::zeros(4).expect("alloc resident adamw buf");
         // Resident weight starts at 1.0 across the board.
@@ -983,7 +982,7 @@ mod tests {
     /// numerical edge case.
     #[test]
     fn lm_trainer_smoke_loss_decreases() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         skip_if_no_gpu!();
         let config = tiny_config();
         let (model, swiglu_mlps) = build_test_model(&config);
