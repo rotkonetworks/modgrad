@@ -447,12 +447,9 @@ impl BltModel {
         // Zero inter-stage gradient buffers.
         zero_gpuvec_full(&mut state.d_patch_reps_post_latent)?;
         zero_gpuvec_full(&mut state.d_patch_reps_pre_latent)?;
+        zero_gpuvec_full(&mut state.d_seed_byte_reps)?;
 
         // Stage 1: decoder backward.
-        // TODO(blt-bwd): drop the seed-byte-rep gradient path. The
-        // encoder's `backward()` API doesn't yet accept an extra-seed
-        // upstream input; routing the d_seed gradient back through the
-        // encoder's last-layer byte_reps is a follow-up wire-up.
         self.decoder.backward(
             batch,
             boundaries,
@@ -460,7 +457,7 @@ impl BltModel {
             d_byte_logits,
             &mut state.decoder_grads,
             &mut state.d_patch_reps_post_latent,
-            None,
+            Some(&mut state.d_seed_byte_reps),
             &mut scratch.decoder,
         )?;
 
@@ -574,6 +571,7 @@ impl BltModel {
             &mut state.encoder_bwd_scratch,
             &state.encoder_cache,
             &state.d_patch_reps_pre_latent,
+            Some(&state.d_seed_byte_reps),
             &mut state.encoder_grads,
         )?;
 
@@ -620,6 +618,10 @@ pub struct BltBackwardState {
     /// output). Filled by latent backward, consumed by encoder
     /// backward.
     pub d_patch_reps_pre_latent: GpuVec,
+    /// `[max_seq_len × byte_dim]` — d/d(decoder seed = encoder last-layer
+    /// byte_reps). Filled by `decoder.backward`, consumed by
+    /// `encoder.backward` as the path-#2 upstream.
+    pub d_seed_byte_reps: GpuVec,
 }
 
 impl BltBackwardState {
@@ -674,6 +676,9 @@ impl BltBackwardState {
 
         let d_patch_reps_post_latent = GpuVec::try_hip(max_patches * pd)?;
         let d_patch_reps_pre_latent = GpuVec::try_hip(max_patches * pd)?;
+        let d_seed_byte_reps = GpuVec::try_hip(
+            cfg.encoder.max_seq_len * cfg.encoder.byte_dim,
+        )?;
 
         Ok(Self {
             encoder_grads,
@@ -692,6 +697,7 @@ impl BltBackwardState {
             decoder_cache,
             d_patch_reps_post_latent,
             d_patch_reps_pre_latent,
+            d_seed_byte_reps,
         })
     }
 
@@ -721,6 +727,7 @@ impl BltBackwardState {
         zero_gpuvec_full(&mut self.d_latent_final_norm_weight)?;
         zero_gpuvec_full(&mut self.d_patch_reps_post_latent)?;
         zero_gpuvec_full(&mut self.d_patch_reps_pre_latent)?;
+        zero_gpuvec_full(&mut self.d_seed_byte_reps)?;
         Ok(())
     }
 }

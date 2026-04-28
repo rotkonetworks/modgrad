@@ -798,6 +798,7 @@ impl LocalEncoder {
         bwd_scratch: &mut LocalEncoderBackwardScratch,
         cache: &LocalEncoderBwdCache,
         d_patch_reps: &GpuVec,
+        d_seed_byte_reps_extra: Option<&GpuVec>,
         grads: &mut LocalEncoderGrads,
     ) -> Result<(), ResidencyError> {
         let n_bytes = bytes.len();
@@ -851,6 +852,18 @@ impl LocalEncoder {
             // the per-byte backward via `bwd_scratch.dy_per_byte`.
             let mut d_layer_input_host = vec![0.0f32; n_bytes * byte_dim];
             d_layer_input.copy_to_host(&mut d_layer_input_host);
+
+            if last_layer {
+                if let Some(d_seed) = d_seed_byte_reps_extra {
+                    // Both d_patch_reps→cross_attn_bwd and d_seed contribute
+                    // to the same byte_reps[last_layer] activation, so they sum.
+                    let mut d_seed_host = vec![0.0f32; n_bytes * byte_dim];
+                    d_seed.copy_to_host(&mut d_seed_host);
+                    for i in 0..n_bytes * byte_dim {
+                        d_layer_input_host[i] += d_seed_host[i];
+                    }
+                }
+            }
 
             for t in (0..n_bytes).rev() {
                 bwd_scratch.dy_per_byte.copy_from(
@@ -1095,7 +1108,7 @@ mod tests {
 
         encoder.backward(
             &batch, &bytes, &boundaries, &mut scratch, &mut bwd_scratch,
-            &cache, &d_patch_reps, &mut grads,
+            &cache, &d_patch_reps, None, &mut grads,
         ).expect("encoder backward");
         batch.flush().expect("flush");
 
@@ -1115,5 +1128,98 @@ mod tests {
         let mut d_embed = vec![0.0f32; 256 * BYTE_DIM];
         grads.d_byte_embed.copy_to_host(&mut d_embed);
         for &v in &d_embed { assert!(v.is_finite(), "d_byte_embed non-finite"); }
+    }
+
+    #[test]
+    fn encoder_seed_byte_gradient_flows() {
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() { return; }
+
+        const BYTE_DIM: usize = 8;
+        const PATCH_DIM: usize = 8;
+        const N_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const MLP_DIM: usize = 16;
+        const N_BYTES: usize = 8;
+        const N_PATCHES: usize = 2;
+        const MAX_SEQ: usize = 16;
+
+        let cfg = LocalEncoderConfig {
+            n_layers: 1,
+            byte_dim: BYTE_DIM,
+            patch_dim: PATCH_DIM,
+            n_heads: N_HEADS,
+            head_dim: HEAD_DIM,
+            mlp_dim: MLP_DIM,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: MAX_SEQ,
+            ngram_min_n: 3,
+            ngram_max_n: 4,
+            ngram_vocab_per_n: 16,
+        };
+
+        let mut encoder = match LocalEncoder::new(cfg.clone()) {
+            Ok(e) => e, Err(_) => return,
+        };
+        let mut scratch = match LocalEncoderScratch::new(&cfg) {
+            Ok(s) => s, Err(_) => return,
+        };
+        let mut bwd_scratch = match LocalEncoderBackwardScratch::new(&cfg) {
+            Ok(s) => s, Err(_) => return,
+        };
+        let mut cache = match LocalEncoderBwdCache::new(&encoder, N_PATCHES) {
+            Ok(c) => c, Err(_) => return,
+        };
+        let mut grads = match LocalEncoderGrads::zeros_for(&encoder) {
+            Ok(g) => g, Err(_) => return,
+        };
+
+        let batch = HipBatch::new();
+        let _ = grads.zero_resident(&batch);
+
+        let bytes: Vec<u8> = (0..N_BYTES as u8).collect();
+        let boundaries = vec![0, 4, N_BYTES];
+        let mut patch_reps_out = match GpuVec::try_hip(N_PATCHES * PATCH_DIM) {
+            Ok(v) => v, Err(_) => return,
+        };
+
+        encoder.byte_kv_cache.reset();
+        encoder.forward_for_backward(
+            &batch, &bytes, &boundaries, &mut scratch, &mut cache, &mut patch_reps_out,
+        ).expect("forward_for_backward");
+
+        // Path #1 gradient (d_patch_reps): all zeros — no gradient via cross-attn.
+        let d_patch_host = vec![0.0f32; N_PATCHES * PATCH_DIM];
+        let mut d_patch_reps = match GpuVec::try_hip(N_PATCHES * PATCH_DIM) {
+            Ok(v) => v, Err(_) => return,
+        };
+        d_patch_reps.copy_from(&d_patch_host);
+
+        // Path #2 gradient (d_seed_byte_reps_extra): non-zero everywhere.
+        let d_seed_host: Vec<f32> = (0..N_BYTES * BYTE_DIM)
+            .map(|i| 0.01 + (i as f32) * 0.003).collect();
+        let mut d_seed = match GpuVec::try_hip(N_BYTES * BYTE_DIM) {
+            Ok(v) => v, Err(_) => return,
+        };
+        d_seed.copy_from(&d_seed_host);
+
+        encoder.backward(
+            &batch, &bytes, &boundaries, &mut scratch, &mut bwd_scratch,
+            &cache, &d_patch_reps, Some(&d_seed), &mut grads,
+        ).expect("encoder backward with seed extra");
+        batch.flush().expect("flush");
+
+        // The byte-embed grad can ONLY be non-zero if gradient propagated
+        // all the way through the block stack, which requires the seed
+        // path to be honoured.
+        let mut d_embed = vec![0.0f32; 256 * BYTE_DIM];
+        grads.d_byte_embed.copy_to_host(&mut d_embed);
+        let mut sumsq = 0.0f32;
+        for &v in &d_embed {
+            assert!(v.is_finite(), "d_byte_embed non-finite");
+            sumsq += v * v;
+        }
+        assert!(sumsq > 0.0,
+            "d_byte_embed must be non-zero — seed-path gradient was dropped");
     }
 }
