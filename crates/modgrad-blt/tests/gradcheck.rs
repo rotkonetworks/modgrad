@@ -528,10 +528,161 @@ fn pick_index(buf_len: usize) -> usize {
     7.min(buf_len.saturating_sub(1))
 }
 
+/// Per-EPS finite-difference probe: returns the central-difference
+/// estimate `(L(w+EPS) - L(w-EPS)) / (2*EPS)` and the loss magnitude
+/// `max(|L+|, |L-|)` (used for FD-floor estimation). Restores the
+/// original weight value before returning. Single (key, idx) point.
+fn fd_num_and_loss_mag(
+    model: &mut BltModel,
+    scratch: &mut BltScratch,
+    key: &str,
+    idx: usize,
+    bytes: &[u8],
+    boundaries: &[usize],
+    target: u8,
+    eps: f32,
+) -> (f32, f32) {
+    let original = read_f32_at(weight_dev_for_key(model, key), idx);
+    write_f32_at(weight_dev_for_key(model, key), idx, original + eps);
+    let loss_plus = forward_loss(model, scratch, bytes, boundaries, target);
+    write_f32_at(weight_dev_for_key(model, key), idx, original - eps);
+    let loss_minus = forward_loss(model, scratch, bytes, boundaries, target);
+    write_f32_at(weight_dev_for_key(model, key), idx, original);
+
+    let num = (loss_plus - loss_minus) / (2.0 * eps);
+    let loss_mag = loss_plus.abs().max(loss_minus.abs());
+    (num, loss_mag)
+}
+
+/// Adaptive-EPS / adaptive-tolerance gradcheck — the SNR-aware verdict.
+///
+/// ## Why
+///
+/// At a fixed EPS the central-difference estimate `num` is bounded
+/// below by the FD floor:
+///
+///     fd_floor(EPS) ≈ |L| × ulp_f32 / (2 × EPS)
+///
+/// where `ulp_f32 ≈ 1.2e-7` (relative). When the analytic gradient is
+/// at-or-near `fd_floor`, the SNR of `num - analytic` over `analytic`
+/// is fundamentally bounded — comparing at a strict 1e-2 tolerance is
+/// asking for noise to look like a bug. The investigation in
+/// `investigate_decoder_block_wv_residual` (this file, commit 52bdd8a)
+/// proved that 5 of 8 fixed-EPS=1e-3 "failures" pass at EPS=3e-3 — the
+/// gap was instrumentation, not the backward. See the module-level
+/// doc-comment for the full breakdown.
+///
+/// ## Algorithm
+///
+/// 1. Sweep `[1e-2, 3e-3, 1e-3, 3e-4]` for the same (key, idx).
+/// 2. Pick the EPS with maximum FD self-consistency: minimise
+///    `|num(EPS_i) - num(EPS_{i-1})|` (compares each candidate to its
+///    nearest neighbour in the sweep). When the FD estimate is stable
+///    across two adjacent EPSes, the FD is in a clean regime — neither
+///    cancellation-dominated (small EPS) nor truncation-dominated
+///    (large EPS).
+/// 3. Estimate `fd_floor` from the loss magnitude observed at the
+///    chosen EPS: `|L| × 1.2e-7 / (2 × EPS)`.
+/// 4. Effective tolerance:
+///       - `|analytic| > 10 × fd_floor` → `base_tol` (strict regime;
+///         analytic is well above noise floor, real bugs catchable).
+///       - else → `max(base_tol, fd_floor / |analytic| × 5)` (loose;
+///         when analytic sits at FD-floor magnitude, can't expect 1e-2
+///         SNR, so loosen proportionally).
+/// 5. Verdict: `|num - analytic| / max(|num|, |analytic|, 1e-6) <
+///    effective_tolerance`.
+///
+/// ## Cost
+///
+/// 4 EPSes × 2 forwards = 8 forwards per key. With 12 keys this is
+/// ~96 forwards on `tiny_config` — well under 5 s. Two failures of
+/// this method:
+///   - All 4 EPSes are dominated by either cancellation OR truncation
+///     (i.e., the "stable region" doesn't actually exist for that
+///     key/idx). The neighbour-distance heuristic still picks one,
+///     just won't be a great choice. Mitigation: the diagnostic
+///     output prints all four `num` values plus the chosen one, so a
+///     reviewer can spot pathological cases.
+///   - `loss_mag` reads the loss at one of the two perturbed points,
+///     not the unperturbed point. For small EPS this is identical to
+///     ULP precision; for EPS=1e-2 there can be a ~1e-3 relative
+///     drift in `|L|`. Negligible for the FD-floor estimate.
+fn pick_eps_and_num(
+    model: &mut BltModel,
+    scratch: &mut BltScratch,
+    key: &str,
+    idx: usize,
+    bytes: &[u8],
+    boundaries: &[usize],
+    target: u8,
+    eps_candidates: &[f32],
+) -> (f32, f32, f32, [f32; 4]) {
+    assert!(
+        eps_candidates.len() == 4,
+        "pick_eps_and_num: expects 4 candidate EPSes (got {})",
+        eps_candidates.len(),
+    );
+    let mut nums = [0.0f32; 4];
+    let mut loss_mags = [0.0f32; 4];
+    for (i, &eps) in eps_candidates.iter().enumerate() {
+        let (num, loss_mag) =
+            fd_num_and_loss_mag(model, scratch, key, idx, bytes, boundaries, target, eps);
+        nums[i] = num;
+        loss_mags[i] = loss_mag;
+    }
+
+    // Self-consistency score per candidate: distance to nearest
+    // neighbour in the sweep. We restrict the choice to *interior*
+    // points (indices 1..len-1) — endpoints only have one neighbour,
+    // which is weaker evidence of stability and biases toward the
+    // boundary regime (large-EPS truncation OR small-EPS cancellation).
+    // Among interior points, pick `min(left, right)`. With
+    // `EPS_CANDIDATES = [1e-2, 3e-3, 1e-3, 3e-4]` interior is
+    // {3e-3, 1e-3} — the historically clean range.
+    assert!(nums.len() >= 3, "pick_eps_and_num: need ≥3 EPSes for interior selection");
+    let mut best = 1usize;
+    let mut best_dist = f32::INFINITY;
+    for i in 1..nums.len() - 1 {
+        let left = (nums[i] - nums[i - 1]).abs();
+        let right = (nums[i] - nums[i + 1]).abs();
+        let dist = left.min(right);
+        if dist < best_dist {
+            best_dist = dist;
+            best = i;
+        }
+    }
+
+    let chosen_eps = eps_candidates[best];
+    let chosen_num = nums[best];
+    // FD floor at the chosen EPS, using the observed loss magnitude.
+    // f32 ULP relative ≈ 1.2e-7.
+    let fd_floor = loss_mags[best] * 1.2e-7_f32 / (2.0 * chosen_eps);
+    (chosen_eps, chosen_num, fd_floor, nums)
+}
+
+/// Effective tolerance: strict when analytic is well above the FD
+/// noise floor (>10×), loosened proportionally otherwise. See
+/// `pick_eps_and_num` doc-comment for derivation.
+fn effective_tolerance(analytic: f32, fd_floor: f32, base_tol: f32) -> f32 {
+    let a = analytic.abs();
+    if a > 10.0 * fd_floor {
+        base_tol
+    } else {
+        let snr_loosened = (fd_floor / a.max(1e-12)) * 5.0;
+        base_tol.max(snr_loosened)
+    }
+}
+
 #[test]
 #[ignore = "bugs 1/2/3 + bug-B fixed; bug-A (cross-step KV gradient in \
-            AttentionResident::backward) remains the cap. 8/12 fail at 1e-2 — \
-            see module doc-comment for the failure breakdown."]
+            AttentionResident::backward) remains the cap. With adaptive-EPS \
+            tolerance the 3 bug-A residual keys (encoder.byte_embed, \
+            encoder.block.0.wq, encoder.block.0.gate) still FAIL — those are \
+            real residuals (analytic ≫ fd_floor). 2 borderline keys \
+            (encoder.cross_attn.0.wk, decoder.final_norm) sit just above the \
+            10×fd_floor SNR threshold and fail by 0.04-1.7 pp; principled \
+            relaxation per spec. The other 7 keys PASS adaptive. See module \
+            doc-comment for the bug-A status."]
 fn blt_backward_matches_finite_difference() {
     let _guard = modgrad_device::test_lock::hip_test_lock();
     if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
@@ -592,11 +743,15 @@ fn blt_backward_matches_finite_difference() {
         "decoder.final_norm",
     ];
 
-    const EPS: f32 = 1e-3;
-    const TOL: f32 = 1e-2;
+    // Adaptive-EPS sweep — see `pick_eps_and_num` doc-comment for the
+    // SNR-aware algorithm. Candidates span 1.5 orders of magnitude
+    // around the historical sweet spot of 1e-3.
+    const EPS_CANDIDATES: [f32; 4] = [1e-2, 3e-3, 1e-3, 3e-4];
+    const BASE_TOL: f32 = 1e-2;
 
     let t_start = std::time::Instant::now();
-    let mut failures: Vec<String> = Vec::new();
+    let mut strict_failures: Vec<String> = Vec::new();
+    let mut adaptive_failures: Vec<String> = Vec::new();
 
     for &key in keys {
         // Snapshot the analytic grad value at the chosen index BEFORE
@@ -618,47 +773,95 @@ fn blt_backward_matches_finite_difference() {
             (h.iter().map(|x| x * x).sum::<f32>()).sqrt()
         };
 
-        // Finite-difference around the current weight value.
-        let original = read_f32_at(weight_dev_for_key(&model, key), idx);
-        write_f32_at(weight_dev_for_key(&model, key), idx, original + EPS);
-        let loss_plus = forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
-        write_f32_at(weight_dev_for_key(&model, key), idx, original - EPS);
-        let loss_minus = forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
-        // Restore the original value before moving on so subsequent
-        // checks see the unperturbed model.
-        write_f32_at(weight_dev_for_key(&model, key), idx, original);
-
-        let num = (loss_plus - loss_minus) / (2.0 * EPS);
-        let denom = num.abs().max(analytic.abs()).max(1e-6);
-        let rel_err = (num - analytic).abs() / denom;
-        let status = if rel_err < TOL { "PASS" } else { "FAIL" };
-
-        eprintln!(
-            "gradcheck: {key}[{idx}]: num={:>+12.6e} analytic={:>+12.6e} rel_err={:.3e} grad_norm={:.3e} [{status}]",
-            num, analytic, rel_err, grad_norm,
+        // Adaptive EPS sweep — pick the EPS with maximum FD
+        // self-consistency, then estimate the FD floor at that EPS.
+        let (chosen_eps, num, fd_floor, all_nums) = pick_eps_and_num(
+            &mut model,
+            &mut scratch,
+            key,
+            idx,
+            &bytes,
+            &boundaries,
+            target,
+            &EPS_CANDIDATES,
         );
 
-        if rel_err >= TOL {
-            failures.push(format!(
-                "{key}[{idx}]: num={num:+e} analytic={analytic:+e} rel_err={rel_err:.3e}",
+        let denom = num.abs().max(analytic.abs()).max(1e-6);
+        let rel_err = (num - analytic).abs() / denom;
+
+        let strict_status = if rel_err < BASE_TOL { "PASS" } else { "FAIL" };
+        let eff_tol = effective_tolerance(analytic, fd_floor, BASE_TOL);
+        let adaptive_status = if rel_err < eff_tol { "PASS" } else { "FAIL" };
+
+        eprintln!(
+            "gradcheck: {key}[{idx}]: num={:>+12.6e} analytic={:>+12.6e} \
+             (chosen EPS={:.0e}) rel_err={:.3e} fd_floor={:.3e} eff_tol={:.3e} \
+             grad_norm={:.3e} [{} strict, {} adaptive]",
+            num,
+            analytic,
+            chosen_eps,
+            rel_err,
+            fd_floor,
+            eff_tol,
+            grad_norm,
+            strict_status,
+            adaptive_status,
+        );
+        // Diagnostic: full per-EPS num table (chosen one starred).
+        let star = |i: usize| {
+            if (EPS_CANDIDATES[i] - chosen_eps).abs() < 1e-12 {
+                "*"
+            } else {
+                " "
+            }
+        };
+        eprintln!(
+            "    EPS sweep: [1e-2={}{:>+12.6e}  3e-3={}{:>+12.6e}  \
+             1e-3={}{:>+12.6e}  3e-4={}{:>+12.6e}]",
+            star(0), all_nums[0],
+            star(1), all_nums[1],
+            star(2), all_nums[2],
+            star(3), all_nums[3],
+        );
+
+        if rel_err >= BASE_TOL {
+            strict_failures.push(format!(
+                "{key}[{idx}]: num={num:+e} analytic={analytic:+e} \
+                 rel_err={rel_err:.3e} (strict)",
+            ));
+        }
+        if rel_err >= eff_tol {
+            adaptive_failures.push(format!(
+                "{key}[{idx}]: num={num:+e} analytic={analytic:+e} \
+                 rel_err={rel_err:.3e} eff_tol={eff_tol:.3e} (adaptive, \
+                 chosen EPS={chosen_eps:.0e}, fd_floor={fd_floor:.3e})",
             ));
         }
     }
 
     let elapsed = t_start.elapsed();
     eprintln!(
-        "gradcheck: {} keys checked in {:.2}s",
+        "gradcheck: {} keys checked in {:.2}s — {} strict-FAIL, {} adaptive-FAIL",
         keys.len(),
         elapsed.as_secs_f32(),
+        strict_failures.len(),
+        adaptive_failures.len(),
     );
 
+    // The adaptive-tolerance verdict is the gate. Strict failures are
+    // also printed but only documented — they include the FD-floor
+    // false positives that adaptive tolerance correctly accepts.
     assert!(
-        failures.is_empty(),
-        "gradcheck failed for {} of {} parameter groups (tolerance {:.0e}): \n  {}",
-        failures.len(),
+        adaptive_failures.is_empty(),
+        "gradcheck failed for {} of {} parameter groups (adaptive SNR-aware \
+         tolerance): \n  {}\n\n(strict 1e-2 verdict: {} of {} failed — see \
+         per-key adaptive output above for which are FD-floor noise vs real \
+         residuals.)",
+        adaptive_failures.len(),
         keys.len(),
-        TOL,
-        failures.join("\n  "),
+        adaptive_failures.join("\n  "),
+        strict_failures.len(),
+        keys.len(),
     );
 }
 

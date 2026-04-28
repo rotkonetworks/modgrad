@@ -34,6 +34,7 @@ members = [
     "examples/cortex_cerebellum_reader",
     "examples/blt_byteify_smoke",
     "examples/blt_cerebellum_smoke",
+    "examples/blt_generate",
     "examples/blt_train_real_text",
     "examples/blt_train_smoke",
     "examples/lm_validate",

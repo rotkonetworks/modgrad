@@ -707,6 +707,11 @@ impl BltModelTrainer {
     /// Read-only access to the wrapped model.
     pub fn model(&self) -> &BltModel { &self.model }
 
+    /// Mutable access to the wrapped model. Mirrors
+    /// [`BltTrainer::model_mut`] — used by callers that drive inference
+    /// (`BltModel::generate`) or model serialization after training.
+    pub fn model_mut(&mut self) -> &mut BltModel { &mut self.model }
+
     /// Loss values from completed [`Self::train_step`] calls, in order.
     pub fn loss_history(&self) -> &[f32] { &self.loss_history }
 

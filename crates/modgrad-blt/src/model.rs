@@ -617,6 +617,170 @@ impl BltModel {
 
         Ok(())
     }
+
+    /// Generate `n_new_bytes` bytes given a prompt. Greedy if
+    /// `temperature == 0.0`; temperature-sampled otherwise.
+    ///
+    /// Each output byte is computed by:
+    ///   1. Run [`Self::forward`] over `prompt + generated_so_far`.
+    ///   2. Read the last position's logits row.
+    ///   3. Sample (greedy argmax or softmax(logits / T) with a
+    ///      deterministic LCG seeded by `rng_seed`, mixed with the step
+    ///      number so each step draws a fresh sample without per-call
+    ///      RNG state).
+    ///   4. Append the sampled byte to the running token buffer.
+    ///
+    /// This is the **naive O(N²)** path — every step re-runs the full
+    /// encoder→latent→decoder chain over the entire `tokens` slice.
+    /// A KV-cached `generate` is a future slice; for tiny BLTs (the
+    /// `blt_generate` example operates on byte_dim=32, patch_dim=64,
+    /// 8 patches max) the overhead is microseconds per step.
+    ///
+    /// `boundaries` for each forward step is computed inline as a
+    /// fixed-stride patcher (stride = `ceil(n_bytes / max_patches)`,
+    /// capped at `max_patches`) — the same placeholder pattern used by
+    /// the [`isis_runtime::language_model::LanguageModel`] impl on
+    /// [`BltModel`]. Real BLT integration would route through the
+    /// entropy patcher; the smoke uses the placeholder.
+    ///
+    /// **Sliding window.** If `tokens.len()` exceeds the encoder's
+    /// `max_seq_len`, the leading bytes are dropped — only the trailing
+    /// `max_seq_len` bytes are forwarded. The model has no per-call
+    /// memory beyond the KV caches (which `forward` resets each call),
+    /// so this is the only way to keep the contract that
+    /// `bytes.len() <= encoder.max_seq_len` — see
+    /// `LocalEncoder::forward`'s `debug_assert`.
+    ///
+    /// All output bytes are valid `u8` values (0..=255 by construction).
+    pub fn generate(
+        &mut self,
+        batch: &HipBatch,
+        prompt: &[u8],
+        n_new_bytes: usize,
+        temperature: f32,
+        rng_seed: u64,
+        scratch: &mut BltScratch,
+    ) -> Result<Vec<u8>, ResidencyError> {
+        assert!(temperature >= 0.0,
+            "BltModel::generate: temperature must be non-negative, got {temperature}");
+
+        let max_seq_len = self.config.encoder.max_seq_len;
+        let max_patches = self.config.latent.max_patches;
+        assert!(max_seq_len >= 2,
+            "BltModel::generate: encoder.max_seq_len must be >= 2 to support a window");
+        assert!(max_patches >= 1,
+            "BltModel::generate: latent.max_patches must be >= 1");
+
+        // Numerical Recipes LCG. Stateless across calls — we recompute
+        // from `rng_seed ^ step` each step so re-running with the same
+        // seed yields identical output (greedy is also deterministic by
+        // construction, but temperature sampling needs the same seed →
+        // same draws property too, for `hdevalence`-style determinism
+        // checks in the smoke).
+        #[inline]
+        fn lcg_uniform(seed: u64, step: usize) -> f32 {
+            let mut s = seed ^ ((step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            s = s.wrapping_mul(6364136223846793005)
+                 .wrapping_add(1442695040888963407);
+            // Top 24 bits → [0, 1); standard trick.
+            ((s >> 40) as f32) / ((1u64 << 24) as f32)
+        }
+
+        let mut tokens: Vec<u8> = prompt.to_vec();
+        let mut generated: Vec<u8> = Vec::with_capacity(n_new_bytes);
+        let mut row = vec![0.0f32; 256];
+
+        for step in 0..n_new_bytes {
+            // Slide a window if we've grown past max_seq_len.
+            if tokens.len() > max_seq_len {
+                let drop = tokens.len() - max_seq_len;
+                tokens.drain(0..drop);
+            }
+            let n = tokens.len();
+            debug_assert!(n >= 1, "BltModel::generate: empty token buffer");
+            debug_assert!(n <= max_seq_len);
+
+            // Fixed-stride patcher (same placeholder as the
+            // `LanguageModel` impl). Stride is chosen so a `max_seq_len`
+            // window yields exactly `max_patches` patches; for shorter
+            // `n` we get fewer patches but never more than `max_patches`.
+            let stride = ((n + max_patches - 1) / max_patches).max(1);
+            let mut boundaries: Vec<usize> = Vec::with_capacity(max_patches + 1);
+            boundaries.push(0);
+            let mut b = stride;
+            while b < n {
+                boundaries.push(b);
+                b += stride;
+            }
+            if *boundaries.last().unwrap() != n {
+                boundaries.push(n);
+            }
+            // Cap at max_patches: should be impossible by construction
+            // of `stride`, but we assert defensively.
+            debug_assert!(boundaries.len().saturating_sub(1) <= max_patches,
+                "BltModel::generate: too many patches ({} > {})",
+                boundaries.len() - 1, max_patches);
+
+            // Fresh per-step logits buffer. `BltModel::forward` requires
+            // `byte_logits.len() == n * 256` (debug-assert); GpuVec is
+            // not resizeable so we allocate once per step. The naive
+            // O(N²) doc-comment above acknowledges this.
+            let mut byte_logits = GpuVec::try_hip(n * 256)?;
+            self.forward(batch, &tokens, &boundaries, scratch, &mut byte_logits)?;
+
+            // Read the LAST position's logits row.
+            let mut all_logits = vec![0.0f32; n * 256];
+            byte_logits.copy_to_host(&mut all_logits);
+            row.copy_from_slice(&all_logits[(n - 1) * 256..n * 256]);
+
+            // Sample.
+            let next_byte: u8 = if temperature == 0.0 {
+                // Greedy argmax. Stable: ties broken by lowest index.
+                let mut best_i = 0usize;
+                let mut best_v = row[0];
+                for (i, &v) in row.iter().enumerate().skip(1) {
+                    if v > best_v {
+                        best_v = v;
+                        best_i = i;
+                    }
+                }
+                best_i as u8
+            } else {
+                // softmax(logits / T) with a deterministic LCG draw.
+                let inv_t = 1.0 / temperature;
+                let mut max_v = f32::NEG_INFINITY;
+                for &v in &row {
+                    let s = v * inv_t;
+                    if s > max_v { max_v = s; }
+                }
+                let mut sum = 0.0f64;
+                let mut probs = [0.0f32; 256];
+                for i in 0..256 {
+                    let p = ((row[i] * inv_t) - max_v).exp();
+                    probs[i] = p;
+                    sum += p as f64;
+                }
+                debug_assert!(sum > 0.0, "BltModel::generate: softmax sum is zero");
+                let inv_sum = 1.0f32 / (sum as f32);
+                let u = lcg_uniform(rng_seed, step);
+                let mut cdf = 0.0f32;
+                let mut chosen = 255usize;
+                for i in 0..256 {
+                    cdf += probs[i] * inv_sum;
+                    if u <= cdf {
+                        chosen = i;
+                        break;
+                    }
+                }
+                chosen as u8
+            };
+
+            generated.push(next_byte);
+            tokens.push(next_byte);
+        }
+
+        Ok(generated)
+    }
 }
 
 // ─── Backward state ──────────────────────────────────────────
