@@ -6,11 +6,7 @@ description = "isis runtime — the default brain built on the modgrad SDK"
 license = "MIT"
 
 [features]
-# Defaults match the top-level modgrad crate: CUDA is default-on
-# (dynamic-loading cudarc, builds on any host). ROCm is opt-in via
-# `--features rocm` until rocm.rs is ported from `#[link]` to
-# libloading and stops demanding libamdhip64/libhipblas at link time.
-default = ["cuda"]
+default = ["rocm"]
 cuda = ["modgrad-device/cuda"]
 # Enables device-resident weight streaming (LinearResidentStreaming +
 # GpuVec::Hip) needed by the layer scheduler. Mirrors the wiring in
