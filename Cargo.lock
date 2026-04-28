@@ -316,6 +316,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blt_byteify_smoke"
+version = "0.1.0"
+dependencies = [
+ "modgrad-blt",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "blt_cerebellum_smoke"
 version = "0.1.0"
 dependencies = [

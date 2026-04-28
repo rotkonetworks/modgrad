@@ -1,0 +1,18 @@
+[package]
+name = "blt_byteify_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Proof-of-life: ByteifyRecipe::from_qwen2 + BltTrainer compose; per-component LR routing per BLT §6.2."
+
+[[bin]]
+name = "blt_byteify_smoke"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-blt        = { path = "../../crates/modgrad-blt", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+
+[features]
+default = []

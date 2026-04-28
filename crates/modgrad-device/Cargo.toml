@@ -32,6 +32,12 @@ rocm = []
 # types); this flag controls whether the backend is ACTIVE in the
 # dispatch registry.
 kfd = []
+# Test-only utilities exported for use across the workspace's test
+# suites. Currently exposes `test_lock::hip_test_lock()`, a process-
+# wide mutex for serializing HIP-using tests that share the device's
+# default stream. Downstream crates enable it under `[dev-dependencies]`
+# so non-test builds don't compile the helpers.
+test-utils = []
 
 [dependencies]
 libc = "0.2"

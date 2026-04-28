@@ -12,3 +12,10 @@ pub mod cuda;
 pub mod gpu;
 pub mod kfd;
 pub mod backend;
+
+// Shared lock for HIP-using tests across the workspace. Gated behind
+// `test-utils` so non-test builds are unaffected; downstream crates
+// enable it under their `[dev-dependencies]`. See `test_lock.rs` for
+// rationale and usage.
+#[cfg(feature = "test-utils")]
+pub mod test_lock;
