@@ -132,6 +132,16 @@
 //! real backward bug — `grad_norm = 0` even though numerical gradient
 //! is non-zero). The verbose output IS the proof artifact — copy-paste
 //! it into bug reports verbatim.
+//!
+//! ## Coverage variants (also `#[ignore]`'d today)
+//!
+//! - `blt_backward_multi_idx` — same input, 3 indices per key. Reveals
+//!   whether bug-A is uniform or position-dependent across each
+//!   weight buffer.
+//! - `blt_backward_multi_input` — same idx, 3 input variants. Reveals
+//!   whether the failure pattern depends on input distribution.
+//!
+//! Both should pass after bugs A/B are fixed in modgrad-transformer.
 
 #![cfg(feature = "rocm")]
 
@@ -143,12 +153,10 @@ use modgrad_blt::model::{
 use modgrad_compute::backend::GpuVec;
 use modgrad_device::backend::rocm::ffi::runtime_available;
 use modgrad_device::backend::{HipBatch, HipBuffer};
-use std::sync::Mutex;
 
-/// HIP runtime tests must run serially — same rationale as the
-/// `model.rs::tests::HIP_TEST_LOCK`. Multiple concurrent resident
-/// dispatches share the default stream.
-static HIP_GRADCHECK_LOCK: Mutex<()> = Mutex::new(());
+// HIP runtime tests in this file acquire the process-wide
+// `modgrad_device::test_lock::hip_test_lock()` to serialize against every
+// other HIP test in the workspace (default-stream contention).
 
 /// Tiny BLT config — 32 bytes, 8 patches, lE=1 lL=2 lD=1. Lifted from
 /// `model::tests::tiny_config` so this integration test does not depend
@@ -480,7 +488,7 @@ fn pick_index(buf_len: usize) -> usize {
             AttentionResident::backward (bug-A cross-step KV grad dropped, bug-B \
             rms_norm_backward_per_head unconditional). See module doc-comment."]
 fn blt_backward_matches_finite_difference() {
-    let _guard = HIP_GRADCHECK_LOCK.lock().unwrap();
+    let _guard = modgrad_device::test_lock::hip_test_lock();
     if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
         eprintln!("gradcheck: MODGRAD_SKIP_HIP_TESTS set, skipping");
         return;
@@ -604,6 +612,275 @@ fn blt_backward_matches_finite_difference() {
         "gradcheck failed for {} of {} parameter groups (tolerance {:.0e}): \n  {}",
         failures.len(),
         keys.len(),
+        TOL,
+        failures.join("\n  "),
+    );
+}
+
+/// Pick three indices spanning a weight buffer: first, mid, last. Used
+/// by `blt_backward_multi_idx` to characterize whether per-key failures
+/// are uniform across the buffer or position-dependent.
+fn pick_three_indices(buf_len: usize) -> [usize; 3] {
+    [0, buf_len / 2, buf_len.saturating_sub(1)]
+}
+
+/// 32-byte deterministic LCG sequence seeded at `seed`. Glibc-style
+/// linear congruential generator (a=1103515245, c=12345, m=2^31). The
+/// low byte of the state is the output. Stable across runs and
+/// platforms — keeps gradcheck reproducible.
+fn lcg_bytes(seed: u32, n: usize) -> Vec<u8> {
+    let mut state: u32 = seed;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out.push((state & 0xFF) as u8);
+    }
+    out
+}
+
+#[test]
+#[ignore = "Multi-idx variant: characterizes whether per-key failures \
+            are uniform across the weight buffer or position-dependent"]
+fn blt_backward_multi_idx() {
+    let _guard = modgrad_device::test_lock::hip_test_lock();
+    if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+        eprintln!("gradcheck: MODGRAD_SKIP_HIP_TESTS set, skipping");
+        return;
+    }
+    if !runtime_available() {
+        eprintln!("gradcheck: HIP unavailable, skipping");
+        return;
+    }
+
+    let config = tiny_config();
+    let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+    let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+    let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+
+    let bytes: Vec<u8> = (0..32u8).collect();
+    let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+    let target: u8 = 17;
+
+    run_forward_backward(
+        &mut model, &mut scratch, &mut state, &bytes, &boundaries, target,
+    );
+
+    let keys: &[&str] = &[
+        "encoder.byte_embed",
+        "encoder.block.0.wq",
+        "encoder.block.0.gate",
+        "encoder.cross_attn.0.wk",
+        "latent.block.0.wq",
+        "latent.block.0.gate",
+        "latent.block.1.wo",
+        "latent.final_norm",
+        "decoder.block.0.wv",
+        "decoder.cross_attn.0.wq",
+        "decoder.lm_head",
+        "decoder.final_norm",
+    ];
+
+    const EPS: f32 = 1e-3;
+    const TOL: f32 = 1e-2;
+
+    let t_start = std::time::Instant::now();
+    let mut failures: Vec<String> = Vec::new();
+
+    eprintln!(
+        "gradcheck multi-idx: 12 keys × 3 indices (first/mid/last) — input=(0..32), target={target}"
+    );
+    eprintln!(
+        "{:<32} {:>8} {:>8} {:>14} {:>14} {:>10} {:>5}",
+        "key", "buf_len", "idx", "num", "analytic", "rel_err", "stat",
+    );
+
+    for &key in keys {
+        let grad_buf_len = grad_dev_for_key(&state, key).len();
+        let weight_buf_len = weight_dev_for_key(&model, key).len_f32();
+        let n = grad_buf_len.min(weight_buf_len);
+        let indices = pick_three_indices(n);
+
+        for &idx in &indices {
+            let analytic = read_grad_at(grad_dev_for_key(&state, key), idx);
+
+            let original = read_f32_at(weight_dev_for_key(&model, key), idx);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original + EPS);
+            let loss_plus =
+                forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original - EPS);
+            let loss_minus =
+                forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original);
+
+            let num = (loss_plus - loss_minus) / (2.0 * EPS);
+            let denom = num.abs().max(analytic.abs()).max(1e-6);
+            let rel_err = (num - analytic).abs() / denom;
+            let status = if rel_err < TOL { "PASS" } else { "FAIL" };
+
+            eprintln!(
+                "{:<32} {:>8} {:>8} {:>+14.6e} {:>+14.6e} {:>10.3e} {:>5}",
+                key, n, idx, num, analytic, rel_err, status,
+            );
+
+            if rel_err >= TOL {
+                failures.push(format!(
+                    "{key}[{idx}]: num={num:+e} analytic={analytic:+e} rel_err={rel_err:.3e}",
+                ));
+            }
+        }
+    }
+
+    let elapsed = t_start.elapsed();
+    eprintln!(
+        "gradcheck multi-idx: {} keys × 3 indices = {} checks in {:.2}s",
+        keys.len(),
+        keys.len() * 3,
+        elapsed.as_secs_f32(),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "gradcheck multi-idx failed for {} of {} (key,idx) pairs (tolerance {:.0e}): \n  {}",
+        failures.len(),
+        keys.len() * 3,
+        TOL,
+        failures.join("\n  "),
+    );
+}
+
+#[test]
+#[ignore = "Multi-input variant: characterizes whether per-key failures \
+            depend on input distribution"]
+fn blt_backward_multi_input() {
+    let _guard = modgrad_device::test_lock::hip_test_lock();
+    if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+        eprintln!("gradcheck: MODGRAD_SKIP_HIP_TESTS set, skipping");
+        return;
+    }
+    if !runtime_available() {
+        eprintln!("gradcheck: HIP unavailable, skipping");
+        return;
+    }
+
+    let config = tiny_config();
+    let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+    let target: u8 = 17;
+
+    let inputs: [(&str, Vec<u8>); 3] = [
+        ("seq", (0..32u8).collect()),
+        ("const", vec![65u8; 32]),
+        ("lcg", lcg_bytes(0xC0DE, 32)),
+    ];
+
+    let keys: &[&str] = &[
+        "encoder.byte_embed",
+        "encoder.block.0.wq",
+        "encoder.block.0.gate",
+        "encoder.cross_attn.0.wk",
+        "latent.block.0.wq",
+        "latent.block.0.gate",
+        "latent.block.1.wo",
+        "latent.final_norm",
+        "decoder.block.0.wv",
+        "decoder.cross_attn.0.wq",
+        "decoder.lm_head",
+        "decoder.final_norm",
+    ];
+
+    const EPS: f32 = 1e-3;
+    const TOL: f32 = 1e-2;
+
+    // Collect rel_err for each (key, input) into a 12×3 grid for the
+    // summary table at the end.
+    let mut grid: Vec<[f32; 3]> = vec![[f32::NAN; 3]; keys.len()];
+
+    let t_start = std::time::Instant::now();
+    let mut failures: Vec<String> = Vec::new();
+
+    eprintln!(
+        "gradcheck multi-input: 12 keys × 3 inputs (seq | const-65 | lcg-0xC0DE), target={target}, idx=pick_index(n)"
+    );
+    eprintln!(
+        "{:<32} {:>6} {:>8} {:>14} {:>14} {:>10} {:>5}",
+        "key", "input", "idx", "num", "analytic", "rel_err", "stat",
+    );
+
+    for (col, (label, bytes)) in inputs.iter().enumerate() {
+        // Fresh state per input so backward grads aren't accumulated
+        // across calls (BltBackwardState::zero_resident is called inside
+        // run_forward_backward, but a fresh state mirrors how the
+        // original test runs).
+        let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+        let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+        let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+
+        run_forward_backward(
+            &mut model, &mut scratch, &mut state, bytes, &boundaries, target,
+        );
+
+        for (row, &key) in keys.iter().enumerate() {
+            let grad_buf_len = grad_dev_for_key(&state, key).len();
+            let weight_buf_len = weight_dev_for_key(&model, key).len_f32();
+            let n = grad_buf_len.min(weight_buf_len);
+            let idx = pick_index(n);
+            let analytic = read_grad_at(grad_dev_for_key(&state, key), idx);
+
+            let original = read_f32_at(weight_dev_for_key(&model, key), idx);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original + EPS);
+            let loss_plus =
+                forward_loss(&mut model, &mut scratch, bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original - EPS);
+            let loss_minus =
+                forward_loss(&mut model, &mut scratch, bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original);
+
+            let num = (loss_plus - loss_minus) / (2.0 * EPS);
+            let denom = num.abs().max(analytic.abs()).max(1e-6);
+            let rel_err = (num - analytic).abs() / denom;
+            let status = if rel_err < TOL { "PASS" } else { "FAIL" };
+
+            eprintln!(
+                "{:<32} {:>6} {:>8} {:>+14.6e} {:>+14.6e} {:>10.3e} {:>5}",
+                key, label, idx, num, analytic, rel_err, status,
+            );
+
+            grid[row][col] = rel_err;
+
+            if rel_err >= TOL {
+                failures.push(format!(
+                    "{key}[{idx}] input={label}: num={num:+e} analytic={analytic:+e} rel_err={rel_err:.3e}",
+                ));
+            }
+        }
+    }
+
+    // 12×3 summary table — rel_err per (key, input).
+    eprintln!();
+    eprintln!("gradcheck multi-input summary (rel_err):");
+    eprintln!(
+        "{:<32} {:>12} {:>12} {:>12}",
+        "key", "seq", "const", "lcg",
+    );
+    for (row, &key) in keys.iter().enumerate() {
+        eprintln!(
+            "{:<32} {:>12.3e} {:>12.3e} {:>12.3e}",
+            key, grid[row][0], grid[row][1], grid[row][2],
+        );
+    }
+
+    let elapsed = t_start.elapsed();
+    eprintln!(
+        "gradcheck multi-input: {} keys × 3 inputs = {} checks in {:.2}s",
+        keys.len(),
+        keys.len() * 3,
+        elapsed.as_secs_f32(),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "gradcheck multi-input failed for {} of {} (key,input) pairs (tolerance {:.0e}): \n  {}",
+        failures.len(),
+        keys.len() * 3,
         TOL,
         failures.join("\n  "),
     );

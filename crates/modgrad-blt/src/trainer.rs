@@ -1207,17 +1207,16 @@ mod tests {
 
     // ─── BltModelTrainer tests ────────────────────────────────
 
+    // HIP-using tests below acquire the process-wide
+    // `modgrad_device::test_lock::hip_test_lock()` so they serialize
+    // against every other HIP test in the workspace (default-stream
+    // contention under `cargo test`'s default thread parallelism).
+
     use crate::byteify::ByteifyRecipe;
     use crate::decoder::LocalDecoderConfig;
     use crate::encoder::LocalEncoderConfig;
     use crate::model::{BltConfig, BltLatentConfig, BltModel};
     use modgrad_device::backend::rocm::ffi::runtime_available;
-    use std::sync::Mutex;
-
-    /// HIP runtime tests must run serially — the resident dispatch path
-    /// shares the default stream. Mirrors the `tests::HIP_TEST_LOCK` in
-    /// `model.rs`.
-    static MODEL_TRAINER_LOCK: Mutex<()> = Mutex::new(());
 
     /// Tiny config — same shape as `model::tests::tiny_config` but
     /// duplicated here so the trainer tests don't pull from a private
@@ -1283,7 +1282,7 @@ mod tests {
 
     #[test]
     fn blt_model_trainer_alloc() {
-        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
             return;
         }
@@ -1331,7 +1330,7 @@ mod tests {
         //     zero slots stay at zero.
         // This pins the f32 reduction shape against an analytic answer
         // — any drift from the documented algorithm flags here.
-        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
             return;
         }
@@ -1389,7 +1388,7 @@ mod tests {
     #[test]
     fn blt_model_trainer_clip_disabled_passes_through() {
         // `grad_clip = 0.0` must short-circuit — values stay untouched.
-        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
             return;
         }
@@ -1424,7 +1423,7 @@ mod tests {
 
     #[test]
     fn blt_model_trainer_loss_finite() {
-        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
             return;
         }

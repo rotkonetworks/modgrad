@@ -798,14 +798,24 @@ impl AttentionResident {
 
         let mut d_q_proj_host = vec![0.0f32; model_dim];
         let mut d_k_proj_host = vec![0.0f32; kv_dim];
-        rms_norm_backward_per_head(
-            &q_proj_host, &d_q_normed_host, &mut d_q_proj_host,
-            num_heads, head_dim, self.qk_scale, self.norm_eps,
-        );
-        rms_norm_backward_per_head(
-            &k_proj_host, &d_k_current_post_rope, &mut d_k_proj_host,
-            num_kv_heads, head_dim, self.qk_scale, self.norm_eps,
-        );
+        if self.use_qk_norm {
+            rms_norm_backward_per_head(
+                &q_proj_host, &d_q_normed_host, &mut d_q_proj_host,
+                num_heads, head_dim, self.qk_scale, self.norm_eps,
+            );
+            rms_norm_backward_per_head(
+                &k_proj_host, &d_k_current_post_rope, &mut d_k_proj_host,
+                num_kv_heads, head_dim, self.qk_scale, self.norm_eps,
+            );
+        } else {
+            // QK norm was skipped in forward (use_qk_norm = false): the
+            // forward copies q_proj/k_proj straight into the q_normed/
+            // k_normed slots before RoPE, so backward's identity-
+            // passthrough is the exact inverse. q_proj_host / k_proj_host
+            // and self.qk_scale are unused on this branch.
+            d_q_proj_host.copy_from_slice(&d_q_normed_host);
+            d_k_proj_host.copy_from_slice(&d_k_current_post_rope);
+        }
 
         // Stage 7: H2D the d_q_proj, d_k_proj, d_v_proj, then call
         // q/k/v_proj.backward.
@@ -2578,6 +2588,7 @@ mod tests {
             max_seq_len: SeqLen::new(16),
             rope_base: 10000.0,
             qk_norm_scale: 1.0,
+            use_qk_norm: true,
             window_pattern: WindowPattern::Full,
             mlp_activation: MlpActivation::SwiGlu,
             layer_overrides: Vec::new(),

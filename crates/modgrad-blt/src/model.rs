@@ -1358,14 +1358,14 @@ impl isis_runtime::language_model::LanguageModel for BltModel {
 
 #[cfg(test)]
 mod tests {
+    //! HIP-using tests in this module acquire the process-wide
+    //! `modgrad_device::test_lock::hip_test_lock()` to serialize against
+    //! every other HIP test in the workspace; see that module's docs for
+    //! the rationale (default-stream contention under `cargo test`'s
+    //! default thread parallelism).
+
     use super::*;
     use modgrad_device::backend::rocm::ffi::runtime_available;
-    use std::sync::Mutex;
-
-    /// HIP runtime tests must run serially — same rationale as the
-    /// `modgrad-transformer::resident` test guard. Multiple concurrent
-    /// resident dispatches share the default stream.
-    static HIP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Tiny config the smoke test uses: 32 bytes → 8 patches, byte_dim=32,
     /// patch_dim=64, lE=1, lL=2, lD=1. Total params are kilobytes — the
@@ -1421,7 +1421,7 @@ mod tests {
 
     #[test]
     fn blt_model_forward_smoke() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn blt_backward_state_alloc_and_zero() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -1526,7 +1526,7 @@ mod tests {
     /// back, not the canonical RMSNorm-at-init = 1.0 vector.
     #[test]
     fn pretrained_final_norm_propagates() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
