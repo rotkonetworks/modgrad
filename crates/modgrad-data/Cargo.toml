@@ -6,6 +6,7 @@ description = "Data pipeline for the modgrad ML SDK: tokenization, streaming"
 license = "MIT"
 
 [dependencies]
+modgrad-traits = { path = "../modgrad-traits" }
 modgrad-compute = { path = "../modgrad-compute" }
 modgrad-codec = { path = "../modgrad-codec" }
 serde = { version = "1", features = ["derive"] }

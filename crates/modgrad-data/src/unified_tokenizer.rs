@@ -105,26 +105,9 @@ pub const QWEN_VOCAB: usize = 151_936;
 // Compile-time invariant: action range ends below Qwen specials.
 const _: () = assert!(ACTION_END <= QWEN_SPECIAL_START);
 
-/// What kind of token a unified-vocab i64 represents on the target
-/// LLM's vocab. Returned by [`UnifiedTokenizer::decode_modality`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Modality {
-    /// 0..256 — Qwen's native byte BPE tokens, untouched.
-    Byte,
-    /// One of the delimiter slots (`<img>`, `</img>`, etc.).
-    Delimiter,
-    /// Image VQ code in the reserved offset range.
-    ImageVq,
-    /// Audio VQ code.
-    AudioVq,
-    /// Timestamp tick.
-    Timestamp,
-    /// Action token (mouse / keyboard / coordinate).
-    Action,
-    /// Anything else — Qwen's normal vocab (256..140000), Qwen's
-    /// reserved specials, or unrecognised / out-of-range tokens.
-    Other,
-}
+/// Canonical `Modality` lives in `modgrad-traits`; re-exported here for
+/// ergonomic access. Returned by [`UnifiedTokenizer::decode_modality`].
+pub use modgrad_traits::cerebellum::Modality;
 
 /// The six well-known multimodal delimiters. Stable order — index in
 /// this enum equals offset from [`DELIM_START`].

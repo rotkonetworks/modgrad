@@ -1,0 +1,20 @@
+[package]
+name = "blt_cerebellum_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Proof-of-life: tiny BltModel wrapped as BltCerebellum exposes patch-aligned per-layer cache; projection works."
+
+[[bin]]
+name = "blt_cerebellum_smoke"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-blt        = { path = "../../crates/modgrad-blt", features = ["rocm"] }
+modgrad-ctm        = { path = "../../crates/modgrad-ctm", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-traits     = { path = "../../crates/modgrad-traits" }
+
+[features]
+default = []

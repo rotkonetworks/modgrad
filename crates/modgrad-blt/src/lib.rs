@@ -45,6 +45,13 @@ pub mod decoder;
 pub mod model;
 pub mod trainer;
 pub mod byteify;
+/// Device-resident `FrozenCerebellum` adapter wrapping a [`model::BltModel`]
+/// (Byte Latent Transformer). Exposes the latent transformer's
+/// per-layer hidden states only — encoder/decoder are byte-level
+/// adapters, treated as opaque. **Cache rows are PATCHES, not bytes**;
+/// see module docs. Only available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub mod cerebellum;
 
 /// Re-export of the BLT hash n-gram embedding (see paper §3.2.1). The
 /// implementation lives in `modgrad-codec` because it is byte-level
