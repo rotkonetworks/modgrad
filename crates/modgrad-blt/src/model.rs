@@ -185,12 +185,52 @@ impl BltModel {
     /// in the SDK. Byteification (initialising the latent from a Qwen2.5
     /// safetensors checkpoint) is the [`crate::byteify`] slice.
     pub fn new(config: BltConfig) -> Result<Self, ResidencyError> {
+        Self::build(config, None)
+    }
+
+    /// Like [`Self::new`], but explicitly initialises the latent's final
+    /// RMSNorm scale from the supplied weights (length must equal
+    /// `config.latent.patch_dim`). Used by the byteification recipe
+    /// (paper §6.2) to preserve the pretrained model's final-norm scale
+    /// rather than resetting it to all-ones — `BltModel::new` keeps the
+    /// canonical RMSNorm-at-init convention (scale = 1) for greenfield
+    /// training; `with_pretrained_final_norm` is the path for
+    /// initialising from a Qwen2.5 (or similar) safetensors checkpoint
+    /// where the trained final-norm scale is non-trivial and must flow
+    /// through into both the host model and the resident device buffer.
+    ///
+    /// Returns [`ResidencyError::WrongVariant`] if
+    /// `pretrained_final_norm.len() != config.latent.patch_dim`.
+    pub fn with_pretrained_final_norm(
+        config: BltConfig,
+        pretrained_final_norm: &[f32],
+    ) -> Result<Self, ResidencyError> {
+        if pretrained_final_norm.len() != config.latent.patch_dim {
+            return Err(ResidencyError::WrongVariant {
+                expected: "pretrained_final_norm.len() == config.latent.patch_dim",
+                got: "pretrained final-norm scale length mismatch",
+            });
+        }
+        Self::build(config, Some(pretrained_final_norm))
+    }
+
+    /// Shared constructor body — both [`Self::new`] and
+    /// [`Self::with_pretrained_final_norm`] route through here. `None`
+    /// preserves the all-ones RMSNorm-at-init convention; `Some(scale)`
+    /// flows the supplied scale into both the host `GptModel` (via its
+    /// `final_norm.scale`) and the parallel resident buffer
+    /// `latent_final_norm_weight_dev`, keeping the two views in sync.
+    fn build(
+        config: BltConfig,
+        pretrained_final_norm: Option<&[f32]>,
+    ) -> Result<Self, ResidencyError> {
         config.validate()?;
 
         let encoder = LocalEncoder::new(config.encoder.clone())?;
         let decoder = LocalDecoder::new(config.decoder.clone())?;
 
-        let (latent, latent_final_norm_weight_dev) = build_latent(&config.latent)?;
+        let (latent, latent_final_norm_weight_dev) =
+            build_latent(&config.latent, pretrained_final_norm)?;
         let latent_gpt = config.latent.to_gpt_config();
         let latent_kv_cache = KvCacheResident::new(
             latent_gpt.num_layers.get(),
@@ -795,11 +835,23 @@ impl BltLatentScratch {
 
 // ─── Internals ───────────────────────────────────────────────
 
-/// Build the latent transformer + a fresh `[patch_dim]` ones final-norm
-/// buffer. Wraps the existing `GptModelResident::from_model` recipe
-/// from the test harness in `modgrad-transformer`.
+/// Build the latent transformer + a `[patch_dim]` final-norm buffer.
+/// Wraps the existing `GptModelResident::from_model` recipe from the
+/// test harness in `modgrad-transformer`.
+///
+/// `pretrained_final_norm`:
+/// - `None` — initialise the host model's `final_norm.scale` and the
+///   parallel device buffer to all-ones (canonical RMSNorm-at-init
+///   convention; correct for greenfield training).
+/// - `Some(scale)` — copy `scale` (length checked by the caller) into
+///   both the host `final_norm.scale` and the resident device buffer.
+///   This is the byteification path: the BLT loads a pretrained
+///   Qwen-class checkpoint whose final-norm scale has been trained away
+///   from 1.0, so the latent must be initialised to the actual values
+///   from safetensors rather than silently reset to ones.
 fn build_latent(
     config: &BltLatentConfig,
+    pretrained_final_norm: Option<&[f32]>,
 ) -> Result<(GptModelResident, HipBuffer), ResidencyError> {
     use modgrad_compute::neuron::SimpleRng;
     use modgrad_transformer::attention::{AttentionWeights, CausalSelfAttention};
@@ -829,7 +881,17 @@ fn build_latent(
 
     let token_embed = randn(&mut rng, vocab * pd);
     let lm_head = randn(&mut rng, vocab * pd);
-    let final_norm_scale = vec![1.0f32; pd];
+    // Final-norm scale: pretrained override if supplied, else canonical
+    // RMSNorm-at-init = ones. Length is validated by the public caller
+    // (`with_pretrained_final_norm`); guard with `debug_assert` here so
+    // a bad direct call to `build_latent` in this module fails loudly.
+    let final_norm_scale: Vec<f32> = match pretrained_final_norm {
+        Some(scale) => {
+            debug_assert_eq!(scale.len(), pd);
+            scale.to_vec()
+        }
+        None => vec![1.0f32; pd],
+    };
     let smear_gate = vec![0.0f32; pd * gpt_config.smear.gate_channels];
 
     let mut blocks_host = Vec::with_capacity(config.n_layers.max(1));
@@ -1454,6 +1516,56 @@ mod tests {
         let batch = HipBatch::new();
         state.zero_resident(&batch).expect("BltBackwardState::zero_resident");
         let _ = batch.flush();
+    }
+
+    /// `with_pretrained_final_norm` must propagate the supplied scale
+    /// into the resident `latent_final_norm_weight_dev` buffer (rather
+    /// than silently overriding it with the all-ones init that
+    /// `BltModel::new` uses). This is the byteification correctness
+    /// check: load Qwen-class final-norm scale → BLT must serve it
+    /// back, not the canonical RMSNorm-at-init = 1.0 vector.
+    #[test]
+    fn pretrained_final_norm_propagates() {
+        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+            return;
+        }
+        let cfg = tiny_config();
+        let pd = cfg.latent.patch_dim;
+        // Distinct, non-trivial scale — index-encoded so any silent
+        // reset to ones / shuffle would be obvious in the assert.
+        let scale: Vec<f32> = (0..pd).map(|i| 1.0 + (i as f32) * 0.01).collect();
+        let model = BltModel::with_pretrained_final_norm(cfg.clone(), &scale)
+            .expect("with_pretrained_final_norm");
+
+        // Read back the resident device buffer and assert exact match.
+        let mut readback = vec![0.0_f32; pd];
+        model
+            .latent_final_norm_weight_dev
+            .copy_to_host(&mut readback)
+            .expect("copy_to_host");
+        for i in 0..pd {
+            assert!(
+                (readback[i] - scale[i]).abs() < 1e-6,
+                "final_norm_weight_dev[{i}] should be {} not {}",
+                scale[i],
+                readback[i],
+            );
+        }
+
+        // Length-mismatch path returns WrongVariant rather than
+        // panicking — guard the byteify caller against bad config.
+        let bad = vec![1.0_f32; pd + 1];
+        let err = BltModel::with_pretrained_final_norm(cfg, &bad).err()
+            .expect("length-mismatch must error");
+        match err {
+            ResidencyError::WrongVariant { .. } => (),
+            other => panic!("expected WrongVariant, got {other:?}"),
+        }
     }
 }
 

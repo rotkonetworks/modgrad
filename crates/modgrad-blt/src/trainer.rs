@@ -659,6 +659,16 @@ pub struct BltModelTrainer {
     state: BltBackwardState,
     scratch: BltScratch,
     adamw: HashMap<String, AdamWBuf>,
+    /// Per-param-key host scratch sized to match each grad `GpuVec`.
+    /// Pre-allocated once in [`BltModelTrainer::new`] (via
+    /// [`Self::alloc_adamw`]) and reused every [`Self::train_step`] —
+    /// eliminates the per-step `Vec<f32>` churn the previous clip path
+    /// incurred (one fresh allocation per param per step, and the
+    /// `BltModel` key set has on the order of dozens of params for the
+    /// tiny config and hundreds for Qwen2.5-0.5B-class scales). Each
+    /// step downloads grads into these slots, optionally clips them in
+    /// place, then hands them to [`AdamWBuf::step_resident`].
+    grad_host_scratch: HashMap<String, Vec<f32>>,
     config: BltTrainerConfig,
     is_global: Box<dyn Fn(&str) -> bool + Send>,
     loss_history: Vec<f32>,
@@ -684,6 +694,7 @@ impl BltModelTrainer {
             state,
             scratch,
             adamw: HashMap::new(),
+            grad_host_scratch: HashMap::new(),
             config,
             is_global,
             loss_history: Vec::new(),
@@ -782,30 +793,32 @@ impl BltModelTrainer {
         )?;
         batch.flush()?;
 
-        // Stage 5: optional global grad clip. Walk every grad GpuVec,
-        // download to a host vector, clip, and upload back. Order matches
-        // `param_keys_for_model` so the dispatch step below sees clipped
-        // values. Skipped when `grad_clip <= 0` (the no-clip default for
-        // sweeps that want raw norms).
+        // Stage 5: download grads into pre-allocated host scratch, then
+        // (optionally) apply the global grad-norm clip in place. The
+        // scratch is allocated once in `alloc_adamw`, reused every step
+        // — no per-call `Vec<f32>` churn. The download itself is paid
+        // because `AdamWBuf::step_resident` consumes a host slice; the
+        // clip stage only adds a scalar reduction + a conditional
+        // in-place scale (no second D2H/H2D round-trip). See
+        // [`Self::clip_grads_inplace`] for the algorithmic shape.
         let keys = param_keys_for_model(&self.model);
-        let mut grad_hosts: Vec<(String, Vec<f32>)> = Vec::with_capacity(keys.len());
         for k in &keys {
             let grad_dev = grad_dev_for_key(&self.state, k, &self.model);
-            let mut h = vec![0.0f32; grad_dev.len()];
-            grad_dev.copy_to_host(&mut h);
-            grad_hosts.push((k.clone(), h));
+            let host = self.grad_host_scratch.get_mut(k)
+                .expect("grad_host_scratch populated by alloc_adamw");
+            debug_assert_eq!(host.len(), grad_dev.len(),
+                "grad_host_scratch[{k}] sized {} != grad_dev sized {} — \
+                 model shape changed under the trainer",
+                host.len(), grad_dev.len());
+            grad_dev.copy_to_host(host.as_mut_slice());
         }
-        if self.config.grad_clip > 0.0 {
-            let mut slices: Vec<&mut [f32]> = grad_hosts.iter_mut()
-                .map(|(_, v)| v.as_mut_slice()).collect();
-            LmTrainer::<GptModelResident>::clip_grads(
-                &mut slices, self.config.grad_clip,
-            );
-        }
+        self.clip_grads_inplace();
 
         // Stage 6: per-param AdamW.
-        for (k, host_grad) in &grad_hosts {
+        for k in &keys {
             let weight_dev = weight_dev_for_blt_key(&self.model, k);
+            let host_grad = self.grad_host_scratch.get(k)
+                .expect("grad_host_scratch populated by alloc_adamw");
             let buf = self.adamw.get_mut(k)
                 .expect("adamw populated by alloc_adamw");
             let cfg = self.config.for_group((self.is_global)(k));
@@ -816,16 +829,75 @@ impl BltModelTrainer {
         Ok(loss)
     }
 
-    /// Pre-allocate one [`AdamWBuf`] per parameter buffer. Sizes are
-    /// derived from the model directly — same source-of-truth as
-    /// `weight_dev_for_blt_key`.
+    /// Pre-allocate one [`AdamWBuf`] and one host-scratch `Vec<f32>` per
+    /// parameter buffer. Sizes are derived from the model directly —
+    /// same source-of-truth as `weight_dev_for_blt_key`. Sharing the
+    /// allocation here is what lets the per-step grad-clip stage avoid
+    /// the per-call `Vec<f32>` churn (see [`Self::grad_host_scratch`]).
     fn alloc_adamw(&mut self) -> Result<(), ResidencyError> {
         let keys = param_keys_for_model(&self.model);
         for k in &keys {
             let n = grad_dev_for_key(&self.state, k, &self.model).len();
             self.adamw.insert(k.clone(), AdamWBuf::zeros(n)?);
+            self.grad_host_scratch.insert(k.clone(), vec![0.0f32; n]);
         }
         Ok(())
+    }
+
+    /// Apply the global gradient norm clip in place across every host
+    /// grad slot in `grad_host_scratch` (stage 5 of [`Self::train_step`]).
+    ///
+    /// ## Algorithmic shape
+    ///
+    /// 1. **Per-param scalar reduction.** Walk each host grad slice and
+    ///    accumulate `Σ x²` into a single f32 running sum
+    ///    (`global_sumsq`). Reduction stays in f32 to match the
+    ///    precision used downstream by `Op::AdamWResident` — using
+    ///    f64 here would compute a slightly different scale than the
+    ///    one AdamW's f32 path effectively sees once weights are
+    ///    updated. The accumulator overflows only for grads with
+    ///    `Σ x² > 3.4e38`, which is far past every practical range
+    ///    (Qwen2.5-0.5B with f32 weights and unit-scale grads sums to
+    ///    ~10⁸ at most).
+    /// 2. **Global norm.** `global_norm = sqrt(global_sumsq)` —
+    ///    one f32 sqrt total, host-side.
+    /// 3. **Conditional rescale.** If `global_norm > clip` (and
+    ///    `global_norm` is finite and positive), compute
+    ///    `scale = clip / global_norm` and multiply every grad slice
+    ///    by `scale` element-wise. No-op otherwise — preserves the
+    ///    original grad magnitudes when the model is well-behaved.
+    ///
+    /// ## Why this stayed host-side
+    ///
+    /// `AdamWBuf::step_resident` already takes a host `&[f32]` and
+    /// uploads it into `g_dev` itself, so the per-step download into
+    /// `grad_host_scratch` is required by the AdamW dispatch regardless
+    /// of whether we clip. The only redundancy this slice eliminates
+    /// is the per-step `Vec<f32>` allocation churn; the device→host
+    /// move is paid once per step either way until a resident sumsq
+    /// kernel + a resident scalar-multiply kernel both land in
+    /// `modgrad-device`. Adding those is out of scope for this fix
+    /// (no new kernels; preserve `train_step`'s public API).
+    fn clip_grads_inplace(&mut self) {
+        let clip = self.config.grad_clip;
+        if clip <= 0.0 {
+            return;
+        }
+        let mut global_sumsq: f32 = 0.0;
+        for v in self.grad_host_scratch.values() {
+            for &x in v.iter() {
+                global_sumsq += x * x;
+            }
+        }
+        let global_norm = global_sumsq.sqrt();
+        if global_norm.is_finite() && global_norm > clip && global_norm > 0.0 {
+            let scale = clip / global_norm;
+            for v in self.grad_host_scratch.values_mut() {
+                for x in v.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
     }
 }
 
@@ -1246,6 +1318,108 @@ mod tests {
         assert!(!keys_expected.iter().any(|k| k == "latent.lm_head"));
         assert!(!keys_expected.iter().any(|k| k == "embed"));
         assert!(!keys_expected.iter().any(|k| k == "lm_head"));
+    }
+
+    #[test]
+    fn blt_model_trainer_clip_grads_inplace_matches_reference() {
+        // Numerical correctness of the in-place host clip:
+        //   - Pick one param key, fill it with `value = 3.0`, length n.
+        //   - Leave every other key at zero.
+        //   - Global L2 norm = 3 * sqrt(n).
+        //   - With clip = 1.0, the chosen slot must scale to
+        //     `clip / norm * 3.0 = 1 / sqrt(n)` element-wise; the
+        //     zero slots stay at zero.
+        // This pins the f32 reduction shape against an analytic answer
+        // — any drift from the documented algorithm flags here.
+        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+            return;
+        }
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_blt_config();
+        let model = BltModel::new(config).expect("BltModel::new");
+
+        let trainer_cfg = BltTrainerConfig {
+            grad_clip: 1.0,
+            ..BltTrainerConfig::default()
+        };
+        let mut trainer = BltModelTrainer::new(
+            model,
+            trainer_cfg,
+            ByteifyRecipe::global_predicate(),
+        ).expect("BltModelTrainer::new");
+
+        // Pick a stable, present key for the non-zero grad slot.
+        let target_key = "encoder.block.0.wq".to_string();
+        assert!(trainer.grad_host_scratch.contains_key(&target_key),
+            "tiny_blt_config should expose {target_key}");
+
+        // Fill the chosen scratch with 3.0; leave all others at zero.
+        for (k, v) in trainer.grad_host_scratch.iter_mut() {
+            if *k == target_key {
+                v.fill(3.0);
+            } else {
+                v.fill(0.0);
+            }
+        }
+        let n = trainer.grad_host_scratch[&target_key].len();
+        let expected_norm = 3.0_f32 * (n as f32).sqrt();
+        let clip = trainer.config.grad_clip;
+        let expected_scaled = clip / expected_norm * 3.0;
+
+        trainer.clip_grads_inplace();
+
+        // Target slot should be scaled element-wise.
+        for (i, &x) in trainer.grad_host_scratch[&target_key].iter().enumerate() {
+            assert!((x - expected_scaled).abs() < 1e-5,
+                "target[{i}] = {x}, expected {expected_scaled}");
+        }
+        // All other slots should still be zero.
+        for (k, v) in trainer.grad_host_scratch.iter() {
+            if k == &target_key { continue; }
+            for (i, &x) in v.iter().enumerate() {
+                assert_eq!(x, 0.0, "{k}[{i}] = {x} (should still be 0)");
+            }
+        }
+    }
+
+    #[test]
+    fn blt_model_trainer_clip_disabled_passes_through() {
+        // `grad_clip = 0.0` must short-circuit — values stay untouched.
+        let _guard = MODEL_TRAINER_LOCK.lock().unwrap();
+        if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+            return;
+        }
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_blt_config();
+        let model = BltModel::new(config).expect("BltModel::new");
+
+        let trainer_cfg = BltTrainerConfig {
+            grad_clip: 0.0,
+            ..BltTrainerConfig::default()
+        };
+        let mut trainer = BltModelTrainer::new(
+            model,
+            trainer_cfg,
+            ByteifyRecipe::global_predicate(),
+        ).expect("BltModelTrainer::new");
+
+        // Stamp big values everywhere; must survive clip_grads_inplace.
+        for v in trainer.grad_host_scratch.values_mut() {
+            v.fill(7.5);
+        }
+        trainer.clip_grads_inplace();
+        for (k, v) in trainer.grad_host_scratch.iter() {
+            for (i, &x) in v.iter().enumerate() {
+                assert_eq!(x, 7.5, "{k}[{i}] = {x} (clip disabled, should be 7.5)");
+            }
+        }
     }
 
     #[test]

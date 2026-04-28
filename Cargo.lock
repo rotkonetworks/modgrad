@@ -328,6 +328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blt_train_real_text"
+version = "0.1.0"
+dependencies = [
+ "modgrad-blt",
+ "modgrad-compute",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "blt_train_smoke"
 version = "0.1.0"
 dependencies = [

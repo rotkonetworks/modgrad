@@ -1,0 +1,18 @@
+[package]
+name = "blt_train_real_text"
+version = "0.1.0"
+edition = "2024"
+description = "BLT trains on a ~10 KB real-text corpus for 500 steps; asserts >15% loss reduction across run."
+
+[[bin]]
+name = "blt_train_real_text"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-blt        = { path = "../../crates/modgrad-blt", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+
+[features]
+default = []
