@@ -34,6 +34,7 @@ use modgrad_transformer::mlp::{Mlp, MlpWeights, SwigluMlp, SwigluWeights};
 use modgrad_transformer::residual::ResidualLambdas;
 use modgrad_transformer::resident::{
     AttentionBackwardScratch, AttentionResidentGrads, AttentionScratch,
+    KvGradAccumulator,
     SwigluBackwardScratch, SwigluResidentGrads, SwigluScratch,
     TransformerBlockResident, TransformerBlockScratch,
 };
@@ -869,24 +870,59 @@ impl LocalEncoder {
                 }
             }
 
+            // ── bug-A fix: cross-step KV gradient accumulation. ──
+            //
+            // Set up the per-layer kv_acc: zero its host buffers, populate
+            // per-position X[s] and K_proj[s] from the saved per-byte
+            // block scratches.  Then iterate REVERSE byte order calling
+            // `block.backward_full_sequence_step` (which routes attention
+            // through `AttentionResident::backward_full_sequence_step` —
+            // accumulates d_K[s] / d_V[s] for ALL s ≤ t).  Finally call
+            // `AttentionResident::finalize_kv_grads` to overwrite this
+            // layer's `attn_grads.dweight_k / dweight_v / dbias_k / dbias_v`
+            // with Σ_s d_K_proj[s] · X[s]^T  /  Σ_s d_V[s] · X[s]^T.
+            //
+            // The *per-step* dW_q (and dW_o for o_proj) accumulate via
+            // their existing per-step path — `LinearResident::backward`
+            // overwrites — so we *temporary* per-byte attn/mlp grads and
+            // accumulate via op_tensor Add into the layer accumulator,
+            // exactly mirroring `LocalDecoder::backward`'s bug-2 fix.
+            // (Cross-step bug-A and clobber-on-write bug-2 are
+            // independent — fixing one doesn't fix the other.)
+            let kv_acc = &mut bwd_scratch.kv_accs[li];
+            kv_acc.zero_resident(batch)?;
+            // X[s] = attn_normed[s] for each byte position; K_proj[s] from
+            // the saved block scratch.
+            for s in 0..n_bytes {
+                let bs = &cache.block_scratches[li][s];
+                let mut x_host = vec![0.0f32; byte_dim];
+                bs.attn_normed.copy_to_host(&mut x_host);
+                kv_acc.store_x_at(s, &x_host);
+                let attn = &self.byte_layers[li].attn;
+                let kv_dim = attn.kv_dim;
+                let mut k_proj_host = vec![0.0f32; kv_dim];
+                bs.saved_k_proj.copy_to_host(&mut k_proj_host);
+                bwd_scratch.k_proj_per_position_host
+                    [s * kv_dim..(s + 1) * kv_dim]
+                    .copy_from_slice(&k_proj_host);
+            }
+
+            // Per-byte temp grad bundles — accumulated into layer total
+            // (mirrors decoder bug-2 fix; LinearResident::backward
+            // overwrites so we add manually).
+            let attn_kv_dim = self.byte_layers[li].attn.kv_dim;
+            let mlp_dim_l = self.byte_layers[li].mlp.mlp_dim();
+            let mut tmp_attn_grads = AttentionResidentGrads::new(byte_dim, attn_kv_dim)?;
+            let mut tmp_mlp_grads = SwigluResidentGrads::new(byte_dim, mlp_dim_l)?;
+
             for t in (0..n_bytes).rev() {
                 bwd_scratch.dy_per_byte.copy_from(
                     &d_layer_input_host[t * byte_dim..(t + 1) * byte_dim],
                 );
-                // FIXME(blt-bwd-bug-1) fix: drive block backward off the
-                // matched per-byte forward cache (recompute=false), the
-                // same pattern `LocalDecoder::backward` uses. Previously
-                // we passed `bwd_scratch.block_scratch_replay` with
-                // recompute=true, but that scratch is never populated
-                // with this byte's forward state, so the recompute path
-                // started from zeroed `attn_input` and produced
-                // all-zero outer-product weight grads for every encoder
-                // block. The per-byte cache is populated by
-                // `forward_for_backward` at line ~747.
-                self.byte_layers[li].backward(
+
+                self.byte_layers[li].backward_full_sequence_step(
                     batch,
                     &mut bwd_scratch.dy_per_byte,
-                    None,
                     &mut self.byte_kv_cache,
                     t,
                     &self.rope,
@@ -895,16 +931,36 @@ impl LocalEncoder {
                     &mut scratch.mlp_scratch,
                     &mut bwd_scratch.mlp_bwd,
                     &mut cache.block_scratches[li][t],
-                    &mut grads.attn_grads[li],
-                    &mut grads.mlp_grads[li],
-                    /* recompute = */ false,
+                    &mut tmp_attn_grads,
+                    &mut tmp_mlp_grads,
+                    &mut bwd_scratch.kv_accs[li],
                 )?;
+
+                // Accumulate per-byte dW_q / dW_o / db_q / db_o (from
+                // attn) and full SwiGLU grads into the layer total.
+                accumulate_attn_qo_grads(
+                    batch, &tmp_attn_grads, &mut grads.attn_grads[li],
+                )?;
+                accumulate_mlp_grads(
+                    batch, &tmp_mlp_grads, &mut grads.mlp_grads[li],
+                )?;
+
                 // After backward, dy_per_byte holds dx for this byte.
                 let mut dx_host = vec![0.0f32; byte_dim];
                 bwd_scratch.dy_per_byte.copy_to_host(&mut dx_host);
                 d_layer_input_host[t * byte_dim..(t + 1) * byte_dim]
                     .copy_from_slice(&dx_host);
             }
+
+            // Finalize cross-step dW_k / dW_v / db_k / db_v for this layer.
+            self.byte_layers[li].attn.finalize_kv_grads(
+                batch,
+                &bwd_scratch.kv_accs[li],
+                &self.rope,
+                &bwd_scratch.k_proj_per_position_host
+                    [..n_bytes * attn_kv_dim],
+                &mut grads.attn_grads[li],
+            )?;
             // d_layer_input_host now holds d/d(layer_input). For the
             // shallower layer this becomes the upstream into its
             // cross-attn-output buffer; for layer 0 this is the byte-
@@ -949,6 +1005,8 @@ impl LocalEncoder {
 pub struct LocalEncoderBackwardScratch {
     /// `[byte_dim]` — per-byte rolling gradient (in-and-out of block.backward).
     pub dy_per_byte: GpuVec,
+    /// `[byte_dim]` — per-byte dx output of `backward_full_sequence_step`.
+    pub dx_per_byte: GpuVec,
     /// `[n_bytes × byte_dim]` — staging for the layer-to-layer carry.
     pub d_byte_carry: GpuVec,
     /// Single replay slot for the per-byte block backward. The encoder
@@ -957,6 +1015,17 @@ pub struct LocalEncoderBackwardScratch {
     pub block_scratch_replay: TransformerBlockScratch,
     pub attn_bwd: AttentionBackwardScratch,
     pub mlp_bwd: SwigluBackwardScratch,
+    /// Per-layer cross-step KV gradient accumulator. Holds the host-side
+    /// d_K[s] / d_V[s] sums plus per-position X[s]. One per encoder
+    /// transformer layer; sized at `max_seq_len`. Zeroed once per layer
+    /// at the start of that layer's reverse-iteration backward loop.
+    /// See [`KvGradAccumulator`] for the algorithm.
+    pub kv_accs: Vec<KvGradAccumulator>,
+    /// Per-layer host buffer of K_proj[s] for s in 0..n_bytes; passed to
+    /// `AttentionResident::finalize_kv_grads`. Filled per-layer per-call
+    /// by D2H'ing each (li, t)'s `block_scratch.saved_k_proj`. Sized
+    /// `[max_seq × kv_dim]`.
+    pub k_proj_per_position_host: Vec<f32>,
 }
 
 impl LocalEncoderBackwardScratch {
@@ -967,14 +1036,23 @@ impl LocalEncoderBackwardScratch {
         let kv_dim = n_heads * head_dim;
         let mlp_dim = config.mlp_dim;
         let max_seq = config.max_seq_len;
+        let mut kv_accs = Vec::with_capacity(config.n_layers);
+        for _ in 0..config.n_layers {
+            kv_accs.push(KvGradAccumulator::new(
+                max_seq, n_heads, head_dim, byte_dim,
+            )?);
+        }
         Ok(Self {
             dy_per_byte: GpuVec::try_hip(byte_dim)?,
+            dx_per_byte: GpuVec::try_hip(byte_dim)?,
             d_byte_carry: GpuVec::try_hip(max_seq * byte_dim)?,
             block_scratch_replay: TransformerBlockScratch::with_dims(
                 byte_dim, kv_dim, mlp_dim, n_heads * max_seq,
             )?,
             attn_bwd: AttentionBackwardScratch::new(n_heads, head_dim, kv_dim, max_seq)?,
             mlp_bwd: SwigluBackwardScratch::new(byte_dim, mlp_dim)?,
+            kv_accs,
+            k_proj_per_position_host: vec![0.0f32; max_seq * kv_dim],
         })
     }
 }
@@ -1014,6 +1092,73 @@ fn zero_gpuvec(g: &mut GpuVec) -> Result<(), ResidencyError> {
     let n = g.len();
     let zeros = vec![0.0f32; n];
     g.copy_from(&zeros);
+    Ok(())
+}
+
+/// `acc += src` for the per-step Q + O grads only — dW_k / dW_v / db_k /
+/// db_v are written by `AttentionResident::finalize_kv_grads` in one
+/// shot from the cross-step accumulator. (Adding the per-step Q/O,
+/// then having finalize *overwrite* K/V rather than accumulate, is what
+/// keeps bug-A's fix from double-counting.)
+fn accumulate_attn_qo_grads(
+    batch: &HipBatch,
+    src: &AttentionResidentGrads,
+    acc: &mut AttentionResidentGrads,
+) -> Result<(), ResidencyError> {
+    accumulate_pair(batch, &src.dweight_q, &mut acc.dweight_q)?;
+    accumulate_pair(batch, &src.dbias_q,   &mut acc.dbias_q)?;
+    accumulate_pair(batch, &src.dweight_o, &mut acc.dweight_o)?;
+    accumulate_pair(batch, &src.dbias_o,   &mut acc.dbias_o)?;
+    Ok(())
+}
+
+/// `acc += src` for every dweight/dbias buffer in `SwigluResidentGrads`.
+fn accumulate_mlp_grads(
+    batch: &HipBatch,
+    src: &SwigluResidentGrads,
+    acc: &mut SwigluResidentGrads,
+) -> Result<(), ResidencyError> {
+    accumulate_pair(batch, &src.dweight_gate, &mut acc.dweight_gate)?;
+    accumulate_pair(batch, &src.dbias_gate,   &mut acc.dbias_gate)?;
+    accumulate_pair(batch, &src.dweight_up,   &mut acc.dweight_up)?;
+    accumulate_pair(batch, &src.dbias_up,     &mut acc.dbias_up)?;
+    accumulate_pair(batch, &src.dweight_down, &mut acc.dweight_down)?;
+    accumulate_pair(batch, &src.dbias_down,   &mut acc.dbias_down)?;
+    Ok(())
+}
+
+/// `acc += src` over the full length of `acc` (= `src.len()`).
+fn accumulate_pair(
+    batch: &HipBatch,
+    src: &GpuVec,
+    acc: &mut GpuVec,
+) -> Result<(), ResidencyError> {
+    use modgrad_device::backend::op::BinaryOpKind;
+    use modgrad_device::backend::ops::op_tensor_resident;
+    let n = acc.len();
+    debug_assert_eq!(n, src.len());
+    let acc_buf = match acc {
+        GpuVec::Hip(b) => b,
+        other => return Err(ResidencyError::WrongVariant {
+            expected: "Hip", got: other.variant_name(),
+        }),
+    };
+    let src_buf = match src {
+        GpuVec::Hip(b) => b,
+        other => return Err(ResidencyError::WrongVariant {
+            expected: "Hip", got: other.variant_name(),
+        }),
+    };
+    unsafe {
+        op_tensor_resident(
+            acc_buf.device_ptr() as *const f32,
+            src_buf.device_ptr() as *const f32,
+            acc_buf.device_ptr() as *mut f32,
+            n,
+            1.0, 1.0, 0.0, BinaryOpKind::Add,
+        )?;
+    }
+    batch.note_dispatch()?;
     Ok(())
 }
 

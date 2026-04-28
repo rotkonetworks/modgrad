@@ -866,6 +866,671 @@ impl AttentionResident {
     }
 }
 
+// ─── AttentionResident — full-sequence backward path ────────
+//
+// Algorithm derivation (chain rule).
+//
+// Forward at position t, head h, kv_h = h / gqa_ratio:
+//   Q_normed[t, h] = qk_norm(qk_scale, Q_proj[t, h]) → RoPE
+//   K_normed[s, h] = qk_norm(qk_scale, K_proj[s, h]) → RoPE  (s ≤ t)
+//   score[t, h, s] = Q_normed[t, h] · K_normed[s, kv_h]
+//   softmax[t, h, :] = stable_softmax(score[t, h, :])
+//   head_out[t, h]   = Σ_s softmax[t, h, s] · V_raw[s, kv_h]
+//   attn_out[t]      = W_o · concat_h(head_out[t, h])
+//
+// Backward, given d_attn_out[t]:
+//   1. d_head_out[t]    = W_o^T · d_attn_out[t]
+//      dW_o            += d_attn_out[t] · concat_h(head_out[t, h])^T
+//      dbias_o         += d_attn_out[t]
+//   2. d_v_raw[s, kv_h] += Σ_{h: h/gqa==kv_h} softmax[t, h, s] · d_head_out[t, h]
+//      d_softmax[t, h, s] = V_raw[s, kv_h] · d_head_out[t, h]
+//      (both for ALL s in 0..=t)
+//   3. d_score[t, h, s] = softmax[t, h, s] · (d_softmax[t, h, s]
+//                                             - Σ_s' softmax[t, h, s'] · d_softmax[t, h, s'])
+//   4. d_k_postrope[s, kv_h]  += Σ_{h} d_score[t, h, s] · Q_normed[t, h]
+//      d_q_normed[t, h]       = Σ_s    d_score[t, h, s] · K_normed[s, kv_h]
+//      (the d_q_normed[t] sum is over s ≤ t — this is the full Q gradient
+//       from this step; it folds RoPE/RMS bwd → d_Q_proj[t] for current
+//       step's q_proj backward.)
+//   5. After all u > t reverse-iter steps have run, d_k_postrope[t] /
+//      d_v_raw[t] are FULLY populated. At step t we read them and:
+//        - undo RoPE at position t (per kv_head) on d_k_postrope[t]
+//        - undo per-head RMSNorm using saved K_proj[t] → d_k_proj[t]
+//        - dx[t] += W_k^T · d_k_proj[t] + W_v^T · d_v_raw[t]
+//        - dW_k += d_k_proj[t] · X[t]^T  (deferred to finalize)
+//        - dW_v += d_v_raw[t]  · X[t]^T  (deferred to finalize)
+//
+// Reverse iteration ordering matters. At step t:
+//   - the accumulator's d_k_postrope[t] / d_v_raw[t] entries hold the sum
+//     of contributions from u = t+1, t+2, … n-1 (already iterated, since
+//     reverse). These are the "cross-step" extras that the existing per-
+//     step backward dropped.
+//   - The s=t entry is added DURING this step's loop body too — but only
+//     after we've already folded the existing-cross-step value into dx[t].
+//     This matches the spec: "step t backward, all u > t have already
+//     fired. So d_K[t] and d_V[t] are now FULLY populated (sum of all
+//     u ≥ t contributions including the just-added s=t one from this
+//     step)." Actually, re-reading: the spec says the s=t add IS included
+//     in d_K[t] before dx[t] is updated. The two interpretations differ
+//     by whether the current step's s=t contribution flows through dx[t]
+//     or only through finalize. We follow the spec: include s=t in the
+//     accumulator add, then the existing q/k/v_proj.backward call (still
+//     done at this step for the s=t weight-grad contribution to dW_q AND
+//     to provide dx_from_v[t] / dx_from_k[t] for the LOCAL piece) is
+//     SKIPPED for K/V — finalize_kv_grads handles them globally.
+//
+// This file implements the spec literally: a NEW entry point
+// `backward_full_sequence_step` that does NOT call the existing
+// `AttentionResident::backward`. The new path produces dW_q / dW_o /
+// dbias_q / dbias_o for the current step, dx[t] (folding cross-step
+// d_K[t] / d_V[t] from u > t AND the just-added s=t from this step),
+// and accumulates d_K / d_V cross-step contributions for all s ≤ t.
+
+// ─── Cross-step KV gradient accumulator ─────────────────────
+//
+// **Problem.** [`AttentionResident::backward`] is documented as treating
+// prior KV-cache entries as constants — only the current step's Q/K/V
+// projection gradients are produced. That's correct for autoregressive
+// single-position decode-style backward (used by the latent path), but
+// **wrong** for full-sequence per-position backward (used by the BLT
+// encoder/decoder per-byte loops). At step t, Y[t] depends on K[s] and
+// V[s] for ALL s ≤ t, so dW_k = Σ_s d_K[s] · X[s]^T must accumulate
+// across every position s. The per-step backward only adds the s=t term,
+// systematically undercounting dW_k / dW_v / dx[s] for s < t.
+//
+// **Fix shape.** Caller iterates t in REVERSE order (t = n-1 … 0).
+// Maintains a [`KvGradAccumulator`] that holds:
+//   - `d_k_postrope[s, kv_h, i]`  = Σ_{u ≥ s} d_score[u, h, s] · q_normed[u, h, i]
+//                                   (in post-RoPE post-RMSNorm K space, summed
+//                                    over Q-heads sharing this kv_h)
+//   - `d_v_raw[s, kv_h, i]`       = Σ_{u ≥ s} softmax[u, h, s] · d_head_out[u, h, i]
+//                                   (in raw-V space, summed over GQA)
+// At step t, the accumulator is *read* at index t (giving the full Σ_{u ≥ t}
+// because reverse iteration has finished all u > t), folded into dx[t] and
+// dW_k / dW_v, *then written* with new s ≤ t contributions for future steps
+// to consume.
+//
+// **Stays host-side.** The new path runs the cross-step arithmetic on
+// host (n² over positions × heads × head_dim = small for BLT's tiny
+// configs). All saved activations get D2H'd once at the start of each
+// `backward_full_sequence_step`; the result is H2D'd at the end. This
+// trades a few hundred f32s of PCIe per step for absolute simplicity —
+// the previous worktree's GPU-resident attempt regressed encoder.block.
+// gate from 87% → 132% rel_err. Naive correctness first.
+
+/// Per-layer cross-step KV gradient accumulator. See module docs above.
+///
+/// **Invariants** (`debug_assert`'d at the entry-point boundaries):
+///   - `n_positions` matches the caller's per-byte loop length.
+///   - `x_per_position_host` is populated with the per-position attention
+///     input X[s] (= post-attention-RMSNorm hidden) before
+///     [`AttentionResident::finalize_kv_grads`] is called.
+///   - `zero_resident` is called once before the reverse-iteration loop;
+///     `d_k_postrope` / `d_v_raw` accumulate (`+=`) thereafter.
+///
+/// Layout:
+///   - `d_k_postrope`: `[n_positions × n_kv_heads × head_dim]`, post-RoPE
+///     post-RMSNorm space. The cross-step loop adds `d_score · q_normed`
+///     directly here — both operands live in the same space.
+///   - `d_v_raw`: `[n_positions × n_kv_heads × head_dim]`, raw V space
+///     (V is not RoPE'd or normed in forward).
+///   - `x_per_position_host`: `[n_positions × model_dim]`, the per-position
+///     X[s] that feeds the q/k/v projections.
+pub struct KvGradAccumulator {
+    /// Cross-step d/d(K_postrope[s, kv_h, i]). Layout `[n × n_kv × d_h]`
+    /// row-major (position-major).
+    pub d_k_postrope_host: Vec<f32>,
+    /// Cross-step d/d(V_raw[s, kv_h, i]). Same layout.
+    pub d_v_raw_host: Vec<f32>,
+    pub n_positions: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub model_dim: usize,
+    /// Per-position attention sub-layer input X[s] = attn_normed[s].
+    /// Filled by the caller during forward; consumed by `finalize_kv_grads`.
+    pub x_per_position_host: Vec<f32>,
+    /// `true` after `finalize_kv_grads` runs; subsequent calls assert.
+    finalized: bool,
+}
+
+impl KvGradAccumulator {
+    pub fn new(
+        n_positions: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        model_dim: usize,
+    ) -> Result<Self, ResidencyError> {
+        let kv_total = n_positions * n_kv_heads * head_dim;
+        Ok(Self {
+            d_k_postrope_host: vec![0.0f32; kv_total],
+            d_v_raw_host: vec![0.0f32; kv_total],
+            n_positions,
+            n_kv_heads,
+            head_dim,
+            model_dim,
+            x_per_position_host: vec![0.0f32; n_positions * model_dim],
+            finalized: false,
+        })
+    }
+
+    /// Reset accumulators to zero. Call once before each reverse-iteration
+    /// per-step loop. `batch` parameter is for API uniformity (host-side
+    /// fill needs no batch); kept so future GPU-resident impls can swap in.
+    pub fn zero_resident(&mut self, _batch: &HipBatch) -> Result<(), ResidencyError> {
+        for v in self.d_k_postrope_host.iter_mut() { *v = 0.0; }
+        for v in self.d_v_raw_host.iter_mut() { *v = 0.0; }
+        self.finalized = false;
+        Ok(())
+    }
+
+    /// Convenience: write X[s] into `x_per_position_host` from a host slice.
+    pub fn store_x_at(&mut self, position: usize, x: &[f32]) {
+        debug_assert_eq!(x.len(), self.model_dim);
+        debug_assert!(position < self.n_positions);
+        let off = position * self.model_dim;
+        self.x_per_position_host[off..off + self.model_dim].copy_from_slice(x);
+    }
+}
+
+impl AttentionResident {
+    /// Full-sequence per-position backward step. See module-level
+    /// "AttentionResident — full-sequence backward path" doc-comment for
+    /// the chain-rule derivation.
+    ///
+    /// **Caller contract:**
+    /// - Iterate `position` in REVERSE order (`n-1, n-2, …, 0`).
+    /// - Before the loop: call `kv_acc.zero_resident(batch)`.
+    /// - After the loop: call [`AttentionResident::finalize_kv_grads`].
+    /// - `kv_acc.x_per_position_host` must be populated with X[s] for
+    ///   every s in 0..n_positions before `finalize_kv_grads`. (Easiest:
+    ///   D2H attn_normed into `kv_acc.x_per_position_host[s*model_dim..]`
+    ///   during forward.)
+    /// - `attn_scratch` is unused for activations — every per-position
+    ///   activation read comes from `block_scratch.saved_*` (per-position
+    ///   snapshots) or `kv_cache` slabs. We accept it for signature
+    ///   uniformity with the existing `backward` and to expose enough
+    ///   workspace for the o_proj backward.
+    /// - `kv_cache` must be in the post-forward state: K[s] (post-RoPE
+    ///   post-RMSNorm) and V[s] (raw) for all s in 0..n_positions.
+    ///
+    /// **What this writes:**
+    /// - `attn_grads.dweight_o / dbias_o` += this step's o_proj outer
+    ///   product / d_attn_out (per-step, just like existing backward).
+    /// - `attn_grads.dweight_q / dbias_q` += this step's q_proj outer
+    ///   product / d_q_proj (per-step).
+    /// - `attn_grads.dweight_k / dbias_k`,  `dweight_v / dbias_v` —
+    ///   left UNTOUCHED here. `finalize_kv_grads` writes them all in one
+    ///   shot using the fully-accumulated `kv_acc`.
+    /// - `dy_dev` (in-place) → `dx[position]`: the dx contribution from
+    ///   (a) Q's projection at position t, plus (b) the cross-step
+    ///   d_K[t] / d_V[t] from all u ≥ t (= u > t pre-existing + s=t just
+    ///   added; both are summed in `kv_acc.{d_k_postrope_host,d_v_raw_host}[t]`
+    ///   right BEFORE we read them — see step (5) in the algorithm).
+    /// - `kv_acc.{d_k_postrope_host,d_v_raw_host}[s, kv_h]` += this step's
+    ///   contribution for every s in 0..=position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_full_sequence_step(
+        &self,
+        batch: &HipBatch,
+        dy_dev: &mut GpuVec,
+        kv_cache: &KvCacheResident,
+        layer: usize,
+        position: usize,
+        rope: &RotaryEmbedding,
+        attn_scratch: &AttentionScratch,
+        bwd: &mut AttentionBackwardScratch,
+        block_scratch: &TransformerBlockScratch,
+        attn_grads: &mut AttentionResidentGrads,
+        kv_acc: &mut KvGradAccumulator,
+        dx_dev: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        let _ = attn_scratch; // unused, see contract
+        let model_dim = self.model_dim;
+        let kv_dim = self.kv_dim;
+        let head_dim = self.head_dim;
+        let num_heads = self.num_heads;
+        let num_kv_heads = self.num_kv_heads;
+        let gqa_ratio = self.gqa_ratio;
+        let attn_len = position + 1;
+        let max_seq = kv_cache.max_seq_len();
+
+        debug_assert_eq!(dy_dev.len(), model_dim);
+        debug_assert_eq!(dx_dev.len(), model_dim);
+        debug_assert!(bwd.fits(num_heads, head_dim, kv_dim, max_seq));
+        debug_assert_eq!(kv_acc.n_kv_heads, num_kv_heads);
+        debug_assert_eq!(kv_acc.head_dim, head_dim);
+        debug_assert_eq!(kv_acc.model_dim, model_dim);
+        debug_assert!(position < kv_acc.n_positions);
+        debug_assert!(!kv_acc.finalized,
+            "backward_full_sequence_step called after finalize_kv_grads");
+
+        // ── Stage 1: o_proj backward (UNCHANGED from per-step backward). ──
+        //   d_head_out = W_o^T · dy
+        //   dW_o += dy · head_out^T  (overwrites — caller accumulates)
+        self.o_proj.backward(
+            batch, &block_scratch.saved_head_out, dy_dev,
+            &mut bwd.d_head_out,
+            &mut attn_grads.dweight_o,
+            &mut attn_grads.dbias_o,
+        )?;
+
+        // ── D2H every host-side input we need. ──
+        // d_head_out[t] (post o_proj.backward): [model_dim]
+        let mut d_head_out_host = vec![0.0f32; model_dim];
+        bwd.d_head_out.copy_to_host(&mut d_head_out_host);
+        // q_normed[t] (post-RoPE post-RMSNorm): [model_dim], saved by
+        // forward_for_backward.
+        let mut q_normed_host = vec![0.0f32; model_dim];
+        block_scratch.saved_q_normed.copy_to_host(&mut q_normed_host);
+        // q_proj[t] (pre-RMSNorm): [model_dim], for RMS bwd of d_Q.
+        let mut q_proj_host = vec![0.0f32; model_dim];
+        block_scratch.saved_q_proj.copy_to_host(&mut q_proj_host);
+        // k_proj[t] (pre-RMSNorm): [kv_dim], for RMS bwd of d_K[t].
+        let mut k_proj_t_host = vec![0.0f32; kv_dim];
+        block_scratch.saved_k_proj.copy_to_host(&mut k_proj_t_host);
+        // softmax[t, h, :] for s in 0..attn_len: [num_heads × attn_len]
+        // contiguous in the first num_heads*attn_len slots of saved_scores_tight.
+        let mut softmax_host = vec![0.0f32; num_heads * attn_len];
+        {
+            let mut full = vec![0.0f32; num_heads * max_seq];
+            block_scratch.saved_scores_tight.copy_to_host(&mut full);
+            softmax_host.copy_from_slice(&full[..num_heads * attn_len]);
+        }
+        // K cache: per-kv_head slab [max_seq × head_dim]; we read rows
+        // 0..attn_len for each kv_head.
+        let mut k_slabs_host = vec![0.0f32; num_kv_heads * attn_len * head_dim];
+        let mut v_slabs_host = vec![0.0f32; num_kv_heads * attn_len * head_dim];
+        {
+            // KV is laid out [n_kv_heads × max_seq × head_dim] per layer.
+            // D2H the first attn_len rows of each kv_head.
+            use modgrad_device::backend::rocm::ffi;
+            const HIP_D2H: std::os::raw::c_int = 2;
+            for kv_h in 0..num_kv_heads {
+                let src_k = unsafe {
+                    (kv_cache.k_layer_ptr(layer) as *const u8)
+                        .add(kv_h * max_seq * head_dim * 4)
+                } as *const std::os::raw::c_void;
+                let src_v = unsafe {
+                    (kv_cache.v_layer_ptr(layer) as *const u8)
+                        .add(kv_h * max_seq * head_dim * 4)
+                } as *const std::os::raw::c_void;
+                let dst_k = k_slabs_host[kv_h * attn_len * head_dim..]
+                    .as_mut_ptr() as *mut std::os::raw::c_void;
+                let dst_v = v_slabs_host[kv_h * attn_len * head_dim..]
+                    .as_mut_ptr() as *mut std::os::raw::c_void;
+                let bytes = attn_len * head_dim * 4;
+                let err = unsafe { ffi::hipMemcpy(dst_k, src_k, bytes, HIP_D2H) };
+                if err != 0 {
+                    return Err(ResidencyError::Backend(
+                        modgrad_device::backend::BackendError::Runtime(format!(
+                            "kv_acc K D2H ({} bytes): {}", bytes, ffi::hip_err_str(err),
+                        )),
+                    ));
+                }
+                let err = unsafe { ffi::hipMemcpy(dst_v, src_v, bytes, HIP_D2H) };
+                if err != 0 {
+                    return Err(ResidencyError::Backend(
+                        modgrad_device::backend::BackendError::Runtime(format!(
+                            "kv_acc V D2H ({} bytes): {}", bytes, ffi::hip_err_str(err),
+                        )),
+                    ));
+                }
+            }
+        }
+
+        // ── Stage 2 + 3: per-head softmax bwd. ──
+        // For each (h, s in 0..attn_len):
+        //   d_softmax[h, s] = V[s, kv_h] · d_head_out[h]
+        //   d_v_raw[s, kv_h] += softmax[h, s] · d_head_out[h]      (cross-step write)
+        // Then stable softmax bwd:
+        //   d_score[h, s] = softmax[h, s] · (d_softmax[h, s]
+        //                                    - Σ_s' softmax[h, s'] · d_softmax[h, s'])
+        let mut d_softmax_host = vec![0.0f32; num_heads * attn_len];
+        let mut d_score_host = vec![0.0f32; num_heads * attn_len];
+        for h in 0..num_heads {
+            let kv_h = h / gqa_ratio;
+            let d_head_h = &d_head_out_host[h * head_dim..(h + 1) * head_dim];
+            for s in 0..attn_len {
+                let v_s = &v_slabs_host[
+                    (kv_h * attn_len + s) * head_dim..(kv_h * attn_len + s + 1) * head_dim
+                ];
+                let mut dot = 0.0f32;
+                for i in 0..head_dim { dot += v_s[i] * d_head_h[i]; }
+                d_softmax_host[h * attn_len + s] = dot;
+                let sm = softmax_host[h * attn_len + s];
+                let dv_off = (s * num_kv_heads + kv_h) * head_dim;
+                for i in 0..head_dim {
+                    kv_acc.d_v_raw_host[dv_off + i] += sm * d_head_h[i];
+                }
+            }
+            // Stable softmax bwd: dot = Σ_s' softmax[h, s'] · d_softmax[h, s']
+            let mut sm_dot = 0.0f32;
+            for s in 0..attn_len {
+                sm_dot += softmax_host[h * attn_len + s]
+                        * d_softmax_host[h * attn_len + s];
+            }
+            for s in 0..attn_len {
+                let sm = softmax_host[h * attn_len + s];
+                let ds = d_softmax_host[h * attn_len + s];
+                d_score_host[h * attn_len + s] = sm * (ds - sm_dot);
+            }
+        }
+
+        // ── Stage 4: per-head, accumulate d_k_postrope[s, kv_h] and d_q_normed[t, h]. ──
+        //   d_k_postrope[s, kv_h] += Σ_{h: h/gqa==kv_h} d_score[h, s] · q_normed[h]
+        //   d_q_normed[t, h]      = Σ_s    d_score[h, s] · K_postrope[s, kv_h]
+        let mut d_q_normed_host = vec![0.0f32; model_dim];
+        for h in 0..num_heads {
+            let kv_h = h / gqa_ratio;
+            let q_h = &q_normed_host[h * head_dim..(h + 1) * head_dim];
+            let dq_h = &mut d_q_normed_host[h * head_dim..(h + 1) * head_dim];
+            for s in 0..attn_len {
+                let ds = d_score_host[h * attn_len + s];
+                let dk_off = (s * num_kv_heads + kv_h) * head_dim;
+                let k_s = &k_slabs_host[
+                    (kv_h * attn_len + s) * head_dim..(kv_h * attn_len + s + 1) * head_dim
+                ];
+                for i in 0..head_dim {
+                    kv_acc.d_k_postrope_host[dk_off + i] += ds * q_h[i];
+                    dq_h[i] += ds * k_s[i];
+                }
+            }
+        }
+
+        // ── Stage 5: read FULLY-populated d_k_postrope[t] / d_v_raw[t]. ──
+        // After this step's add (Stage 2 / Stage 4) for s=t, the entry t
+        // of the accumulator now holds Σ_{u ≥ t} contributions: prior u>t
+        // from earlier reverse-iter steps PLUS the just-added s=t add.
+        // Per the algorithm spec: "At step t backward (reverse iteration),
+        // all u > t have already fired. So d_K[t] and d_V[t] are now FULLY
+        // populated (sum of all u ≥ t contributions including the just-
+        // added s=t one from this step)."
+        let mut d_k_postrope_t = vec![0.0f32; kv_dim];
+        let mut d_v_raw_t = vec![0.0f32; kv_dim];
+        let acc_off_t = position * num_kv_heads * head_dim;
+        d_k_postrope_t.copy_from_slice(
+            &kv_acc.d_k_postrope_host[acc_off_t..acc_off_t + kv_dim]
+        );
+        d_v_raw_t.copy_from_slice(
+            &kv_acc.d_v_raw_host[acc_off_t..acc_off_t + kv_dim]
+        );
+
+        // Undo RoPE on d_k_postrope_t (per kv_head, position).
+        rope_backward(rope, &mut d_k_postrope_t, head_dim, num_kv_heads, position);
+
+        // Undo RMSNorm (or passthrough) on d_k_postrope_t → d_k_proj_t.
+        let mut d_k_proj_t = vec![0.0f32; kv_dim];
+        if self.use_qk_norm {
+            rms_norm_backward_per_head(
+                &k_proj_t_host, &d_k_postrope_t, &mut d_k_proj_t,
+                num_kv_heads, head_dim, self.qk_scale, self.norm_eps,
+            );
+        } else {
+            d_k_proj_t.copy_from_slice(&d_k_postrope_t);
+        }
+
+        // ── Stage 6: undo RoPE + RMS on d_q_normed[t] → d_q_proj[t]. ──
+        // RoPE undo on Q (position t, num_heads).
+        rope_backward(rope, &mut d_q_normed_host, head_dim, num_heads, position);
+        let mut d_q_proj_host = vec![0.0f32; model_dim];
+        if self.use_qk_norm {
+            rms_norm_backward_per_head(
+                &q_proj_host, &d_q_normed_host, &mut d_q_proj_host,
+                num_heads, head_dim, self.qk_scale, self.norm_eps,
+            );
+        } else {
+            d_q_proj_host.copy_from_slice(&d_q_normed_host);
+        }
+
+        // ── Stage 7: q_proj.backward (per-step dW_q + dx_from_q). ──
+        bwd.d_q_proj.copy_from(&d_q_proj_host);
+        self.q_proj.backward(
+            batch, &block_scratch.attn_normed, &bwd.d_q_proj,
+            &mut bwd.dx_from_q,
+            &mut attn_grads.dweight_q,
+            &mut attn_grads.dbias_q,
+        )?;
+
+        // ── Stage 8: cross-step contribution to dx[t] via W_k^T·d_k_proj[t]
+        //   + W_v^T·d_v_raw[t]. We DON'T touch attn_grads.dweight_k / dweight_v
+        //   here — those are accumulated globally in `finalize_kv_grads`.
+        //   But we need dx contributions, which require running W_k^T /
+        //   W_v^T. We use q_proj.backward-style stage-1 directly via
+        //   matmul_resident_tn. Easier: call k_proj.backward / v_proj.
+        //   backward into a per-call temp grad bundle (overwrite is fine,
+        //   we discard the dweight side).
+        //
+        // Actually `LinearResident::backward` writes dweight, dbias, dx
+        // all together. We can't split them cheaply. So: use a temp local
+        // `AttentionResidentGrads` bundle for K/V, run k_proj.backward
+        // and v_proj.backward into it, take the dx outputs, discard the
+        // dweight outputs (they'd be wrong here anyway — dweight from
+        // these calls is `d_X_proj[t] · X[t]^T`, the s=t term, which is
+        // PART of the global dW_k = Σ_s d_K_proj[s] · X[s]^T but only
+        // ONE of n terms; finalize handles the full sum from kv_acc).
+        bwd.d_k_proj.copy_from(&d_k_proj_t);
+        bwd.d_v_proj.copy_from(&d_v_raw_t);
+
+        // Per-call temp dweight buffers (we need to satisfy
+        // LinearResident::backward's signature; values are overwritten
+        // and discarded).
+        let mut tmp_dw_k = GpuVec::try_hip(kv_dim * model_dim)?;
+        let mut tmp_db_k = GpuVec::try_hip(kv_dim)?;
+        let mut tmp_dw_v = GpuVec::try_hip(kv_dim * model_dim)?;
+        let mut tmp_db_v = GpuVec::try_hip(kv_dim)?;
+
+        self.k_proj.backward(
+            batch, &block_scratch.attn_normed, &bwd.d_k_proj,
+            &mut bwd.dx_from_k,
+            &mut tmp_dw_k, &mut tmp_db_k,
+        )?;
+        self.v_proj.backward(
+            batch, &block_scratch.attn_normed, &bwd.d_v_proj,
+            &mut bwd.dx_from_v,
+            &mut tmp_dw_v, &mut tmp_db_v,
+        )?;
+
+        // ── Stage 9: dx = dx_from_q + dx_from_k + dx_from_v. ──
+        // Same accumulation pattern as the per-step backward, just feeding
+        // into the caller-supplied `dx_dev`.
+        unsafe {
+            op_tensor_resident(
+                hip_buf(&bwd.dx_from_q)?.device_ptr() as *const f32,
+                hip_buf(&bwd.dx_from_k)?.device_ptr() as *const f32,
+                hip_buf_mut(dx_dev)?.device_ptr() as *mut f32,
+                model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+        unsafe {
+            op_tensor_resident(
+                hip_buf(dx_dev)?.device_ptr() as *const f32,
+                hip_buf(&bwd.dx_from_v)?.device_ptr() as *const f32,
+                hip_buf_mut(dx_dev)?.device_ptr() as *mut f32,
+                model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+
+        Ok(())
+    }
+
+    /// Finalize the cross-step KV gradient. Called once after the
+    /// reverse-iteration `backward_full_sequence_step` loop completes.
+    ///
+    /// **What this does.** For each position s in 0..n_positions:
+    ///   1. Read d_k_postrope[s] / d_v_raw[s] from `kv_acc`.
+    ///   2. Undo RoPE at position s on d_k_postrope[s] → d_k_norm_pre_rope[s].
+    ///   3. Undo per-head RMSNorm using `kv_acc.x_per_position_host[s]`'s
+    ///      pre-projection input piped through `k_proj` to get K_proj[s].
+    ///      But we DON'T have saved K_proj[s] in this struct — we'd need
+    ///      the caller's per-position `block_scratch.saved_k_proj[s]`.
+    ///      So this method takes a host-side `k_proj_per_position` buffer
+    ///      via `kv_acc` itself … wait, we don't store it there. Solution:
+    ///      we don't need K_proj to undo RMS — we can recompute it on-the-
+    ///      fly from the stored X[s] by running `K_proj = W_k · X[s] + b_k`
+    ///      using the host-side weight matrix. But this requires reading
+    ///      W_k off the device. To keep this method self-contained AND
+    ///      avoid an extra D2H per finalize, we accept a per-position
+    ///      K_proj host buffer the caller fills (e.g. by D2H'ing each
+    ///      step's `block_scratch.saved_k_proj` during the per-step loop).
+    ///
+    /// To keep the API simple we store K_proj per position right inside
+    /// `kv_acc.k_proj_per_position_host` (added below). The caller must
+    /// populate it during the forward / per-step backward (D2H of
+    /// `block_scratch.saved_k_proj` is one line).
+    ///
+    /// **OVERWRITES** `attn_grads.dweight_k / dbias_k / dweight_v / dbias_v`
+    /// (and zeros them first), per the spec: "OVERWRITING attn_grads.
+    /// dweight_k/v."
+    pub fn finalize_kv_grads(
+        &self,
+        batch: &HipBatch,
+        kv_acc: &KvGradAccumulator,
+        rope: &RotaryEmbedding,
+        k_proj_per_position_host: &[f32],
+        attn_grads: &mut AttentionResidentGrads,
+    ) -> Result<(), ResidencyError> {
+        let model_dim = self.model_dim;
+        let kv_dim = self.kv_dim;
+        let head_dim = self.head_dim;
+        let num_kv_heads = self.num_kv_heads;
+        // Runtime sequence length: derive from the K_proj host buffer the
+        // caller passed. `kv_acc.n_positions` is the *capacity* (typically
+        // max_seq); `n_positions` here is the *actual* per-call byte count
+        // (≤ capacity). Any slot ≥ n_positions in `kv_acc.d_k_postrope_host`
+        // / `d_v_raw_host` is guaranteed zero (no step touched them) so it
+        // would contribute nothing — but iterating only 0..n_positions is
+        // both faster and clearer.
+        debug_assert_eq!(k_proj_per_position_host.len() % kv_dim, 0);
+        let n_positions = k_proj_per_position_host.len() / kv_dim;
+        debug_assert!(n_positions <= kv_acc.n_positions);
+        debug_assert!(
+            kv_acc.x_per_position_host.len() >= n_positions * model_dim,
+        );
+
+        // Zero dW_k / dW_v / db_k / db_v before the s-loop. We'll
+        // accumulate via op_tensor Add per position.
+        zero_gpuvec_resident(&mut attn_grads.dweight_k, kv_dim * model_dim)?;
+        zero_gpuvec_resident(&mut attn_grads.dbias_k, kv_dim)?;
+        zero_gpuvec_resident(&mut attn_grads.dweight_v, kv_dim * model_dim)?;
+        zero_gpuvec_resident(&mut attn_grads.dbias_v, kv_dim)?;
+
+        // Per-position scratch for the per-call LinearResident::backward
+        // outputs. dweight/dbias overwrite — we add into the layer accumulator.
+        let mut tmp_dw_k = GpuVec::try_hip(kv_dim * model_dim)?;
+        let mut tmp_db_k = GpuVec::try_hip(kv_dim)?;
+        let mut tmp_dw_v = GpuVec::try_hip(kv_dim * model_dim)?;
+        let mut tmp_db_v = GpuVec::try_hip(kv_dim)?;
+        let mut tmp_dx_unused = GpuVec::try_hip(model_dim)?;
+        let mut x_dev = GpuVec::try_hip(model_dim)?;
+        let mut d_k_proj_dev = GpuVec::try_hip(kv_dim)?;
+        let mut d_v_dev = GpuVec::try_hip(kv_dim)?;
+
+        for s in 0..n_positions {
+            // d_k_postrope[s], d_v_raw[s] from accumulator.
+            let acc_off = s * num_kv_heads * head_dim;
+            let mut d_k_postrope = vec![0.0f32; kv_dim];
+            d_k_postrope.copy_from_slice(
+                &kv_acc.d_k_postrope_host[acc_off..acc_off + kv_dim]
+            );
+            let mut d_v_raw = vec![0.0f32; kv_dim];
+            d_v_raw.copy_from_slice(
+                &kv_acc.d_v_raw_host[acc_off..acc_off + kv_dim]
+            );
+
+            // Undo RoPE at position s.
+            rope_backward(rope, &mut d_k_postrope, head_dim, num_kv_heads, s);
+            // Undo RMS norm using k_proj[s] from caller.
+            let k_proj_s = &k_proj_per_position_host[s * kv_dim..(s + 1) * kv_dim];
+            let mut d_k_proj = vec![0.0f32; kv_dim];
+            if self.use_qk_norm {
+                rms_norm_backward_per_head(
+                    k_proj_s, &d_k_postrope, &mut d_k_proj,
+                    num_kv_heads, head_dim, self.qk_scale, self.norm_eps,
+                );
+            } else {
+                d_k_proj.copy_from_slice(&d_k_postrope);
+            }
+
+            // X[s] for the projection backward.
+            let x_s = &kv_acc.x_per_position_host[s * model_dim..(s + 1) * model_dim];
+            x_dev.copy_from(x_s);
+            d_k_proj_dev.copy_from(&d_k_proj);
+            d_v_dev.copy_from(&d_v_raw);
+
+            // Per-position K projection backward: tmp_dw_k = d_k_proj · x^T.
+            // We run k_proj.backward / v_proj.backward into tmp buffers
+            // then add into attn_grads. dx output is unused (the caller's
+            // dx[s] was already updated in the per-step loop's stage 8).
+            self.k_proj.backward(
+                batch, &x_dev, &d_k_proj_dev,
+                &mut tmp_dx_unused,
+                &mut tmp_dw_k, &mut tmp_db_k,
+            )?;
+            self.v_proj.backward(
+                batch, &x_dev, &d_v_dev,
+                &mut tmp_dx_unused,
+                &mut tmp_dw_v, &mut tmp_db_v,
+            )?;
+
+            // Accumulate into attn_grads.
+            unsafe {
+                op_tensor_resident(
+                    hip_buf(&attn_grads.dweight_k)?.device_ptr() as *const f32,
+                    hip_buf(&tmp_dw_k)?.device_ptr() as *const f32,
+                    hip_buf_mut(&mut attn_grads.dweight_k)?
+                        .device_ptr() as *mut f32,
+                    kv_dim * model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                op_tensor_resident(
+                    hip_buf(&attn_grads.dbias_k)?.device_ptr() as *const f32,
+                    hip_buf(&tmp_db_k)?.device_ptr() as *const f32,
+                    hip_buf_mut(&mut attn_grads.dbias_k)?
+                        .device_ptr() as *mut f32,
+                    kv_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                op_tensor_resident(
+                    hip_buf(&attn_grads.dweight_v)?.device_ptr() as *const f32,
+                    hip_buf(&tmp_dw_v)?.device_ptr() as *const f32,
+                    hip_buf_mut(&mut attn_grads.dweight_v)?
+                        .device_ptr() as *mut f32,
+                    kv_dim * model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                op_tensor_resident(
+                    hip_buf(&attn_grads.dbias_v)?.device_ptr() as *const f32,
+                    hip_buf(&tmp_db_v)?.device_ptr() as *const f32,
+                    hip_buf_mut(&mut attn_grads.dbias_v)?
+                        .device_ptr() as *mut f32,
+                    kv_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+                )?;
+            }
+            batch.note_dispatch()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Zero a `GpuVec` of length `n` via host fill + H2D. Cheap one-shot; the
+/// `op_tensor`-based zero-and-add path needed both an init and an add,
+/// which cost the same number of dispatches.
+fn zero_gpuvec_resident(g: &mut GpuVec, n: usize) -> Result<(), ResidencyError> {
+    debug_assert_eq!(g.len(), n);
+    let zeros = vec![0.0f32; n];
+    g.copy_from(&zeros);
+    Ok(())
+}
+
 /// Inverse RoPE — adjoint of [`RotaryEmbedding::apply`]. Used by the
 /// attention backward path. The Givens rotation in 2D satisfies
 /// `(R · v)^T · w = v^T · (R^T · w)`, so propagating the gradient back
@@ -1761,6 +2426,128 @@ impl TransformerBlockResident {
             }
         }
 
+        Ok(())
+    }
+
+    /// Per-position backward for the full-sequence (BLT-encoder/decoder)
+    /// path — mirrors [`Self::backward`] but routes the attention sublayer
+    /// through [`AttentionResident::backward_full_sequence_step`] so
+    /// cross-step KV gradient contributions accumulate into `kv_acc`.
+    ///
+    /// **Caller contract:**
+    /// - Iterate `position` in REVERSE order; before the loop call
+    ///   `kv_acc.zero_resident(batch)`.
+    /// - After the loop call [`AttentionResident::finalize_kv_grads`]
+    ///   passing `kv_acc`, the layer's `attn_grads`, and the per-position
+    ///   K_proj host buffer (D2H'd from each step's `block_scratch.saved_k_proj`).
+    /// - Caller must populate `kv_acc.x_per_position_host[s]` with X[s] =
+    ///   `block_scratch.attn_normed[s]` for every s in 0..n_positions.
+    /// - This method does NOT support `recompute=true` (kv_acc requires
+    ///   per-position activation snapshots; recompute is incompatible).
+    /// - This method does NOT support `dx0_dev` (BLT encoder/decoder use
+    ///   x_lambda=0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_full_sequence_step(
+        &self,
+        batch: &HipBatch,
+        dy_dev: &mut GpuVec,
+        kv_cache: &mut KvCacheResident,
+        position: usize,
+        rope: &RotaryEmbedding,
+        attn_scratch: &mut AttentionScratch,
+        attn_bwd_scratch: &mut AttentionBackwardScratch,
+        mlp_scratch: &mut SwigluScratch,
+        mlp_bwd_scratch: &mut SwigluBackwardScratch,
+        block_scratch: &mut TransformerBlockScratch,
+        attn_grads: &mut AttentionResidentGrads,
+        mlp_grads: &mut SwigluResidentGrads,
+        kv_acc: &mut KvGradAccumulator,
+    ) -> Result<(), ResidencyError> {
+        let model_dim = self.model_dim;
+        debug_assert_eq!(dy_dev.len(), model_dim);
+        // Stage A: peel MLP residual (same as `backward`).
+        let mut d_mlp_out = GpuVec::try_hip(model_dim)?;
+        unsafe {
+            op_tensor_resident(
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf_mut(&mut d_mlp_out)?.device_ptr() as *mut f32,
+                model_dim,
+                self.resid_lambda * 0.5, self.resid_lambda * 0.5, 0.0,
+                BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+        // Stage B: SwiGLU backward.
+        let mut d_mlp_normed = GpuVec::try_hip(model_dim)?;
+        self.mlp.backward(
+            batch, &block_scratch.mlp_normed, &d_mlp_out,
+            mlp_scratch, mlp_bwd_scratch, mlp_grads, &mut d_mlp_normed,
+        )?;
+        // Stage C: pre-MLP RMSNorm backward (host).
+        let mut mlp_input_host = vec![0.0f32; model_dim];
+        block_scratch.mlp_input.copy_to_host(&mut mlp_input_host);
+        let mut d_mlp_normed_host = vec![0.0f32; model_dim];
+        d_mlp_normed.copy_to_host(&mut d_mlp_normed_host);
+        let mut d_mlp_input_host = vec![0.0f32; model_dim];
+        rms_norm_backward_per_head(
+            &mlp_input_host, &d_mlp_normed_host, &mut d_mlp_input_host,
+            1, model_dim, 1.0, self.norm_eps,
+        );
+        let mut d_mlp_input = GpuVec::try_hip(model_dim)?;
+        d_mlp_input.copy_from(&d_mlp_input_host);
+        // Stage D: fold MLP residual.
+        unsafe {
+            op_tensor_resident(
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf(&d_mlp_input)?.device_ptr() as *const f32,
+                hip_buf_mut(dy_dev)?.device_ptr() as *mut f32,
+                model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+        // Stage E: peel attn residual.
+        let mut d_attn_out = GpuVec::try_hip(model_dim)?;
+        unsafe {
+            op_tensor_resident(
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf_mut(&mut d_attn_out)?.device_ptr() as *mut f32,
+                model_dim,
+                self.resid_lambda * 0.5, self.resid_lambda * 0.5, 0.0,
+                BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
+        // Stage F: NEW attention backward (full-sequence step).
+        let mut d_attn_normed = GpuVec::try_hip(model_dim)?;
+        self.attn.backward_full_sequence_step(
+            batch, &mut d_attn_out, kv_cache, self.layer_idx, position, rope,
+            attn_scratch, attn_bwd_scratch, block_scratch,
+            attn_grads, kv_acc, &mut d_attn_normed,
+        )?;
+        // Stage G: pre-attn RMSNorm backward (host).
+        let mut attn_input_host = vec![0.0f32; model_dim];
+        block_scratch.attn_input.copy_to_host(&mut attn_input_host);
+        let mut d_attn_normed_host = vec![0.0f32; model_dim];
+        d_attn_normed.copy_to_host(&mut d_attn_normed_host);
+        let mut d_attn_input_host = vec![0.0f32; model_dim];
+        rms_norm_backward_per_head(
+            &attn_input_host, &d_attn_normed_host, &mut d_attn_input_host,
+            1, model_dim, 1.0, self.norm_eps,
+        );
+        let mut d_attn_input = GpuVec::try_hip(model_dim)?;
+        d_attn_input.copy_from(&d_attn_input_host);
+        // Stage H: fold attn residual.
+        unsafe {
+            op_tensor_resident(
+                hip_buf(dy_dev)?.device_ptr() as *const f32,
+                hip_buf(&d_attn_input)?.device_ptr() as *const f32,
+                hip_buf_mut(dy_dev)?.device_ptr() as *mut f32,
+                model_dim, 1.0, 1.0, 0.0, BinaryOpKind::Add,
+            )?;
+        }
+        batch.note_dispatch()?;
         Ok(())
     }
 

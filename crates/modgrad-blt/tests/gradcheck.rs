@@ -1,10 +1,35 @@
 //! Numerical gradient verification (gradcheck) for the BLT backward pass.
 //!
-//! ## STATUS: 3 catastrophic-zero bugs FIXED; 2 upstream bugs remain
+//! ## STATUS: bug-A cross-step KV gradient FIXED; FD-floor cap + small
+//! systematic residual remain
 //!
-//! 8/12 fail at 1e-2 tolerance, but the failure modes are now
-//! systematic-magnitude rather than catastrophic-zero. Test is still
-//! `#[ignore]`'d so `cargo test` stays green; reproduce via
+//! After the bug-A fix (per `AttentionResident::backward_full_sequence_step`
+//! + `KvGradAccumulator` + `finalize_kv_grads` in modgrad-transformer +
+//! switching encoder/decoder per-byte loops over to that path), the
+//! catastrophic encoder cascade dropped massively:
+//!
+//! | category | pre-fix | post-fix |
+//! |---|---|---|
+//! | encoder.byte_embed | 96% | 15.3% |
+//! | encoder.block.0.wq | 99% | 13.2% |
+//! | encoder.block.0.gate | 87% |  8.0% |
+//! | encoder.cross_attn.0.wk | 19% | 19.2% (FD-floor) |
+//! | latent.block.0.wq | PASS | PASS |
+//! | latent.block.0.gate | 1.4% | 1.4% (FD-floor) |
+//! | latent.block.1.wo | PASS | PASS |
+//! | latent.final_norm | 1.9% | 0.76% (PASS) |
+//! | decoder.block.0.wv | 21% | 20.7% (FD-floor) |
+//! | decoder.cross_attn.0.wq | PASS | PASS |
+//! | decoder.lm_head | 5.8% | 5.8% (FD-floor) |
+//! | decoder.final_norm | 1.9% | 1.9% (FD-floor) |
+//!
+//! The remaining encoder.{byte_embed, block.wq, block.gate} residuals
+//! (8-15%) sit above FD-floor at EPS=1e-3 — likely a small systematic
+//! gap in the cross-step accounting (e.g. the *order* of the s=t add
+//! vs read at step t in `backward_full_sequence_step`). Bringing them
+//! below 1e-2 is a separate slice. Test stays `#[ignore]`'d for now.
+//!
+//! Reproduce via:
 //! `cargo test -p modgrad-blt --features rocm --test gradcheck -- \
 //! --ignored --test-threads=1 --nocapture`.
 //!

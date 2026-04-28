@@ -29,6 +29,7 @@ use modgrad_transformer::mlp::{Mlp, MlpWeights, SwigluMlp, SwigluWeights};
 use modgrad_transformer::residual::ResidualLambdas;
 use modgrad_transformer::resident::{
     AttentionBackwardScratch, AttentionResidentGrads, AttentionScratch,
+    KvGradAccumulator,
     SwigluBackwardScratch, SwigluResidentGrads, SwigluScratch,
     TransformerBlockResident, TransformerBlockScratch,
 };
@@ -793,16 +794,38 @@ impl LocalDecoder {
         let mut tmp_mlp_grads = SwigluResidentGrads::new(byte_dim, block_mlp_dim)?;
 
         for li in (0..n_layers).rev() {
-            // Per-byte block.backward in reverse traversal order.
-            // backward needs the kv_cache in post-forward state; for
-            // single-token decode the cache contents don't change across
-            // bytes (each byte was a fresh position), so we can iterate
-            // forward or reverse — we go forward for cache locality.
-            for t in 0..n_bytes {
-                // (1) Restore per-byte saved attention/MLP activations
-                // into the shared scratch buffers. Without this,
-                // attn.backward / mlp.backward read stale data from the
-                // last byte of the last layer's forward.
+            // ── bug-A fix (cross-step KV gradient): set up per-layer
+            //    `kv_acc` then iterate REVERSE byte order using the new
+            //    `block.backward_full_sequence_step`. Finalize after the
+            //    loop overwrites this layer's K/V weight grads with the
+            //    Σ_s d_K[s] · X[s]^T  /  Σ_s d_V[s] · X[s]^T total.
+            //    See `LocalEncoder::backward` for the same pattern. ──
+            let kv_acc = &mut scratch.kv_accs[li];
+            kv_acc.zero_resident(batch)?;
+            // X[s] = attn_normed[s] for each byte; K_proj[s] from saved scratch.
+            for s in 0..n_bytes {
+                let bs = &cache.block_scratches[li][s];
+                let mut x_host = vec![0.0f32; byte_dim];
+                bs.attn_normed.copy_to_host(&mut x_host);
+                kv_acc.store_x_at(s, &x_host);
+                let mut k_proj_host = vec![0.0f32; attn_kv_dim];
+                bs.saved_k_proj.copy_to_host(&mut k_proj_host);
+                scratch.k_proj_per_position_host
+                    [s * attn_kv_dim..(s + 1) * attn_kv_dim]
+                    .copy_from_slice(&k_proj_host);
+            }
+
+            // Per-byte block backward in REVERSE order so each step's
+            // cross-step write to `kv_acc` is consumed correctly by
+            // earlier (smaller t) steps via the d_k_postrope[t] /
+            // d_v_raw[t] read at stage 5.
+            for t in (0..n_bytes).rev() {
+                // Restore per-byte saved activations into shared scratch
+                // (still required — block.backward_full_sequence_step
+                // reads `block_scratch.saved_*`; the shared
+                // attn_scratch/mlp_scratch buffers are unused by the
+                // attention path now, but mlp.backward still reads
+                // mlp_scratch.{gate_out,up_out,silu,hidden}).
                 restore_block_scratch_into_shared(
                     batch,
                     &cache.block_scratches[li][t],
@@ -818,14 +841,9 @@ impl LocalDecoder {
                 )?;
                 batch.note_dispatch()?;
 
-                // (2) Run the per-byte block backward into a per-call
-                // *temporary* grad bundle; LinearResident::backward
-                // overwrites these, so we add into the layer accumulator
-                // explicitly below.
-                self.byte_layers[li].backward(
+                self.byte_layers[li].backward_full_sequence_step(
                     batch,
                     &mut hidden_step,
-                    None,
                     &mut self.byte_kv_cache,
                     t,
                     &self.rope,
@@ -836,13 +854,14 @@ impl LocalDecoder {
                     &mut cache.block_scratches[li][t],
                     &mut tmp_attn_grads,
                     &mut tmp_mlp_grads,
-                    /* recompute = */ false,
+                    &mut scratch.kv_accs[li],
                 )?;
 
-                // (3) Accumulate per-byte grads into the layer
-                // accumulator. Use `op_tensor_resident(..., Add)` for
-                // each weight/bias buffer.
-                accumulate_attn_grads(
+                // Accumulate per-byte Q/O attn grads + full SwiGLU grads
+                // into the layer accumulator. K/V grads are NOT added
+                // here — `finalize_kv_grads` overwrites them after the
+                // per-byte loop.
+                accumulate_attn_qo_grads(
                     batch, &tmp_attn_grads, &mut grads.attn_grads[li],
                 )?;
                 accumulate_mlp_grads(
@@ -855,6 +874,16 @@ impl LocalDecoder {
                 )?;
                 batch.note_dispatch()?;
             }
+
+            // Finalize cross-step dW_k / dW_v for this layer.
+            self.byte_layers[li].attn.finalize_kv_grads(
+                batch,
+                &scratch.kv_accs[li],
+                &self.rope,
+                &scratch.k_proj_per_position_host
+                    [..n_bytes * attn_kv_dim],
+                &mut grads.attn_grads[li],
+            )?;
 
             // Cross-attn backward: produces d_q_in (additive into
             // d_byte_reps_q_layer) and d_patch_reps (additive into
@@ -935,6 +964,13 @@ pub struct LocalDecoderScratch {
     /// Backward scratch — used only by [`LocalDecoder::backward`].
     pub attn_bwd: AttentionBackwardScratch,
     pub mlp_bwd: SwigluBackwardScratch,
+    /// Per-layer cross-step KV gradient accumulator (bug-A fix). One per
+    /// decoder transformer layer; sized at `max_seq_len`. See
+    /// [`KvGradAccumulator`] for the algorithm.
+    pub kv_accs: Vec<KvGradAccumulator>,
+    /// Per-layer K_proj[s] host buffer for finalize_kv_grads.
+    /// Sized `[max_seq × kv_dim]`; populated per-layer per-call.
+    pub k_proj_per_position_host: Vec<f32>,
 }
 
 impl LocalDecoderScratch {
@@ -945,6 +981,12 @@ impl LocalDecoderScratch {
         let kv_dim = n_heads * head_dim;
         let mlp_dim = config.mlp_dim;
         let max_seq = config.max_seq_len;
+        let mut kv_accs = Vec::with_capacity(config.n_layers);
+        for _ in 0..config.n_layers {
+            kv_accs.push(KvGradAccumulator::new(
+                max_seq, n_heads, head_dim, byte_dim,
+            )?);
+        }
 
         Ok(Self {
             byte_reps: GpuVec::try_hip(max_seq * byte_dim)?,
@@ -970,6 +1012,8 @@ impl LocalDecoderScratch {
             )?,
             attn_bwd: AttentionBackwardScratch::new(n_heads, head_dim, kv_dim, max_seq)?,
             mlp_bwd: SwigluBackwardScratch::new(byte_dim, mlp_dim)?,
+            kv_accs,
+            k_proj_per_position_host: vec![0.0f32; max_seq * kv_dim],
         })
     }
 }
@@ -1452,6 +1496,7 @@ fn restore_block_scratch_into_shared(
 /// dweight buffer it is handed, so the decoder's per-byte loop runs
 /// each block.backward into a per-call temporary `src` and then adds
 /// into the layer accumulator `acc` here.
+#[allow(dead_code)]
 fn accumulate_attn_grads(
     batch: &HipBatch,
     src: &AttentionResidentGrads,
@@ -1463,6 +1508,25 @@ fn accumulate_attn_grads(
     accumulate_pair(batch, &src.dbias_k,   &mut acc.dbias_k)?;
     accumulate_pair(batch, &src.dweight_v, &mut acc.dweight_v)?;
     accumulate_pair(batch, &src.dbias_v,   &mut acc.dbias_v)?;
+    accumulate_pair(batch, &src.dweight_o, &mut acc.dweight_o)?;
+    accumulate_pair(batch, &src.dbias_o,   &mut acc.dbias_o)?;
+    Ok(())
+}
+
+/// Q + O only — bug-A path: dW_k / dW_v / db_k / db_v are written
+/// (overwriting) by `AttentionResident::finalize_kv_grads` after the
+/// per-byte reverse-iteration loop. Mixing per-step accumulation of K/V
+/// here with finalize's overwrite would lose the per-step contribution
+/// — but the per-step K/V contribution is ALREADY part of the cross-step
+/// accumulator's s=t entry, which finalize sees. So accumulating Q/O
+/// per-step is correct, and finalize overwriting K/V is correct.
+fn accumulate_attn_qo_grads(
+    batch: &HipBatch,
+    src: &AttentionResidentGrads,
+    acc: &mut AttentionResidentGrads,
+) -> Result<(), ResidencyError> {
+    accumulate_pair(batch, &src.dweight_q, &mut acc.dweight_q)?;
+    accumulate_pair(batch, &src.dbias_q,   &mut acc.dbias_q)?;
     accumulate_pair(batch, &src.dweight_o, &mut acc.dweight_o)?;
     accumulate_pair(batch, &src.dbias_o,   &mut acc.dbias_o)?;
     Ok(())

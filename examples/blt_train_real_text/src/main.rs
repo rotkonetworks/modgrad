@@ -252,9 +252,9 @@ fn main() {
             eprintln!("  step {i:>3}: {l:.4}");
         }
         panic!(
-            "BLT real-text training: loss did not drop ≥15% \
+            "BLT real-text training: loss did not drop ≥50% \
              (first 5% mean {mean_first:.4} → last 5% mean {mean_last:.4}, \
-             drop {drop_pct:.1}% < 15%) — backward chain or optimiser may be regressing"
+             drop {drop_pct:.1}% < 50%) — backward chain or optimiser may be regressing"
         );
     }
 }
