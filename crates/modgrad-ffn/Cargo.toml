@@ -23,3 +23,10 @@ wincode = "0.5"
 wincode-derive = "0.4"
 # Pure-Rust SIMD GEMM (cache-blocked matmul). Same version as modgrad-compute.
 matrixmultiply = "0.3"
+
+# Tests in this crate share a process-wide HIP serialization mutex with
+# other downstream crates (see `modgrad-device::test_lock::hip_test_lock`).
+# The `test-utils` feature only flips on for `cargo test`, so production
+# builds via the `[dependencies]` modgrad-device entry above are untouched.
+[dev-dependencies]
+modgrad-device = { path = "../modgrad-device", features = ["test-utils"] }

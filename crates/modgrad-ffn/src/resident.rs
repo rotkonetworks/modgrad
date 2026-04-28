@@ -639,20 +639,16 @@ impl FfnBlockScratch {
 
 #[cfg(test)]
 mod tests {
+    //! HIP-using tests in this module acquire the process-wide
+    //! `modgrad_device::test_lock::hip_test_lock()` to serialize against
+    //! every other HIP test in the workspace; see that module's docs for
+    //! the rationale (default-stream contention under `cargo test`'s
+    //! default thread parallelism). Same convention as modgrad-blt's
+    //! migration in commit a76ef75.
+
     use super::*;
     use modgrad_device::backend::rocm::ffi::runtime_available;
     use crate::FfnBlock;
-    use std::sync::Mutex;
-
-    /// HIP runtime tests must run serially — concurrent matvec_resident
-    /// dispatches from multiple test threads share the default stream
-    /// and can interleave intermediate buffers (the SiLU compose is
-    /// three sequential dispatches; another test queuing matvec between
-    /// stages corrupts the output). The other rocm-using tests in this
-    /// crate (`tests::ffn_*` for AdamW path) already accept this risk;
-    /// the cleanest local fix is a per-test mutex guard. Workspace-wide
-    /// fix would be a `serial_test` dep.
-    static HIP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Reference: host-side single-token SwiGLU forward (no residual,
     /// no skip-add — matches what `FfnBlockResident::forward` returns).
@@ -716,7 +712,7 @@ mod tests {
 
     #[test]
     fn ffn_block_resident_matches_host_one_token() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;
@@ -750,7 +746,7 @@ mod tests {
 
     #[test]
     fn ffn_block_resident_sync_weights() {
-        let _guard = HIP_TEST_LOCK.lock().unwrap();
+        let _guard = modgrad_device::test_lock::hip_test_lock();
         if !runtime_available() {
             eprintln!("hip runtime unavailable, skipping");
             return;

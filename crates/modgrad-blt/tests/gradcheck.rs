@@ -43,13 +43,15 @@
 //!   Affects encoder.block.{wq,gate} and the byte_embed scatter (which
 //!   is downstream of the encoder hidden gradient). Fix requires
 //!   modifying `AttentionResident::backward`'s KV gradient handling.
-//! - **bug-B (rms_norm_backward_per_head unconditional)** —
-//!   `AttentionResident::backward` calls `rms_norm_backward_per_head`
-//!   on Q/K unconditionally, even when the matched forward skipped QK
-//!   norm (`use_qk_norm=false`, BLT's config). Distorts d_q_proj /
-//!   d_k_proj and propagates into the residual fold, shifting all
-//!   downstream gradients. Affects decoder.block.wv (21% rel_err) and
-//!   the cross-attn marginals. Fix: gate the call on `use_qk_norm`.
+//! - **bug-B (FIXED in commit a76ef75)** — `AttentionResident::backward`
+//!   was calling `rms_norm_backward_per_head` unconditionally on Q/K
+//!   even when the matched forward skipped QK norm (`use_qk_norm=false`).
+//!   Now gated on the config flag (resident.rs:801-818). Empirical impact
+//!   smaller than originally hypothesised: only encoder-branch grads are
+//!   sensitive (the Q/K chain). decoder.block.wv 21% and other marginals
+//!   are bit-identical pre/post-fix — those are downstream of a SEPARATE
+//!   residual (likely host-fp32 acc arithmetic in decoder stage 5; see
+//!   decoder.rs:783-784). Bug-A remains the dominant cap.
 //!
 //! ### Failure breakdown today (8 of 12)
 //!
@@ -58,8 +60,8 @@
 //! | encoder.block.0.wq | 99% | bug-A cascade |
 //! | encoder.block.0.gate | 87% | bug-A cascade |
 //! | encoder.byte_embed | 96% | bug-A cascade |
-//! | encoder.cross_attn.0.wk | 19% | bug-B cascade |
-//! | decoder.block.0.wv | 21% | bug-B cascade |
+//! | encoder.cross_attn.0.wk | 19% | residual (decoder stage-5 acc) |
+//! | decoder.block.0.wv | 21% | residual (decoder stage-5 acc) |
 //! | latent.block.0.gate | 1.4% | marginal (fp32) |
 //! | decoder.lm_head | 5.8% | marginal (fp32) |
 //! | decoder.final_norm | 1.9% | marginal (fp32) |
@@ -484,9 +486,9 @@ fn pick_index(buf_len: usize) -> usize {
 }
 
 #[test]
-#[ignore = "8/12 fail at 1e-2; bugs 1/2/3 fixed; remaining failures trace to upstream \
-            AttentionResident::backward (bug-A cross-step KV grad dropped, bug-B \
-            rms_norm_backward_per_head unconditional). See module doc-comment."]
+#[ignore = "bugs 1/2/3 + bug-B fixed; bug-A (cross-step KV gradient in \
+            AttentionResident::backward) remains the cap. 8/12 fail at 1e-2 — \
+            see module doc-comment for the failure breakdown."]
 fn blt_backward_matches_finite_difference() {
     let _guard = modgrad_device::test_lock::hip_test_lock();
     if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
