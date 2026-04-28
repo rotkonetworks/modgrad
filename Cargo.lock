@@ -3761,6 +3761,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen_cerebellum_smoke"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-device",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "qwen_chat"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "qwen_cerebellum_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Proof-of-life: tiny QwenCerebellum exposes per-layer hidden states; CerebProjection reads them; eight_region_v2 builds clean."
+
+[[bin]]
+name = "qwen_cerebellum_smoke"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm        = { path = "../../crates/modgrad-ctm", features = ["rocm"] }
+modgrad-transformer = { path = "../../crates/modgrad-transformer", features = ["rocm"] }
+modgrad-compute    = { path = "../../crates/modgrad-compute", features = ["rocm"] }
+modgrad-device     = { path = "../../crates/modgrad-device", features = ["rocm"] }
+
+[features]
+default = []
