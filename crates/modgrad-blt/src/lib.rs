@@ -53,6 +53,13 @@ pub mod byteify;
 #[cfg(feature = "rocm")]
 pub mod cerebellum;
 
+/// Binary checkpoint format for [`model::BltModel`]: save/load resident
+/// weights to disk so a training session can resume after process
+/// exit. NOT a stable cross-version format — see module docs. Only
+/// available with `--features rocm`.
+#[cfg(feature = "rocm")]
+pub mod checkpoint;
+
 /// Re-export of the BLT hash n-gram embedding (see paper §3.2.1). The
 /// implementation lives in `modgrad-codec` because it is byte-level
 /// utility shared with non-BLT paths; we re-export here so BLT-specific

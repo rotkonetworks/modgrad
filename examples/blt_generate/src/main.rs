@@ -235,13 +235,22 @@ fn main() {
     println!("PASS: BLT generate works end-to-end (greedy deterministic, temperature varies)");
     println!();
 
+    // Wall-clock accumulators for the naive vs cached comparison. We
+    // sum across all prompts so the comparison aggregates over enough
+    // generation steps to drown out per-call jitter.
+    let mut total_naive_ms = 0.0f64;
+    let mut total_cached_ms = 0.0f64;
+
     for prompt in prompts {
         let prompt_bytes = prompt.as_bytes();
 
         // Greedy run #1.
+        let t0 = std::time::Instant::now();
         let greedy_a = model.generate(
             &batch, prompt_bytes, N_NEW_BYTES, 0.0, RNG_SEED, &mut scratch,
         ).expect("generate (greedy a)");
+        let naive_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        total_naive_ms += naive_ms;
 
         // Greedy run #2 — must be byte-identical.
         let greedy_b = model.generate(
@@ -254,12 +263,38 @@ fn main() {
         assert_eq!(greedy_a.len(), N_NEW_BYTES,
             "greedy output length mismatch (prompt {prompt:?})");
 
+        // Greedy via the cached path. Must match `generate` bit-for-bit
+        // — `hdevalence`-rigor: the cache is an optimization, not a
+        // semantic change, so any divergence is a bug.
+        let t1 = std::time::Instant::now();
+        let greedy_cached = model.generate_cached(
+            &batch, prompt_bytes, N_NEW_BYTES, 0.0, RNG_SEED, &mut scratch,
+        ).expect("generate_cached (greedy)");
+        let cached_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        total_cached_ms += cached_ms;
+
+        assert_eq!(
+            greedy_a, greedy_cached,
+            "generate_cached must match generate bit-for-bit (greedy, prompt {prompt:?}) — \
+             a divergence here means the boundary-keyed cache served a stale entry"
+        );
+
         // Temperature.
         let temp_out = model.generate(
             &batch, prompt_bytes, N_NEW_BYTES, TEMPERATURE, RNG_SEED, &mut scratch,
         ).expect("generate (temperature)");
         assert_eq!(temp_out.len(), N_NEW_BYTES,
             "temperature output length mismatch (prompt {prompt:?})");
+
+        // Temperature via cached path — bit-identical RNG draws + the
+        // cache reusing identical intermediates ⇒ identical output.
+        let temp_cached = model.generate_cached(
+            &batch, prompt_bytes, N_NEW_BYTES, TEMPERATURE, RNG_SEED, &mut scratch,
+        ).expect("generate_cached (temperature)");
+        assert_eq!(
+            temp_out, temp_cached,
+            "generate_cached must match generate bit-for-bit (temperature, prompt {prompt:?})",
+        );
 
         // All bytes are valid u8 — trivially true at the type level
         // (Vec<u8>), but the assertion makes the contract explicit.
@@ -268,9 +303,37 @@ fn main() {
 
         println!("prompt: {prompt:?}");
         println!("  greedy:    {}", format_bytes(&greedy_a));
+        println!("  cached:    {}  [bit-identical: {}]",
+            format_bytes(&greedy_cached),
+            greedy_a == greedy_cached);
         println!("  temp=0.7:  {}", format_bytes(&temp_out));
+        println!("  wall-clock: naive {naive_ms:.1} ms  cached {cached_ms:.1} ms  \
+                  ratio {:.2}x", naive_ms / cached_ms.max(1e-6));
         println!();
     }
+
+    // ── Wall-clock summary ───────────────────────────────────────
+    //
+    // Honest framing: under the placeholder fixed-stride patcher the
+    // boundaries shift on every step, so the cache hit rate is zero
+    // and the cached path runs the same work plus a small bookkeeping
+    // overhead (boundary-equality compare, two D2D clones at miss).
+    // The interesting number to read is therefore "ratio close to 1.0
+    // ± noise" — a genuine speedup will land once an entropy patcher
+    // emits stable boundaries for stable byte prefixes. The decomposed
+    // forward shape this lays down is the prerequisite for that future
+    // slice plus true incremental KV-caching.
+    println!(
+        "wall-clock summary across {} prompts × {} new bytes:\n  \
+         naive   {:>7.1} ms total\n  \
+         cached  {:>7.1} ms total\n  \
+         ratio   {:>7.2}x  (1.0x = no speedup; cache misses every step \
+         under fixed-stride patcher — see BltModel::generate_cached doc)",
+        prompts.len(), N_NEW_BYTES,
+        total_naive_ms, total_cached_ms,
+        total_naive_ms / total_cached_ms.max(1e-6),
+    );
+    println!();
 
     // ── Sanity check across all prompts: temperature differs from
     //    greedy for at least one (prompt, byte) pair. We aggregate

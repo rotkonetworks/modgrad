@@ -1639,3 +1639,318 @@ fn run_forward_backward_pos(
         .expect("BltModel::backward");
     batch.flush().expect("flush backward");
 }
+
+/// ── Investigation: characterize the encoder bug-A residual distribution ──
+///
+/// The bug-A fix (commit `9c4be70`) reduced encoder
+/// `{byte_embed, block.0.wq, block.0.gate}` rel_err from 87-99% to 8-15%
+/// at EPS=1e-3. The residual is above FD-floor (analytic >> noise floor),
+/// so it's a *real* analytic gap. Algorithmic inspection of
+/// `AttentionResident::backward_full_sequence_step` (resident.rs:1072+)
+/// and `finalize_kv_grads` (resident.rs:1386+) didn't pin it down.
+///
+/// ### Hypothesis-test pattern
+///
+/// The cross-step KV path mixes four terms: T1 (s=t self-contribution,
+/// known correct from autoregressive backward), T2 (s<t cross terms,
+/// new), T3 (the dx[t] cross-step fold), and T4 (finalize_kv_grads).
+/// T2-T4 are suspect.
+///
+/// We probe the *shape* of the bug indirectly via a HISTOGRAM of
+/// `analytic / num` across many indices of `encoder.block.0.wq`:
+///
+/// - **Tight cluster around a constant** (e.g. all ratios in
+///   [0.85, 0.90]) -> uniform multiplicative bias. This points at a
+///   *missing constant scale factor* — typical candidates: 1/sqrt(2),
+///   1/sqrt(head_dim), `1 - 1/n`, or a missing softmax-Jacobian
+///   identity term applied to T2.
+/// - **Broad spread** -> index-dependent bug, likely a per-position
+///   miscount in T2 (e.g. an off-by-one at the s=0 boundary in the
+///   inner cross-step loop, or a missed contribution at one specific
+///   `s`).
+///
+/// We mirror the same probe on `encoder.byte_embed` for comparison —
+/// it's downstream of the encoder hidden gradient (so same root bug,
+/// but routed through the byte-embed scatter and the n-gram-table
+/// `1/(n_tables+1)` divider). Comparing the two distributions tests
+/// whether the bug propagates as a constant scale or accumulates.
+///
+/// ### Index sampling
+///
+/// 50 random indices via a deterministic LCG. 50 is enough for a
+/// stable histogram on the 1024-float `encoder.block.0.wq` buffer;
+/// cheap enough to run in <30 s on the tiny config (50 x 2 forwards =
+/// 100 forwards per key, x 2 keys ~ 200 forwards).
+///
+/// ### Bucketing
+///
+/// 10 buckets in `analytic / num` space:
+///   `(-inf, 0.5]  (0.5, 0.7]  (0.7, 0.9]  (0.9, 1.0]  (1.0, 1.1]
+///    (1.1, 1.3]  (1.3, 1.5]  (1.5, 2.0]  (2.0, 5.0]  (5.0, +inf)`
+///
+/// Plus three sentinel buckets:
+///   - `analytic ~ 0` (sparse / dropped contribution): `|analytic| < 1e-6`
+///   - `num ~ 0` (FD floor): `|num| < 1e-6` AND `|analytic| >= 1e-6`
+///   - both small (degenerate): `max(|num|, |analytic|) < 1e-6`
+///
+/// ### Test always passes
+///
+/// This is a diagnostic — print is the proof artifact. The test does
+/// not gate; it produces a histogram for offline analysis.
+#[test]
+#[ignore = "Investigation: characterize the encoder bug-A residual via \
+            ratio histogram across many indices. \
+            cargo test -p modgrad-blt --features rocm --test gradcheck \
+            investigate_bug_a_residual_distribution -- --ignored \
+            --test-threads=1 --nocapture"]
+fn investigate_bug_a_residual_distribution() {
+    let _guard = modgrad_device::test_lock::hip_test_lock();
+    if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+        eprintln!("investigate: MODGRAD_SKIP_HIP_TESTS set, skipping");
+        return;
+    }
+    if !runtime_available() {
+        eprintln!("investigate: HIP unavailable, skipping");
+        return;
+    }
+
+    let config = tiny_config();
+    let bytes: Vec<u8> = (0..32u8).collect();
+    let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+    let target: u8 = 17;
+
+    eprintln!();
+    eprintln!("════════════════════════════════════════════════════════════════════");
+    eprintln!(" investigate_bug_a_residual_distribution");
+    eprintln!(" config: tiny_config (encoder n_layers=1, byte_dim=32, n_heads=4,");
+    eprintln!("                     head_dim=8 -> encoder.block.0.wq is 32x32 = 1024)");
+    eprintln!(" probe : 50 random indices per key via LCG");
+    eprintln!(" EPS   : 1e-3 (the regime where bug-A residual was characterised)");
+    eprintln!("════════════════════════════════════════════════════════════════════");
+
+    let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+    let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+    let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+
+    // Populate analytic grads once. Subsequent FD perturbations only
+    // mutate the weight buffer (then restore it); the analytic grad
+    // buffer is read-only.
+    run_forward_backward(
+        &mut model, &mut scratch, &mut state, &bytes, &boundaries, target,
+    );
+
+    const N_SAMPLES: usize = 50;
+    const EPS: f32 = 1e-3;
+    const ZERO_FLOOR: f32 = 1e-6;
+
+    // The two probe keys.
+    let probe_keys: &[&str] = &["encoder.block.0.wq", "encoder.byte_embed"];
+
+    // Bucket layout: 10 finite buckets + 3 sentinels.
+    let bucket_edges: [f32; 9] = [0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5, 2.0, 5.0];
+    let bucket_labels: [&str; 10] = [
+        "(-inf,0.5]", "(0.5,0.7] ", "(0.7,0.9] ", "(0.9,1.0] ",
+        "(1.0,1.1] ", "(1.1,1.3] ", "(1.3,1.5] ", "(1.5,2.0] ",
+        "(2.0,5.0] ", "(5.0,+inf)",
+    ];
+
+    for &key in probe_keys {
+        eprintln!();
+        eprintln!("──────────────────────────────────────────────────────────────────");
+        eprintln!(" key = {key}");
+        eprintln!("──────────────────────────────────────────────────────────────────");
+
+        let grad_buf_len = grad_dev_for_key(&state, key).len();
+        let weight_buf_len = weight_dev_for_key(&model, key).len_f32();
+        let n = grad_buf_len.min(weight_buf_len);
+        eprintln!(
+            " buffer length: grad={grad_buf_len} weight={weight_buf_len} (probing first {n})"
+        );
+
+        // Deterministic LCG-sampled indices in [0, n). Same glibc LCG
+        // shape as `lcg_bytes` but produces 32-bit words modded into
+        // the buffer length. Seed varies per key so the sample sets
+        // don't trivially correlate.
+        let seed: u32 = if key == "encoder.block.0.wq" {
+            0x000B_A66A
+        } else {
+            0x000B_A66B
+        };
+        let mut lcg_state: u32 = seed;
+        let mut indices: Vec<usize> = Vec::with_capacity(N_SAMPLES);
+        // Bound the loop hard so a pathologically small `n` cannot spin.
+        let mut spins = 0usize;
+        while indices.len() < N_SAMPLES && spins < N_SAMPLES * 20 {
+            lcg_state = lcg_state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let idx = (lcg_state as usize) % n;
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
+            spins += 1;
+        }
+
+        // Per-sample data collection.
+        let mut bucket_counts = [0usize; 10];
+        let mut count_analytic_zero = 0usize; // analytic ~ 0 (potential dropped contribution)
+        let mut count_num_zero = 0usize;       // num ~ 0 but analytic != 0 (FD floor)
+        let mut count_both_zero = 0usize;      // both ~ 0 (degenerate)
+        let mut log_ratios: Vec<f32> = Vec::new();
+        let mut signed_ratios: Vec<f32> = Vec::new();
+
+        // Print per-sample table for forensic review.
+        eprintln!(" idx       num             analytic         ratio       log|ratio|  bucket");
+
+        for &idx in &indices {
+            let analytic = read_grad_at(grad_dev_for_key(&state, key), idx);
+
+            let original = read_f32_at(weight_dev_for_key(&model, key), idx);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original + EPS);
+            let loss_plus =
+                forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original - EPS);
+            let loss_minus =
+                forward_loss(&mut model, &mut scratch, &bytes, &boundaries, target);
+            write_f32_at(weight_dev_for_key(&model, key), idx, original);
+
+            let num = (loss_plus - loss_minus) / (2.0 * EPS);
+
+            let a_abs = analytic.abs();
+            let n_abs = num.abs();
+
+            let label;
+            let mut ratio_for_print = f32::NAN;
+            let mut log_for_print = f32::NAN;
+            if a_abs < ZERO_FLOOR && n_abs < ZERO_FLOOR {
+                count_both_zero += 1;
+                label = "BOTH~0";
+            } else if a_abs < ZERO_FLOOR {
+                count_analytic_zero += 1;
+                label = "ANA~0 ";
+            } else if n_abs < ZERO_FLOOR {
+                count_num_zero += 1;
+                label = "NUM~0 ";
+            } else {
+                let ratio = analytic / num;
+                ratio_for_print = ratio;
+                signed_ratios.push(ratio);
+                let abs_ratio = ratio.abs();
+                let lr = abs_ratio.ln();
+                log_ratios.push(lr);
+                log_for_print = lr;
+                // Bucket on signed ratio: a negative ratio (sign flip)
+                // lands in the (-inf, 0.5] bucket since ratio < 0 < 0.5.
+                let mut b = bucket_edges.len(); // default: past last edge
+                for (i, &edge) in bucket_edges.iter().enumerate() {
+                    if ratio <= edge {
+                        b = i;
+                        break;
+                    }
+                }
+                bucket_counts[b] += 1;
+                label = bucket_labels[b];
+            }
+
+            eprintln!(
+                " {:>5}  {:>+13.6e}  {:>+13.6e}  {:>+10.4}  {:>+10.4}  {}",
+                idx, num, analytic, ratio_for_print, log_for_print, label,
+            );
+        }
+
+        // Summary statistics over non-degenerate samples.
+        let n_valid = log_ratios.len();
+        let (log_mean, log_std) = if n_valid > 0 {
+            let mean = log_ratios.iter().sum::<f32>() / (n_valid as f32);
+            let var = log_ratios
+                .iter()
+                .map(|x| (x - mean).powi(2))
+                .sum::<f32>()
+                / (n_valid as f32);
+            (mean, var.sqrt())
+        } else {
+            (f32::NAN, f32::NAN)
+        };
+        let signed_mean = if n_valid > 0 {
+            signed_ratios.iter().sum::<f32>() / (n_valid as f32)
+        } else {
+            f32::NAN
+        };
+        let signed_std = if n_valid > 0 {
+            let m = signed_mean;
+            (signed_ratios.iter().map(|x| (x - m).powi(2)).sum::<f32>() / (n_valid as f32)).sqrt()
+        } else {
+            f32::NAN
+        };
+
+        eprintln!();
+        eprintln!(
+            " Histogram of analytic / num (signed) over {} non-degenerate samples:",
+            n_valid,
+        );
+        for (i, label) in bucket_labels.iter().enumerate() {
+            let bar: String = std::iter::repeat('#').take(bucket_counts[i]).collect();
+            eprintln!("   {label}  {:>3}  {bar}", bucket_counts[i]);
+        }
+        eprintln!();
+        eprintln!(" Sentinels:");
+        eprintln!(
+            "   analytic ~ 0 (|a|<1e-6, possible dropped contribution): {}",
+            count_analytic_zero,
+        );
+        eprintln!(
+            "   num ~ 0      (|n|<1e-6, FD-floor):                       {}",
+            count_num_zero,
+        );
+        eprintln!(
+            "   both ~ 0     (|a|<1e-6 AND |n|<1e-6, degenerate):        {}",
+            count_both_zero,
+        );
+
+        eprintln!();
+        eprintln!(" Statistics on log|analytic / num| (n={}):", n_valid);
+        eprintln!(
+            "   mean = {:.4}  ->  geomean ratio = {:.4}",
+            log_mean,
+            log_mean.exp(),
+        );
+        eprintln!(
+            "   std  = {:.4}  ->  multiplicative +-1sigma band = [{:.4}, {:.4}]",
+            log_std,
+            (log_mean - log_std).exp(),
+            (log_mean + log_std).exp(),
+        );
+        eprintln!(" Signed ratio (analytic / num):");
+        eprintln!("   mean = {:+.4}  std = {:.4}", signed_mean, signed_std);
+
+        // Compare geomean to known constants — the meat of the verdict.
+        let geomean = log_mean.exp();
+        let candidates: &[(&str, f32)] = &[
+            ("1.0", 1.0),
+            ("0.5 (1/2)", 0.5),
+            ("2.0 (x2)", 2.0),
+            ("1/sqrt(2)", 1.0 / 2.0_f32.sqrt()),
+            ("sqrt(2)", 2.0_f32.sqrt()),
+            ("1/sqrt(8)=1/sqrt(head_dim)", 1.0 / 8.0_f32.sqrt()),
+            ("sqrt(8)=sqrt(head_dim)", 8.0_f32.sqrt()),
+            ("0.25 (1/n_heads)", 0.25),
+            ("4.0 (n_heads)", 4.0),
+            ("1/32 (1/byte_dim)", 1.0 / 32.0),
+            ("31/32 (1-1/n_bytes)", 31.0 / 32.0),
+        ];
+        eprintln!();
+        eprintln!(" Comparison to known constants (rel-distance from geomean ratio):");
+        eprintln!("   geomean = {:.4}", geomean);
+        for &(name, val) in candidates {
+            let rd = (geomean - val).abs() / val.abs().max(1e-12);
+            let marker = if rd < 0.05 { "  <- CLOSE" } else { "" };
+            eprintln!(
+                "   {:<32} val={:.4}  rel-dist={:.3e}{}",
+                name, val, rd, marker,
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!("════════════════════════════════════════════════════════════════════");
+    eprintln!(" END investigate_bug_a_residual_distribution");
+    eprintln!("════════════════════════════════════════════════════════════════════");
+}
