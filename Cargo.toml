@@ -29,6 +29,7 @@ members = [
     "examples/filter_viz",
     "examples/hebbian_sanity",
     "examples/pretrain_retina",
+    "examples/bench_brain_crossover",
     "examples/bench_maze_resident",
     "examples/bench_maze_resident_medium",
     "examples/cortex_cerebellum_reader",
