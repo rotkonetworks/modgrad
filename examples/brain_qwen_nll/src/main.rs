@@ -102,6 +102,21 @@ fn main() {
         /// (~57× reduction). Set to 0 to use the dense modulator.
         #[arg(long, default_value_t = 8)]
         rank: usize,
+
+        /// What signal feeds into the modulator. Used to ablate
+        /// whether brain dynamics are doing useful work, or whether
+        /// the modulator's improvement could come from any
+        /// content-causal feature extractor:
+        ///   "real"   — RegionalBrain via NeuralComputer.step (default)
+        ///   "random" — fresh random Gaussian per token (no
+        ///              cross-token state — pure noise)
+        ///   "embed"  — deterministic per-token-id vector (sin-based
+        ///              hash — content-causal but no temporal
+        ///              dependency or memory)
+        ///   "zero"   — vec![0.0; brain_dim] (modulator learns a
+        ///              constant bias only)
+        #[arg(long, default_value = "real")]
+        brain_mode: String,
     }
 
     let args = Args::parse();
@@ -211,29 +226,61 @@ fn main() {
     let baseline_nll = nll_per_token(&m_baseline, &qwen_per_pos, None, &targets);
     eprintln!("brain_qwen_nll: BASELINE Qwen-only NLL = {baseline_nll:.4}");
 
-    // ── 5. Run brain over the same sequence; collect brain outputs.
-    // Brain out_dims is intentionally small (BRAIN_OUT_DIM): the
-    // modulator handles the brain → vocab projection. Setting brain
-    // out_dims = vocab = 152K would force a sync→vocab matvec at the
-    // brain's output projection that takes hundreds of ms per token. ──
+    // ── 5. Compute brain outputs per token. The --brain-mode flag
+    // selects between the real brain and ablation baselines that test
+    // whether brain dynamics are doing useful work. ──
     const BRAIN_OUT_DIM: usize = 512;
-    let mut cfg = RegionalConfig::eight_region(16, BRAIN_OUT_DIM, 2);
-    cfg.router = None; // exercise fixed connections (HIPPO → ATTENTION)
-    let w = RegionalWeights::new(cfg);
-    let mut nc = NeuralComputer::new(w);
-
-    eprintln!("brain_qwen_nll: running brain over {n} tokens (out_dim={BRAIN_OUT_DIM}) …");
+    eprintln!("brain_qwen_nll: brain mode = {}, out_dim={BRAIN_OUT_DIM}",
+              args.brain_mode);
     let brain_t = Instant::now();
-    let brain_outputs: Vec<Vec<f32>> = token_ids.iter()
-        .map(|&id| {
-            // Brain's input vocab is small (we use eight_region's
-            // default raw_obs_dim from `embed`), so squash Qwen token
-            // IDs into that range. The brain's actual job here is to
-            // produce a content-causal output vector for the
-            // modulator — token-id-as-input is fine.
-            nc.step((id as usize) % 256)
-        })
-        .collect();
+    let brain_outputs: Vec<Vec<f32>> = match args.brain_mode.as_str() {
+        "real" => {
+            let mut cfg = RegionalConfig::eight_region(16, BRAIN_OUT_DIM, 2);
+            cfg.router = None;
+            let w = RegionalWeights::new(cfg);
+            let mut nc = NeuralComputer::new(w);
+            token_ids.iter().map(|&id| nc.step((id as usize) % 256)).collect()
+        }
+        "random" => {
+            // Fresh random Gaussian per token — no cross-token state.
+            // PCG-style PRNG keyed off token position so the run is
+            // deterministic and reproducible.
+            (0..n).map(|t| {
+                let mut s = 0xdeadbeef_u64
+                    .wrapping_add(t as u64)
+                    .wrapping_mul(6364136223846793005);
+                (0..BRAIN_OUT_DIM).map(|_| {
+                    s = s.wrapping_mul(6364136223846793005)
+                          .wrapping_add(1442695040888963407);
+                    let u1 = ((s >> 40) as f32 / (1u64 << 24) as f32).max(1e-10);
+                    s = s.wrapping_mul(6364136223846793005)
+                          .wrapping_add(1442695040888963407);
+                    let u2 = (s >> 40) as f32 / (1u64 << 24) as f32;
+                    (-2.0 * u1.ln()).sqrt()
+                        * (2.0 * std::f32::consts::PI * u2).cos()
+                }).collect()
+            }).collect()
+        }
+        "embed" => {
+            // Deterministic per-token-id sinusoidal vector. Content-
+            // causal (same token → same output) but no temporal
+            // dependency, no memory.
+            token_ids.iter().map(|&id| {
+                let id = id as usize;
+                (0..BRAIN_OUT_DIM).map(|i| {
+                    ((id as f32 * 0.13 + i as f32 * 0.21).sin())
+                }).collect()
+            }).collect()
+        }
+        "zero" => {
+            (0..n).map(|_| vec![0.0f32; BRAIN_OUT_DIM]).collect()
+        }
+        other => {
+            eprintln!("brain_qwen_nll: unknown --brain-mode {other:?} \
+                       (expected: real / random / embed / zero)");
+            return;
+        }
+    };
     let brain_ms = brain_t.elapsed().as_millis();
     eprintln!("brain_qwen_nll: brain forward {n} ticks in {brain_ms} ms");
     debug_assert_eq!(brain_outputs[0].len(), BRAIN_OUT_DIM);
