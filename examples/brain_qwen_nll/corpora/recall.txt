@@ -1,0 +1,7 @@
+Alice was born in May. Bob was born in June. Carol was born in July. David was born in August.
+Eve lives in Tokyo. Frank lives in Paris. Grace lives in Madrid. Henry lives in Berlin.
+The capital of France is Paris. The capital of Japan is Tokyo. The capital of Germany is Berlin.
+Alice was born in May. Eve lives in Tokyo. Frank lives in Paris.
+Bob was born in June. Grace lives in Madrid. The capital of Germany is Berlin.
+The capital of France is Paris. Carol was born in July. Henry lives in Berlin.
+David was born in August. The capital of Japan is Tokyo. Alice was born in May.
