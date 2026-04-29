@@ -44,7 +44,8 @@ fn main() {
 
     use modgrad_ctm::graph::{NeuralComputer, RegionalConfig, RegionalWeights};
     use modgrad_ctm::logit_modulator::{
-        BrainLogitModulator, nll_per_token, cross_entropy_grad,
+        BrainLogitModulator, LowRankBrainLogitModulator,
+        nll_per_token, cross_entropy_grad,
     };
 
     #[derive(Parser, Debug)]
@@ -86,6 +87,13 @@ fn main() {
         /// Learning rate for the modulator's SGD steps.
         #[arg(long, default_value_t = 0.05)]
         lr: f32,
+
+        /// LoRA rank for the modulator. The dense modulator at
+        /// brain_dim=512, vocab=152K is 78M params — guaranteed to
+        /// overfit a small text. Default rank=8 drops to ~1.4M params
+        /// (~57× reduction). Set to 0 to use the dense modulator.
+        #[arg(long, default_value_t = 8)]
+        rank: usize,
     }
 
     let args = Args::parse();
@@ -274,45 +282,93 @@ fn main() {
     eprintln!("brain_qwen_nll: TEST baseline (Qwen alone)        = {test_baseline_nll:.4}");
     eprintln!("brain_qwen_nll: TEST alpha=1 random init          = {test_random_nll:.4}");
 
-    // Train modulator (start from random init).
-    let mut m_trained = BrainLogitModulator::new(BRAIN_DIM_FOR_MODULATOR, vocab);
-    m_trained.alpha = 1.0;
-    for w in m_trained.proj.weight.iter_mut() { *w *= 0.01; }
-
-    let mut d_w = vec![0.0f32; vocab * BRAIN_DIM_FOR_MODULATOR];
-    let mut d_b = vec![0.0f32; vocab];
-    let mut modulated = vec![0.0f32; vocab];
-    let mut d_modulated = vec![0.0f32; vocab];
-
-    eprintln!("brain_qwen_nll: training modulator for {} epochs at lr={} …",
-              args.epochs, args.lr);
+    // Train modulator (low-rank or dense based on --rank flag).
+    eprintln!("brain_qwen_nll: training modulator (rank={}) for {} epochs at lr={} …",
+              args.rank, args.epochs, args.lr);
     let train_t = Instant::now();
-    let scale = 1.0 / n_train as f32;
-    for epoch in 0..args.epochs {
-        for t in 0..n_train {
-            m_trained.modulate_into(train_qwen[t], train_brain[t], &mut modulated);
-            cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
-            for v in 0..vocab { d_modulated[v] *= scale; }
-            m_trained.backward(train_brain[t], &d_modulated, &mut d_w, &mut d_b);
-        }
-        m_trained.sgd_step(&mut d_w, &mut d_b, args.lr);
+    let (test_trained_nll, train_trained_nll, n_params) = if args.rank == 0 {
+        // Dense path.
+        let mut m_trained = BrainLogitModulator::new(BRAIN_DIM_FOR_MODULATOR, vocab);
+        m_trained.alpha = 1.0;
+        for w in m_trained.proj.weight.iter_mut() { *w *= 0.01; }
+        let np = m_trained.proj.weight.len() + m_trained.proj.bias.len();
+        eprintln!("  dense modulator: {} params", np);
 
-        if epoch == 0 || (epoch + 1) % (args.epochs.max(10) / 10) == 0 || epoch == args.epochs - 1 {
-            let train_nll = nll_per_token(
-                &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
-            let test_nll = nll_per_token(
-                &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
-            eprintln!("  epoch {:>3}/{}  train NLL = {train_nll:.4}  test NLL = {test_nll:.4}",
-                      epoch + 1, args.epochs);
+        let mut d_w = vec![0.0f32; vocab * BRAIN_DIM_FOR_MODULATOR];
+        let mut d_b = vec![0.0f32; vocab];
+        let mut modulated = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let scale = 1.0 / n_train as f32;
+        for epoch in 0..args.epochs {
+            for t in 0..n_train {
+                m_trained.modulate_into(train_qwen[t], train_brain[t], &mut modulated);
+                cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m_trained.backward(train_brain[t], &d_modulated, &mut d_w, &mut d_b);
+            }
+            m_trained.sgd_step(&mut d_w, &mut d_b, args.lr);
+            if epoch == 0 || (epoch + 1) % (args.epochs.max(10) / 10) == 0
+                || epoch == args.epochs - 1 {
+                let train_nll = nll_per_token(
+                    &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+                let test_nll = nll_per_token(
+                    &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+                eprintln!("  epoch {:>3}/{}  train NLL = {train_nll:.4}  test NLL = {test_nll:.4}",
+                          epoch + 1, args.epochs);
+            }
         }
-    }
+        let test  = nll_per_token(&m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+        let train = nll_per_token(&m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+        (test, train, np)
+    } else {
+        // Low-rank path.
+        let mut m_trained = LowRankBrainLogitModulator::new(
+            BRAIN_DIM_FOR_MODULATOR, args.rank, vocab);
+        m_trained.alpha = 1.0;
+        // Scale the up-projection so alpha=1 starts in the same logit
+        // magnitude regime as Qwen's logits (down-projection is small,
+        // up-projection multiplies by it before adding to logits).
+        for w in m_trained.up.weight.iter_mut() { *w *= 0.01; }
+        let np = m_trained.n_params();
+        eprintln!("  low-rank modulator (rank={}): {} params", args.rank, np);
+
+        let mut d_dw = vec![0.0f32; args.rank * BRAIN_DIM_FOR_MODULATOR];
+        let mut d_db = vec![0.0f32; args.rank];
+        let mut d_uw = vec![0.0f32; vocab * args.rank];
+        let mut d_ub = vec![0.0f32; vocab];
+        let mut modulated = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let mut z_scratch = vec![0.0f32; args.rank];
+        let scale = 1.0 / n_train as f32;
+        for epoch in 0..args.epochs {
+            for t in 0..n_train {
+                m_trained.modulate_into_with_scratch(
+                    train_qwen[t], train_brain[t], &mut modulated, &mut z_scratch);
+                cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m_trained.backward(train_brain[t], &d_modulated,
+                    &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub);
+            }
+            m_trained.sgd_step(&mut d_dw, &mut d_db, &mut d_uw, &mut d_ub, args.lr);
+            if epoch == 0 || (epoch + 1) % (args.epochs.max(10) / 10) == 0
+                || epoch == args.epochs - 1 {
+                let train_nll = nll_per_token(
+                    &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+                let test_nll = nll_per_token(
+                    &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+                eprintln!("  epoch {:>3}/{}  train NLL = {train_nll:.4}  test NLL = {test_nll:.4}",
+                          epoch + 1, args.epochs);
+            }
+        }
+        let test  = nll_per_token(&m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+        let train = nll_per_token(&m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+        (test, train, np)
+    };
     let train_ms = train_t.elapsed().as_millis();
     eprintln!("brain_qwen_nll: training done in {train_ms} ms");
-
-    let test_trained_nll = nll_per_token(
-        &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
-    let train_trained_nll = nll_per_token(
-        &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+    eprintln!("brain_qwen_nll: modulator params = {n_params}, train positions = {n_train}, \
+               params-per-example = {}",
+              n_params / n_train.max(1));
 
     eprintln!();
     eprintln!("---- redshiftzero summary (with training) ----");

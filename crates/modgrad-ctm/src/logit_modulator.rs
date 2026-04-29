@@ -50,6 +50,22 @@ use modgrad_compute::neuron::Linear;
 use serde::{Deserialize, Serialize};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
+/// Common surface for any modulator that maps brain output → vocab-
+/// sized logit delta. Lets `nll_per_token` and downstream consumers
+/// stay generic across the dense `BrainLogitModulator` and
+/// `LowRankBrainLogitModulator` (LoRA-factored). Adding a third
+/// modulator (sparse, hashed, hyper-network) only needs a new impl;
+/// no per-modulator NLL helper.
+pub trait LogitModulator {
+    fn vocab(&self) -> usize;
+    fn brain_dim(&self) -> usize;
+    /// Write `qwen_logits + alpha · proj(brain_output)` into `out`.
+    /// Implementations are free to allocate temporary scratch buffers.
+    /// Hot training loops should call type-specific
+    /// `modulate_into_with_scratch` (or analogous) instead.
+    fn modulate_into(&self, qwen_logits: &[f32], brain_output: &[f32], out: &mut [f32]);
+}
+
 /// Adds a learnable brain-derived bias to LLM logits before sampling.
 /// Field-by-field serialisable so trained projections roundtrip
 /// through the standard `modgrad-persist` save/load.
@@ -429,6 +445,27 @@ pub fn cross_entropy_grad(logits: &[f32], target: usize, out: &mut [f32]) {
     out[target] -= 1.0;
 }
 
+impl LogitModulator for BrainLogitModulator {
+    fn vocab(&self) -> usize { self.vocab }
+    fn brain_dim(&self) -> usize { self.brain_dim }
+    fn modulate_into(&self, qwen: &[f32], brain: &[f32], out: &mut [f32]) {
+        BrainLogitModulator::modulate_into(self, qwen, brain, out);
+    }
+}
+
+impl LogitModulator for LowRankBrainLogitModulator {
+    fn vocab(&self) -> usize { self.vocab }
+    fn brain_dim(&self) -> usize { self.brain_dim }
+    fn modulate_into(&self, qwen: &[f32], brain: &[f32], out: &mut [f32]) {
+        // Allocate the rank-dim scratch per call. Acceptable for
+        // measurement helpers (called once per evaluation); training
+        // loops should bypass the trait and call
+        // `modulate_into_with_scratch` directly.
+        let mut z = vec![0.0f32; self.rank];
+        self.modulate_into_with_scratch(qwen, brain, out, &mut z);
+    }
+}
+
 /// Mean per-token negative log-likelihood given a sequence of LLM
 /// logits, optional per-step brain outputs to fold in, and the target
 /// next-token IDs. Returns `f32::INFINITY` on empty input or if any
@@ -440,16 +477,14 @@ pub fn cross_entropy_grad(logits: &[f32], target: usize, out: &mut [f32]) {
 ///   `brain_outputs`:    `Some(&[&[f32; brain_dim]])` of length `T` or `None`
 ///   `targets`:          `&[usize]` of length `T`, each `< vocab`
 ///
-/// When `brain_outputs` is `None`, computes the baseline LLM NLL — no
-/// modulation, no projection cost. When `Some`, applies the modulator
-/// per step before computing NLL. This is the primitive the Slice C2
-/// training loop and the comparison report ("Qwen-alone NLL" vs
-/// "Qwen+brain NLL") are both built on.
+/// Generic over the modulator type via the [`LogitModulator`] trait —
+/// works with `BrainLogitModulator`, `LowRankBrainLogitModulator`, or
+/// any future variant.
 ///
 /// NLL definition: `-(1/T) · sum_t log_softmax(modulated_logits[t])[targets[t]]`.
 /// Numerically stable: subtracts max-logit before exp.
-pub fn nll_per_token(
-    modulator: &BrainLogitModulator,
+pub fn nll_per_token<M: LogitModulator>(
+    modulator: &M,
     qwen_logits_seq: &[&[f32]],
     brain_outputs: Option<&[&[f32]]>,
     targets: &[usize],
@@ -461,7 +496,7 @@ pub fn nll_per_token(
         if bo.len() != qwen_logits_seq.len() { return f32::INFINITY; }
     }
 
-    let vocab = modulator.vocab;
+    let vocab = modulator.vocab();
     let mut total_nll: f32 = 0.0;
     let mut scratch = vec![0.0f32; vocab];
 
@@ -479,7 +514,6 @@ pub fn nll_per_token(
             None => logits_t,
         };
 
-        // log-softmax(modulated)[target_id], numerically stable.
         let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let lse: f32 = modulated.iter()
             .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
