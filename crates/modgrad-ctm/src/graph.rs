@@ -589,7 +589,16 @@ impl RegionalConfig {
 
         let connections = vec![
             Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
-            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            // ATTENTION reads from cortex (INPUT) AND from hippocampal
+            // episodic memory (HIPPOCAMPUS). Memory-guided attention:
+            // episodic state accumulated in hippocampus modulates the
+            // attention region's input, so the {attention → output →
+            // motor} prediction loop becomes content-causal in past
+            // observation history. Without this edge hippocampus is a
+            // memory sink (entries accumulate but never reach
+            // predictions); see the
+            // `episodic_memory_propagates_to_prediction` test.
+            Connection { from: vec![INPUT, HIPPOCAMPUS], to: ATTENTION, receives_observation: false, observation_scale: 0 },
             Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
             Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
             Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
@@ -6027,31 +6036,30 @@ mod tests {
              l2={l2:.4}, |kv_a|={norm_a:.4}, |kv_b|={norm_b:.4})");
     }
 
-    /// Episodic memory in the hippocampus does NOT today propagate to
-    /// brain predictions — measured at logit L2 = 4e-6 (FP noise) for
-    /// two paths whose hippocampus KVs differ substantially (rel L2 ≫
-    /// 0.05, see `episodic_memory_is_content_dependent`).
+    /// Episodic memory in the hippocampus must propagate to brain
+    /// predictions — i.e. the brain's logit on a held-out query token
+    /// must depend on episodic content accumulated by prior forwards.
     ///
-    /// **Architectural gap.** The `eight_region` topology wires
-    /// hippocampus as a memory **sink**:
+    /// Two paths from a fresh init:
+    ///   A: tokens [1..=19], then query 42
+    ///   B: tokens [200..=218], then query 42
     ///
-    /// ```text
-    ///   {input, attention, output, motor} → hippocampus
-    ///   hippocampus → insula
-    ///   [insula has no outgoing edges]
-    /// ```
+    /// `episodic_memory_is_content_dependent` already proves the
+    /// hippocampus KVs at the end of A and B differ substantially.
+    /// This test asserts that propagates to logits.
     ///
-    /// Hippocampus accumulates content-dependent episodic memory but
-    /// never fans back into the {attention → output → motor} loop that
-    /// produces predictions. Adding an edge `hippocampus → attention`
-    /// (or `hippocampus → output`) would be the structural fix.
-    ///
-    /// This test is `#[ignore]`-d so CI stays green while the gap is
-    /// documented. Un-ignore once the fix lands.
+    /// Uses fixed-connection topology (router disabled): `eight_region`
+    /// is configured with `Connection { from: [INPUT, HIPPOCAMPUS], to:
+    /// ATTENTION }` so hippocampus's content-dependent state actually
+    /// fans into the {attention → output → motor} prediction loop.
+    /// With the default learned router enabled, that fixed edge is
+    /// shadowed and the propagation becomes empirical (depends on what
+    /// the router learns to attend to) — out of scope for an
+    /// architecture-truth test.
     #[test]
-    #[ignore = "documented architectural gap: hippocampus → predictions edge missing"]
     fn episodic_memory_propagates_to_prediction() {
-        let cfg = RegionalConfig::eight_region(16, 256, 2);
+        let mut cfg = RegionalConfig::eight_region(16, 256, 2);
+        cfg.router = None; // exercise the fixed-connection path
         let w = RegionalWeights::new(cfg);
 
         let mut nc_a = NeuralComputer::new(w.clone());
@@ -6067,7 +6075,9 @@ mod tests {
             .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
         assert!(pred_l2 > 1e-3,
             "logits on query=42 must differ between paths A and B \
-             (L2 = {pred_l2:.6})");
+             (L2 = {pred_l2:.6}); identical logits would mean \
+             hippocampus → attention edge is not propagating episodic \
+             content into the prediction loop");
     }
 
     #[test]
