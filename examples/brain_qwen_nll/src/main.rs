@@ -178,6 +178,17 @@ fn main() {
         #[arg(long)]
         per_position: bool,
 
+        /// Recall-shaped loss: only count training gradient at
+        /// positions where the target token has appeared earlier in
+        /// the sequence. Forces the optimizer to find corrections
+        /// that benefit recall-specific predictions, not generic
+        /// content-causal patterns. Without this, the loss averages
+        /// over all positions and the modulator drifts toward
+        /// fitting common patterns (sentence-start names,
+        /// verb-prep transitions) rather than recall.
+        #[arg(long)]
+        recall_only_loss: bool,
+
         /// What signal feeds into the modulator. Used to ablate
         /// whether brain dynamics are doing useful work, or whether
         /// the modulator's improvement could come from any
@@ -421,6 +432,32 @@ fn main() {
     let test_brain: Vec<&[f32]>  = brain_per_pos[n_train..].to_vec();
     let test_tgts: Vec<usize>    = targets[n_train..].to_vec();
 
+    // Recall mask: train_recall_mask[t] is true iff target token
+    // train_tgts[t] has appeared at some earlier position in the
+    // sequence. Used by --recall-only-loss to focus gradient on
+    // recall-specific positions only.
+    let train_recall_mask: Vec<bool> = (0..n_train).map(|t| {
+        let target = train_tgts[t];
+        // Was this target token seen at any position 0..=t in the
+        // input sequence? (token_ids[..=t] are the tokens fed to the
+        // model up to and including position t.)
+        token_ids[..=t].iter().any(|&id| id as usize == target)
+    }).collect();
+    let n_recall = train_recall_mask.iter().filter(|&&b| b).count();
+    if args.recall_only_loss {
+        eprintln!("brain_qwen_nll: --recall-only-loss enabled — \
+                   {n_recall}/{n_train} train positions are recall positions");
+        if n_recall == 0 {
+            eprintln!("brain_qwen_nll: ZERO recall positions in train split — \
+                       no gradient signal. Disabling --recall-only-loss.");
+        }
+    }
+    let active_recall_mask = if args.recall_only_loss && n_recall > 0 {
+        Some(&train_recall_mask)
+    } else {
+        None
+    };
+
     let test_baseline_nll = nll_per_token(&m_baseline, &test_qwen, None, &test_tgts);
     let test_random_nll   = nll_per_token(&m_random,   &test_qwen, Some(&test_brain), &test_tgts);
     eprintln!("brain_qwen_nll: TEST baseline (Qwen alone)        = {test_baseline_nll:.4}");
@@ -442,9 +479,15 @@ fn main() {
         let mut d_b = vec![0.0f32; vocab];
         let mut modulated = vec![0.0f32; vocab];
         let mut d_modulated = vec![0.0f32; vocab];
-        let scale = 1.0 / n_train as f32;
+        let scale = match active_recall_mask {
+            Some(_) => 1.0 / n_recall.max(1) as f32,
+            None    => 1.0 / n_train as f32,
+        };
         for epoch in 0..args.epochs {
             for t in 0..n_train {
+                if let Some(mask) = active_recall_mask {
+                    if !mask[t] { continue; }
+                }
                 m_trained.modulate_into(train_qwen[t], train_brain[t], &mut modulated);
                 cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
                 for v in 0..vocab { d_modulated[v] *= scale; }
@@ -488,9 +531,15 @@ fn main() {
         let mut modulated = vec![0.0f32; vocab];
         let mut d_modulated = vec![0.0f32; vocab];
         let mut z_scratch = vec![0.0f32; args.rank];
-        let scale = 1.0 / n_train as f32;
+        let scale = match active_recall_mask {
+            Some(_) => 1.0 / n_recall.max(1) as f32,
+            None    => 1.0 / n_train as f32,
+        };
         for epoch in 0..args.epochs {
             for t in 0..n_train {
+                if let Some(mask) = active_recall_mask {
+                    if !mask[t] { continue; }
+                }
                 m_trained.modulate_into_with_scratch(
                     train_qwen[t], train_brain[t], &mut modulated, &mut z_scratch);
                 cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
