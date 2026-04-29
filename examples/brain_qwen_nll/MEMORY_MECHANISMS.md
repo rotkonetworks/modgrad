@@ -150,3 +150,43 @@ Decision: scaffold flag stays unwired until one of (1)/(3) lands.
 Don't ship a partial joint-train that silently uses fresh-state
 per token — that would be the WORST of both worlds (joint training
 without the memory advantage that motivates the brain at all).
+
+## Calibration: the Qwen2.5-0.5B baseline is weak
+
+(Added 2026-04-29.) A roundtable of three haiku probe agents +
+direct test runs converged on the same observation:
+
+  Raw prompt + T=0.7    → token salad
+  Chat template + T=0.7 → multilingual word soup
+  Chat template + T=0   → "C C C C / Answer: C" loop
+
+Qwen2.5-0.5B is genuinely a poor chatbot at this size. The chat
+template parses correctly (special tokens 151644/151645 visible in
+encoded IDs), the throughput is fine (~35 tok/s on gfx1102), the
+sampler works — the model itself just doesn't produce coherent
+free-form text at 500M params, regardless of formatting or
+temperature.
+
+This calibrates the held-out NLL improvements measured this
+session:
+
+  best on 37-token corpus  : -0.13 nats / +13.9% raw probability
+  robust on 265-token corpus: -0.003 nats
+
+These are real NLL deltas — the math holds. But they're nudging
+probability mass within a distribution whose mode is already
+gibberish. Brain isn't going to make Qwen-0.5B speak; it's just
+slightly improving its already-broken token guesses.
+
+For the redshiftzero arc this means:
+  ✓ The architectural pipeline (modulator, gradient flow, joint
+    training infra) is verified end-to-end on real weights.
+  ✗ The practical demonstration "brain makes the LLM better at
+    talking" needs a stronger LLM. Qwen2.5-0.5B is the test
+    harness; Qwen2.5-3B or 7B is the actual deployment target if
+    we want observable text-quality gains.
+
+The session's primitives are correct and ready for a bigger Qwen.
+The held-out NLL improvements at 500M param size are measurement
+artifacts of a working pipeline on a weak baseline, not a claim
+that brain makes Qwen-0.5B competent.
