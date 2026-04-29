@@ -53,6 +53,12 @@ pub mod qwen_cerebellum;
 /// Every attack function has a defense counterpart in bio/ or plural.
 /// This is penetration testing tooling, not weaponization.
 pub mod monarch;
+/// Brain → LLM logit modulation seam. The brain produces an output
+/// vector; this module projects it to vocab dim and folds it into the
+/// LLM's logits before sampling. Closes the architectural one-way
+/// gap where `CerebellumService` lets brain read from Qwen but never
+/// write back. See module docs.
+pub mod logit_modulator;
 
 pub use config::CtmConfig;
 pub use weights::{CtmWeights, CtmState};
