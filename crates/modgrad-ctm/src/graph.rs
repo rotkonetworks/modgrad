@@ -6036,6 +6036,76 @@ mod tests {
              l2={l2:.4}, |kv_a|={norm_a:.4}, |kv_b|={norm_b:.4})");
     }
 
+    /// End-to-end integrated test: brain episodic memory must affect
+    /// the **NLL on a query token** when brain output is folded into
+    /// LLM logits through `BrainLogitModulator`. This composes:
+    ///
+    ///   brain(episodic) → brain_output → modulator → Qwen-side NLL
+    ///
+    /// Two paths from a fresh init using the canonical `eight_region`
+    /// (already content-causal at brain-prediction level via the
+    /// HIPPOCAMPUS → ATTENTION edge added in `20736b2`):
+    ///
+    ///   Path A: brain consumes [1..=19], then query=42
+    ///   Path B: brain consumes [200..=218], then query=42
+    ///
+    /// Brain output for path X is `nc_x.step(42)` — vocab-sized
+    /// prediction vector. Synthetic qwen_logits = uniform zeros so any
+    /// measured NLL delta isolates the modulator's contribution from
+    /// the brain's state.
+    ///
+    /// Assertion: `NLL_a != NLL_b` by more than 1e-4. This is the
+    /// pre-requisite for any future "brain reduces Qwen NLL on
+    /// held-out text" claim — without it the modulator+brain+NLL
+    /// stack is structurally unable to express the dependency.
+    #[test]
+    fn brain_episodic_memory_affects_modulated_nll() {
+        use crate::logit_modulator::{BrainLogitModulator, nll_per_token};
+
+        let mut cfg = RegionalConfig::eight_region(16, 256, 2);
+        cfg.router = None; // exercise fixed connections (HIPPO → ATTN edge)
+        let w = RegionalWeights::new(cfg);
+
+        // brain_dim = vocab = 256: use brain.step's logit-shaped output
+        // directly as the brain_output vector for the modulator.
+        let mut m = BrainLogitModulator::new(256, 256);
+        m.alpha = 1.0;
+
+        // Path A.
+        let mut nc_a = NeuralComputer::new(w.clone());
+        for i in 1..=19usize { let _ = nc_a.step(i); }
+        let brain_out_a = nc_a.step(42);
+
+        // Path B.
+        let mut nc_b = NeuralComputer::new(w);
+        for i in 200..=218usize { let _ = nc_b.step(i); }
+        let brain_out_b = nc_b.step(42);
+
+        // Synthetic qwen_logits: uniform zeros so brain output is the
+        // only signal in the modulated logits. Single-step sequence.
+        let qwen = vec![0.0f32; 256];
+        let qwen_seq: Vec<&[f32]> = vec![qwen.as_slice()];
+        let answer_target: Vec<usize> = vec![100];
+
+        let nll_a = nll_per_token(
+            &m, &qwen_seq,
+            Some(&[brain_out_a.as_slice()]),
+            &answer_target,
+        );
+        let nll_b = nll_per_token(
+            &m, &qwen_seq,
+            Some(&[brain_out_b.as_slice()]),
+            &answer_target,
+        );
+
+        assert!(nll_a.is_finite() && nll_b.is_finite());
+        assert!((nll_a - nll_b).abs() > 1e-4,
+            "modulated NLL on query token must depend on brain's \
+             episodic history (NLL_a={nll_a}, NLL_b={nll_b}); \
+             identical NLLs would mean episodic memory cannot \
+             affect Qwen-side prediction quality even in principle");
+    }
+
     /// Episodic memory in the hippocampus must propagate to brain
     /// predictions — i.e. the brain's logit on a held-out query token
     /// must depend on episodic content accumulated by prior forwards.
