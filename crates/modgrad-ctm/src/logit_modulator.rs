@@ -195,6 +195,50 @@ impl BrainLogitModulator {
         }
     }
 
+    /// Like [`backward`] but also accumulates gradient w.r.t. the
+    /// brain_output vector. Lets a caller route this gradient back
+    /// into the brain's own backward path so the brain's weights
+    /// co-adapt with the modulator. This is the missing plumbing
+    /// piece for "train brain QK projections to support semantic
+    /// recall" — see `examples/brain_qwen_nll/MEMORY_MECHANISMS.md`.
+    ///
+    /// Math (chain rule through `out[v] = qwen[v] + alpha · (W·brain + b)`):
+    ///   ∂L/∂brain[b] = alpha · sum_v d_modulated[v] · W[v, b]
+    ///
+    /// `d_brain_output` is **accumulated**, matching the style of
+    /// `d_proj_weight`/`d_proj_bias`. Pass a zero-initialised buffer
+    /// for a single-step gradient; reuse for sequence accumulation.
+    pub fn backward_with_d_brain(
+        &self,
+        brain_output: &[f32],
+        d_modulated: &[f32],
+        d_proj_weight: &mut [f32],
+        d_proj_bias: &mut [f32],
+        d_brain_output: &mut [f32],
+    ) {
+        debug_assert_eq!(brain_output.len(), self.brain_dim);
+        debug_assert_eq!(d_modulated.len(), self.vocab);
+        debug_assert_eq!(d_brain_output.len(), self.brain_dim);
+
+        // Param grads first (same as `backward`).
+        self.backward(brain_output, d_modulated, d_proj_weight, d_proj_bias);
+
+        if self.alpha == 0.0 { return; }
+
+        let bd = self.brain_dim;
+        // d_brain[b] += alpha · sum_v d_modulated[v] · W[v, b]
+        // Scan column-wise over W: for each v, scale row-times-alpha and
+        // add to the column accumulator. Equivalent to W^T · (alpha ·
+        // d_modulated), accumulated.
+        for v in 0..self.vocab {
+            let scale = self.alpha * d_modulated[v];
+            let row = &self.proj.weight[v * bd..(v + 1) * bd];
+            for b in 0..bd {
+                d_brain_output[b] += scale * row[b];
+            }
+        }
+    }
+
     /// In-place SGD step. Subtracts `lr * grad` from weight + bias and
     /// zeros the grad buffers — caller can immediately accumulate into
     /// them again. Plain SGD (no momentum / no weight decay) keeps
@@ -389,6 +433,64 @@ impl LowRankBrainLogitModulator {
             let row = &mut d_down_w[r * self.brain_dim..(r + 1) * self.brain_dim];
             for b in 0..self.brain_dim {
                 row[b] += d_z[r] * brain_output[b];
+            }
+        }
+    }
+
+    /// Like [`backward`] but also accumulates `d_brain_output` for
+    /// downstream brain-side BPTT. Math: chain rule through the two
+    /// projections.
+    ///   d_z[r]    = sum_v alpha · d_modulated[v] · up.weight[v, r]
+    ///   d_brain[b] = sum_r d_z[r] · down.weight[r, b]
+    pub fn backward_with_d_brain(
+        &self,
+        brain_output: &[f32],
+        d_modulated: &[f32],
+        d_down_w: &mut [f32], d_down_b: &mut [f32],
+        d_up_w: &mut [f32],   d_up_b: &mut [f32],
+        d_brain_output: &mut [f32],
+    ) {
+        debug_assert_eq!(d_brain_output.len(), self.brain_dim);
+
+        // Run the existing param-grad path first (same body as `backward`).
+        // We need d_z which it computes internally; refactoring to share
+        // would require more state. For clarity, recompute it here.
+        if self.alpha == 0.0 {
+            // Still call to enforce shape asserts in `backward`.
+            self.backward(brain_output, d_modulated,
+                d_down_w, d_down_b, d_up_w, d_up_b);
+            return;
+        }
+
+        // Recompute z forward (same as `backward`).
+        let mut z = vec![0.0f32; self.rank];
+        for r in 0..self.rank {
+            let mut acc = self.down.bias[r];
+            let row = &self.down.weight[r * self.brain_dim..(r + 1) * self.brain_dim];
+            for b in 0..self.brain_dim { acc += row[b] * brain_output[b]; }
+            z[r] = acc;
+        }
+
+        // d_z and param grads.
+        let mut d_z = vec![0.0f32; self.rank];
+        for v in 0..self.vocab {
+            let dy = self.alpha * d_modulated[v];
+            d_up_b[v] += dy;
+            let row = &mut d_up_w[v * self.rank..(v + 1) * self.rank];
+            let up_row = &self.up.weight[v * self.rank..(v + 1) * self.rank];
+            for r in 0..self.rank {
+                row[r] += dy * z[r];
+                d_z[r] += dy * up_row[r];
+            }
+        }
+        for r in 0..self.rank {
+            d_down_b[r] += d_z[r];
+            let row = &mut d_down_w[r * self.brain_dim..(r + 1) * self.brain_dim];
+            let down_row = &self.down.weight[r * self.brain_dim..(r + 1) * self.brain_dim];
+            for b in 0..self.brain_dim {
+                row[b] += d_z[r] * brain_output[b];
+                // Chain into brain: d_brain[b] += sum_r d_z[r] · down[r, b]
+                d_brain_output[b] += d_z[r] * down_row[b];
             }
         }
     }
@@ -1024,6 +1126,86 @@ mod tests {
         assert!(final_nll < initial * 0.5,
             "low-rank training must cut NLL by ≥2× \
              (initial = {initial:.4}, final = {final_nll:.4})");
+    }
+
+    /// `backward_with_d_brain` must produce d_brain_output that matches
+    /// finite-difference reference. Loss f(brain) = ½‖modulated‖² has
+    /// d_modulated = modulated, so the analytic d_brain[b] should equal
+    /// (f(brain + eps·e_b) - f(brain - eps·e_b)) / (2·eps).
+    #[test]
+    fn dense_backward_with_d_brain_matches_finite_difference() {
+        let mut m = BrainLogitModulator::new(4, 6);
+        m.alpha = 0.7;
+        // Bias the projection so it's non-trivially content-causal.
+        let qwen = vec![0.0f32; 6];
+        let brain = vec![0.5, -0.3, 0.7, 0.1];
+
+        let out = m.modulate(&qwen, &brain);
+        let d_modulated = out.clone();   // gradient of ½‖out‖² is out
+
+        let mut d_w = vec![0.0f32; 6 * 4];
+        let mut d_b = vec![0.0f32; 6];
+        let mut d_brain = vec![0.0f32; 4];
+        m.backward_with_d_brain(
+            &brain, &d_modulated,
+            &mut d_w, &mut d_b, &mut d_brain,
+        );
+
+        let eps = 1e-3;
+        for bidx in 0..4 {
+            let mut bp = brain.clone(); bp[bidx] += eps;
+            let mut bm = brain.clone(); bm[bidx] -= eps;
+            let l_plus: f32 = m.modulate(&qwen, &bp).iter()
+                .map(|x| 0.5 * x * x).sum();
+            let l_minus: f32 = m.modulate(&qwen, &bm).iter()
+                .map(|x| 0.5 * x * x).sum();
+            let num = (l_plus - l_minus) / (2.0 * eps);
+            let analytic = d_brain[bidx];
+            assert!((num - analytic).abs() < 1e-4,
+                "dense d_brain[{bidx}]: analytic {analytic:.6} vs FD {num:.6}");
+        }
+    }
+
+    /// Same FD check for the LowRank variant. Chain rule goes through
+    /// up then down: d_brain[b] = down^T · (up^T · alpha · d_modulated).
+    /// Catches transcription errors at either junction.
+    #[test]
+    fn low_rank_backward_with_d_brain_matches_finite_difference() {
+        let mut m = LowRankBrainLogitModulator::new(4, 2, 6);
+        m.alpha = 0.7;
+        let qwen = vec![0.0f32; 6];
+        let brain = vec![0.5, -0.3, 0.7, 0.1];
+
+        let out = m.modulate(&qwen, &brain);
+        let d_modulated = out.clone();
+
+        let mut d_dw = vec![0.0f32; 2 * 4];
+        let mut d_db = vec![0.0f32; 2];
+        let mut d_uw = vec![0.0f32; 6 * 2];
+        let mut d_ub = vec![0.0f32; 6];
+        let mut d_brain = vec![0.0f32; 4];
+        m.backward_with_d_brain(
+            &brain, &d_modulated,
+            &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub,
+            &mut d_brain,
+        );
+
+        let eps = 1e-3;
+        for bidx in 0..4 {
+            let mut bp = brain.clone(); bp[bidx] += eps;
+            let mut bm = brain.clone(); bm[bidx] -= eps;
+            let l_plus: f32 = m.modulate(&qwen, &bp).iter()
+                .map(|x| 0.5 * x * x).sum();
+            let l_minus: f32 = m.modulate(&qwen, &bm).iter()
+                .map(|x| 0.5 * x * x).sum();
+            let num = (l_plus - l_minus) / (2.0 * eps);
+            let analytic = d_brain[bidx];
+            // Tolerance is looser for low-rank than dense: an extra
+            // matmul through `down` accumulates ~one more layer of f32
+            // round-off vs the dense single-matmul case.
+            assert!((num - analytic).abs() < 5e-4,
+                "low-rank d_brain[{bidx}]: analytic {analytic:.6} vs FD {num:.6}");
+        }
     }
 
     /// `cross_entropy_grad` must satisfy the gradient identity
