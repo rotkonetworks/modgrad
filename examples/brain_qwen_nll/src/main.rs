@@ -43,7 +43,9 @@ fn main() {
     use modgrad_transformer::kv_cache_resident::KvCacheResident;
 
     use modgrad_ctm::graph::{NeuralComputer, RegionalConfig, RegionalWeights};
-    use modgrad_ctm::logit_modulator::{BrainLogitModulator, nll_per_token};
+    use modgrad_ctm::logit_modulator::{
+        BrainLogitModulator, nll_per_token, cross_entropy_grad,
+    };
 
     #[derive(Parser, Debug)]
     #[command(name = "brain_qwen_nll")]
@@ -57,11 +59,33 @@ fn main() {
         /// Text whose per-token NLL we measure. Tokenized once, then
         /// fed to both Qwen and the brain. Should be at least a few
         /// tokens long for the NLL average to be meaningful.
-        #[arg(long, default_value = "The quick brown fox jumps over the lazy dog.")]
+        #[arg(long, default_value =
+            "The quick brown fox jumps over the lazy dog. \
+             The early bird catches the worm. \
+             A stitch in time saves nine. \
+             Every cloud has a silver lining. \
+             Actions speak louder than words.")]
         text: String,
 
         #[arg(long, default_value_t = 256)]
         max_seq: usize,
+
+        /// Fraction of tokens reserved for the held-out test split.
+        /// 0.3 means train on first 70% of prediction positions, hold
+        /// out the last 30% for evaluation. Set to 0.0 to skip the
+        /// training phase entirely (just baseline + sanity).
+        #[arg(long, default_value_t = 0.3)]
+        test_fraction: f32,
+
+        /// Number of full-sequence gradient updates over the train
+        /// split. Plain SGD on the modulator only; brain + Qwen
+        /// frozen.
+        #[arg(long, default_value_t = 200)]
+        epochs: usize,
+
+        /// Learning rate for the modulator's SGD steps.
+        #[arg(long, default_value_t = 0.05)]
+        lr: f32,
     }
 
     let args = Args::parse();
@@ -212,13 +236,106 @@ fn main() {
     eprintln!("brain_qwen_nll: alpha=1 RAND NLL = {alpha_one_nll:.4}  \
                (Δ vs baseline = {:+.4})", alpha_one_nll - baseline_nll);
 
+    // ── 7. Train/test split + training loop. ──
+    if args.test_fraction <= 0.0 || args.epochs == 0 {
+        eprintln!();
+        eprintln!("---- redshiftzero summary (no-train mode) ----");
+        eprintln!("  baseline (Qwen alone)          : {baseline_nll:.4}");
+        eprintln!("  alpha=0   (sanity)             : {alpha_zero_nll:.4}");
+        eprintln!("  alpha=1   (random brain proj)  : {alpha_one_nll:.4}");
+        return;
+    }
+
+    let n_pred = n - 1;
+    let n_test = ((n_pred as f32) * args.test_fraction).round() as usize;
+    let n_train = n_pred.saturating_sub(n_test);
+    if n_train < 2 || n_test < 1 {
+        eprintln!("brain_qwen_nll: not enough tokens for {:.0}% test split \
+                   (n_pred={n_pred}, n_train={n_train}, n_test={n_test}); \
+                   extend --text or lower --test-fraction",
+                  args.test_fraction * 100.0);
+        return;
+    }
     eprintln!();
-    eprintln!("---- redshiftzero summary ----");
-    eprintln!("  baseline (Qwen alone)          : {baseline_nll:.4}");
-    eprintln!("  alpha=0   (sanity)             : {alpha_zero_nll:.4}  must == baseline");
-    eprintln!("  alpha=1   (random brain proj)  : {alpha_one_nll:.4}  expected ≠ baseline");
+    eprintln!("brain_qwen_nll: train/test split: {n_train} train + {n_test} test \
+               positions ({}% / {}%)",
+              (100.0 * n_train as f32 / n_pred as f32).round() as i32,
+              (100.0 * n_test  as f32 / n_pred as f32).round() as i32);
+
+    let train_qwen: Vec<&[f32]>  = qwen_per_pos[..n_train].to_vec();
+    let train_brain: Vec<&[f32]> = brain_per_pos[..n_train].to_vec();
+    let train_tgts: Vec<usize>   = targets[..n_train].to_vec();
+    let test_qwen: Vec<&[f32]>   = qwen_per_pos[n_train..].to_vec();
+    let test_brain: Vec<&[f32]>  = brain_per_pos[n_train..].to_vec();
+    let test_tgts: Vec<usize>    = targets[n_train..].to_vec();
+
+    let test_baseline_nll = nll_per_token(&m_baseline, &test_qwen, None, &test_tgts);
+    let test_random_nll   = nll_per_token(&m_random,   &test_qwen, Some(&test_brain), &test_tgts);
+    eprintln!("brain_qwen_nll: TEST baseline (Qwen alone)        = {test_baseline_nll:.4}");
+    eprintln!("brain_qwen_nll: TEST alpha=1 random init          = {test_random_nll:.4}");
+
+    // Train modulator (start from random init).
+    let mut m_trained = BrainLogitModulator::new(BRAIN_DIM_FOR_MODULATOR, vocab);
+    m_trained.alpha = 1.0;
+    for w in m_trained.proj.weight.iter_mut() { *w *= 0.01; }
+
+    let mut d_w = vec![0.0f32; vocab * BRAIN_DIM_FOR_MODULATOR];
+    let mut d_b = vec![0.0f32; vocab];
+    let mut modulated = vec![0.0f32; vocab];
+    let mut d_modulated = vec![0.0f32; vocab];
+
+    eprintln!("brain_qwen_nll: training modulator for {} epochs at lr={} …",
+              args.epochs, args.lr);
+    let train_t = Instant::now();
+    let scale = 1.0 / n_train as f32;
+    for epoch in 0..args.epochs {
+        for t in 0..n_train {
+            m_trained.modulate_into(train_qwen[t], train_brain[t], &mut modulated);
+            cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
+            for v in 0..vocab { d_modulated[v] *= scale; }
+            m_trained.backward(train_brain[t], &d_modulated, &mut d_w, &mut d_b);
+        }
+        m_trained.sgd_step(&mut d_w, &mut d_b, args.lr);
+
+        if epoch == 0 || (epoch + 1) % (args.epochs.max(10) / 10) == 0 || epoch == args.epochs - 1 {
+            let train_nll = nll_per_token(
+                &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+            let test_nll = nll_per_token(
+                &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+            eprintln!("  epoch {:>3}/{}  train NLL = {train_nll:.4}  test NLL = {test_nll:.4}",
+                      epoch + 1, args.epochs);
+        }
+    }
+    let train_ms = train_t.elapsed().as_millis();
+    eprintln!("brain_qwen_nll: training done in {train_ms} ms");
+
+    let test_trained_nll = nll_per_token(
+        &m_trained, &test_qwen, Some(&test_brain), &test_tgts);
+    let train_trained_nll = nll_per_token(
+        &m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+
     eprintln!();
-    eprintln!("Next slice: train the modulator on a held-out corpus,");
-    eprintln!("report alpha=1 trained NLL. Architecture verified — what");
-    eprintln!("remains is a real training-loop binary on a real corpus.");
+    eprintln!("---- redshiftzero summary (with training) ----");
+    eprintln!("  baseline (Qwen alone, full)         : {baseline_nll:.4}");
+    eprintln!("  alpha=0   sanity (must == baseline) : {alpha_zero_nll:.4}");
+    eprintln!();
+    eprintln!("  TEST set ({n_test} held-out positions):");
+    eprintln!("    Qwen alone                        : {test_baseline_nll:.4}");
+    eprintln!("    + brain (random init)             : {test_random_nll:.4}  (Δ {:+.4})",
+              test_random_nll - test_baseline_nll);
+    eprintln!("    + brain (TRAINED, {} epochs)       : {test_trained_nll:.4}  (Δ {:+.4})",
+              args.epochs, test_trained_nll - test_baseline_nll);
+    eprintln!();
+    eprintln!("  TRAIN set ({n_train} positions, for overfit context):");
+    eprintln!("    Qwen alone                        : {:.4}",
+              nll_per_token(&m_baseline, &train_qwen, None, &train_tgts));
+    eprintln!("    + brain (TRAINED)                 : {train_trained_nll:.4}");
+    eprintln!();
+    let test_improvement = test_baseline_nll - test_trained_nll;
+    if test_improvement > 0.0 {
+        eprintln!("  → trained brain BEATS Qwen alone on held-out by {test_improvement:.4} nats/token");
+    } else {
+        eprintln!("  → trained brain UNDERPERFORMS Qwen alone on held-out by {:.4} nats/token", -test_improvement);
+        eprintln!("    (modulator overfit train; lower --lr or --epochs, or use larger corpus)");
+    }
 }
