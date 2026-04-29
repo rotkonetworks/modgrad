@@ -140,6 +140,65 @@ impl BrainLogitModulator {
     }
 }
 
+/// Mean per-token negative log-likelihood given a sequence of LLM
+/// logits, optional per-step brain outputs to fold in, and the target
+/// next-token IDs. Returns `f32::INFINITY` on empty input or if any
+/// target id is out of range — fail-loud rather than silently
+/// reporting a bogus average.
+///
+/// Shapes:
+///   `qwen_logits_seq`:  `&[&[f32; vocab]]` of length `T`
+///   `brain_outputs`:    `Some(&[&[f32; brain_dim]])` of length `T` or `None`
+///   `targets`:          `&[usize]` of length `T`, each `< vocab`
+///
+/// When `brain_outputs` is `None`, computes the baseline LLM NLL — no
+/// modulation, no projection cost. When `Some`, applies the modulator
+/// per step before computing NLL. This is the primitive the Slice C2
+/// training loop and the comparison report ("Qwen-alone NLL" vs
+/// "Qwen+brain NLL") are both built on.
+///
+/// NLL definition: `-(1/T) · sum_t log_softmax(modulated_logits[t])[targets[t]]`.
+/// Numerically stable: subtracts max-logit before exp.
+pub fn nll_per_token(
+    modulator: &BrainLogitModulator,
+    qwen_logits_seq: &[&[f32]],
+    brain_outputs: Option<&[&[f32]]>,
+    targets: &[usize],
+) -> f32 {
+    if qwen_logits_seq.is_empty() || targets.len() != qwen_logits_seq.len() {
+        return f32::INFINITY;
+    }
+    if let Some(bo) = brain_outputs {
+        if bo.len() != qwen_logits_seq.len() { return f32::INFINITY; }
+    }
+
+    let vocab = modulator.vocab;
+    let mut total_nll: f32 = 0.0;
+    let mut scratch = vec![0.0f32; vocab];
+
+    for t in 0..qwen_logits_seq.len() {
+        let logits_t = qwen_logits_seq[t];
+        if logits_t.len() != vocab { return f32::INFINITY; }
+        let target_id = targets[t];
+        if target_id >= vocab { return f32::INFINITY; }
+
+        let modulated: &[f32] = match brain_outputs {
+            Some(bo) => {
+                modulator.modulate_into(logits_t, bo[t], &mut scratch);
+                &scratch
+            }
+            None => logits_t,
+        };
+
+        // log-softmax(modulated)[target_id], numerically stable.
+        let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let lse: f32 = modulated.iter()
+            .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+        total_nll += lse - modulated[target_id];
+    }
+    total_nll / qwen_logits_seq.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +259,94 @@ mod tests {
             assert!((a - b).abs() < 1e-7,
                 "zero projection must be no-op regardless of alpha");
         }
+    }
+
+    /// Sanity for the NLL primitive: with `alpha=0` modulator, the
+    /// "Qwen+brain" NLL must equal the "Qwen-alone" NLL bit-exactly.
+    /// Without this any future training-loop measurement is
+    /// confounded — we'd see a delta even when nothing should differ.
+    #[test]
+    fn nll_alpha_zero_matches_baseline() {
+        let m = BrainLogitModulator::new(8, 16);
+        assert_eq!(m.alpha, 0.0);
+
+        // Synthetic logits: 5 timesteps, vocab 16.
+        let logits_storage: Vec<Vec<f32>> = (0..5).map(|t| {
+            (0..16).map(|v| ((t * 7 + v * 3) as f32 * 0.13).sin()).collect()
+        }).collect();
+        let logits_refs: Vec<&[f32]> = logits_storage.iter()
+            .map(|v| v.as_slice()).collect();
+
+        let brain_storage: Vec<Vec<f32>> = (0..5).map(|t| {
+            (0..8).map(|i| ((t * 11 + i * 5) as f32 * 0.17).cos()).collect()
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain_storage.iter()
+            .map(|v| v.as_slice()).collect();
+
+        let targets: Vec<usize> = vec![3, 7, 1, 12, 5];
+
+        let nll_baseline = nll_per_token(&m, &logits_refs, None, &targets);
+        let nll_with_brain = nll_per_token(&m, &logits_refs, Some(&brain_refs), &targets);
+        assert!(nll_baseline.is_finite());
+        assert_eq!(nll_baseline, nll_with_brain,
+            "alpha=0 modulator must produce baseline NLL bit-exactly \
+             ({nll_baseline} vs {nll_with_brain})");
+    }
+
+    /// With non-zero alpha and random projection, NLL with brain
+    /// must differ from baseline. The direction of difference depends
+    /// on whether the random projection happens to favor the targets;
+    /// here we just assert non-zero delta (content-causal NLL).
+    #[test]
+    fn nll_with_brain_modulation_differs_from_baseline() {
+        let mut m = BrainLogitModulator::new(8, 16);
+        m.alpha = 1.0;
+
+        let logits_storage: Vec<Vec<f32>> = (0..5).map(|t| {
+            (0..16).map(|v| ((t * 7 + v * 3) as f32 * 0.13).sin()).collect()
+        }).collect();
+        let logits_refs: Vec<&[f32]> = logits_storage.iter()
+            .map(|v| v.as_slice()).collect();
+
+        let brain_storage: Vec<Vec<f32>> = (0..5).map(|t| {
+            (0..8).map(|i| ((t * 11 + i * 5) as f32 * 0.17).cos()).collect()
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain_storage.iter()
+            .map(|v| v.as_slice()).collect();
+
+        let targets: Vec<usize> = vec![3, 7, 1, 12, 5];
+
+        let nll_baseline = nll_per_token(&m, &logits_refs, None, &targets);
+        let nll_brain = nll_per_token(&m, &logits_refs, Some(&brain_refs), &targets);
+        assert!(nll_baseline.is_finite() && nll_brain.is_finite());
+        assert!((nll_brain - nll_baseline).abs() > 1e-4,
+            "with alpha=1 and random proj, brain-modulated NLL must \
+             differ from baseline (baseline={nll_baseline}, \
+             brain={nll_brain})");
+    }
+
+    /// NLL primitive must fail-loud on shape mismatches rather than
+    /// silently producing a bogus average — the "Qwen+brain NLL"
+    /// claim only means something if the inputs are well-formed.
+    #[test]
+    fn nll_rejects_shape_mismatches() {
+        let m = BrainLogitModulator::new(4, 8);
+
+        // Empty.
+        assert!(nll_per_token(&m, &[], None, &[]).is_infinite());
+
+        // targets length != logits length.
+        let l = vec![0.0f32; 8];
+        let lr: Vec<&[f32]> = vec![l.as_slice()];
+        assert!(nll_per_token(&m, &lr, None, &[]).is_infinite());
+
+        // target id >= vocab.
+        assert!(nll_per_token(&m, &lr, None, &[8]).is_infinite());
+
+        // Wrong vocab.
+        let bad = vec![0.0f32; 7];
+        let badr: Vec<&[f32]> = vec![bad.as_slice()];
+        assert!(nll_per_token(&m, &badr, None, &[0]).is_infinite());
     }
 
     /// Linearity check: the modulator is linear in brain_output, so
