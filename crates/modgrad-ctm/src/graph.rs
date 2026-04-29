@@ -6106,6 +6106,144 @@ mod tests {
              affect Qwen-side prediction quality even in principle");
     }
 
+    /// Bridge composition test: the architectural piece that lets
+    /// brain weights train against external Qwen NLL via the
+    /// modulator's gradient hook. This composes:
+    ///
+    ///   regional_train_step_generic(brain, grads, obs, |preds, _| {
+    ///       let brain_out = preds.last().unwrap();
+    ///       modulator forward → modulated logits
+    ///       cross_entropy_grad(modulated, target) → d_modulated
+    ///       modulator.backward_with_d_brain → d_brain_output
+    ///       return (loss, per-tick d_preds with d_brain_output at last)
+    ///   })
+    ///
+    /// This is the bridge from `f6a00f0` (modulator gradient hook)
+    /// and `d223503` (synthetic joint training) to the real brain.
+    /// The test verifies the full chain composes WITHOUT errors and
+    /// that brain gradients accumulate as expected.
+    #[test]
+    fn regional_train_via_modulator_gradient_bridge() {
+        use crate::logit_modulator::{
+            LowRankBrainLogitModulator, cross_entropy_grad,
+        };
+
+        // Tiny brain: small d_model, brain-output dim of 8 so the
+        // modulator can have brain_dim=8 cleanly.
+        const BRAIN_OUT: usize = 8;
+        const VOCAB: usize = 16;
+        let mut cfg = RegionalConfig::eight_region(16, BRAIN_OUT, 2);
+        cfg.router = None;
+        let weights = RegionalWeights::new(cfg);
+        let mut grads = RegionalGradients::zeros(&weights);
+
+        let mut modulator = LowRankBrainLogitModulator::new(BRAIN_OUT, 2, VOCAB);
+        modulator.alpha = 1.0;
+
+        let mut d_dw = vec![0.0f32; 2 * BRAIN_OUT];
+        let mut d_db = vec![0.0f32; 2];
+        let mut d_uw = vec![0.0f32; VOCAB * 2];
+        let mut d_ub = vec![0.0f32; VOCAB];
+
+        let observation: Vec<f32> = (0..16).map(|i| (i as f32 * 0.13).sin()).collect();
+        let qwen_logits = vec![0.0f32; VOCAB];
+        let target_token: usize = 7;
+
+        // Closure: brain produces preds[tick] of size BRAIN_OUT each;
+        // we use the last tick as the modulator's brain_output input.
+        let modulator_ref = &modulator;
+        let qwen_ref = &qwen_logits;
+        let d_dw_r = &mut d_dw;
+        let d_db_r = &mut d_db;
+        let d_uw_r = &mut d_uw;
+        let d_ub_r = &mut d_ub;
+
+        let (loss, d_obs) = regional_train_step_generic(
+            &weights, &mut grads, &observation,
+            |preds, _certainties| {
+                let last_tick = preds.len() - 1;
+                let brain_output = &preds[last_tick];
+                debug_assert_eq!(brain_output.len(), VOCAB,
+                    "brain emits at out_dims=VOCAB; check config");
+
+                // Brain's out_dims is VOCAB (=BRAIN_OUT in this test
+                // because we set cfg's out_dims = BRAIN_OUT). For a
+                // real-world Qwen experiment with vocab≠brain_dim,
+                // there's an additional projection. Here both equal
+                // BRAIN_OUT so the modulator's brain_dim matches.
+
+                // Synthetic mod_brain_dim must match brain's out_dim.
+                // BRAIN_OUT was used for both: brain.out_dims=BRAIN_OUT
+                // (configured) and modulator.brain_dim=BRAIN_OUT.
+                let mut modulated = vec![0.0f32; VOCAB];
+                let mut z = vec![0.0f32; modulator_ref.rank];
+                modulator_ref.modulate_into_with_scratch(
+                    qwen_ref, brain_output, &mut modulated, &mut z);
+
+                // Cross-entropy gradient w.r.t. modulated logits.
+                let mut d_modulated = vec![0.0f32; VOCAB];
+                cross_entropy_grad(&modulated, target_token, &mut d_modulated);
+
+                // NLL value (returned to caller as `loss`).
+                let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let lse: f32 = modulated.iter()
+                    .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+                let nll = lse - modulated[target_token];
+
+                // Modulator backward with d_brain_output: feeds the
+                // gradient back through the projection and produces
+                // `d_brain_output` we hand to the brain backward.
+                let mut d_brain_output = vec![0.0f32; VOCAB];
+                modulator_ref.backward_with_d_brain(
+                    brain_output, &d_modulated,
+                    d_dw_r, d_db_r, d_uw_r, d_ub_r,
+                    &mut d_brain_output,
+                );
+
+                // Per-tick d_preds: zero for non-last ticks, gradient
+                // at the last tick.
+                let n_ticks = preds.len();
+                let mut d_preds: Vec<Vec<f32>> = (0..n_ticks)
+                    .map(|_| vec![0.0f32; VOCAB]).collect();
+                d_preds[last_tick] = d_brain_output;
+
+                (nll, d_preds)
+            },
+        );
+
+        // Smoke checks — bridge composes and produces finite outputs.
+        assert!(loss.is_finite(), "bridge loss must be finite (got {loss})");
+        assert_eq!(d_obs.len(), observation.len(),
+            "d_observation should match observation shape");
+
+        // Gradient accumulation check: at least SOMETHING in the
+        // brain's gradients should be non-zero (otherwise the
+        // modulator's d_brain_output didn't propagate through brain
+        // backward).
+        // Walk every gradient field and find the largest accumulated
+        // value across the brain's parameters. ANY non-zero entry
+        // anywhere in the brain's gradients proves the d_preds from
+        // our closure reached the brain backward through CTM ticks.
+        let kv  = grads.region_grads.iter().flat_map(|rg| rg.kv_proj_w.iter()).map(|g: &f32| g.abs()).sum::<f32>();
+        let mha = grads.region_grads.iter().flat_map(|rg| rg.mha_in_w.iter()).map(|g: &f32| g.abs()).sum::<f32>();
+        let nlm = grads.region_grads.iter().flat_map(|rg| rg.nlm_s1_w.iter()).map(|g: &f32| g.abs()).sum::<f32>();
+        let conn: f32 = grads.connection_dw.iter().flatten().map(|g: &f32| g.abs()).sum::<f32>();
+        let outp: f32 = grads.output_proj_dw.iter().map(|g: &f32| g.abs()).sum::<f32>();
+        eprintln!("brain grad coverage: kv_proj={kv:.4}  mha_in={mha:.4}  \
+                   nlm_s1={nlm:.4}  conn={conn:.4}  output_proj={outp:.4}");
+        let any_brain_grad = kv + mha + nlm + conn + outp;
+        assert!(any_brain_grad > 0.0,
+            "at least one brain gradient field should accumulate from \
+             external modulator gradient. All zero means d_preds didn't \
+             reach the brain backward through CTM ticks.");
+
+        // Modulator gradients also accumulated.
+        let total_mod_grad_norm: f32 = d_uw_r.iter().map(|&g| g.abs()).sum::<f32>()
+                                     + d_dw_r.iter().map(|&g| g.abs()).sum::<f32>();
+        assert!(total_mod_grad_norm > 0.0,
+            "modulator gradients should accumulate from CE backward");
+    }
+
     /// Episodic memory in the hippocampus must propagate to brain
     /// predictions — i.e. the brain's logit on a held-out query token
     /// must depend on episodic content accumulated by prior forwards.
