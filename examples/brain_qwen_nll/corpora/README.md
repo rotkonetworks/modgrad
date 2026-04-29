@@ -50,6 +50,52 @@ separate `recall_probe` binary on top of the same modulator stack —
 no new architectural primitives needed, just a more discriminating
 evaluation harness.
 
+## Full brain-mode ablation matrix (corrected)
+
+The original ablation in commit `5b12bda` was on three modes
+(real / random / embed / zero). After commit `8938e9f` added
+hippo-kv-{mean,last}, here is the full matrix at rank=2, lr=0.01,
+30 epochs (15 for hippo-kv-mean to avoid NaN):
+
+  | brain-mode      | NARRATIVE Δ | RECALL Δ |
+  |-----------------|-------------|----------|
+  | real            | -0.0027 ✓   | -0.0009  |
+  | hippo-kv-last   | -0.0002     | -0.0038  |
+  | hippo-kv-mean   | NaN (inst.) | n/a      |
+  | random          | +0.0025 ✗   | -0.0032  |
+  | embed           | +0.0001     | n/a      |
+  | zero            | +0.0001     | n/a      |
+
+Honest readings:
+
+1. **NARRATIVE is the clean diagnostic.** Brain's processed
+   predictions (`real`) are the only mode that clearly beats
+   baseline. `hippo-kv-last` beats baseline by a hair (0.0002) and
+   beats random by 0.003 — episodic memory carries some additional
+   signal over noise on diverse text, but not the lion's share.
+
+2. **RECALL is structure-dominated.** Random brain works (-0.0032),
+   nearly matching hippo-kv-last (-0.0038). The repetitive corpus
+   structure means any per-position feature suffices; the metric
+   stops discriminating between brain channels.
+
+3. **The "4× hippo-kv-last beats real on recall" finding from
+   `8938e9f` is mostly corpus structure, not specifically episodic
+   memory.** The honest comparison is on narrative text where real
+   is best and random fails.
+
+What's NOT validated:
+  - Brain doing clean semantic recall (per-position diagnostic in
+    `fadf632` shows mostly generic correction).
+  - Episodic memory channel alone beating processed-prediction
+    channel on diverse text.
+
+What IS validated:
+  - Brain dynamics carry real signal on diverse text that random,
+    embed, and zero baselines do NOT.
+  - The architectural seam between brain and Qwen logits is
+    functional and high-bandwidth.
+
 ## Running
 
     cargo run --release --features rocm -p brain_qwen_nll -- \
