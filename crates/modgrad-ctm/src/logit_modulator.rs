@@ -484,6 +484,87 @@ mod tests {
              gradient signal end-to-end");
     }
 
+    /// The honest redshiftzero claim: when Qwen is **already
+    /// competent** (not uniform-zero), can the modulator still drive
+    /// NLL further down using the brain's signal? That's the
+    /// real-world question — Qwen alone has a baseline; brain attached
+    /// must beat that baseline.
+    ///
+    /// Setup: synthetic "Qwen" logits peak at `(target + offset[t]) %
+    /// vocab` — wrong by a deterministic per-step offset. Qwen alone
+    /// has high NLL because the peak is in the wrong place. Brain
+    /// output is a distinct deterministic vector per step, so the
+    /// modulator has ground to work with: learn a step-conditional
+    /// correction that shifts the logit mass back to `target`.
+    ///
+    /// Assertion: trained NLL < Qwen-alone baseline NLL by at least 30%.
+    /// 30% is the empirically-honest bar for ~1.3K parameters
+    /// (vocab × brain_dim) trained on 8 token positions; weaker would
+    /// be drift, much stronger would risk overfitting noise.
+    #[test]
+    fn training_improves_over_competent_baseline() {
+        let vocab = 16;
+        let brain_dim = 8;
+        let n_steps = 8;
+        let targets: Vec<usize> = (0..n_steps).map(|t| (t * 5 + 3) % vocab).collect();
+        // Per-step offset so Qwen's peak is wrong by a *different*
+        // amount per step — modulator must use brain output to know
+        // which correction to apply.
+        let offsets: Vec<i32> = (0..n_steps as i32).map(|t| ((t * 7) % 11) - 5).collect();
+
+        let qwen: Vec<Vec<f32>> = (0..n_steps).map(|t| {
+            let wrong_peak = (targets[t] as i32 + offsets[t]).rem_euclid(vocab as i32) as usize;
+            let mut logits = vec![0.0f32; vocab];
+            logits[wrong_peak] = 4.0;       // strong but not infinite
+            logits
+        }).collect();
+        let qwen_refs: Vec<&[f32]> = qwen.iter().map(|v| v.as_slice()).collect();
+
+        let brain: Vec<Vec<f32>> = (0..n_steps).map(|t| {
+            (0..brain_dim).map(|i| ((t * 13 + i * 7) as f32 * 0.21).sin()).collect()
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain.iter().map(|v| v.as_slice()).collect();
+
+        let mut m = BrainLogitModulator::new(brain_dim, vocab);
+        m.alpha = 1.0;
+
+        let nll_baseline = nll_per_token(&m, &qwen_refs, None, &targets);
+        let nll_initial  = nll_per_token(&m, &qwen_refs, Some(&brain_refs), &targets);
+        assert!(nll_baseline.is_finite() && nll_baseline > 0.5,
+            "synthetic Qwen should be wrong enough to leave headroom \
+             (baseline = {nll_baseline:.4})");
+        // Sanity: at random init, brain-attached starts close to baseline.
+        // (We're not asserting equality — random projection adds noise.)
+
+        // Train.
+        let mut d_w = vec![0.0f32; vocab * brain_dim];
+        let mut d_b = vec![0.0f32; vocab];
+        let mut modulated = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let lr = 0.1;
+        let n_train = 500;
+        for _step in 0..n_train {
+            for t in 0..n_steps {
+                m.modulate_into(qwen_refs[t], brain_refs[t], &mut modulated);
+                cross_entropy_grad(&modulated, targets[t], &mut d_modulated);
+                let scale = 1.0 / n_steps as f32;
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m.backward(brain_refs[t], &d_modulated, &mut d_w, &mut d_b);
+            }
+            m.sgd_step(&mut d_w, &mut d_b, lr);
+        }
+
+        let nll_final = nll_per_token(&m, &qwen_refs, Some(&brain_refs), &targets);
+        assert!(nll_final.is_finite());
+        let improvement = (nll_baseline - nll_final) / nll_baseline;
+        assert!(improvement > 0.30,
+            "trained brain+modulator must reduce NLL by ≥30% over \
+             Qwen-alone baseline (baseline = {nll_baseline:.4}, \
+             initial-with-random-brain = {nll_initial:.4}, \
+             final = {nll_final:.4}, improvement = {:.2}%)",
+            improvement * 100.0);
+    }
+
     /// `cross_entropy_grad` must satisfy the gradient identity
     /// `sum_v ∂L/∂logits[v] = 0` (the softmax shifts mass between
     /// classes but doesn't add or remove total probability mass).
