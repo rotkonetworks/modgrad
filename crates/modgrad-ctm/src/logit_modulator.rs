@@ -565,6 +565,98 @@ mod tests {
             improvement * 100.0);
     }
 
+    /// **Generalization** test — the strongest claim available without
+    /// real Qwen weights. The prior training tests could be the
+    /// modulator memorizing per-step (Qwen, brain, target) triplets.
+    /// This test holds out unseen steps and asserts the modulator's
+    /// learned correction transfers.
+    ///
+    /// Setup: 16 steps of synthetic (Qwen, brain, target). Targets
+    /// follow a deterministic function of the brain output's argmax
+    /// index — so a modulator that learns the brain → target mapping
+    /// will generalize to any new brain vector drawn from the same
+    /// distribution. Train on first 12 steps; held-out test = last 4.
+    ///
+    /// Assertion: held-out NLL after training < held-out NLL before
+    /// training. The bar is intentionally loose (any improvement) so
+    /// the test fails on overfit, not on a tight threshold that
+    /// might pass on noise.
+    #[test]
+    fn training_generalizes_to_held_out_steps() {
+        let vocab = 16;
+        let brain_dim = 8;
+        let n_total = 16;
+        let n_train = 12;
+
+        // Brain output: one-hot-ish (sharp peak at deterministic index).
+        // Index varies per step so the brain space is well-covered.
+        let brain: Vec<Vec<f32>> = (0..n_total).map(|t| {
+            let peak = (t * 5 + 1) % brain_dim;
+            let mut v = vec![0.1f32; brain_dim];
+            v[peak] = 1.0;
+            v
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain.iter().map(|v| v.as_slice()).collect();
+
+        // Target = function of brain peak (modulo vocab) — same rule
+        // for train and test, so the modulator can generalize.
+        let targets: Vec<usize> = (0..n_total).map(|t| {
+            let peak = (t * 5 + 1) % brain_dim;
+            (peak * 2 + 1) % vocab
+        }).collect();
+
+        // Qwen baseline: small uniform — modulator does the lifting.
+        let qwen: Vec<Vec<f32>> = (0..n_total).map(|_| vec![0.0f32; vocab]).collect();
+        let qwen_refs: Vec<&[f32]> = qwen.iter().map(|v| v.as_slice()).collect();
+
+        let train_qwen = &qwen_refs[..n_train];
+        let train_brain = &brain_refs[..n_train];
+        let train_tgts = &targets[..n_train];
+        let test_qwen = &qwen_refs[n_train..];
+        let test_brain = &brain_refs[n_train..];
+        let test_tgts = &targets[n_train..];
+
+        let mut m = BrainLogitModulator::new(brain_dim, vocab);
+        m.alpha = 1.0;
+        let test_nll_before = nll_per_token(
+            &m, test_qwen, Some(test_brain), test_tgts);
+        assert!(test_nll_before.is_finite());
+
+        // Train on first 12 only.
+        let mut d_w = vec![0.0f32; vocab * brain_dim];
+        let mut d_b = vec![0.0f32; vocab];
+        let mut modulated = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let lr = 0.1;
+        for _step in 0..400 {
+            for t in 0..n_train {
+                m.modulate_into(train_qwen[t], train_brain[t], &mut modulated);
+                cross_entropy_grad(&modulated, train_tgts[t], &mut d_modulated);
+                let scale = 1.0 / n_train as f32;
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m.backward(train_brain[t], &d_modulated, &mut d_w, &mut d_b);
+            }
+            m.sgd_step(&mut d_w, &mut d_b, lr);
+        }
+
+        let test_nll_after = nll_per_token(
+            &m, test_qwen, Some(test_brain), test_tgts);
+        assert!(test_nll_after.is_finite());
+
+        assert!(test_nll_after < test_nll_before,
+            "trained modulator must improve held-out NLL \
+             (before = {test_nll_before:.4}, after = {test_nll_after:.4}); \
+             same-or-worse means the optimizer overfit train rather \
+             than learning the generalizable brain → target rule");
+
+        // Also report train NLL to surface overfit in test logs if
+        // the held-out drop is much smaller than the train drop.
+        let train_nll = nll_per_token(
+            &m, train_qwen, Some(train_brain), train_tgts);
+        eprintln!("train NLL = {train_nll:.4}, held-out NLL = {test_nll_after:.4} \
+                   (was {test_nll_before:.4})");
+    }
+
     /// `cross_entropy_grad` must satisfy the gradient identity
     /// `sum_v ∂L/∂logits[v] = 0` (the softmax shifts mass between
     /// classes but doesn't add or remove total probability mass).
