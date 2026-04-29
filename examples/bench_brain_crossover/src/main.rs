@@ -58,12 +58,35 @@ fn main() {
         cfg
     }, OBS_DIM, N_ITERS, N_WARMUP);
 
+    // ── mega-2048 — 16× compute over medium ────────
+    // Each cortex region matvec is ~16 MB f32; per-dispatch MIOpen
+    // overhead (~5µs) is amortised against ~µs-scale GPU work. Fewer
+    // iters because per-iter wall climbs.
+    bench_preset("mega-2048", "d_model=2048", |obs_dim| {
+        let mut cfg = RegionalConfig::eight_region_mega(obs_dim, OUT_DIMS, TICKS, 2048);
+        cfg.router = None;
+        cfg
+    }, OBS_DIM, 100, 2);
+
+    // ── mega-2560 — 25× compute over medium ────────
+    // Largest size that fits on 8 GB VRAM at f32 (mega-4096 = 4.58B
+    // params = 18 GB OOMs hipMalloc). bf16 would unlock 4096 but
+    // requires the resident path to take a non-f32 weight type — tracked
+    // separately. mega-2560 is the rightmost data point on this card.
+    bench_preset("mega-2560", "d_model=2560", |obs_dim| {
+        let mut cfg = RegionalConfig::eight_region_mega(obs_dim, OUT_DIMS, TICKS, 2560);
+        cfg.router = None;
+        cfg
+    }, OBS_DIM, 50, 2);
+
     eprintln!("\n────────────────────────────────────────────");
-    eprintln!("Read: if billion's 'speedup' is < 1.0×, the brain at");
-    eprintln!("d_model=1024 still isn't enough compute per dispatch to");
-    eprintln!("amortize MIOpen overhead. Crossover lives above 1024 for");
-    eprintln!("this brain shape; the answer is 'larger brains' or");
-    eprintln!("'batched cross-region kernels' (multi-week project).");
+    eprintln!("Read each preset's verdict line. Per-region matvec compute");
+    eprintln!("scales as cortex_d_model²; per-dispatch MIOpen overhead is");
+    eprintln!("constant ~5µs. The crossover (resident ≥ host) is whichever");
+    eprintln!("preset is the first to flip from HOST WINS to RESIDENT WINS.");
+    eprintln!("Sequential single-stream HipBatch caps the resident path —");
+    eprintln!("if even mega-4096 loses, true parallelism (per-stream HIP");
+    eprintln!("contexts + multi-thread dispatch) is the next intervention.");
     eprintln!("────────────────────────────────────────────");
 
     fn bench_preset(

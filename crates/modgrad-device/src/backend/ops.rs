@@ -131,6 +131,35 @@ pub unsafe fn matvec_resident(
     Ok(())
 }
 
+/// Device-resident batched per-neuron matvec.
+/// See [`Op::SuperLinearFwdResident`](super::Op::SuperLinearFwdResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `x_dev`     covers at least `n_neurons * in_per * 4` bytes.
+/// - `weight_dev` covers at least `n_neurons * out_per * in_per * 4` bytes.
+/// - `bias_dev`   covers at least `n_neurons * out_per * 4` bytes.
+/// - `out_dev`    covers at least `n_neurons * out_per * 4` bytes (writable).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn super_linear_fwd_resident(
+    x_dev: *const f32,
+    weight_dev: *const f32,
+    bias_dev: *const f32,
+    out_dev: *mut f32,
+    n_neurons: usize,
+    in_per: usize,
+    out_per: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::SuperLinearFwdResident {
+        x_dev, weight_dev, bias_dev, out_dev,
+        n_neurons, in_per, out_per,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident matmul `C = A @ B`.
 /// See [`Op::MatmulResidentNN`](super::Op::MatmulResidentNN).
 ///

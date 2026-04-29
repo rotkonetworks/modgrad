@@ -207,6 +207,30 @@ pub enum Op<'a> {
         in_dim: usize,
     },
 
+    /// **Device-resident** batched per-neuron matvec — fused dispatch
+    /// for `SuperLinear`'s `for n in 0..n_neurons { matvec }` loop.
+    /// Computes `out[n] = W[n] @ x[n] + bias[n]` for all `n` in one
+    /// hipBLAS call. Replaces O(n_neurons) dispatches with O(1).
+    ///
+    /// Memory layout (all device pointers, contiguous f32):
+    ///   x:      `[n_neurons × in_per]`
+    ///   weight: `[n_neurons × out_per × in_per]` row-major per neuron
+    ///   bias:   `[n_neurons × out_per]`
+    ///   out:    `[n_neurons × out_per]`
+    ///
+    /// Backends that don't support strided-batched GEMM return
+    /// `BackendError::Unsupported`; CTM-side caller falls back to the
+    /// per-neuron `MatvecResident` loop.
+    SuperLinearFwdResident {
+        x_dev: *const f32,
+        weight_dev: *const f32,
+        bias_dev: *const f32,
+        out_dev: *mut f32,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    },
+
     /// **Device-resident** matmul: `C = A @ B`. Same math as
     /// [`Op::MatmulNN`] but every operand is a hip-device pointer.
     /// Backends that cannot consume device pointers (CPU, vulkan-
@@ -999,6 +1023,7 @@ impl<'a> Op<'a> {
             Op::MatmulTN { .. } => "matmul_tn",
             Op::Matvec { .. } => "matvec",
             Op::MatvecResident { .. } => "matvec_resident",
+            Op::SuperLinearFwdResident { .. } => "super_linear_fwd_resident",
             Op::MatmulResidentNN { .. } => "matmul_resident_nn",
             Op::MatmulResidentNT { .. } => "matmul_resident_nt",
             Op::MatmulResidentTN { .. } => "matmul_resident_tn",

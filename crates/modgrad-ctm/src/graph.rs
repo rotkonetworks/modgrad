@@ -1071,6 +1071,75 @@ impl RegionalConfig {
         }
     }
 
+    /// 8-region brain with parameterised cortex `d_model`. Same topology as
+    /// `eight_region_billion`; `cortex_d_model` controls the per-region
+    /// CTM hidden width (input/attention/output/motor) so callers can
+    /// sweep matvec compute against per-dispatch overhead. Subcortical
+    /// regions stay at d_model=128 (their job is small/fast routing).
+    pub fn eight_region_mega(
+        obs_dim: usize, out_dims: usize, ticks: usize, cortex_d_model: usize,
+    ) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let d = obs_dim;
+        let cm = cortex_d_model;
+        let mem_cortex = (cm / 8).max(64);
+        let regions = vec![
+            CtmConfig::region("input", cm, d, mem_cortex, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("attention", cm, d, mem_cortex, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("output", cm, d, mem_cortex, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("motor", cm, d, mem_cortex, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("cerebellum", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("basal_ganglia", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 }),
+            CtmConfig::region("insula", 128, d, 64, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.05, threshold: 0.99 }),
+            CtmConfig::region("hippocampus", 128, d, 128, true, ticks,
+                crate::config::ExitStrategy::AdaptiveGate { beta: 0.15, threshold: 0.99 }),
+        ];
+
+        let names = vec![
+            "input", "attention", "output", "motor",
+            "cerebellum", "basal_ganglia", "insula", "hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        let n_global_sync = total_neurons.min(4096);
+
+        Self {
+            regions, region_names: names, connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
+            n_global_sync, out_dims, raw_obs_dim: obs_dim, obs_scale_dims: vec![obs_dim],
+            aux_losses: AuxLossConfig::default(),
+            router: Some(RouterConfig::default()),
+            cereb_mode: Default::default(),
+        }
+    }
+
     /// Large 8-region: GPU-scale model (~200M params).
     /// Cortical regions: d_model=512, memory=64 → SuperLinear crosses GPU threshold.
     /// Subcortical regions: d_model=64, memory=32 → moderate size.

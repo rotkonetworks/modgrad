@@ -1327,25 +1327,17 @@ impl SuperLinearResident {
         let out_base = out_buf.device_ptr() as *mut f32;
         let w_base = self.weight_dev.device_ptr() as *const f32;
         let b_base = self.bias_dev.device_ptr() as *const f32;
-        let in_per = self.in_per;
-        let out_per = self.out_per;
-        let weight_stride = out_per * in_per;
-        for n in 0..self.n_neurons {
-            // Per-neuron pointer offsets — same layout the host
-            // `SuperLinear::forward_cpu` uses, just expressed as
-            // pointer arithmetic against the resident buffers.
-            unsafe {
-                modgrad_device::backend::ops::matvec_resident(
-                    x_base.add(n * in_per),
-                    w_base.add(n * weight_stride),
-                    b_base.add(n * out_per),
-                    out_base.add(n * out_per),
-                    out_per,
-                    in_per,
-                )?;
-            }
-            batch.note_dispatch()?;
+        // Single batched dispatch — `hipblasSgemmStridedBatched` covers
+        // all `n_neurons` per-neuron matvecs as one call. Replaces the
+        // O(n_neurons) `hipblasSgemv` loop that bottlenecked CTM brains
+        // at d_model > 512 (per-dispatch overhead dominated wall time).
+        unsafe {
+            modgrad_device::backend::ops::super_linear_fwd_resident(
+                x_base, w_base, b_base, out_base,
+                self.n_neurons, self.in_per, self.out_per,
+            )?;
         }
+        batch.note_dispatch()?;
         Ok(())
     }
 }

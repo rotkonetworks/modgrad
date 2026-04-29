@@ -101,6 +101,32 @@ pub mod ffi {
             ldc: c_int,
         ) -> hipblasStatus_t;
 
+        /// Strided-batched f32 GEMM. One dispatch covers `batch_count`
+        /// independent matmuls whose A/B/C addresses are
+        /// `base + n * stride{A,B,C}` for n in 0..batch_count. Used to
+        /// fuse `SuperLinear`'s per-neuron matvec loop into a single
+        /// hipBLAS call. Strides are `long long` (i64) in the C ABI.
+        pub fn hipblasSgemmStridedBatched(
+            handle: hipblasHandle_t,
+            transa: c_int,
+            transb: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: *const f32,
+            a: *const f32,
+            lda: c_int,
+            stride_a: i64,
+            b: *const f32,
+            ldb: c_int,
+            stride_b: i64,
+            beta: *const f32,
+            c: *mut f32,
+            ldc: c_int,
+            stride_c: i64,
+            batch_count: c_int,
+        ) -> hipblasStatus_t;
+
         /// Modern hipblas mixed-dtype GEMM. Inputs/output may be bf16,
         /// fp16, or fp32; compute precision is selectable
         /// independently. We invoke it with `HIPBLAS_R_16BF` for A/B/C
@@ -1045,6 +1071,7 @@ impl Backend for RocmBackend {
                 // gate is dropped — small ops are still profitable
                 // when weights and activations are already on device.
                 Op::MatvecResident { .. } => true,
+                Op::SuperLinearFwdResident { .. } => true,
                 Op::MatmulResidentNN { .. }
                 | Op::MatmulResidentNT { .. }
                 | Op::MatmulResidentTN { .. } => true,
@@ -1137,6 +1164,16 @@ impl Backend for RocmBackend {
                     *bias_dev as *const std::os::raw::c_void,
                     *out_dev as *mut std::os::raw::c_void,
                     *out_dim, *in_dim,
+                ),
+                Op::SuperLinearFwdResident {
+                    x_dev, weight_dev, bias_dev, out_dev,
+                    n_neurons, in_per, out_per,
+                } => self.super_linear_fwd_resident_batched_f32(
+                    *x_dev as *const std::os::raw::c_void,
+                    *weight_dev as *const std::os::raw::c_void,
+                    *bias_dev as *const std::os::raw::c_void,
+                    *out_dev as *mut std::os::raw::c_void,
+                    *n_neurons, *in_per, *out_per,
                 ),
                 Op::MatmulResidentNN {
                     a_dev, b_dev, out_dev, m, k, n,
@@ -1505,6 +1542,92 @@ impl RocmBackend {
         if status != 0 {
             return Err(BackendError::Runtime(format!(
                 "hipblasSgemv (resident): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Per-neuron SuperLinear forward, batched into a single
+    /// `hipblasSgemmStridedBatched` dispatch. Replaces the per-neuron
+    /// `for n in 0..n_neurons { hipblasSgemv(...) }` loop in
+    /// `SuperLinearResident::forward` so dispatch overhead stops being
+    /// O(n_neurons).
+    ///
+    /// Memory layout (all device pointers, contiguous f32):
+    ///   weight: [n_neurons × out_per × in_per] row-major per neuron
+    ///   bias:   [n_neurons × out_per]
+    ///   x:      [n_neurons × in_per]
+    ///   out:    [n_neurons × out_per]
+    ///
+    /// Two dispatches total: one D2D `hipMemcpy` for `bias → out`
+    /// (the whole flat array, not per-neuron), then one strided-batched
+    /// SGEMM with `beta=1.0` to add `W[n] @ x[n]` into the bias-loaded
+    /// output.
+    pub(crate) fn super_linear_fwd_resident_batched_f32(
+        &self,
+        x_dev: *const std::os::raw::c_void,
+        weight_dev: *const std::os::raw::c_void,
+        bias_dev: *const std::os::raw::c_void,
+        out_dev: *mut std::os::raw::c_void,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    ) -> Result<(), BackendError> {
+        let in_per_i32  = as_i32(in_per,  "in_per")?;
+        let out_per_i32 = as_i32(out_per, "out_per")?;
+        let batch_i32   = as_i32(n_neurons, "n_neurons")?;
+
+        // Step 1: D2D bias → out (single big memcpy, replaces n_neurons
+        // small ones from the loop path).
+        const HIP_MEMCPY_DEVICE_TO_DEVICE: std::os::raw::c_int = 3;
+        let total_bytes = n_neurons * out_per * 4;
+        let err = unsafe {
+            ffi::hipMemcpy(out_dev, bias_dev, total_bytes, HIP_MEMCPY_DEVICE_TO_DEVICE)
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipMemcpy D2D bias→out (batched): {}", ffi::hip_err_str(err)
+            )));
+        }
+
+        // Step 2: strided-batched SGEMM. Same column-major-via-TRANS=T
+        // trick as `matvec_resident_f32`: weight row-major
+        // [out_per × in_per] read as column-major [in_per × out_per],
+        // TRANS=T gives row-major matvec. With m=out_per, n=1, k=in_per
+        // this is exactly the per-neuron SGEMV, batched.
+        let alpha: f32 = 1.0;
+        let beta:  f32 = 1.0;
+        let stride_a: i64 = (out_per * in_per) as i64;
+        let stride_b: i64 = in_per as i64;
+        let stride_c: i64 = out_per as i64;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemmStridedBatched(
+                *handle,
+                ffi::HIPBLAS_OP_T,         // weight: row-major → col-major TRANS=T
+                ffi::HIPBLAS_OP_N,         // x: column vector, no transpose
+                out_per_i32,               // m (rows of C in col-major view)
+                1,                         // n (cols of C — single vector)
+                in_per_i32,                // k (contraction dim)
+                &alpha,
+                weight_dev as *const f32,
+                in_per_i32,                // lda (col-major leading dim = in_per)
+                stride_a,
+                x_dev as *const f32,
+                in_per_i32,                // ldb
+                stride_b,
+                &beta,
+                out_dev as *mut f32,
+                out_per_i32,               // ldc
+                stride_c,
+                batch_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemmStridedBatched (super_linear): status {status}"
             )));
         }
         Ok(())
