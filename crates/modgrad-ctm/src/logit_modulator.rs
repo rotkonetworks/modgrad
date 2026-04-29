@@ -1208,6 +1208,145 @@ mod tests {
         }
     }
 
+    /// Integration test that demonstrates the `d_brain_output`
+    /// gradient is functionally useful: a synthetic two-layer setup
+    /// where a "brain" is a `Linear` projection from input to
+    /// brain_dim, and training BOTH the brain weights AND the
+    /// modulator weights via the gradient hook achieves lower NLL
+    /// than training only the modulator with brain frozen.
+    ///
+    /// Setup that exposes the difference:
+    ///   modulator rank=1 (extremely constrained — can only learn a
+    ///                     single direction in vocab × brain_dim space)
+    ///   brain     = Linear(input_dim=8, brain_dim=8)
+    ///
+    /// With brain frozen, modulator's rank-1 projection can't fit
+    /// the per-input target offsets. With brain trainable, the
+    /// optimizer can use brain as a feature transformer that aligns
+    /// inputs to the modulator's single learned direction. Joint
+    /// training should beat frozen-brain by a measurable margin.
+    #[test]
+    fn joint_brain_modulator_training_beats_modulator_only() {
+        use modgrad_compute::neuron::Linear;
+
+        let input_dim = 8;
+        let brain_dim = 8;
+        let vocab = 16;
+        let n_steps = 8;
+
+        // Synthetic data: per-step input vector, target token offset
+        // varies per-input so a single rank-1 modulator direction
+        // can't fit all of them simultaneously without brain
+        // transforming inputs.
+        let inputs: Vec<Vec<f32>> = (0..n_steps).map(|t| {
+            (0..input_dim).map(|i| ((t * 13 + i * 7) as f32 * 0.21).sin()).collect()
+        }).collect();
+        let targets: Vec<usize> = (0..n_steps).map(|t| (t * 5 + 3) % vocab).collect();
+        let qwen: Vec<Vec<f32>> = (0..n_steps).map(|_| vec![0.0f32; vocab]).collect();
+
+        let train = |joint: bool| -> f32 {
+            let mut brain = Linear::new(input_dim, brain_dim);
+            let mut m = LowRankBrainLogitModulator::new(brain_dim, 1, vocab);
+            m.alpha = 1.0;
+
+            let mut d_dw = vec![0.0f32; 1 * brain_dim];
+            let mut d_db = vec![0.0f32; 1];
+            let mut d_uw = vec![0.0f32; vocab * 1];
+            let mut d_ub = vec![0.0f32; vocab];
+            let mut d_brain_out = vec![0.0f32; brain_dim];
+            let mut d_brain_w = vec![0.0f32; brain_dim * input_dim];
+            let mut d_brain_b = vec![0.0f32; brain_dim];
+            let mut modulated = vec![0.0f32; vocab];
+            let mut d_modulated = vec![0.0f32; vocab];
+            let mut z_scratch = vec![0.0f32; 1];
+            let lr = 0.05;
+            let scale = 1.0 / n_steps as f32;
+            for _epoch in 0..400 {
+                for t in 0..n_steps {
+                    // Brain forward: brain_out[k] = sum_i W[k,i]·input[i] + b[k]
+                    let mut brain_out = vec![0.0f32; brain_dim];
+                    for k in 0..brain_dim {
+                        let mut acc = brain.bias[k];
+                        let row = &brain.weight[k * input_dim..(k + 1) * input_dim];
+                        for i in 0..input_dim { acc += row[i] * inputs[t][i]; }
+                        brain_out[k] = acc;
+                    }
+                    m.modulate_into_with_scratch(
+                        &qwen[t], &brain_out, &mut modulated, &mut z_scratch);
+                    cross_entropy_grad(&modulated, targets[t], &mut d_modulated);
+                    for v in 0..vocab { d_modulated[v] *= scale; }
+
+                    if joint {
+                        d_brain_out.iter_mut().for_each(|x| *x = 0.0);
+                        m.backward_with_d_brain(
+                            &brain_out, &d_modulated,
+                            &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub,
+                            &mut d_brain_out,
+                        );
+                        // Brain backward: d_W[k,i] += d_brain[k] · input[i]
+                        for k in 0..brain_dim {
+                            d_brain_b[k] += d_brain_out[k];
+                            let row = &mut d_brain_w[k * input_dim..(k + 1) * input_dim];
+                            for i in 0..input_dim {
+                                row[i] += d_brain_out[k] * inputs[t][i];
+                            }
+                        }
+                    } else {
+                        m.backward(
+                            &brain_out, &d_modulated,
+                            &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub,
+                        );
+                    }
+                }
+                m.sgd_step(&mut d_dw, &mut d_db, &mut d_uw, &mut d_ub, lr);
+                if joint {
+                    for (w, dw) in brain.weight.iter_mut().zip(d_brain_w.iter_mut()) {
+                        *w -= lr * *dw; *dw = 0.0;
+                    }
+                    for (b, db) in brain.bias.iter_mut().zip(d_brain_b.iter_mut()) {
+                        *b -= lr * *db; *db = 0.0;
+                    }
+                }
+            }
+
+            // Final NLL.
+            let mut total = 0.0;
+            for t in 0..n_steps {
+                let mut brain_out = vec![0.0f32; brain_dim];
+                for k in 0..brain_dim {
+                    let mut acc = brain.bias[k];
+                    let row = &brain.weight[k * input_dim..(k + 1) * input_dim];
+                    for i in 0..input_dim { acc += row[i] * inputs[t][i]; }
+                    brain_out[k] = acc;
+                }
+                m.modulate_into_with_scratch(
+                    &qwen[t], &brain_out, &mut modulated, &mut z_scratch);
+                let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let lse: f32 = modulated.iter()
+                    .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+                total += lse - modulated[targets[t]];
+            }
+            total / n_steps as f32
+        };
+
+        let nll_modulator_only = train(false);
+        let nll_joint = train(true);
+
+        eprintln!("modulator-only NLL = {nll_modulator_only:.4}");
+        eprintln!("joint  brain+mod NLL = {nll_joint:.4}");
+        // Joint training must measurably beat frozen brain. 0.02 nat
+        // bar is the conservative bound on what the d_brain gradient
+        // is observably contributing on this synthetic setup at 400
+        // epochs / lr=0.05 — empirically the gap is ~0.04. Looser
+        // thresholds invite test noise; tighter thresholds risk
+        // failing on legitimate variance.
+        assert!(nll_joint < nll_modulator_only - 0.02,
+            "joint training must beat modulator-only by ≥0.02 nats \
+             (modulator-only = {nll_modulator_only:.4}, joint = \
+             {nll_joint:.4}). Gradient hook delivers {:.4} nat \
+             improvement here.", nll_modulator_only - nll_joint);
+    }
+
     /// `cross_entropy_grad` must satisfy the gradient identity
     /// `sum_v ∂L/∂logits[v] = 0` (the softmax shifts mass between
     /// classes but doesn't add or remove total probability mass).
