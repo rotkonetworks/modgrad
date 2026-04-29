@@ -101,3 +101,52 @@ displacement activity.
 tried the conditional reflex injection trick for memory" and ended
 with "memory IS continuous self-conditioning." Both true; both
 already in code; neither matters until QK trains.
+
+## Friction discovered while scoping joint-train integration
+
+(Added 2026-04-29.) The `--joint-train` scaffold flag in
+`brain_qwen_nll` was added at `57e61c3`, but wiring its body
+revealed a real architectural friction with `regional_train_step`
+that wasn't visible at the unit-test scale of `d6d9775`:
+
+**`regional_train_step` creates a fresh `RegionalState::new(w)` per
+call** (see `crates/modgrad-ctm/src/graph.rs:2738`). Each call
+starts the brain from `start_activated` and a fresh empty episodic
+KV. This is fine for single-step gradient checks but **breaks the
+"continuous memory across tokens" assumption** the brain_qwen_nll
+modulator-only path relies on (which uses `nc.step` that mutates
+`nc.state` across calls).
+
+For per-token joint training to maintain episodic memory across
+tokens — which is the entire point of having episodic memory — we
+need ONE OF:
+
+1. **A stateful train variant** that takes `&mut RegionalState`
+   alongside `&mut grads`. Real engineering: refactor of the
+   training function or a new wrapper.
+
+2. **Accept per-step independence** during training (each token's
+   training gradient computed against fresh-state forward). Loses
+   the "brain accumulates context" signal for training; only good
+   for IID training samples, not for token streams.
+
+3. **Whole-sequence forward then per-step backward** — analogous to
+   how transformers train on a sequence (one forward over the
+   whole sequence, then per-position backward). Architecturally
+   different from the current per-step `regional_train_step` loop;
+   would require a new `regional_train_sequence` function.
+
+(1) is the cleanest fit for joint train on token streams. (3) is
+the cleanest fit for "this is how transformers train"; might let
+us reuse Qwen's per-position backward pattern. (2) sacrifices the
+architectural commitment to stateful brain.
+
+This is the actual gap between `d6d9775` (chain composes at
+single-step scale) and "wire joint train into brain_qwen_nll"
+(needs sequence-level state management). Smaller than rebuilding
+brain from scratch but bigger than I scoped at `57e61c3`.
+
+Decision: scaffold flag stays unwired until one of (1)/(3) lands.
+Don't ship a partial joint-train that silently uses fresh-state
+per token — that would be the WORST of both worlds (joint training
+without the memory advantage that motivates the brain at all).
