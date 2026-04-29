@@ -204,6 +204,208 @@ impl BrainLogitModulator {
     }
 }
 
+/// Low-rank (LoRA-style) variant of `BrainLogitModulator`. Replaces
+/// the dense `Linear(brain_dim, vocab)` projection with a factored
+/// pair: `Linear(brain_dim, rank) · Linear(rank, vocab)`. Drops
+/// parameter count by `(brain_dim + vocab) · rank / (brain_dim · vocab)`
+/// — at brain_dim=512, vocab=152K, rank=8 that's a ~57× reduction
+/// (78M → 1.37M params).
+///
+/// This is the structural fix for the brain_qwen_nll overfit observed
+/// at commit `c41952c`: 78M dense params on 25 train positions
+/// memorised the train split and underperformed Qwen-alone on held-out
+/// by ~0.8 nats/token. Low-rank constrains the modulator to a
+/// `rank`-dimensional subspace of corrections, which both reduces
+/// param count and biases the optimiser toward generalisable
+/// structure.
+///
+/// Forward: `out[v] = qwen[v] + alpha · (up · down · brain + b_up)`
+///   `down`: `Linear(brain_dim, rank)` — `[rank × brain_dim]` weight
+///   `up`:   `Linear(rank, vocab)`     — `[vocab × rank]` weight,
+///                                       `[vocab]` bias
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub struct LowRankBrainLogitModulator {
+    pub down: Linear,
+    pub up: Linear,
+    pub alpha: f32,
+    pub brain_dim: usize,
+    pub rank: usize,
+    pub vocab: usize,
+}
+
+impl LowRankBrainLogitModulator {
+    /// Random-init both layers, alpha=0 (neutral). Same convention as
+    /// `BrainLogitModulator`: ramp alpha during training so the
+    /// modulator can be wired as a no-op.
+    pub fn new(brain_dim: usize, rank: usize, vocab: usize) -> Self {
+        debug_assert!(rank >= 1, "rank must be ≥ 1");
+        debug_assert!(rank < brain_dim.max(vocab),
+            "rank ≥ min(brain_dim, vocab) defeats the factorisation");
+        Self {
+            down: Linear::new(brain_dim, rank),
+            up:   Linear::new(rank, vocab),
+            alpha: 0.0,
+            brain_dim, rank, vocab,
+        }
+    }
+
+    /// Identity-zero: both layers' weights and biases all zero.
+    pub fn zero(brain_dim: usize, rank: usize, vocab: usize) -> Self {
+        let mut s = Self::new(brain_dim, rank, vocab);
+        s.down.weight.iter_mut().for_each(|w| *w = 0.0);
+        s.down.bias.iter_mut().for_each(|b| *b = 0.0);
+        s.up.weight.iter_mut().for_each(|w| *w = 0.0);
+        s.up.bias.iter_mut().for_each(|b| *b = 0.0);
+        s
+    }
+
+    /// Compute modulated logits. Allocates the rank-dim scratch.
+    pub fn modulate(&self, qwen_logits: &[f32], brain_output: &[f32]) -> Vec<f32> {
+        let mut out = qwen_logits.to_vec();
+        let mut z = vec![0.0f32; self.rank];
+        self.modulate_into_with_scratch(qwen_logits, brain_output, &mut out, &mut z);
+        out
+    }
+
+    /// Like `modulate` but writes into pre-allocated buffers — the
+    /// caller owns `out` (length vocab) and `z_scratch` (length rank).
+    /// Hot training loops should call this and reuse buffers.
+    pub fn modulate_into_with_scratch(
+        &self,
+        qwen_logits: &[f32],
+        brain_output: &[f32],
+        out: &mut [f32],
+        z_scratch: &mut [f32],
+    ) {
+        debug_assert_eq!(qwen_logits.len(), self.vocab);
+        debug_assert_eq!(brain_output.len(), self.brain_dim);
+        debug_assert_eq!(out.len(), self.vocab);
+        debug_assert_eq!(z_scratch.len(), self.rank);
+
+        if self.alpha == 0.0 {
+            out.copy_from_slice(qwen_logits);
+            return;
+        }
+
+        // Step 1: z = down · brain + bias_down
+        let dw = &self.down.weight; // [rank × brain_dim]
+        let db = &self.down.bias;
+        for r in 0..self.rank {
+            let mut acc = db[r];
+            let row = &dw[r * self.brain_dim..(r + 1) * self.brain_dim];
+            for b in 0..self.brain_dim {
+                acc += row[b] * brain_output[b];
+            }
+            z_scratch[r] = acc;
+        }
+
+        // Step 2: y = up · z + bias_up; out = qwen + alpha · y
+        let uw = &self.up.weight; // [vocab × rank]
+        let ub = &self.up.bias;
+        for v in 0..self.vocab {
+            let mut acc = ub[v];
+            let row = &uw[v * self.rank..(v + 1) * self.rank];
+            for r in 0..self.rank {
+                acc += row[r] * z_scratch[r];
+            }
+            out[v] = qwen_logits[v] + self.alpha * acc;
+        }
+    }
+
+    /// Backward pass. Accumulates into `d_down_w`, `d_down_b`,
+    /// `d_up_w`, `d_up_b`. Math:
+    ///   z = down · brain + b_down                 (forward step 1)
+    ///   y = up · z + b_up                         (forward step 2)
+    ///   out = qwen + alpha · y
+    ///
+    /// Given `d_out`:
+    ///   d_y       = alpha · d_out
+    ///   d_b_up    = d_y
+    ///   d_up[v,r] = d_y[v] · z[r]
+    ///   d_z[r]    = sum_v d_y[v] · up[v,r]
+    ///   d_b_down  = d_z
+    ///   d_down[r,b] = d_z[r] · brain[b]
+    pub fn backward(
+        &self,
+        brain_output: &[f32],
+        d_modulated: &[f32],
+        d_down_w: &mut [f32],
+        d_down_b: &mut [f32],
+        d_up_w: &mut [f32],
+        d_up_b: &mut [f32],
+    ) {
+        debug_assert_eq!(brain_output.len(), self.brain_dim);
+        debug_assert_eq!(d_modulated.len(), self.vocab);
+        debug_assert_eq!(d_down_w.len(), self.rank * self.brain_dim);
+        debug_assert_eq!(d_down_b.len(), self.rank);
+        debug_assert_eq!(d_up_w.len(), self.vocab * self.rank);
+        debug_assert_eq!(d_up_b.len(), self.vocab);
+
+        if self.alpha == 0.0 { return; }
+
+        // Recompute z (forward stash would save it; for now, recompute).
+        let mut z = vec![0.0f32; self.rank];
+        for r in 0..self.rank {
+            let mut acc = self.down.bias[r];
+            let row = &self.down.weight[r * self.brain_dim..(r + 1) * self.brain_dim];
+            for b in 0..self.brain_dim {
+                acc += row[b] * brain_output[b];
+            }
+            z[r] = acc;
+        }
+
+        // d_b_up += alpha * d_modulated; d_up[v,r] += alpha * d_modulated[v] * z[r]
+        let mut d_z = vec![0.0f32; self.rank];
+        for v in 0..self.vocab {
+            let dy = self.alpha * d_modulated[v];
+            d_up_b[v] += dy;
+            let row = &mut d_up_w[v * self.rank..(v + 1) * self.rank];
+            let up_row = &self.up.weight[v * self.rank..(v + 1) * self.rank];
+            for r in 0..self.rank {
+                row[r] += dy * z[r];
+                d_z[r] += dy * up_row[r];
+            }
+        }
+
+        // d_b_down += d_z; d_down[r,b] += d_z[r] * brain[b]
+        for r in 0..self.rank {
+            d_down_b[r] += d_z[r];
+            let row = &mut d_down_w[r * self.brain_dim..(r + 1) * self.brain_dim];
+            for b in 0..self.brain_dim {
+                row[b] += d_z[r] * brain_output[b];
+            }
+        }
+    }
+
+    /// In-place SGD step on all four parameter buffers; zeros grads.
+    pub fn sgd_step(
+        &mut self,
+        d_down_w: &mut [f32], d_down_b: &mut [f32],
+        d_up_w: &mut [f32],   d_up_b: &mut [f32],
+        lr: f32,
+    ) {
+        for (w, dw) in self.down.weight.iter_mut().zip(d_down_w.iter_mut()) {
+            *w -= lr * *dw; *dw = 0.0;
+        }
+        for (b, db) in self.down.bias.iter_mut().zip(d_down_b.iter_mut()) {
+            *b -= lr * *db; *db = 0.0;
+        }
+        for (w, dw) in self.up.weight.iter_mut().zip(d_up_w.iter_mut()) {
+            *w -= lr * *dw; *dw = 0.0;
+        }
+        for (b, db) in self.up.bias.iter_mut().zip(d_up_b.iter_mut()) {
+            *b -= lr * *db; *db = 0.0;
+        }
+    }
+
+    /// Total trainable parameters. Useful for the param/data ratio
+    /// budget that drove the introduction of this struct.
+    pub fn n_params(&self) -> usize {
+        self.down.weight.len() + self.down.bias.len()
+            + self.up.weight.len() + self.up.bias.len()
+    }
+}
+
 /// Cross-entropy gradient w.r.t. logits, given the target token index.
 ///   ∂L/∂logits[v] = softmax(logits)[v] - I[v == target]
 /// (no `1/T` averaging — caller does that at the loop level if
@@ -655,6 +857,139 @@ mod tests {
             &m, train_qwen, Some(train_brain), train_tgts);
         eprintln!("train NLL = {train_nll:.4}, held-out NLL = {test_nll_after:.4} \
                    (was {test_nll_before:.4})");
+    }
+
+    /// Low-rank modulator: alpha=0 must produce baseline regardless
+    /// of brain input. Same invariant as the dense variant.
+    #[test]
+    fn low_rank_alpha_zero_is_no_op() {
+        let m = LowRankBrainLogitModulator::new(8, 2, 16);
+        let qwen = vec![0.1f32, -0.5, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0,
+                        2.1, -1.3, 0.7, 0.4, -0.2, 0.9, 0.0, 0.5];
+        let brain = vec![0.3f32, -0.7, 1.1, 0.0, 0.5, -0.4, 0.2, 0.8];
+        let modulated = m.modulate(&qwen, &brain);
+        assert_eq!(modulated, qwen);
+    }
+
+    /// Low-rank modulator: param-count-vs-rank scaling check.
+    /// At brain_dim=512, rank=8, vocab=152K the count must drop ~57×
+    /// vs the dense `BrainLogitModulator(512, 152K)`. This is the
+    /// structural property the low-rank form was added for; lock it.
+    #[test]
+    fn low_rank_param_count_drops_vs_dense() {
+        let dense = BrainLogitModulator::new(512, 151_936);
+        let lowrank = LowRankBrainLogitModulator::new(512, 8, 151_936);
+        let dense_params = dense.proj.weight.len() + dense.proj.bias.len();
+        let lr_params = lowrank.n_params();
+        assert!(dense_params > 50 * lr_params,
+            "expected ≥50× parameter reduction at rank=8 \
+             (dense = {dense_params}, low-rank = {lr_params})");
+    }
+
+    /// Backward must match finite-difference for both the up and down
+    /// projections. f(W) = ½‖out‖², so d_modulated = out (chain rule).
+    #[test]
+    fn low_rank_backward_matches_finite_difference() {
+        let mut m = LowRankBrainLogitModulator::new(4, 2, 6);
+        m.alpha = 0.7;
+        let qwen = vec![0.0f32; 6];
+        let brain = vec![0.5, -0.3, 0.7, 0.1];
+
+        let out = m.modulate(&qwen, &brain);
+        let d_modulated = out.clone();
+
+        let mut d_dw = vec![0.0f32; 2 * 4];
+        let mut d_db = vec![0.0f32; 2];
+        let mut d_uw = vec![0.0f32; 6 * 2];
+        let mut d_ub = vec![0.0f32; 6];
+        m.backward(&brain, &d_modulated, &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub);
+
+        // FD on up.weight[v=3, r=1]
+        let v = 3; let r = 1;
+        let eps = 1e-3;
+        let saved = m.up.weight[v * 2 + r];
+        m.up.weight[v * 2 + r] = saved + eps;
+        let l_plus: f32 = m.modulate(&qwen, &brain).iter()
+            .map(|x| 0.5 * x * x).sum();
+        m.up.weight[v * 2 + r] = saved - eps;
+        let l_minus: f32 = m.modulate(&qwen, &brain).iter()
+            .map(|x| 0.5 * x * x).sum();
+        m.up.weight[v * 2 + r] = saved;
+        let num = (l_plus - l_minus) / (2.0 * eps);
+        let analytic = d_uw[v * 2 + r];
+        assert!((num - analytic).abs() < 1e-4,
+            "low-rank up.weight[{v},{r}] FD = {num:.6} analytic = {analytic:.6}");
+
+        // FD on down.weight[r=0, b=2]
+        let rd = 0; let b = 2;
+        let saved = m.down.weight[rd * 4 + b];
+        m.down.weight[rd * 4 + b] = saved + eps;
+        let l_plus: f32 = m.modulate(&qwen, &brain).iter()
+            .map(|x| 0.5 * x * x).sum();
+        m.down.weight[rd * 4 + b] = saved - eps;
+        let l_minus: f32 = m.modulate(&qwen, &brain).iter()
+            .map(|x| 0.5 * x * x).sum();
+        m.down.weight[rd * 4 + b] = saved;
+        let num = (l_plus - l_minus) / (2.0 * eps);
+        let analytic = d_dw[rd * 4 + b];
+        assert!((num - analytic).abs() < 1e-4,
+            "low-rank down.weight[{rd},{b}] FD = {num:.6} analytic = {analytic:.6}");
+    }
+
+    /// Low-rank training reduces NLL on synthetic data. Same setup as
+    /// the dense `training_reduces_nll` so the two are comparable.
+    #[test]
+    fn low_rank_training_reduces_nll() {
+        let vocab = 16; let brain_dim = 8; let rank = 4; let n_steps = 10;
+        let qwen: Vec<Vec<f32>> = (0..n_steps).map(|_| vec![0.0f32; vocab]).collect();
+        let qwen_refs: Vec<&[f32]> = qwen.iter().map(|v| v.as_slice()).collect();
+        let brain: Vec<Vec<f32>> = (0..n_steps).map(|t| {
+            (0..brain_dim).map(|i| ((t * 13 + i * 7) as f32 * 0.21).sin()).collect()
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain.iter().map(|v| v.as_slice()).collect();
+        let targets: Vec<usize> = (0..n_steps).map(|t| (t * 5 + 3) % vocab).collect();
+
+        let mut m = LowRankBrainLogitModulator::new(brain_dim, rank, vocab);
+        m.alpha = 1.0;
+
+        // Initial NLL via direct compute (no public NLL helper for low-rank yet).
+        let initial: f32 = (0..n_steps).map(|t| {
+            let modulated = m.modulate(qwen_refs[t], brain_refs[t]);
+            let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let lse: f32 = modulated.iter()
+                .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+            lse - modulated[targets[t]]
+        }).sum::<f32>() / n_steps as f32;
+        assert!(initial.is_finite() && initial > 0.0);
+
+        let mut d_dw = vec![0.0f32; rank * brain_dim];
+        let mut d_db = vec![0.0f32; rank];
+        let mut d_uw = vec![0.0f32; vocab * rank];
+        let mut d_ub = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let lr = 0.05;
+        let scale = 1.0 / n_steps as f32;
+        for _ in 0..200 {
+            for t in 0..n_steps {
+                let modulated = m.modulate(qwen_refs[t], brain_refs[t]);
+                cross_entropy_grad(&modulated, targets[t], &mut d_modulated);
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m.backward(brain_refs[t], &d_modulated,
+                    &mut d_dw, &mut d_db, &mut d_uw, &mut d_ub);
+            }
+            m.sgd_step(&mut d_dw, &mut d_db, &mut d_uw, &mut d_ub, lr);
+        }
+
+        let final_nll: f32 = (0..n_steps).map(|t| {
+            let modulated = m.modulate(qwen_refs[t], brain_refs[t]);
+            let max_l = modulated.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let lse: f32 = modulated.iter()
+                .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+            lse - modulated[targets[t]]
+        }).sum::<f32>() / n_steps as f32;
+        assert!(final_nll < initial * 0.5,
+            "low-rank training must cut NLL by ≥2× \
+             (initial = {initial:.4}, final = {final_nll:.4})");
     }
 
     /// `cross_entropy_grad` must satisfy the gradient identity
