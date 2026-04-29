@@ -140,6 +140,93 @@ impl BrainLogitModulator {
     }
 }
 
+impl BrainLogitModulator {
+    /// Backward pass through `modulate`: given the upstream gradient
+    /// `d_modulated[v] = ∂L/∂out[v]`, accumulate into `d_proj_weight`
+    /// and `d_proj_bias`. Does **not** backprop into `qwen_logits`
+    /// (passes straight through — Qwen is frozen) or into
+    /// `brain_output` (handled by a separate slice when brain weights
+    /// also train).
+    ///
+    /// Math:
+    ///   ∂L/∂W[v,b]  = d_modulated[v] · alpha · brain[b]
+    ///   ∂L/∂bias[v] = d_modulated[v] · alpha
+    ///
+    /// Both gradients are **accumulated** (`+=`) so a caller can sum
+    /// across a sequence of timesteps with one allocation.
+    pub fn backward(
+        &self,
+        brain_output: &[f32],
+        d_modulated: &[f32],
+        d_proj_weight: &mut [f32],
+        d_proj_bias: &mut [f32],
+    ) {
+        debug_assert_eq!(brain_output.len(), self.brain_dim);
+        debug_assert_eq!(d_modulated.len(), self.vocab);
+        debug_assert_eq!(d_proj_weight.len(), self.vocab * self.brain_dim);
+        debug_assert_eq!(d_proj_bias.len(), self.vocab);
+
+        if self.alpha == 0.0 { return; } // gradient is zero w.r.t. proj params
+
+        let bd = self.brain_dim;
+        for v in 0..self.vocab {
+            let scale = d_modulated[v] * self.alpha;
+            d_proj_bias[v] += scale;
+            let row = &mut d_proj_weight[v * bd..(v + 1) * bd];
+            for b in 0..bd {
+                row[b] += scale * brain_output[b];
+            }
+        }
+    }
+
+    /// In-place SGD step. Subtracts `lr * grad` from weight + bias and
+    /// zeros the grad buffers — caller can immediately accumulate into
+    /// them again. Plain SGD (no momentum / no weight decay) keeps
+    /// the slice minimal; swap to AdamW from `modgrad-training` later
+    /// if convergence speed becomes the bottleneck.
+    pub fn sgd_step(
+        &mut self,
+        d_proj_weight: &mut [f32],
+        d_proj_bias: &mut [f32],
+        lr: f32,
+    ) {
+        debug_assert_eq!(d_proj_weight.len(), self.proj.weight.len());
+        debug_assert_eq!(d_proj_bias.len(), self.proj.bias.len());
+
+        for (w, dw) in self.proj.weight.iter_mut().zip(d_proj_weight.iter_mut()) {
+            *w -= lr * *dw;
+            *dw = 0.0;
+        }
+        for (b, db) in self.proj.bias.iter_mut().zip(d_proj_bias.iter_mut()) {
+            *b -= lr * *db;
+            *db = 0.0;
+        }
+    }
+}
+
+/// Cross-entropy gradient w.r.t. logits, given the target token index.
+///   ∂L/∂logits[v] = softmax(logits)[v] - I[v == target]
+/// (no `1/T` averaging — caller does that at the loop level if
+/// summing across timesteps.) Numerically stable softmax.
+pub fn cross_entropy_grad(logits: &[f32], target: usize, out: &mut [f32]) {
+    debug_assert_eq!(logits.len(), out.len());
+    debug_assert!(target < logits.len(),
+        "cross_entropy_grad: target {} out of range [0, {})", target, logits.len());
+
+    let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut sum_exp: f32 = 0.0;
+    for i in 0..logits.len() {
+        let e = (logits[i] - max_l).exp();
+        out[i] = e;
+        sum_exp += e;
+    }
+    let inv = 1.0 / sum_exp;
+    for v in 0..logits.len() {
+        out[v] *= inv;
+    }
+    out[target] -= 1.0;
+}
+
 /// Mean per-token negative log-likelihood given a sequence of LLM
 /// logits, optional per-step brain outputs to fold in, and the target
 /// next-token IDs. Returns `f32::INFINITY` on empty input or if any
@@ -323,6 +410,132 @@ mod tests {
             "with alpha=1 and random proj, brain-modulated NLL must \
              differ from baseline (baseline={nll_baseline}, \
              brain={nll_brain})");
+    }
+
+    /// The redshiftzero load-bearing claim: the modulator can be
+    /// **trained** to reduce NLL. Without this all the prior
+    /// content-causality work is just expressivity — the seam can be
+    /// non-zero, but does the optimizer find a non-zero gradient
+    /// signal that actually moves loss down?
+    ///
+    /// Setup: deterministic synthetic Qwen logits, 10 steps × vocab 16,
+    /// brain output sequence, fixed targets. Modulator alpha=1, random
+    /// init. SGD on cross-entropy loss for 200 steps at lr=0.05.
+    ///
+    /// Assertion: NLL_final < NLL_initial · 0.5 — i.e. training cuts
+    /// loss in half. Anything weaker would mean the optimizer is just
+    /// drifting around. Anything stronger (e.g. < 0.01) might be
+    /// overfitting noise — the bound is honest about what's
+    /// expectable for ~3.2K parameters trained on 10 token positions.
+    ///
+    /// Synthetic Qwen logits are uniform zeros so the brain+modulator
+    /// has to do all the lifting. Brain outputs are deterministic
+    /// non-zero vectors so there's a well-defined target the
+    /// projection can learn.
+    #[test]
+    fn training_reduces_nll() {
+        // Synthetic data.
+        let vocab = 16;
+        let brain_dim = 8;
+        let n_steps = 10;
+        let qwen: Vec<Vec<f32>> = (0..n_steps).map(|_| vec![0.0f32; vocab]).collect();
+        let qwen_refs: Vec<&[f32]> = qwen.iter().map(|v| v.as_slice()).collect();
+        let brain: Vec<Vec<f32>> = (0..n_steps).map(|t| {
+            (0..brain_dim).map(|i| ((t * 13 + i * 7) as f32 * 0.21).sin()).collect()
+        }).collect();
+        let brain_refs: Vec<&[f32]> = brain.iter().map(|v| v.as_slice()).collect();
+        // Targets chosen pseudo-randomly but deterministically.
+        let targets: Vec<usize> = (0..n_steps).map(|t| (t * 5 + 3) % vocab).collect();
+
+        let mut m = BrainLogitModulator::new(brain_dim, vocab);
+        m.alpha = 1.0;
+
+        let nll_initial = nll_per_token(&m, &qwen_refs, Some(&brain_refs), &targets);
+        assert!(nll_initial.is_finite() && nll_initial > 0.0);
+
+        // Training loop: SGD on cross-entropy.
+        let mut d_w = vec![0.0f32; vocab * brain_dim];
+        let mut d_b = vec![0.0f32; vocab];
+        let mut modulated = vec![0.0f32; vocab];
+        let mut d_modulated = vec![0.0f32; vocab];
+        let lr = 0.05;
+        let n_train = 200;
+
+        for _step in 0..n_train {
+            // Accumulate gradients across the whole sequence.
+            for t in 0..n_steps {
+                m.modulate_into(qwen_refs[t], brain_refs[t], &mut modulated);
+                cross_entropy_grad(&modulated, targets[t], &mut d_modulated);
+                // Mean gradient: divide by n_steps so lr scaling is
+                // independent of sequence length.
+                let scale = 1.0 / n_steps as f32;
+                for v in 0..vocab { d_modulated[v] *= scale; }
+                m.backward(brain_refs[t], &d_modulated, &mut d_w, &mut d_b);
+            }
+            m.sgd_step(&mut d_w, &mut d_b, lr);
+        }
+
+        let nll_final = nll_per_token(&m, &qwen_refs, Some(&brain_refs), &targets);
+        assert!(nll_final.is_finite());
+        assert!(nll_final < nll_initial * 0.5,
+            "training must reduce NLL by at least 2× \
+             (initial = {nll_initial:.4}, final = {nll_final:.4}); \
+             smaller delta means the optimizer is not finding the \
+             gradient signal end-to-end");
+    }
+
+    /// `cross_entropy_grad` must satisfy the gradient identity
+    /// `sum_v ∂L/∂logits[v] = 0` (the softmax shifts mass between
+    /// classes but doesn't add or remove total probability mass).
+    /// Catches sign errors and missing target subtraction.
+    #[test]
+    fn cross_entropy_grad_sums_to_zero() {
+        let logits = vec![0.5f32, -1.2, 0.3, 2.1, -0.7, 1.4, 0.0, -0.4];
+        let mut grad = vec![0.0f32; logits.len()];
+        cross_entropy_grad(&logits, 3, &mut grad);
+        let s: f32 = grad.iter().sum();
+        assert!(s.abs() < 1e-5,
+            "softmax-target gradient must sum to zero (got {s:.6})");
+    }
+
+    /// Modulator backward must agree with a finite-difference reference.
+    /// f(W) = sum_v out[v]^2 / 2 (so df/d_modulated[v] = out[v]).
+    /// Then backward should produce d_W[v,b] ≈ out[v] · alpha · brain[b].
+    /// Compares analytic vs numerical for one (v, b) entry.
+    #[test]
+    fn backward_matches_finite_difference() {
+        let mut m = BrainLogitModulator::new(4, 6);
+        m.alpha = 0.7;
+        let qwen = vec![0.0f32; 6];
+        let brain = vec![0.5, -0.3, 0.7, 0.1];
+
+        let out = m.modulate(&qwen, &brain);
+        // d_modulated = out (gradient of L=½‖out‖²)
+        let d_modulated = out.clone();
+
+        let mut d_w = vec![0.0f32; 6 * 4];
+        let mut d_b = vec![0.0f32; 6];
+        m.backward(&brain, &d_modulated, &mut d_w, &mut d_b);
+
+        // Finite-difference d_W[2, 1].
+        let v = 2; let bidx = 1;
+        let eps = 1e-3;
+        let saved = m.proj.weight[v * 4 + bidx];
+
+        m.proj.weight[v * 4 + bidx] = saved + eps;
+        let plus_out = m.modulate(&qwen, &brain);
+        let l_plus: f32 = plus_out.iter().map(|x| 0.5 * x * x).sum();
+
+        m.proj.weight[v * 4 + bidx] = saved - eps;
+        let minus_out = m.modulate(&qwen, &brain);
+        let l_minus: f32 = minus_out.iter().map(|x| 0.5 * x * x).sum();
+
+        m.proj.weight[v * 4 + bidx] = saved; // restore
+        let num_grad = (l_plus - l_minus) / (2.0 * eps);
+        let analytic = d_w[v * 4 + bidx];
+        assert!((num_grad - analytic).abs() < 1e-4,
+            "analytic backward d_W[{v},{bidx}] = {analytic:.6} vs \
+             finite-diff {num_grad:.6}");
     }
 
     /// NLL primitive must fail-loud on shape mismatches rather than
