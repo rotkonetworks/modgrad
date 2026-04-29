@@ -193,14 +193,20 @@ fn main() {
         /// whether brain dynamics are doing useful work, or whether
         /// the modulator's improvement could come from any
         /// content-causal feature extractor:
-        ///   "real"   — RegionalBrain via NeuralComputer.step (default)
-        ///   "random" — fresh random Gaussian per token (no
-        ///              cross-token state — pure noise)
-        ///   "embed"  — deterministic per-token-id vector (sin-based
-        ///              hash — content-causal but no temporal
-        ///              dependency or memory)
-        ///   "zero"   — vec![0.0; brain_dim] (modulator learns a
-        ///              constant bias only)
+        ///   "real"           — RegionalBrain via NeuralComputer.step
+        ///                      (default, brain's prediction output)
+        ///   "random"         — fresh random Gaussian per token (no
+        ///                      cross-token state — pure noise)
+        ///   "embed"          — deterministic per-token-id vector
+        ///                      (sin-based hash — content-causal but
+        ///                      no temporal dependency or memory)
+        ///   "zero"           — vec![0.0; brain_dim] (constant bias)
+        ///   "hippo-kv-mean"  — mean-pooled hippocampus episodic KV
+        ///                      (direct access to memory contents,
+        ///                      skips the brain's prediction
+        ///                      projection)
+        ///   "hippo-kv-last"  — last (most recent) hippocampus episodic
+        ///                      entry (recency-weighted memory)
         #[arg(long, default_value = "real")]
         brain_mode: String,
     }
@@ -326,6 +332,52 @@ fn main() {
             let w = RegionalWeights::new(cfg);
             let mut nc = NeuralComputer::new(w);
             token_ids.iter().map(|&id| nc.step((id as usize) % 256)).collect()
+        }
+        "hippo-kv-mean" | "hippo-kv-last" => {
+            // Drive brain forward to populate hippocampus episodic
+            // memory; extract the KV after each step and pool. Skips
+            // the brain's lossy `predictions` output projection and
+            // gives the modulator direct access to the memory store.
+            let mut cfg = RegionalConfig::eight_region(16, BRAIN_OUT_DIM, 2);
+            cfg.router = None;
+            let w = RegionalWeights::new(cfg);
+            let mut nc = NeuralComputer::new(w);
+            let hippo_idx = nc.weights.config.region_names.iter()
+                .position(|n| n.contains("hippocampus"))
+                .expect("eight_region should have hippocampus");
+            let last_only = args.brain_mode == "hippo-kv-last";
+            token_ids.iter().map(|&id| {
+                // Drive a tick to update episodic state.
+                let _ = nc.step((id as usize) % 256);
+                // Episodic KV is `[n_entries × hippo_d_input]`.
+                let ep = nc.state.region_states[hippo_idx]
+                    .episodic.as_ref().expect("hippocampus has episodic");
+                let kv = ep.as_kv();
+                let dim = ep.dim();
+                let mut out = vec![0.0f32; BRAIN_OUT_DIM];
+                if kv.is_empty() {
+                    // First-tick bootstrap: episodic is empty, fall
+                    // back to zeros (same shape as `zero` mode).
+                    return out;
+                }
+                let n_entries = kv.len() / dim;
+                if last_only {
+                    let last_off = (n_entries - 1) * dim;
+                    let n_copy = dim.min(BRAIN_OUT_DIM);
+                    out[..n_copy].copy_from_slice(&kv[last_off..last_off + n_copy]);
+                } else {
+                    // Mean-pool across all entries.
+                    let n_copy = dim.min(BRAIN_OUT_DIM);
+                    let inv = 1.0 / n_entries as f32;
+                    for e in 0..n_entries {
+                        let off = e * dim;
+                        for k in 0..n_copy {
+                            out[k] += kv[off + k] * inv;
+                        }
+                    }
+                }
+                out
+            }).collect()
         }
         "random" => {
             // Fresh random Gaussian per token — no cross-token state.
