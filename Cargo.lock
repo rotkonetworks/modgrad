@@ -388,6 +388,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain_qwen_nll"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-device",
+ "modgrad-io",
+ "modgrad-transformer",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

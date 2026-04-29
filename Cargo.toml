@@ -30,6 +30,7 @@ members = [
     "examples/hebbian_sanity",
     "examples/pretrain_retina",
     "examples/bench_brain_crossover",
+    "examples/brain_qwen_nll",
     "examples/bench_maze_resident",
     "examples/bench_maze_resident_medium",
     "examples/cortex_cerebellum_reader",

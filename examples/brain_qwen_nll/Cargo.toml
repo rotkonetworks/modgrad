@@ -1,0 +1,27 @@
+[package]
+name = "brain_qwen_nll"
+version = "0.1.0"
+edition = "2024"
+description = "Real-Qwen integration: measure baseline Qwen NLL vs Qwen+brain NLL on a token sequence via BrainLogitModulator. The redshiftzero comparison primitive on real weights."
+
+[[bin]]
+name = "brain_qwen_nll"
+path = "src/main.rs"
+
+[features]
+default = []
+rocm = [
+    "modgrad-io/rocm",
+    "modgrad-transformer/rocm",
+    "modgrad-compute/rocm",
+    "modgrad-device/rocm",
+    "modgrad-ctm/rocm",
+]
+
+[dependencies]
+modgrad-io          = { path = "../../crates/modgrad-io" }
+modgrad-transformer = { path = "../../crates/modgrad-transformer" }
+modgrad-compute     = { path = "../../crates/modgrad-compute" }
+modgrad-device      = { path = "../../crates/modgrad-device" }
+modgrad-ctm         = { path = "../../crates/modgrad-ctm" }
+clap                = { version = "4", features = ["derive"] }
