@@ -178,6 +178,19 @@ fn main() {
         #[arg(long)]
         per_position: bool,
 
+        /// Joint training: brain + modulator co-trained against Qwen
+        /// NLL. Routes the modulator's `backward_with_d_brain`
+        /// gradient through the brain's existing BPTT path
+        /// (`regional_train_step_generic`) so brain weights move
+        /// under Qwen-side loss. Without this, only the modulator's
+        /// projection trains; brain stays random-init.
+        #[arg(long)]
+        joint_train: bool,
+
+        /// Brain-side learning rate (used when --joint-train is set).
+        #[arg(long, default_value_t = 0.001)]
+        brain_lr: f32,
+
         /// Recall-shaped loss: only count training gradient at
         /// positions where the target token has appeared earlier in
         /// the sequence. Forces the optimizer to find corrections
