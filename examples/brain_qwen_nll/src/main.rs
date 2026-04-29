@@ -45,8 +45,73 @@ fn main() {
     use modgrad_ctm::graph::{NeuralComputer, RegionalConfig, RegionalWeights};
     use modgrad_ctm::logit_modulator::{
         BrainLogitModulator, LowRankBrainLogitModulator,
-        nll_per_token, cross_entropy_grad,
+        LogitModulator, nll_per_token, cross_entropy_grad,
     };
+
+    /// For each test position, compute baseline (Qwen-alone) NLL and
+    /// trained (Qwen+brain) NLL on the actual target token. Print
+    /// the positions sorted by improvement (Δ = baseline − trained,
+    /// positive = brain helped). Also reports the per-position token
+    /// strings via the tokenizer.
+    fn print_per_position_breakdown<M: LogitModulator>(
+        modulator: &M,
+        test_qwen: &[&[f32]],
+        test_brain: &[&[f32]],
+        test_tgts: &[usize],
+        token_ids: &[i64],
+        n_train: usize,
+        tokenizer: &HfTokenizer,
+    ) {
+        let vocab = modulator.vocab();
+        let n = test_qwen.len();
+        let mut deltas: Vec<(usize, f32, f32, f32, String, String)> = Vec::with_capacity(n);
+        let mut scratch = vec![0.0f32; vocab];
+
+        let log_softmax_at = |logits: &[f32], target: usize| -> f32 {
+            let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let lse: f32 = logits.iter()
+                .map(|&l| (l - max_l).exp()).sum::<f32>().ln() + max_l;
+            lse - logits[target]
+        };
+
+        for t in 0..n {
+            let qwen_t = test_qwen[t];
+            let target = test_tgts[t];
+            let baseline_nll = log_softmax_at(qwen_t, target);
+            modulator.modulate_into(qwen_t, test_brain[t], &mut scratch);
+            let trained_nll = log_softmax_at(&scratch, target);
+            // Recover the input token at this prediction position (the
+            // token whose successor we're predicting) for readability.
+            let abs_pos = n_train + t;
+            let input_tok = tokenizer.decode(&[token_ids[abs_pos] as u32])
+                .unwrap_or_else(|_| "??".into());
+            let target_tok = tokenizer.decode(&[token_ids[abs_pos + 1] as u32])
+                .unwrap_or_else(|_| "??".into());
+            deltas.push((t, baseline_nll, trained_nll, baseline_nll - trained_nll,
+                         input_tok, target_tok));
+        }
+
+        // Sort by improvement (descending).
+        deltas.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        eprintln!();
+        eprintln!("---- per-position breakdown (test set) ----");
+        eprintln!("  pos | baseline NLL | trained NLL |    Δ     | context → target");
+        eprintln!("  ----+--------------+-------------+----------+---------------------------");
+        for (t, base, trained, delta, in_tok, tgt_tok) in &deltas {
+            let in_tok_clean: String = in_tok.chars()
+                .map(|c| if c.is_control() { '·' } else { c }).collect();
+            let tgt_tok_clean: String = tgt_tok.chars()
+                .map(|c| if c.is_control() { '·' } else { c }).collect();
+            eprintln!("  {:>3} |   {:>8.4}   |  {:>8.4}   | {:>+7.4} | {:>15} → {}",
+                t, base, trained, delta,
+                format!("{:?}", in_tok_clean), format!("{:?}", tgt_tok_clean));
+        }
+        let n_helped = deltas.iter().filter(|d| d.3 > 0.0).count();
+        let n_hurt = deltas.iter().filter(|d| d.3 < 0.0).count();
+        eprintln!("  ────────");
+        eprintln!("  {n_helped} positions helped, {n_hurt} hurt (out of {n})");
+    }
 
     #[derive(Parser, Debug)]
     #[command(name = "brain_qwen_nll")]
@@ -102,6 +167,16 @@ fn main() {
         /// (~57× reduction). Set to 0 to use the dense modulator.
         #[arg(long, default_value_t = 8)]
         rank: usize,
+
+        /// Per-position NLL breakdown. After training, prints the test
+        /// positions sorted by NLL improvement (Qwen-alone NLL minus
+        /// Qwen+brain NLL). Lets us see WHICH positions benefit from
+        /// brain attachment instead of just averaging across all of
+        /// them — separates generic content-causal modulation
+        /// (uniform improvement) from specific semantic recall
+        /// (clustered improvement at recall positions).
+        #[arg(long)]
+        per_position: bool,
 
         /// What signal feeds into the modulator. Used to ablate
         /// whether brain dynamics are doing useful work, or whether
@@ -388,6 +463,11 @@ fn main() {
         }
         let test  = nll_per_token(&m_trained, &test_qwen, Some(&test_brain), &test_tgts);
         let train = nll_per_token(&m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+        if args.per_position {
+            print_per_position_breakdown(
+                &m_trained, &test_qwen, &test_brain, &test_tgts,
+                &token_ids, n_train, &tokenizer);
+        }
         (test, train, np)
     } else {
         // Low-rank path.
@@ -431,6 +511,11 @@ fn main() {
         }
         let test  = nll_per_token(&m_trained, &test_qwen, Some(&test_brain), &test_tgts);
         let train = nll_per_token(&m_trained, &train_qwen, Some(&train_brain), &train_tgts);
+        if args.per_position {
+            print_per_position_breakdown(
+                &m_trained, &test_qwen, &test_brain, &test_tgts,
+                &token_ids, n_train, &tokenizer);
+        }
         (test, train, np)
     };
     let train_ms = train_t.elapsed().as_millis();
