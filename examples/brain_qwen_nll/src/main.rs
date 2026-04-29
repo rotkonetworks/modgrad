@@ -59,7 +59,8 @@ fn main() {
 
         /// Text whose per-token NLL we measure. Tokenized once, then
         /// fed to both Qwen and the brain. Should be at least a few
-        /// tokens long for the NLL average to be meaningful.
+        /// tokens long for the NLL average to be meaningful. Ignored
+        /// when --text-file is set.
         #[arg(long, default_value =
             "The quick brown fox jumps over the lazy dog. \
              The early bird catches the worm. \
@@ -67,6 +68,13 @@ fn main() {
              Every cloud has a silver lining. \
              Actions speak louder than words.")]
         text: String,
+
+        /// Path to a text file. When set, replaces --text. Use this
+        /// to run on a longer corpus where modulator capacity isn't
+        /// the bottleneck (with 37-token --text default, even rank=2
+        /// has 18K params/example — overfits past epoch ~14).
+        #[arg(long)]
+        text_file: Option<String>,
 
         #[arg(long, default_value_t = 256)]
         max_seq: usize,
@@ -132,7 +140,20 @@ fn main() {
 
     // ── 2. Encode the text. The first token is "context"; logits at
     // position t predict token t+1, so we need ≥ 2 tokens. ──
-    let token_ids: Vec<i64> = match tokenizer.encode(&args.text) {
+    let text: String = match args.text_file.as_ref() {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => {
+                eprintln!("brain_qwen_nll: loaded {} bytes from {p}", s.len());
+                s
+            }
+            Err(e) => {
+                eprintln!("brain_qwen_nll: read --text-file {p} failed: {e}");
+                return;
+            }
+        },
+        None => args.text.clone(),
+    };
+    let token_ids: Vec<i64> = match tokenizer.encode(&text) {
         Ok(ids) => ids.into_iter().map(|id| id as i64).collect(),
         Err(e) => {
             eprintln!("brain_qwen_nll: encode failed: {e}");
@@ -144,7 +165,8 @@ fn main() {
         eprintln!("brain_qwen_nll: need ≥2 tokens, got {n} — extend --text");
         return;
     }
-    eprintln!("brain_qwen_nll: text = {:?} ({n} tokens)", args.text);
+    eprintln!("brain_qwen_nll: text {} tokens, max_seq={}",
+        n, args.max_seq);
 
     let positions: Vec<usize> = (0..n).collect();
 
