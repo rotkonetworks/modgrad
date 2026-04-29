@@ -5989,6 +5989,87 @@ mod tests {
             "episodic memory should be bounded: {} > {}", epi.n_tokens(), max);
     }
 
+    /// Hippocampus episodic memory must be **content-dependent**:
+    /// different input sequences from a fresh weight init must yield
+    /// different episodic KV buffers. The existing
+    /// `episodic_memory_accumulates` only asserts entries exist; this
+    /// asserts that what they hold actually depends on what was seen
+    /// (rules out degenerate constant / zero-fill memory).
+    #[test]
+    fn episodic_memory_is_content_dependent() {
+        let cfg = RegionalConfig::eight_region(16, 256, 2);
+        let w = RegionalWeights::new(cfg);
+
+        let hippo_idx = w.config.region_names.iter()
+            .position(|n| n.contains("hippocampus"))
+            .expect("eight_region should have hippocampus");
+
+        let mut nc_a = NeuralComputer::new(w.clone());
+        for i in 1..=19usize { let _ = nc_a.step(i); }
+        let kv_a: Vec<f32> = nc_a.state.region_states[hippo_idx]
+            .episodic.as_ref().unwrap().as_kv();
+
+        let mut nc_b = NeuralComputer::new(w);
+        for i in 200..=218usize { let _ = nc_b.step(i); }
+        let kv_b: Vec<f32> = nc_b.state.region_states[hippo_idx]
+            .episodic.as_ref().unwrap().as_kv();
+
+        assert!(!kv_a.is_empty() && !kv_b.is_empty(),
+            "both paths should produce non-empty episodic KV");
+        let m = kv_a.len().min(kv_b.len());
+        let l2: f32 = kv_a[..m].iter().zip(kv_b[..m].iter())
+            .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        let norm_a: f32 = kv_a[..m].iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
+        let norm_b: f32 = kv_b[..m].iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
+        let rel_l2 = l2 / (0.5 * (norm_a + norm_b)).max(1e-6);
+        assert!(rel_l2 > 0.05,
+            "episodic KV must depend on input content (rel L2 = {rel_l2:.4}, \
+             l2={l2:.4}, |kv_a|={norm_a:.4}, |kv_b|={norm_b:.4})");
+    }
+
+    /// Episodic memory in the hippocampus does NOT today propagate to
+    /// brain predictions — measured at logit L2 = 4e-6 (FP noise) for
+    /// two paths whose hippocampus KVs differ substantially (rel L2 ≫
+    /// 0.05, see `episodic_memory_is_content_dependent`).
+    ///
+    /// **Architectural gap.** The `eight_region` topology wires
+    /// hippocampus as a memory **sink**:
+    ///
+    /// ```text
+    ///   {input, attention, output, motor} → hippocampus
+    ///   hippocampus → insula
+    ///   [insula has no outgoing edges]
+    /// ```
+    ///
+    /// Hippocampus accumulates content-dependent episodic memory but
+    /// never fans back into the {attention → output → motor} loop that
+    /// produces predictions. Adding an edge `hippocampus → attention`
+    /// (or `hippocampus → output`) would be the structural fix.
+    ///
+    /// This test is `#[ignore]`-d so CI stays green while the gap is
+    /// documented. Un-ignore once the fix lands.
+    #[test]
+    #[ignore = "documented architectural gap: hippocampus → predictions edge missing"]
+    fn episodic_memory_propagates_to_prediction() {
+        let cfg = RegionalConfig::eight_region(16, 256, 2);
+        let w = RegionalWeights::new(cfg);
+
+        let mut nc_a = NeuralComputer::new(w.clone());
+        for i in 1..=19usize { let _ = nc_a.step(i); }
+        let logits_a = nc_a.step(42);
+
+        let mut nc_b = NeuralComputer::new(w);
+        for i in 200..=218usize { let _ = nc_b.step(i); }
+        let logits_b = nc_b.step(42);
+
+        assert_eq!(logits_a.len(), logits_b.len());
+        let pred_l2: f32 = logits_a.iter().zip(logits_b.iter())
+            .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(pred_l2 > 1e-3,
+            "logits on query=42 must differ between paths A and B \
+             (L2 = {pred_l2:.6})");
+    }
+
     #[test]
     fn nc_continuity_survives_save_load() {
         // Clive-Wearing fix #1: after save/load, the NC should have the
