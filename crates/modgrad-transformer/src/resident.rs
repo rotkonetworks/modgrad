@@ -2310,6 +2310,7 @@ impl TransformerBlockResident {
         dx0_dev: Option<&mut GpuVec>,
         kv_cache: &mut KvCacheResident,
         position: usize,
+        window: Option<usize>,
         rope: &RotaryEmbedding,
         attn_scratch: &mut AttentionScratch,
         attn_bwd_scratch: &mut AttentionBackwardScratch,
@@ -2354,16 +2355,11 @@ impl TransformerBlockResident {
                 )?;
             }
             batch.note_dispatch()?;
-            // TODO(swa-backward): when block.backward gains a `window` param,
-            // thread it through here. Until then the resident backward path
-            // assumes full attention (window=None); SWA backward correctness
-            // is a follow-up commit (see GptConfig::window_size for the
-            // forward-side plumbing landed alongside this).
             self.forward_for_backward(
                 batch,
                 &mut hidden_dev,
                 &x0_local,
-                kv_cache, position, None, rope,
+                kv_cache, position, window, rope,
                 attn_scratch, mlp_scratch, block_scratch,
             )?;
         }
@@ -2453,13 +2449,10 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // Stage F: attention backward. Returns d_attn_normed.
-        // Window stays None here; per-layer SWA backward is plumbed at
-        // the model level alongside the existing forward windows[]
-        // (a follow-up commit threads it through block.backward).
         let mut d_attn_normed = GpuVec::try_hip(model_dim)?;
         self.attn.backward(
             batch, &block_scratch.attn_normed, &d_attn_out,
-            kv_cache, self.layer_idx, position, None, rope,
+            kv_cache, self.layer_idx, position, window, rope,
             attn_scratch, attn_bwd_scratch, attn_grads, &mut d_attn_normed,
         )?;
 
@@ -3236,11 +3229,12 @@ impl GptModelResident {
             }
             for _ in 0..10 { batch.note_dispatch()?; }
 
+            let window = self.windows[li];
             block.backward(
                 batch,
                 &mut state.d_hidden,
                 None,  // dx0_dev (x_lambda=0 in test)
-                kv_cache, position, &self.rope,
+                kv_cache, position, window, &self.rope,
                 &mut state.attn_scratch,
                 &mut state.attn_bwd,
                 &mut state.mlp_scratch,

@@ -567,6 +567,7 @@ impl BltModel {
                     None,
                     &mut self.latent_kv_cache,
                     p,
+                    self.latent.windows[li],
                     &self.latent.rope,
                     &mut state.latent_attn_scratch,
                     &mut state.latent_attn_bwd,
