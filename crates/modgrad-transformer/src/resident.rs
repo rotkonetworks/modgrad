@@ -218,6 +218,7 @@ impl AttentionResident {
         kv_cache: &mut KvCacheResident,
         layer: usize,
         position: usize,
+        window: Option<usize>,
         rope: &RotaryEmbedding,
         scratch: &mut AttentionScratch,
         out_dev: &mut GpuVec,
@@ -292,11 +293,31 @@ impl AttentionResident {
 
         // Stage 5: per-head scoring matvec. For head h, kv_h = h / gqa_ratio.
         // K slab for kv_h is `[max_seq_len × head_dim]` row-major;
-        // we use the first `attn_len = position + 1` rows.
-        // scores[h, t] = K[t, :] · q_normed[h, :]
-        // → matvec_resident(weight=K_slab[:attn_len], x=q_normed[h], bias=0,
-        //                   out=scores[h], out_dim=attn_len, in_dim=head_dim).
+        // we use rows `[start, attn_len)` where `start` enforces the
+        // sliding window (matching the host `forward_one` semantics).
+        // scores[h, t] = K[t, :] · q_normed[h, :] for t in [start, attn_len).
+        // → matvec_resident(weight=K_slab[start..attn_len], x=q_normed[h],
+        //                   bias=0, out=scores[h, :windowed_len],
+        //                   out_dim=windowed_len, in_dim=head_dim).
         let attn_len = position + 1;
+        let start = match window {
+            Some(w) => position.saturating_sub(w) + 1,
+            None => 0,
+        };
+        let windowed_len = attn_len - start;
+
+        // Empty-window case: matches host semantics — when the windowed
+        // range is empty (e.g. position 0 with a non-trivial window),
+        // host iterates an empty `start..attn_len` loop, leaves `head_out`
+        // all-zero, and the (bias-free) output projection of zero is zero.
+        // Stages 1–4 above already ran (so the cache write stays in sync
+        // for later positions); skip 5–8 and emit a zero output.
+        if windowed_len == 0 {
+            let zeros = vec![0.0f32; self.model_dim];
+            out_dev.copy_from(&zeros);
+            return Ok(());
+        }
+
         let q_normed_base = hip_buf(&scratch.q_normed)?.device_ptr() as *const f32;
         let scores_base = hip_buf(&scratch.scores)?.device_ptr() as *mut f32;
         let max_seq = kv_cache.max_seq_len();
@@ -307,10 +328,10 @@ impl AttentionResident {
             unsafe {
                 matvec_resident(
                     q_normed_base.add(h * self.head_dim),
-                    k_slab,                                 // [max_seq × head_dim]
+                    k_slab.add(start * self.head_dim),      // [windowed_len × head_dim]
                     self.zero_bias_dev.device_ptr() as *const f32,
                     scores_base.add(h * max_seq),
-                    attn_len,
+                    windowed_len,
                     self.head_dim,
                 )?;
             }
@@ -318,21 +339,11 @@ impl AttentionResident {
         }
 
         // Stage 6: batched softmax — `n_rows = num_heads`, but each row is
-        // `attn_len` wide while the underlying buffer is striped at
+        // `windowed_len` wide while the underlying buffer is striped at
         // `max_seq`. To keep the row layout contiguous we softmax in a
-        // dense `[num_heads × attn_len]` scratch then copy back. For the
-        // test config (max_seq=16, attn_len ≤ 16) the gather is one
-        // D2D copy per row — cheap. The performance-tuned version
-        // would softmax in place over a tighter scratch by laying out
-        // scores `[num_heads × attn_len]` from the matvec stage onward,
-        // but that requires per-call recomputation of stride; we keep
-        // it readable for slice 9.
-        // … Actually we can just softmax across `max_seq` columns and
-        // mask attn_len..max_seq. But unwritten K rows past attn_len
-        // were zero-init'd so their dot products are 0, which softmax
-        // won't ignore — they'd dilute the distribution. Cleanest fix:
-        // run softmax over `attn_len` only, reading from the strided
-        // buffer. We use a tight `[num_heads × attn_len]` scratch.
+        // dense `[num_heads × windowed_len]` scratch then copy back. For
+        // the test config (max_seq=16, windowed_len ≤ 16) the gather is
+        // one D2D copy per row — cheap.
         let scores_tight = &scratch.scores_tight;
         let scores_tight_buf = hip_buf(scores_tight)?;
         for h in 0..self.num_heads {
@@ -341,8 +352,8 @@ impl AttentionResident {
                 let src = (scores_base as *const u8)
                     .add(h * max_seq * 4) as *const c_void;
                 let dst = (scores_tight_buf.device_ptr() as *mut u8)
-                    .add(h * attn_len * 4) as *mut c_void;
-                hip_memcpy_d2d(dst, src, attn_len * 4)?;
+                    .add(h * windowed_len * 4) as *mut c_void;
+                hip_memcpy_d2d(dst, src, windowed_len * 4)?;
             }
             batch.note_dispatch()?;
         }
@@ -350,17 +361,17 @@ impl AttentionResident {
             softmax_resident(
                 scores_tight_buf.device_ptr() as *const f32,
                 scores_tight_buf.device_ptr() as *mut f32,
-                self.num_heads, attn_len, false,
+                self.num_heads, windowed_len, false,
             )?;
         }
         batch.note_dispatch()?;
 
-        // Stage 7: weighted V sum per head.
-        //   head_out[h, :] = softmax[h, :attn_len] @ V_slab_kv_h[:attn_len, :]
-        // Using `matmul_resident_tn`: A is `V_slab[:attn_len × head_dim]`
-        // (read transposed → `[head_dim × attn_len]`), B is
-        // `softmax[h, :attn_len]` viewed as `[attn_len × 1]`, output is
-        // `[head_dim × 1]`. m=head_dim, k=attn_len, n=1.
+        // Stage 7: weighted V sum per head, restricted to the window.
+        //   head_out[h, :] = softmax[h, :windowed_len] @ V_slab_kv_h[start..attn_len, :]
+        // Using `matmul_resident_tn`: A is `V_slab[start..attn_len × head_dim]`
+        // (read transposed → `[head_dim × windowed_len]`), B is
+        // `softmax[h, :windowed_len]` viewed as `[windowed_len × 1]`, output is
+        // `[head_dim × 1]`. m=head_dim, k=windowed_len, n=1.
         let head_out_base = hip_buf(&scratch.head_out)?.device_ptr() as *mut f32;
         let scores_tight_base = scores_tight_buf.device_ptr() as *const f32;
         for h in 0..self.num_heads {
@@ -368,10 +379,10 @@ impl AttentionResident {
             let v_slab = kv_cache.v_slab_ptr(layer, kv_h);
             unsafe {
                 matmul_resident_tn(
-                    v_slab,                                 // [attn_len × head_dim] (transposed read)
-                    scores_tight_base.add(h * attn_len),    // [attn_len × 1]
+                    v_slab.add(start * self.head_dim),       // [windowed_len × head_dim]
+                    scores_tight_base.add(h * windowed_len), // [windowed_len × 1]
                     head_out_base.add(h * self.head_dim),
-                    self.head_dim, attn_len, 1,
+                    self.head_dim, windowed_len, 1,
                 )?;
             }
             batch.note_dispatch()?;
@@ -2060,9 +2071,11 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // attn_out = Attention(attn_normed) — into dedicated buffer.
+        // Window stays None here; per-layer windowing is plumbed at the
+        // model level (a follow-up commit). See `GptConfig::window_size`.
         self.attn.forward(
             batch, &block_scratch.attn_normed, kv_cache,
-            self.layer_idx, position, rope,
+            self.layer_idx, position, None, rope,
             attn_scratch, &mut block_scratch.attn_out,
         )?;
 
@@ -2585,9 +2598,11 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // attn_out = Attention(attn_normed)
+        // Window stays None here; per-layer windowing is plumbed at the
+        // model level (a follow-up commit). See `GptConfig::window_size`.
         self.attn.forward(
             batch, &block_scratch.normed, kv_cache,
-            self.layer_idx, position, rope,
+            self.layer_idx, position, None, rope,
             attn_scratch, &mut block_scratch.sublayer_out,
         )?;
 
@@ -3672,7 +3687,7 @@ mod tests {
 
         let batch = HipBatch::new();
         resident.forward(
-            &batch, &x_dev, &mut kv_cache, 0, 0, &rope,
+            &batch, &x_dev, &mut kv_cache, 0, 0, None, &rope,
             &mut scratch, &mut out_dev,
         ).expect("forward");
         batch.flush().expect("flush");
@@ -3692,6 +3707,110 @@ mod tests {
         eprintln!("attn one-token: max abs {max_abs}, rel {max_rel}");
         assert!(max_rel < 5e-3,
             "attention resident vs host: max abs {max_abs}, rel {max_rel}");
+    }
+
+    /// SWA validation: run host + resident in lockstep across multiple
+    /// positions with a non-trivial sliding window, comparing outputs at
+    /// every position. Exercises both the empty-window early-out
+    /// (positions where `windowed_len == 0`) and the active-mask path
+    /// (positions where the window clips earlier cache entries).
+    #[test]
+    fn attention_resident_matches_host_swa() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let md = config.model_dim.get();
+        let kv_dim = config.num_kv_heads.get() * config.head_dim.get();
+        let max_seq = config.max_seq_len.get();
+        let n_positions: usize = 6;
+        let window: Option<usize> = Some(3);
+        assert!(window.unwrap() < n_positions);
+        assert!(n_positions <= max_seq);
+
+        let mut rng = modgrad_compute::neuron::SimpleRng::new(0xBEEF);
+        let randn = |rng: &mut modgrad_compute::neuron::SimpleRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.05).collect()
+        };
+        let weights = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+        };
+        let attn = CausalSelfAttention::new(weights, &config);
+        let resident = AttentionResident::from_attention(&attn, &config).expect("upload");
+
+        let backend = CpuBackend::new();
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
+
+        // Host KV state, manually advanced after every step.
+        let mut kv_k = vec![0.0f32; max_seq * kv_dim];
+        let mut kv_v = vec![0.0f32; max_seq * kv_dim];
+        let mut host_outs: Vec<Vec<f32>> = Vec::with_capacity(n_positions);
+
+        // Resident state.
+        let mut kv_cache = KvCacheResident::new(
+            1, config.num_kv_heads.get(), config.head_dim.get(),
+            config.max_seq_len.get(), md,
+        ).expect("alloc kv");
+        let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+        let mut out_dev = GpuVec::try_hip(md).expect("alloc out");
+        let mut scratch = AttentionScratch::new(
+            config.num_heads.get(), config.head_dim.get(),
+            kv_dim, config.max_seq_len.get(),
+        ).expect("scratch");
+        let batch = HipBatch::new();
+        let mut device_outs: Vec<Vec<f32>> = Vec::with_capacity(n_positions);
+
+        for position in 0..n_positions {
+            let host_x: Vec<f32> = randn(&mut rng, md);
+
+            // Host forward.
+            let mut host_out = vec![0.0f32; md];
+            let mut cur_k = vec![0.0f32; kv_dim];
+            let mut cur_v = vec![0.0f32; kv_dim];
+            attn.forward_one(
+                &host_x, &kv_k, &kv_v,
+                &mut cur_k, &mut cur_v,
+                &rope, position, position + 1, window,
+                &backend, &mut host_out,
+            );
+            kv_k[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_k);
+            kv_v[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_v);
+            host_outs.push(host_out);
+
+            // Resident forward at the same position with the same input.
+            x_dev.copy_from(&host_x);
+            resident.forward(
+                &batch, &x_dev, &mut kv_cache, 0, position, window, &rope,
+                &mut scratch, &mut out_dev,
+            ).expect("resident forward");
+            batch.flush().expect("flush");
+            let mut device_out = vec![0.0f32; md];
+            out_dev.copy_to_host(&mut device_out);
+            device_outs.push(device_out);
+        }
+
+        // Compare across all positions.
+        let mut worst_pos = 0usize;
+        let mut worst_rel = 0.0f32;
+        let mut worst_abs = 0.0f32;
+        for position in 0..n_positions {
+            for (h, &d) in host_outs[position].iter().zip(device_outs[position].iter()) {
+                let abs = (h - d).abs();
+                let scale = h.abs().max(d.abs()).max(1e-6);
+                let rel = abs / scale;
+                if rel > worst_rel { worst_rel = rel; worst_pos = position; }
+                if abs > worst_abs { worst_abs = abs; }
+            }
+        }
+        eprintln!("attn SWA (window={:?}, n={}): max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}",
+                  window, n_positions);
+        assert!(worst_rel < 5e-3,
+            "SWA resident vs host: max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}");
     }
 
     #[test]
