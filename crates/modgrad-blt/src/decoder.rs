@@ -325,12 +325,16 @@ impl LocalDecoder {
                 )?;
                 batch.note_dispatch()?;
 
+                // TODO(swa-byte): BLT byte layers are full-attention today;
+                // wire per-layer windows here if BLT needs SWA at the byte
+                // level (would mirror `GptModelResident::windows`).
                 block.forward(
                     batch,
                     &mut hidden_dev,
                     &x0_dev,
                     &mut self.byte_kv_cache,
                     t,
+                    None,
                     &self.rope,
                     &mut scratch.attn_scratch,
                     &mut scratch.mlp_scratch,
@@ -479,12 +483,16 @@ impl LocalDecoder {
                 )?;
                 batch.note_dispatch()?;
 
+                // TODO(swa-byte): BLT byte layers are full-attention today;
+                // wire per-layer windows here if BLT needs SWA at the byte
+                // level (would mirror `GptModelResident::windows`).
                 self.byte_layers[li].forward_for_backward(
                     batch,
                     &mut hidden_dev,
                     &x0_dev,
                     &mut self.byte_kv_cache,
                     t,
+                    None,
                     &self.rope,
                     &mut scratch.attn_scratch,
                     &mut scratch.mlp_scratch,

@@ -2038,6 +2038,7 @@ impl TransformerBlockResident {
         x0_dev: &GpuVec,
         kv_cache: &mut KvCacheResident,
         position: usize,
+        window: Option<usize>,
         rope: &RotaryEmbedding,
         attn_scratch: &mut AttentionScratch,
         mlp_scratch: &mut SwigluScratch,
@@ -2071,11 +2072,9 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // attn_out = Attention(attn_normed) — into dedicated buffer.
-        // Window stays None here; per-layer windowing is plumbed at the
-        // model level (a follow-up commit). See `GptConfig::window_size`.
         self.attn.forward(
             batch, &block_scratch.attn_normed, kv_cache,
-            self.layer_idx, position, None, rope,
+            self.layer_idx, position, window, rope,
             attn_scratch, &mut block_scratch.attn_out,
         )?;
 
@@ -2290,11 +2289,16 @@ impl TransformerBlockResident {
                 )?;
             }
             batch.note_dispatch()?;
+            // TODO(swa-backward): when block.backward gains a `window` param,
+            // thread it through here. Until then the resident backward path
+            // assumes full attention (window=None); SWA backward correctness
+            // is a follow-up commit (see GptConfig::window_size for the
+            // forward-side plumbing landed alongside this).
             self.forward_for_backward(
                 batch,
                 &mut hidden_dev,
                 &x0_local,
-                kv_cache, position, rope,
+                kv_cache, position, None, rope,
                 attn_scratch, mlp_scratch, block_scratch,
             )?;
         }
@@ -2577,6 +2581,7 @@ impl TransformerBlockResident {
         x0_dev: &GpuVec,
         kv_cache: &mut KvCacheResident,
         position: usize,
+        window: Option<usize>,
         rope: &RotaryEmbedding,
         attn_scratch: &mut AttentionScratch,
         mlp_scratch: &mut SwigluScratch,
@@ -2598,11 +2603,9 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // attn_out = Attention(attn_normed)
-        // Window stays None here; per-layer windowing is plumbed at the
-        // model level (a follow-up commit). See `GptConfig::window_size`.
         self.attn.forward(
             batch, &block_scratch.normed, kv_cache,
-            self.layer_idx, position, None, rope,
+            self.layer_idx, position, window, rope,
             attn_scratch, &mut block_scratch.sublayer_out,
         )?;
 
@@ -2838,6 +2841,9 @@ pub struct GptModelResident {
     pub blocks: Vec<TransformerBlockResident>,
     /// RoPE — host-side; cached for the per-block forward call.
     pub rope: RotaryEmbedding,
+    /// Per-layer attention window (`None` = full attention). Derived
+    /// from `GptConfig::window_size` at construction. Indexed by layer.
+    pub windows: Vec<Option<usize>>,
     vocab: usize,
     model_dim: usize,
     norm_eps: f32,
@@ -2877,12 +2883,20 @@ impl GptModelResident {
             blocks.push(resident_block);
         }
 
+        let n_layers = config.num_layers;
+        let windows: Vec<Option<usize>> = (0..model.blocks.len())
+            .map(|li| config.window_size(
+                LayerIdx::new(li, n_layers).expect("li < num_layers")
+            ))
+            .collect();
+
         Ok(Self {
             embed_dev, lm_head, final_norm_weight_dev,
             blocks,
             rope: RotaryEmbedding::new(
                 config.head_dim, config.max_seq_len, config.rope_base,
             ),
+            windows,
             vocab, model_dim,
             norm_eps: config.norm_eps,
         })
@@ -2990,10 +3004,11 @@ impl GptModelResident {
 
         // Blocks (with backward-cache forward).
         for (li, block) in self.blocks.iter().enumerate() {
+            let window = self.windows[li];
             block.forward_for_backward(
                 batch,
                 &mut state.hidden_dev, &state.x0_dev,
-                kv_cache, position, &self.rope,
+                kv_cache, position, window, &self.rope,
                 &mut state.attn_scratch, &mut state.mlp_scratch,
                 &mut state.block_scratches[li],
             )?;
@@ -3264,11 +3279,12 @@ impl GptModelResident {
             batch.note_dispatch()?;
 
             // Stage 2: blocks.
-            for block in &self.blocks {
+            for (li, block) in self.blocks.iter().enumerate() {
+                let window = self.windows[li];
                 block.forward(
                     batch,
                     &mut hidden_dev, &x0_dev,
-                    kv_cache, pos, &self.rope,
+                    kv_cache, pos, window, &self.rope,
                     &mut attn_scratch, &mut mlp_scratch,
                     &mut block_scratch,
                 )?;

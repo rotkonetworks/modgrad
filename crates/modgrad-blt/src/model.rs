@@ -414,6 +414,7 @@ impl BltModel {
                     &scratch.latent.x0,
                     &mut self.latent_kv_cache,
                     p,
+                    self.latent.windows[li],
                     &self.latent.rope,
                     &mut state.latent_attn_scratch,
                     &mut state.latent_mlp_scratch,
@@ -1455,13 +1456,14 @@ fn run_latent_forward(
         copy_slab_to_dense(patch_reps_in, p, patch_dim, &mut scratch.x0)?;
         batch.note_dispatch()?;
 
-        for block in &latent.blocks {
+        for (li, block) in latent.blocks.iter().enumerate() {
             block.forward(
                 batch,
                 &mut scratch.hidden,
                 &scratch.x0,
                 kv_cache,
                 p,
+                latent.windows[li],
                 &latent.rope,
                 &mut scratch.attn_scratch,
                 &mut scratch.mlp_scratch,

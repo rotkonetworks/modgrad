@@ -229,7 +229,7 @@ impl FrozenCerebellum for QwenCerebellum {
                 block.forward(
                     &batch,
                     &mut hidden_dev, &x0_dev,
-                    &mut self.kv_cache, t, &self.model.rope,
+                    &mut self.kv_cache, t, self.model.windows[li], &self.model.rope,
                     &mut attn_scratch, &mut mlp_scratch,
                     &mut block_scratch,
                 ).expect("QwenCerebellum: block forward");
