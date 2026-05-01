@@ -145,6 +145,27 @@ impl KvCacheResident {
         Self::with_layer_slots(slots, n_kv_heads, head_dim, max_seq_len, model_dim)
     }
 
+    /// Convenience: build a cache with rolling slots derived from a
+    /// per-layer windows vector. Layer with `windows[i] = Some(W)`
+    /// becomes a ring buffer of size `min(W, max_seq_len)`; layer with
+    /// `windows[i] = None` stays linear (sized `max_seq_len`). This is
+    /// the natural pairing with `GptModelResident::windows[]`: pass the
+    /// model's windows vector directly to size the cache to match the
+    /// SWA configuration (linear layers stay linear, SWA layers shrink
+    /// to the window size — Mimo-style ~7× memory reduction).
+    pub fn with_windows(
+        windows: &[Option<usize>],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        model_dim: usize,
+    ) -> Result<Self, ResidencyError> {
+        let slots: Vec<usize> = windows.iter()
+            .map(|w| w.unwrap_or(max_seq_len).min(max_seq_len))
+            .collect();
+        Self::with_layer_slots(slots, n_kv_heads, head_dim, max_seq_len, model_dim)
+    }
+
     /// Allocate K and V buffers per-layer with caller-specified slot
     /// counts. A layer with `layer_slots[i] < max_seq_len` is a ring
     /// buffer: position `p` writes to slot `p % layer_slots[i]`. Sized
@@ -457,6 +478,33 @@ mod tests {
         let mut buf = vec![1.0f32; total];
         cache.k_dev[0].copy_to_host(&mut buf).expect("d2h");
         assert!(buf.iter().all(|&v| v == 0.0), "fresh cache should be zero");
+    }
+
+    #[test]
+    fn with_windows_derives_per_layer_slots() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        // Mimo-flavored mix: 3 SWA layers + 1 GA layer.
+        let windows = vec![Some(128), Some(128), Some(128), None];
+        let max_seq = 1024;
+        let cache = KvCacheResident::with_windows(
+            &windows, 4, 32, max_seq, 128,
+        ).expect("alloc");
+        assert_eq!(cache.layer_slots(0), 128, "SWA layer 0 should have 128 slots");
+        assert_eq!(cache.layer_slots(1), 128, "SWA layer 1 should have 128 slots");
+        assert_eq!(cache.layer_slots(2), 128, "SWA layer 2 should have 128 slots");
+        assert_eq!(cache.layer_slots(3), max_seq, "GA layer 3 should have max_seq slots");
+
+        // Bounds check: window > max_seq gets clamped down so we don't
+        // over-allocate or trip an internal debug_assert.
+        let oversized = vec![Some(2048)];
+        let cache_clamped = KvCacheResident::with_windows(
+            &oversized, 1, 32, max_seq, 32,
+        ).expect("alloc clamped");
+        assert_eq!(cache_clamped.layer_slots(0), max_seq);
     }
 
     #[test]
