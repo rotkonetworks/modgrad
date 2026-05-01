@@ -656,12 +656,33 @@ impl AttentionResident {
         let num_kv_heads = self.num_kv_heads;
         let gqa_ratio = self.gqa_ratio;
         let attn_len = position + 1;
-        let start = match window {
+        let logical_start = match window {
             Some(w) => position.saturating_sub(w) + 1,
             None => 0,
         };
-        let windowed_len = attn_len - start;
+        let logical_windowed_len = attn_len - logical_start;
         let max_seq = kv_cache.max_seq_len();
+        let layer_slots = kv_cache.layer_slots(layer);
+
+        // Probe the cache view (same logic as forward) so the backward
+        // matmul ranges + softmax_backward stride match what forward
+        // actually computed. For linear caches and partial rolling rings
+        // this is just `windowed_len`; for a full rolling ring it's
+        // `slot_count` (the whole ring, in slot order). Backward must use
+        // the same shape — the saved `scores_tight` activations already
+        // sit at this stride.
+        let probe_view = kv_cache.k_slab_view(layer, 0, logical_start, position);
+        let view_rows = probe_view.rows;
+        // Index of the current-token's row within the view layout.
+        // Linear / partial ring: it's the last entry (view_rows - 1).
+        // Full rolling ring: it's slot `position % layer_slots` because
+        // the matvec read the whole ring in slot order, not position
+        // order, and the just-written K[position] sits at slot p%S.
+        let current_row_in_view = if position < layer_slots {
+            view_rows - 1
+        } else {
+            position % layer_slots
+        };
 
         debug_assert_eq!(x_dev.len(), model_dim);
         debug_assert_eq!(dy_dev.len(), model_dim);
@@ -687,30 +708,28 @@ impl AttentionResident {
         // (kernels balk) and produce zeros anyway. Short-circuit by
         // zeroing dx_dev and returning. Q/K/V proj weight grads are
         // unchanged because head_out=0 makes their contributions zero.
-        if windowed_len == 0 {
+        if logical_windowed_len == 0 {
             let zeros = vec![0.0f32; model_dim];
             dx_dev.copy_from(&zeros);
             return Ok(());
         }
 
-        // Stage 2: per-head, compute d_softmax[h, t] = V_slab[t, :] · d_head_out[h, :]
-        // for t in [start, attn_len). matmul reads V_slab[start..attn_len]
-        // (advance v_slab pointer by start*head_dim, m=windowed_len);
-        // writes d_softmax row tightly at h*windowed_len for `windowed_len`
-        // entries.
+        // Stage 2: per-head, compute d_softmax[h, t] = V_view[t, :] · d_head_out[h, :]
+        // for t in [0, view_rows). The V view comes from the cache and
+        // handles linear vs rolling uniformly (same as forward Stage 7).
         let d_head_out_buf = hip_buf(&bwd.d_head_out)?;
         let d_softmax_buf = hip_buf(&bwd.d_softmax)?;
         let d_softmax_base = d_softmax_buf.device_ptr() as *mut f32;
         let d_head_out_base = d_head_out_buf.device_ptr() as *const f32;
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio;
-            let v_slab = kv_cache.v_slab_ptr(layer, kv_h);
+            let view = kv_cache.v_slab_view(layer, kv_h, logical_start, position);
             unsafe {
                 matmul_resident_nn(
-                    v_slab.add(start * head_dim),                   // [windowed_len × head_dim]
+                    view.ptr,                                       // [view_rows × head_dim]
                     d_head_out_base.add(h * head_dim),              // [head_dim × 1]
-                    d_softmax_base.add(h * windowed_len),           // [windowed_len × 1]
-                    windowed_len, head_dim, 1,
+                    d_softmax_base.add(h * view_rows),              // [view_rows × 1]
+                    view.rows, head_dim, 1,
                 )?;
             }
             batch.note_dispatch()?;
@@ -718,8 +737,8 @@ impl AttentionResident {
 
         // Stage 3: softmax backward.
         // scores_tight stores the *forward softmax output* — already
-        // tightly packed at stride `windowed_len` per head from the
-        // forward path.
+        // tightly packed at stride `view_rows` per head from the forward
+        // path (forward Stage 6 packs into scores_tight at this stride).
         let scores_tight_buf = hip_buf(&attn_scratch.scores_tight)?;
         let d_scores_buf = hip_buf(&bwd.d_scores)?;
         unsafe {
@@ -727,27 +746,27 @@ impl AttentionResident {
                 scores_tight_buf.device_ptr() as *const f32,
                 d_softmax_base as *const f32,
                 d_scores_buf.device_ptr() as *mut f32,
-                num_heads, windowed_len, false,
+                num_heads, view_rows, false,
             )?;
         }
         batch.note_dispatch()?;
 
-        // Stage 4: per-head, d_q_normed[h, :] = sum_t d_scores[h, t] * K_slab[t, :]
-        // for t in [start, attn_len). matmul reads K_slab[start..attn_len]
-        // (advance k_slab pointer by start*head_dim, k=windowed_len);
-        // d_scores tight at h*windowed_len.
+        // Stage 4: per-head, d_q_normed[h, :] = sum_t d_scores[h, t] * K_view[t, :]
+        // The K view mirrors Stage 2's V view so each row's K and V
+        // correspond to the same logical position (preserves
+        // permutation-invariance).
         let d_q_normed_buf = hip_buf(&bwd.d_q_normed)?;
         let d_q_normed_base = d_q_normed_buf.device_ptr() as *mut f32;
         let d_scores_base = d_scores_buf.device_ptr() as *const f32;
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio;
-            let k_slab = kv_cache.k_slab_ptr(layer, kv_h);
+            let view = kv_cache.k_slab_view(layer, kv_h, logical_start, position);
             unsafe {
                 matmul_resident_tn(
-                    k_slab.add(start * head_dim),                   // [windowed_len × head_dim]
-                    d_scores_base.add(h * windowed_len),            // [windowed_len × 1]
+                    view.ptr,                                       // [view_rows × head_dim]
+                    d_scores_base.add(h * view_rows),               // [view_rows × 1]
                     d_q_normed_base.add(h * head_dim),              // [head_dim × 1]
-                    head_dim, windowed_len, 1,
+                    head_dim, view.rows, 1,
                 )?;
             }
             batch.note_dispatch()?;
@@ -767,47 +786,43 @@ impl AttentionResident {
         // negligible relative to the matmul stages.
         let mut q_normed_host = vec![0.0f32; model_dim];
         attn_scratch.q_normed.copy_to_host(&mut q_normed_host);
-        // forward's `scores_tight` is laid out tightly at stride
-        // `windowed_len` per head; copy that prefix.
-        // Sink slot (if present) reserves +1 column per head — extra
-        // capacity here doesn't hurt (we read only the first windowed_len
-        // entries; the sink contributes only a softmax mass drain, never
-        // a current-token gradient).
+        // forward's `scores_tight` is packed at stride `view_rows` per
+        // head (plus +1 for sink if installed). Sink slot doesn't
+        // contribute to the current-token K/V gradient — it has no V row.
         let scratch_cap = num_heads * (max_seq + 1);
-        let mut scores_host = vec![0.0f32; num_heads * windowed_len];
+        let mut scores_host = vec![0.0f32; num_heads * view_rows];
         {
             let mut full = vec![0.0f32; scratch_cap];
             attn_scratch.scores_tight.copy_to_host(&mut full);
             for h in 0..num_heads {
-                let extended_stride = windowed_len + (self.sink_bias_dev.is_some() as usize);
+                let extended_stride = view_rows + (self.sink_bias_dev.is_some() as usize);
                 let src_base = h * extended_stride;
-                let dst_base = h * windowed_len;
-                scores_host[dst_base..dst_base + windowed_len]
-                    .copy_from_slice(&full[src_base..src_base + windowed_len]);
+                let dst_base = h * view_rows;
+                scores_host[dst_base..dst_base + view_rows]
+                    .copy_from_slice(&full[src_base..src_base + view_rows]);
             }
         }
-        // d_scores from softmax_backward — same tight stride windowed_len.
-        let mut d_scores_host = vec![0.0f32; num_heads * windowed_len];
+        // d_scores from softmax_backward — same tight stride view_rows.
+        let mut d_scores_host = vec![0.0f32; num_heads * view_rows];
         {
             let mut full = vec![0.0f32; num_heads * max_seq];
             bwd.d_scores.copy_to_host(&mut full);
-            d_scores_host.copy_from_slice(&full[..num_heads * windowed_len]);
+            d_scores_host.copy_from_slice(&full[..num_heads * view_rows]);
         }
         let mut d_head_out_host = vec![0.0f32; model_dim];
         bwd.d_head_out.copy_to_host(&mut d_head_out_host);
 
-        // The current token sits at the LAST entry of the windowed range
-        // (index `windowed_len - 1`). For window=None this collapses to
-        // `attn_len - 1` (the original behavior).
-        // d_v_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} softmax[h, last] * d_head_out[h, i]
-        // d_k_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} d_scores[h, last] * q_normed[h, i]
+        // The current token's column in the view layout. Linear / partial
+        // ring: the LAST entry (view_rows - 1). Full rolling ring: the
+        // slot the just-written K[position] occupies, `position % slots`.
+        // d_v_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} softmax[h, current_idx] * d_head_out[h, i]
+        // d_k_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} d_scores[h, current_idx] * q_normed[h, i]
         let mut d_k_current_post_rope = vec![0.0f32; kv_dim];
         let mut d_v_current_host = vec![0.0f32; kv_dim];
-        let last = windowed_len - 1;
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio;
-            let s = scores_host[h * windowed_len + last];
-            let ds = d_scores_host[h * windowed_len + last];
+            let s = scores_host[h * view_rows + current_row_in_view];
+            let ds = d_scores_host[h * view_rows + current_row_in_view];
             let q_h = &q_normed_host[h * head_dim..(h + 1) * head_dim];
             let d_h_out = &d_head_out_host[h * head_dim..(h + 1) * head_dim];
             for i in 0..head_dim {
@@ -4064,6 +4079,134 @@ mod tests {
         eprintln!("rolling vs linear (window=3, n=6): max abs {max_abs}, rel {max_rel}");
         assert!(max_rel < 5e-3,
             "rolling cache deviates from linear under SWA: max abs {max_abs}, rel {max_rel}");
+    }
+
+    /// Backward parity: rolling cache + SWA backward must produce the
+    /// same gradients (dx, dW_q, dW_k, dW_v, dW_o) as linear cache + SWA
+    /// backward. Runs forward + backward at one position past the wrap
+    /// (position 4 with window=3, slots=3) so the ring's full-ring
+    /// branch is exercised in both Stage 5 (current-token K/V grad
+    /// indexing) and Stages 2/4 (whole-ring matmul).
+    #[test]
+    fn rolling_cache_backward_matches_linear_cache() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let md = config.model_dim.get();
+        let kv_dim = config.num_kv_heads.get() * config.head_dim.get();
+        let max_seq = config.max_seq_len.get();
+        let window: Option<usize> = Some(3);
+        let target_position: usize = 4; // past the wrap
+        let n_warmup = target_position; // forward through 0..target_position to fill the ring
+
+        let mut rng = modgrad_compute::neuron::SimpleRng::new(0xBACC_BACCu64);
+        let randn = |rng: &mut modgrad_compute::neuron::SimpleRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.05).collect()
+        };
+        let weights = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+        };
+        let attn = CausalSelfAttention::new(weights, &config);
+        let resident = AttentionResident::from_attention(&attn, &config).expect("upload");
+
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
+
+        // Synthesize a stable input sequence both runs see.
+        let mut rng2 = modgrad_compute::neuron::SimpleRng::new(0xBACC_DECAFu64);
+        let inputs: Vec<Vec<f32>> = (0..=target_position).map(|_| randn(&mut rng2, md)).collect();
+        let dy_host: Vec<f32> = randn(&mut rng2, md);
+
+        // ── Linear cache run ──
+        let mut kv_lin = KvCacheResident::new(
+            1, config.num_kv_heads.get(), config.head_dim.get(), max_seq, md,
+        ).expect("alloc lin");
+        let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+        let mut out_dev = GpuVec::try_hip(md).expect("alloc out");
+        let mut scratch_lin = AttentionScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("scratch lin");
+        let batch = HipBatch::new();
+        // Warm up the cache via forwards 0..target_position.
+        for p in 0..n_warmup {
+            x_dev.copy_from(&inputs[p]);
+            resident.forward(&batch, &x_dev, &mut kv_lin, 0, p, window, &rope,
+                &mut scratch_lin, &mut out_dev).expect("fwd warmup lin");
+        }
+        // The forward at target_position must populate scratch_lin's
+        // saved activations for the matched backward.
+        x_dev.copy_from(&inputs[target_position]);
+        resident.forward(&batch, &x_dev, &mut kv_lin, 0, target_position, window, &rope,
+            &mut scratch_lin, &mut out_dev).expect("fwd target lin");
+        // Run backward.
+        let mut dy_dev = GpuVec::try_hip(md).expect("alloc dy");
+        dy_dev.copy_from(&dy_host);
+        let mut bwd_lin = AttentionBackwardScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("bwd scratch lin");
+        let mut grads_lin = AttentionResidentGrads::new(md, kv_dim).expect("grads lin");
+        let mut dx_lin = GpuVec::try_hip(md).expect("dx lin");
+        resident.backward(
+            &batch, &x_dev, &dy_dev, &kv_lin, 0, target_position, window, &rope,
+            &scratch_lin, &mut bwd_lin, &mut grads_lin, &mut dx_lin,
+        ).expect("backward lin");
+        batch.flush().expect("flush");
+
+        // ── Rolling cache run (slots = window = 3) ──
+        let mut kv_roll = KvCacheResident::with_layer_slots(
+            vec![3], config.num_kv_heads.get(), config.head_dim.get(), max_seq, md,
+        ).expect("alloc roll");
+        let mut scratch_roll = AttentionScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("scratch roll");
+        for p in 0..n_warmup {
+            x_dev.copy_from(&inputs[p]);
+            resident.forward(&batch, &x_dev, &mut kv_roll, 0, p, window, &rope,
+                &mut scratch_roll, &mut out_dev).expect("fwd warmup roll");
+        }
+        x_dev.copy_from(&inputs[target_position]);
+        resident.forward(&batch, &x_dev, &mut kv_roll, 0, target_position, window, &rope,
+            &mut scratch_roll, &mut out_dev).expect("fwd target roll");
+        let mut bwd_roll = AttentionBackwardScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("bwd scratch roll");
+        let mut grads_roll = AttentionResidentGrads::new(md, kv_dim).expect("grads roll");
+        let mut dx_roll = GpuVec::try_hip(md).expect("dx roll");
+        resident.backward(
+            &batch, &x_dev, &dy_dev, &kv_roll, 0, target_position, window, &rope,
+            &scratch_roll, &mut bwd_roll, &mut grads_roll, &mut dx_roll,
+        ).expect("backward roll");
+        batch.flush().expect("flush");
+
+        // Compare gradients.
+        let cmp = |name: &str, a: &GpuVec, b: &GpuVec, n: usize, tol: f32| {
+            let mut ah = vec![0.0f32; n];
+            let mut bh = vec![0.0f32; n];
+            a.copy_to_host(&mut ah);
+            b.copy_to_host(&mut bh);
+            let mut max_abs = 0.0f32;
+            let mut max_rel = 0.0f32;
+            for (l, r) in ah.iter().zip(bh.iter()) {
+                let abs = (l - r).abs();
+                let scale = l.abs().max(r.abs()).max(1e-6);
+                let rel = abs / scale;
+                if abs > max_abs { max_abs = abs; }
+                if rel > max_rel { max_rel = rel; }
+            }
+            eprintln!("{name}: max abs {max_abs}, rel {max_rel}");
+            assert!(max_rel < tol,
+                "{name} rolling vs linear: max abs {max_abs}, rel {max_rel}");
+        };
+        cmp("dx", &dx_lin, &dx_roll, md, 5e-3);
+        cmp("dW_q", &grads_lin.dweight_q, &grads_roll.dweight_q, md * md, 5e-3);
+        cmp("dW_k", &grads_lin.dweight_k, &grads_roll.dweight_k, kv_dim * md, 5e-3);
+        cmp("dW_v", &grads_lin.dweight_v, &grads_roll.dweight_v, kv_dim * md, 5e-3);
+        cmp("dW_o", &grads_lin.dweight_o, &grads_roll.dweight_o, md * md, 5e-3);
     }
 
     /// Attention sink validation: install a non-trivial per-head sink bias
