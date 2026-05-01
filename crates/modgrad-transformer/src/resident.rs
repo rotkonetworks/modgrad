@@ -307,27 +307,34 @@ impl AttentionResident {
         kv_cache.write(batch, layer, position, &scratch.k_normed, &scratch.v_proj)?;
 
         // Stage 5: per-head scoring matvec. For head h, kv_h = h / gqa_ratio.
-        // K slab for kv_h is `[max_seq_len × head_dim]` row-major;
-        // we use rows `[start, attn_len)` where `start` enforces the
-        // sliding window (matching the host `forward_one` semantics).
-        // scores[h, t] = K[t, :] · q_normed[h, :] for t in [start, attn_len).
-        // → matvec_resident(weight=K_slab[start..attn_len], x=q_normed[h],
-        //                   bias=0, out=scores[h, :windowed_len],
-        //                   out_dim=windowed_len, in_dim=head_dim).
+        // K slab is window-aware via `KvCacheResident::k_slab_view`:
+        //   - linear layer or partial rolling ring: ptr at `start * head_dim`,
+        //     rows = position + 1 - start (== windowed_len, legacy semantics)
+        //   - full rolling ring: ptr at slab base (offset 0),
+        //     rows = layer_slots (whole ring; permutation-invariant attention)
+        // The view rows replace `windowed_len` everywhere in stages 5/6/7.
         let attn_len = position + 1;
-        let start = match window {
+        let logical_start = match window {
             Some(w) => position.saturating_sub(w) + 1,
             None => 0,
         };
-        let windowed_len = attn_len - start;
+        // Probe view for kv_head=0 (all kv_heads share the layer's slot
+        // count, so any view gives the same `rows`).
+        let probe_view = kv_cache.k_slab_view(layer, 0, logical_start, position);
+        let windowed_len = probe_view.rows;
+        // Logical "is the window empty" test still uses the unclamped
+        // start/attn_len — matches host empty-range semantics regardless
+        // of cache shape.
+        let logical_windowed_len = attn_len - logical_start;
 
-        // Empty-window case: matches host semantics — when the windowed
-        // range is empty (e.g. position 0 with a non-trivial window),
-        // host iterates an empty `start..attn_len` loop, leaves `head_out`
-        // all-zero, and the (bias-free) output projection of zero is zero.
-        // Stages 1–4 above already ran (so the cache write stays in sync
-        // for later positions); skip 5–8 and emit a zero output.
-        if windowed_len == 0 {
+        // Empty-window case: matches host semantics — when the logical
+        // windowed range is empty (e.g. position 0 with a non-trivial
+        // window), host iterates an empty `start..attn_len` loop, leaves
+        // `head_out` all-zero, and the (bias-free) output projection of
+        // zero is zero. Stages 1–4 above already ran (so the cache write
+        // stays in sync for later positions); skip 5–8 and emit a zero
+        // output.
+        if logical_windowed_len == 0 {
             let zeros = vec![0.0f32; self.model_dim];
             out_dev.copy_from(&zeros);
             return Ok(());
@@ -339,14 +346,14 @@ impl AttentionResident {
 
         for h in 0..self.num_heads {
             let kv_h = h / self.gqa_ratio;
-            let k_slab = kv_cache.k_slab_ptr(layer, kv_h);
+            let view = kv_cache.k_slab_view(layer, kv_h, logical_start, position);
             unsafe {
                 matvec_resident(
                     q_normed_base.add(h * self.head_dim),
-                    k_slab.add(start * self.head_dim),      // [windowed_len × head_dim]
+                    view.ptr,                                // [windowed_len × head_dim]
                     self.zero_bias_dev.device_ptr() as *const f32,
                     scores_base.add(h * max_seq),
-                    windowed_len,
+                    view.rows,
                     self.head_dim,
                 )?;
             }
@@ -400,23 +407,24 @@ impl AttentionResident {
         batch.note_dispatch()?;
 
         // Stage 7: weighted V sum per head, restricted to the window.
-        //   head_out[h, :] = softmax[h, :windowed_len] @ V_slab_kv_h[start..attn_len, :]
+        //   head_out[h, :] = softmax[h, :windowed_len] @ V_view[h, :]
         // The optional sink slot (at column `windowed_len` if present)
         // has no V row and is skipped in this matmul — its softmax weight
         // simply doesn't contribute to head_out, matching the host
-        // semantics in `forward_one`. Stride per head is `extended_len`,
-        // not `windowed_len`, when sink is installed.
+        // semantics in `forward_one`. The V view mirrors the K view from
+        // Stage 5 so each row's K and V correspond to the same logical
+        // position (preserving permutation-invariance of attention).
         let head_out_base = hip_buf(&scratch.head_out)?.device_ptr() as *mut f32;
         let scores_tight_base = scores_tight_buf.device_ptr() as *const f32;
         for h in 0..self.num_heads {
             let kv_h = h / self.gqa_ratio;
-            let v_slab = kv_cache.v_slab_ptr(layer, kv_h);
+            let view = kv_cache.v_slab_view(layer, kv_h, logical_start, position);
             unsafe {
                 matmul_resident_tn(
-                    v_slab.add(start * self.head_dim),       // [windowed_len × head_dim]
+                    view.ptr,                                // [windowed_len × head_dim]
                     scores_tight_base.add(h * extended_len), // [windowed_len × 1] (sink column ignored)
                     head_out_base.add(h * self.head_dim),
-                    self.head_dim, windowed_len, 1,
+                    self.head_dim, view.rows, 1,
                 )?;
             }
             batch.note_dispatch()?;
@@ -3966,6 +3974,102 @@ mod tests {
                   window, n_positions);
         assert!(worst_rel < 5e-3,
             "SWA resident vs host: max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}");
+    }
+
+    /// Rolling-cache parity: a SWA layer with a rolling cache (slots ==
+    /// window) must produce the same forward output as the same SWA
+    /// layer with a linear cache (slots == max_seq_len). Run 6 positions
+    /// in lockstep with window=3 — enough to fill (positions 0..2),
+    /// reach the wrap (3), and walk past it (4, 5) so the ring's slot
+    /// permutation is exercised.
+    #[test]
+    fn rolling_cache_matches_linear_cache_under_swa() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let md = config.model_dim.get();
+        let kv_dim = config.num_kv_heads.get() * config.head_dim.get();
+        let max_seq = config.max_seq_len.get();
+        let window: Option<usize> = Some(3);
+        let n_positions: usize = 6;
+
+        let mut rng = modgrad_compute::neuron::SimpleRng::new(0x1011_5A1Du64);
+        let randn = |rng: &mut modgrad_compute::neuron::SimpleRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.05).collect()
+        };
+        let weights = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+        };
+        let attn = CausalSelfAttention::new(weights, &config);
+        let resident = AttentionResident::from_attention(&attn, &config).expect("upload");
+
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
+
+        // Two caches — same shapes for K/V semantics, different storage:
+        //   linear: slots = max_seq for every layer (current default)
+        //   rolling: slots = 3 for layer 0 (matches the SWA window)
+        let mut kv_linear = KvCacheResident::new(
+            1, config.num_kv_heads.get(), config.head_dim.get(),
+            max_seq, md,
+        ).expect("alloc kv linear");
+        let mut kv_rolling = KvCacheResident::with_layer_slots(
+            vec![3], config.num_kv_heads.get(), config.head_dim.get(),
+            max_seq, md,
+        ).expect("alloc kv rolling");
+        assert_eq!(kv_rolling.layer_slots(0), 3);
+
+        let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+        let mut out_lin = GpuVec::try_hip(md).expect("alloc out lin");
+        let mut out_roll = GpuVec::try_hip(md).expect("alloc out roll");
+        let mut scratch_lin = AttentionScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("scratch lin");
+        let mut scratch_roll = AttentionScratch::new(
+            config.num_heads.get(), config.head_dim.get(), kv_dim, max_seq,
+        ).expect("scratch roll");
+        let batch = HipBatch::new();
+
+        let mut rng2 = modgrad_compute::neuron::SimpleRng::new(0xCABBA6E_C0DEu64);
+        let inputs: Vec<Vec<f32>> = (0..n_positions).map(|_| randn(&mut rng2, md)).collect();
+
+        let mut max_rel = 0.0f32;
+        let mut max_abs = 0.0f32;
+        for position in 0..n_positions {
+            x_dev.copy_from(&inputs[position]);
+
+            // Linear cache forward.
+            resident.forward(
+                &batch, &x_dev, &mut kv_linear, 0, position, window, &rope,
+                &mut scratch_lin, &mut out_lin,
+            ).expect("forward lin");
+            // Rolling cache forward.
+            resident.forward(
+                &batch, &x_dev, &mut kv_rolling, 0, position, window, &rope,
+                &mut scratch_roll, &mut out_roll,
+            ).expect("forward roll");
+            batch.flush().expect("flush");
+
+            let mut a = vec![0.0f32; md];
+            let mut b = vec![0.0f32; md];
+            out_lin.copy_to_host(&mut a);
+            out_roll.copy_to_host(&mut b);
+            for (l, r) in a.iter().zip(b.iter()) {
+                let abs = (l - r).abs();
+                let scale = l.abs().max(r.abs()).max(1e-6);
+                let rel = abs / scale;
+                if abs > max_abs { max_abs = abs; }
+                if rel > max_rel { max_rel = rel; }
+            }
+        }
+        eprintln!("rolling vs linear (window=3, n=6): max abs {max_abs}, rel {max_rel}");
+        assert!(max_rel < 5e-3,
+            "rolling cache deviates from linear under SWA: max abs {max_abs}, rel {max_rel}");
     }
 
     /// Attention sink validation: install a non-trivial per-head sink bias

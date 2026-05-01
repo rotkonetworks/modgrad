@@ -53,6 +53,42 @@
 use modgrad_compute::backend::{GpuVec, ResidencyError};
 use modgrad_device::backend::{HipBatch, HipBuffer};
 
+/// Window-aware view into one (layer, kv_head)'s K or V slab. Returned
+/// by [`KvCacheResident::k_slab_view`] / [`KvCacheResident::v_slab_view`].
+/// Encodes "where to start reading" + "how many rows to read" for the
+/// matvec/matmul call — handles linear caches and rolling caches
+/// uniformly so the attention forward code stays branch-free on cache
+/// shape.
+#[derive(Debug, Clone, Copy)]
+pub struct KvSlabView {
+    /// Device pointer to the first row to read (already offset into the
+    /// per-(layer, kv_head) slab).
+    pub ptr: *const f32,
+    /// Number of rows to read starting at `ptr`. Multiply by `head_dim`
+    /// for the byte/element count.
+    pub rows: usize,
+}
+
+#[inline]
+fn slab_view_inner(slab_base: *const f32, head_dim: usize, slot_count: usize, start: usize, position: usize) -> KvSlabView {
+    if position < slot_count {
+        // Either a linear layer (slot_count == max_seq_len) or a rolling
+        // layer whose ring isn't full yet — slot index equals position
+        // either way, so the legacy linear-style offset is correct.
+        let off = start * head_dim;
+        KvSlabView {
+            ptr: unsafe { slab_base.add(off) },
+            rows: position + 1 - start,
+        }
+    } else {
+        // Full rolling ring: every slot holds one of the most recent
+        // `slot_count` positions. Reading the entire slab in slot order
+        // is fine because attention is permutation-invariant in K/V
+        // position. Caller's `start` is unused here.
+        KvSlabView { ptr: slab_base, rows: slot_count }
+    }
+}
+
 /// Device-resident KV cache. See module docs.
 ///
 /// **Per-layer rolling support.** Each layer has its own `slots` capacity
@@ -293,6 +329,37 @@ impl KvCacheResident {
     /// layers that opted into a rolling cache.
     #[inline]
     pub fn layer_slots(&self, layer: usize) -> usize { self.slots[layer] }
+
+    /// Compute a window-aware view into the K slab for one (layer, kv_head)
+    /// over the logical position range `[start, position]` (inclusive on
+    /// both ends — caller passes the most recent `position`, not `position
+    /// + 1`).
+    ///
+    /// For **linear** layers (`slots[layer] == max_seq_len`) and for
+    /// **rolling** layers while the ring isn't full yet (`position <
+    /// slots[layer]`), the slab is still in slot=position order, so the
+    /// view is `(slab_base + start * head_dim, position + 1 - start)`
+    /// — exactly the legacy linear semantics.
+    ///
+    /// For a **full rolling ring** (`position >= slots[layer]`), all slots
+    /// are populated and hold the most recent `slots[layer]` positions in
+    /// some cyclic permutation. Attention is permutation-invariant in
+    /// position order (softmax + V-sum don't care about ordering of K/V
+    /// pairs), so reading the whole ring as one contiguous slab from
+    /// offset 0 with `rows = slots[layer]` is correct — no unroll copy
+    /// needed. Caller's `start` is ignored in this case (the entire ring
+    /// IS the window).
+    pub fn k_slab_view(&self, layer: usize, kv_head: usize, start: usize, position: usize) -> KvSlabView {
+        slab_view_inner(self.k_slab_ptr(layer, kv_head), self.head_dim, self.slots[layer], start, position)
+    }
+
+    /// V-side analog of [`Self::k_slab_view`]. Same view semantics — for
+    /// permutation invariance to hold, K and V must be read with the
+    /// **same** `start`/`position` so each row's K and V correspond to
+    /// the same logical position.
+    pub fn v_slab_view(&self, layer: usize, kv_head: usize, start: usize, position: usize) -> KvSlabView {
+        slab_view_inner(self.v_slab_ptr(layer, kv_head), self.head_dim, self.slots[layer], start, position)
+    }
 
     /// Pointer to the K slab for a specific (layer, kv_head).
     /// Slab shape `[slots[layer] × head_dim]` row-major; for matvec
