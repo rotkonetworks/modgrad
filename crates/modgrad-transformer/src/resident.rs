@@ -634,6 +634,7 @@ impl AttentionResident {
         kv_cache: &KvCacheResident,
         layer: usize,
         position: usize,
+        window: Option<usize>,
         rope: &RotaryEmbedding,
         attn_scratch: &AttentionScratch,
         bwd: &mut AttentionBackwardScratch,
@@ -647,6 +648,11 @@ impl AttentionResident {
         let num_kv_heads = self.num_kv_heads;
         let gqa_ratio = self.gqa_ratio;
         let attn_len = position + 1;
+        let start = match window {
+            Some(w) => position.saturating_sub(w) + 1,
+            None => 0,
+        };
+        let windowed_len = attn_len - start;
         let max_seq = kv_cache.max_seq_len();
 
         debug_assert_eq!(x_dev.len(), model_dim);
@@ -657,6 +663,9 @@ impl AttentionResident {
         // Stage 1: o_proj backward.
         //   d_head_out = o.W^T · dy
         //   dweight_o = dy ⊗ head_out
+        // Runs unconditionally — dbias_o picks up d_attn_out even when
+        // the window is empty (bias is the only o_proj contribution to
+        // forward output in the empty-window short-circuit case).
         self.o_proj.backward(
             batch, &attn_scratch.head_out, dy_dev,
             &mut bwd.d_head_out,
@@ -664,15 +673,23 @@ impl AttentionResident {
             &mut grads.dbias_o,
         )?;
 
+        // Empty-window backward: forward returned a zero output (post-bias),
+        // so head_out / scores / softmax are all zero. d/d(input) of a
+        // constant is zero. Stages 2–8 would all dispatch with dim=0
+        // (kernels balk) and produce zeros anyway. Short-circuit by
+        // zeroing dx_dev and returning. Q/K/V proj weight grads are
+        // unchanged because head_out=0 makes their contributions zero.
+        if windowed_len == 0 {
+            let zeros = vec![0.0f32; model_dim];
+            dx_dev.copy_from(&zeros);
+            return Ok(());
+        }
+
         // Stage 2: per-head, compute d_softmax[h, t] = V_slab[t, :] · d_head_out[h, :]
-        // for t in 0..attn_len.  matmul_resident_nn with A=[attn_len × head_dim],
-        // B=[head_dim × 1], C=[attn_len × 1] would do this. We use the same
-        // approach as the forward V·softmax (which uses _tn).
-        //
-        // d_softmax[h] = V_slab[:attn_len] · d_head_out[h]
-        //   shape: V_slab[attn_len × head_dim] · d_head_out[head_dim] → [attn_len].
-        // matmul_resident_nn: A=V_slab, B=d_head_out (as [head_dim × 1]),
-        //   C=d_softmax_row, m=attn_len, k=head_dim, n=1.
+        // for t in [start, attn_len). matmul reads V_slab[start..attn_len]
+        // (advance v_slab pointer by start*head_dim, m=windowed_len);
+        // writes d_softmax row tightly at h*windowed_len for `windowed_len`
+        // entries.
         let d_head_out_buf = hip_buf(&bwd.d_head_out)?;
         let d_softmax_buf = hip_buf(&bwd.d_softmax)?;
         let d_softmax_base = d_softmax_buf.device_ptr() as *mut f32;
@@ -682,19 +699,19 @@ impl AttentionResident {
             let v_slab = kv_cache.v_slab_ptr(layer, kv_h);
             unsafe {
                 matmul_resident_nn(
-                    v_slab,                                         // [attn_len × head_dim]
+                    v_slab.add(start * head_dim),                   // [windowed_len × head_dim]
                     d_head_out_base.add(h * head_dim),              // [head_dim × 1]
-                    d_softmax_base.add(h * attn_len),               // [attn_len × 1]
-                    attn_len, head_dim, 1,
+                    d_softmax_base.add(h * windowed_len),           // [windowed_len × 1]
+                    windowed_len, head_dim, 1,
                 )?;
             }
             batch.note_dispatch()?;
         }
 
         // Stage 3: softmax backward.
-        // scores_tight stores the *forward softmax output* (same buffer
-        // is in/out of the forward dispatch). softmax_backward_resident
-        // takes y (forward output) and dy.
+        // scores_tight stores the *forward softmax output* — already
+        // tightly packed at stride `windowed_len` per head from the
+        // forward path.
         let scores_tight_buf = hip_buf(&attn_scratch.scores_tight)?;
         let d_scores_buf = hip_buf(&bwd.d_scores)?;
         unsafe {
@@ -702,22 +719,15 @@ impl AttentionResident {
                 scores_tight_buf.device_ptr() as *const f32,
                 d_softmax_base as *const f32,
                 d_scores_buf.device_ptr() as *mut f32,
-                num_heads, attn_len, false,
+                num_heads, windowed_len, false,
             )?;
         }
         batch.note_dispatch()?;
 
-        // Stage 4: per-head, d_q_normed[h, :] = sum_t d_scores[h, t] * K_slab[t, :].
-        //   shape: K_slab[attn_len × head_dim], d_scores_row[attn_len].
-        //   d_q_normed_head = K_slab^T · d_scores_row → wait, we want
-        //   d_q_normed[h, i] = sum_t d_scores[h, t] * K_slab[t, i]
-        //                    = (d_scores[h, :])^T @ K_slab^T[:, i]
-        //                    = K_slab^T @ d_scores[h, :]_T
-        //     (matrix·vector with K_slab transposed: d_q_normed = K_slab^T · d_scores_row)
-        // matmul_resident_tn: A=K_slab (transposed-on-fly read → [head_dim × attn_len]),
-        //   B=d_scores_row (as [attn_len × 1]),
-        //   C=d_q_normed_head (as [head_dim × 1]),
-        //   m=head_dim, k=attn_len, n=1.
+        // Stage 4: per-head, d_q_normed[h, :] = sum_t d_scores[h, t] * K_slab[t, :]
+        // for t in [start, attn_len). matmul reads K_slab[start..attn_len]
+        // (advance k_slab pointer by start*head_dim, k=windowed_len);
+        // d_scores tight at h*windowed_len.
         let d_q_normed_buf = hip_buf(&bwd.d_q_normed)?;
         let d_q_normed_base = d_q_normed_buf.device_ptr() as *mut f32;
         let d_scores_base = d_scores_buf.device_ptr() as *const f32;
@@ -726,10 +736,10 @@ impl AttentionResident {
             let k_slab = kv_cache.k_slab_ptr(layer, kv_h);
             unsafe {
                 matmul_resident_tn(
-                    k_slab,                                         // [attn_len × head_dim]
-                    d_scores_base.add(h * attn_len),                // [attn_len × 1]
+                    k_slab.add(start * head_dim),                   // [windowed_len × head_dim]
+                    d_scores_base.add(h * windowed_len),            // [windowed_len × 1]
                     d_q_normed_base.add(h * head_dim),              // [head_dim × 1]
-                    head_dim, attn_len, 1,
+                    head_dim, windowed_len, 1,
                 )?;
             }
             batch.note_dispatch()?;
@@ -749,37 +759,47 @@ impl AttentionResident {
         // negligible relative to the matmul stages.
         let mut q_normed_host = vec![0.0f32; model_dim];
         attn_scratch.q_normed.copy_to_host(&mut q_normed_host);
-        // The forward stores `scores_tight` as `[num_heads × attn_len]`
-        // contiguous (the in-place softmax sees row_len=attn_len rows;
-        // the underlying device buffer is sized for the worst case
-        // num_heads × max_seq but only the first num_heads * attn_len
-        // floats are populated).
-        let mut scores_host = vec![0.0f32; num_heads * attn_len];
+        // forward's `scores_tight` is laid out tightly at stride
+        // `windowed_len` per head; copy that prefix.
+        // Sink slot (if present) reserves +1 column per head — extra
+        // capacity here doesn't hurt (we read only the first windowed_len
+        // entries; the sink contributes only a softmax mass drain, never
+        // a current-token gradient).
+        let scratch_cap = num_heads * (max_seq + 1);
+        let mut scores_host = vec![0.0f32; num_heads * windowed_len];
         {
-            let mut full = vec![0.0f32; num_heads * max_seq];
+            let mut full = vec![0.0f32; scratch_cap];
             attn_scratch.scores_tight.copy_to_host(&mut full);
-            scores_host.copy_from_slice(&full[..num_heads * attn_len]);
+            for h in 0..num_heads {
+                let extended_stride = windowed_len + (self.sink_bias_dev.is_some() as usize);
+                let src_base = h * extended_stride;
+                let dst_base = h * windowed_len;
+                scores_host[dst_base..dst_base + windowed_len]
+                    .copy_from_slice(&full[src_base..src_base + windowed_len]);
+            }
         }
-        // d_scores comes out of softmax_backward with the same
-        // [num_heads × attn_len] contiguous layout in the buffer's
-        // first num_heads * attn_len floats.
-        let mut d_scores_host = vec![0.0f32; num_heads * attn_len];
+        // d_scores from softmax_backward — same tight stride windowed_len.
+        let mut d_scores_host = vec![0.0f32; num_heads * windowed_len];
         {
             let mut full = vec![0.0f32; num_heads * max_seq];
             bwd.d_scores.copy_to_host(&mut full);
-            d_scores_host.copy_from_slice(&full[..num_heads * attn_len]);
+            d_scores_host.copy_from_slice(&full[..num_heads * windowed_len]);
         }
         let mut d_head_out_host = vec![0.0f32; model_dim];
         bwd.d_head_out.copy_to_host(&mut d_head_out_host);
 
-        // d_v_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} softmax[h, position] * d_head_out[h, i]
-        // d_k_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} d_scores[h, position] * q_normed[h, i]
+        // The current token sits at the LAST entry of the windowed range
+        // (index `windowed_len - 1`). For window=None this collapses to
+        // `attn_len - 1` (the original behavior).
+        // d_v_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} softmax[h, last] * d_head_out[h, i]
+        // d_k_current[kv_h, i] = sum_{h: h/gqa_ratio==kv_h} d_scores[h, last] * q_normed[h, i]
         let mut d_k_current_post_rope = vec![0.0f32; kv_dim];
         let mut d_v_current_host = vec![0.0f32; kv_dim];
+        let last = windowed_len - 1;
         for h in 0..num_heads {
             let kv_h = h / gqa_ratio;
-            let s = scores_host[h * attn_len + (attn_len - 1)];
-            let ds = d_scores_host[h * attn_len + (attn_len - 1)];
+            let s = scores_host[h * windowed_len + last];
+            let ds = d_scores_host[h * windowed_len + last];
             let q_h = &q_normed_host[h * head_dim..(h + 1) * head_dim];
             let d_h_out = &d_head_out_host[h * head_dim..(h + 1) * head_dim];
             for i in 0..head_dim {
@@ -2425,10 +2445,13 @@ impl TransformerBlockResident {
         batch.note_dispatch()?;
 
         // Stage F: attention backward. Returns d_attn_normed.
+        // Window stays None here; per-layer SWA backward is plumbed at
+        // the model level alongside the existing forward windows[]
+        // (a follow-up commit threads it through block.backward).
         let mut d_attn_normed = GpuVec::try_hip(model_dim)?;
         self.attn.backward(
             batch, &block_scratch.attn_normed, &d_attn_out,
-            kv_cache, self.layer_idx, position, rope,
+            kv_cache, self.layer_idx, position, None, rope,
             attn_scratch, attn_bwd_scratch, attn_grads, &mut d_attn_normed,
         )?;
 
