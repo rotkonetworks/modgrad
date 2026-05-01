@@ -551,8 +551,11 @@ impl AttentionBackwardScratch {
         let half_dim = head_dim / 2;
         Ok(Self {
             d_head_out: GpuVec::try_hip(model_dim)?,
-            d_softmax: GpuVec::try_hip(num_heads * max_seq)?,
-            d_scores: GpuVec::try_hip(num_heads * max_seq)?,
+            // +1 column per head for the optional sink slot (matches
+            // `AttentionScratch::scores_tight` capacity), so softmax_backward
+            // can run over the same extended range the forward softmax did.
+            d_softmax: GpuVec::try_hip(num_heads * (max_seq + 1))?,
+            d_scores: GpuVec::try_hip(num_heads * (max_seq + 1))?,
             d_q_normed: GpuVec::try_hip(model_dim)?,
             d_q_proj: GpuVec::try_hip(model_dim)?,
             d_k_proj: GpuVec::try_hip(kv_dim)?,
@@ -595,6 +598,11 @@ pub struct AttentionResidentGrads {
     pub dbias_v: GpuVec,
     pub dweight_o: GpuVec,
     pub dbias_o: GpuVec,
+    /// Per-head sink bias gradient `[num_heads]`. Allocated only when the
+    /// matched attention has a sink installed (set via
+    /// [`Self::with_sink`]); `None` when the layer is sink-free, so
+    /// no gradient buffer is wasted on layers that don't need one.
+    pub dsink_bias: Option<GpuVec>,
 }
 
 impl AttentionResidentGrads {
@@ -608,7 +616,20 @@ impl AttentionResidentGrads {
             dbias_v: GpuVec::try_hip(kv_dim)?,
             dweight_o: GpuVec::try_hip(model_dim * model_dim)?,
             dbias_o: GpuVec::try_hip(model_dim)?,
+            dsink_bias: None,
         })
+    }
+
+    /// Allocate a sink-bias gradient buffer. Call once at construction
+    /// for layers whose attention has a sink installed; sink-free layers
+    /// skip this and their `dsink_bias` stays `None`. Zero-initialised
+    /// so the first backward call accumulates correctly.
+    pub fn with_sink(mut self, num_heads: usize) -> Result<Self, ResidencyError> {
+        let mut buf = GpuVec::try_hip(num_heads)?;
+        let zeros = vec![0.0f32; num_heads];
+        buf.copy_from(&zeros);
+        self.dsink_bias = Some(buf);
+        Ok(self)
     }
 }
 
@@ -714,9 +735,22 @@ impl AttentionResident {
             return Ok(());
         }
 
+        // Sink-aware extended row count for d_softmax/d_scores stride.
+        // When sink is installed, forward softmaxed over (view_rows + 1)
+        // entries per head (the +1 is the sink "drain"); backward must
+        // run softmax_backward at the same stride for the sink-column
+        // gradient (which is d_sink_bias[h]) to fall out cleanly.
+        let sink_slot = self.sink_bias_dev.is_some() as usize;
+        let extended_rows = view_rows + sink_slot;
+
         // Stage 2: per-head, compute d_softmax[h, t] = V_view[t, :] · d_head_out[h, :]
-        // for t in [0, view_rows). The V view comes from the cache and
-        // handles linear vs rolling uniformly (same as forward Stage 7).
+        // for t in [0, view_rows). V view from the cache handles linear
+        // vs rolling uniformly (same as forward Stage 7). When sink is
+        // installed we leave the trailing sink column at 0 (no V row) —
+        // softmax_backward then sees d_softmax[sink] = 0 and produces
+        // d_scores[sink] purely from the chain through the sink's own
+        // softmax weight, which IS d_sink_bias[h] (the sink slot's
+        // pre-softmax value was sink_bias[h]).
         let d_head_out_buf = hip_buf(&bwd.d_head_out)?;
         let d_softmax_buf = hip_buf(&bwd.d_softmax)?;
         let d_softmax_base = d_softmax_buf.device_ptr() as *mut f32;
@@ -728,17 +762,33 @@ impl AttentionResident {
                 matmul_resident_nn(
                     view.ptr,                                       // [view_rows × head_dim]
                     d_head_out_base.add(h * head_dim),              // [head_dim × 1]
-                    d_softmax_base.add(h * view_rows),              // [view_rows × 1]
+                    d_softmax_base.add(h * extended_rows),          // [view_rows × 1]
                     view.rows, head_dim, 1,
                 )?;
             }
             batch.note_dispatch()?;
         }
+        // When sink is installed, zero the trailing sink column of
+        // d_softmax for each head so softmax_backward sees the right
+        // upstream gradient there (V-sum doesn't touch the sink, so
+        // d/d(softmax_sink) = 0).
+        if sink_slot > 0 {
+            let zero_src = self.zero_bias_dev.device_ptr() as *const std::os::raw::c_void;
+            for h in 0..num_heads {
+                let dst_off_bytes = (h * extended_rows + view_rows) * 4;
+                unsafe {
+                    hip_memcpy_d2d(
+                        (d_softmax_base as *mut u8).add(dst_off_bytes) as *mut std::os::raw::c_void,
+                        zero_src,
+                        4,
+                    )?;
+                }
+                batch.note_dispatch()?;
+            }
+        }
 
-        // Stage 3: softmax backward.
-        // scores_tight stores the *forward softmax output* — already
-        // tightly packed at stride `view_rows` per head from the forward
-        // path (forward Stage 6 packs into scores_tight at this stride).
+        // Stage 3: softmax backward over (view_rows + sink_slot) entries.
+        // scores_tight from forward is packed at stride extended_rows.
         let scores_tight_buf = hip_buf(&attn_scratch.scores_tight)?;
         let d_scores_buf = hip_buf(&bwd.d_scores)?;
         unsafe {
@@ -746,15 +796,37 @@ impl AttentionResident {
                 scores_tight_buf.device_ptr() as *const f32,
                 d_softmax_base as *const f32,
                 d_scores_buf.device_ptr() as *mut f32,
-                num_heads, view_rows, false,
+                num_heads, extended_rows, false,
             )?;
         }
         batch.note_dispatch()?;
 
+        // Sink bias gradient extraction: the sink column of d_scores IS
+        // d_sink_bias[h]. Pull host-side and accumulate into the
+        // optional grads.dsink_bias buffer (allocated only for sink-
+        // installed layers).
+        if let Some(sink_grad_dev) = grads.dsink_bias.as_mut() {
+            debug_assert!(sink_slot > 0,
+                "dsink_bias allocated but no sink installed on attention");
+            let mut full = vec![0.0f32; num_heads * extended_rows];
+            // Pull only what we need (num_heads * extended_rows is bounded
+            // by num_heads * (max_seq + 1)).
+            let mut full_padded = vec![0.0f32; num_heads * (max_seq + 1)];
+            bwd.d_scores.copy_to_host(&mut full_padded);
+            full.copy_from_slice(&full_padded[..num_heads * extended_rows]);
+            let mut sink_host = vec![0.0f32; num_heads];
+            let mut prev_sink = vec![0.0f32; num_heads];
+            sink_grad_dev.copy_to_host(&mut prev_sink);
+            for h in 0..num_heads {
+                sink_host[h] = prev_sink[h] + full[h * extended_rows + view_rows];
+            }
+            sink_grad_dev.copy_from(&sink_host);
+        }
+
         // Stage 4: per-head, d_q_normed[h, :] = sum_t d_scores[h, t] * K_view[t, :]
-        // The K view mirrors Stage 2's V view so each row's K and V
-        // correspond to the same logical position (preserves
-        // permutation-invariance).
+        // for t in [0, view_rows). Read d_scores at stride extended_rows
+        // but matmul over only the first view_rows entries — the sink
+        // column has no K row and is excluded from the Q gradient.
         let d_q_normed_buf = hip_buf(&bwd.d_q_normed)?;
         let d_q_normed_base = d_q_normed_buf.device_ptr() as *mut f32;
         let d_scores_base = d_scores_buf.device_ptr() as *const f32;
@@ -764,7 +836,7 @@ impl AttentionResident {
             unsafe {
                 matmul_resident_tn(
                     view.ptr,                                       // [view_rows × head_dim]
-                    d_scores_base.add(h * view_rows),               // [view_rows × 1]
+                    d_scores_base.add(h * extended_rows),           // [view_rows × 1]
                     d_q_normed_base.add(h * head_dim),              // [head_dim × 1]
                     head_dim, view.rows, 1,
                 )?;
@@ -802,12 +874,19 @@ impl AttentionResident {
                     .copy_from_slice(&full[src_base..src_base + view_rows]);
             }
         }
-        // d_scores from softmax_backward — same tight stride view_rows.
+        // d_scores from softmax_backward — at stride extended_rows
+        // (view_rows + sink_slot). For Stage 5 we only need the first
+        // view_rows per head; copy that prefix per head.
         let mut d_scores_host = vec![0.0f32; num_heads * view_rows];
         {
-            let mut full = vec![0.0f32; num_heads * max_seq];
+            let mut full = vec![0.0f32; num_heads * (max_seq + 1)];
             bwd.d_scores.copy_to_host(&mut full);
-            d_scores_host.copy_from_slice(&full[..num_heads * view_rows]);
+            for h in 0..num_heads {
+                let src_base = h * extended_rows;
+                let dst_base = h * view_rows;
+                d_scores_host[dst_base..dst_base + view_rows]
+                    .copy_from_slice(&full[src_base..src_base + view_rows]);
+            }
         }
         let mut d_head_out_host = vec![0.0f32; model_dim];
         bwd.d_head_out.copy_to_host(&mut d_head_out_host);
@@ -4207,6 +4286,155 @@ mod tests {
         cmp("dW_k", &grads_lin.dweight_k, &grads_roll.dweight_k, kv_dim * md, 5e-3);
         cmp("dW_v", &grads_lin.dweight_v, &grads_roll.dweight_v, kv_dim * md, 5e-3);
         cmp("dW_o", &grads_lin.dweight_o, &grads_roll.dweight_o, md * md, 5e-3);
+    }
+
+    /// Sink backward smoke + finite-difference gradcheck. Installs a
+    /// per-head sink bias, runs forward + backward to get the analytical
+    /// d_sink_bias, then perturbs each head's sink and computes a finite-
+    /// difference gradient on a quadratic loss `0.5 * |out|^2`. The two
+    /// must agree within a few percent (FD tolerance is loose because
+    /// step size and float accumulation across the model bound it).
+    #[test]
+    fn attention_sink_backward_gradcheck() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let md = config.model_dim.get();
+        let kv_dim = config.num_kv_heads.get() * config.head_dim.get();
+        let max_seq = config.max_seq_len.get();
+        let n_heads = config.num_heads.get();
+        let position = 2usize; // small but non-trivial cache state
+
+        let mut rng = modgrad_compute::neuron::SimpleRng::new(0x51_4B);
+        let randn = |rng: &mut modgrad_compute::neuron::SimpleRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.05).collect()
+        };
+        let weights = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+        };
+        let sink_bias_init: Vec<f32> = (0..n_heads).map(|h| 0.3 + 0.07 * h as f32).collect();
+        let inputs: Vec<Vec<f32>> = (0..=position).map(|_| randn(&mut rng, md)).collect();
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
+
+        // Helper: run the forward pipeline up to `position` with a given
+        // sink bias and return the post-attention output.
+        let run_forward = |sb: &[f32]| -> Vec<f32> {
+            let attn_w = AttentionWeights {
+                wq: Tensor2::new(weights.wq.as_slice().to_vec(), md, md).unwrap(),
+                wk: Tensor2::new(weights.wk.as_slice().to_vec(), kv_dim, md).unwrap(),
+                wv: Tensor2::new(weights.wv.as_slice().to_vec(), kv_dim, md).unwrap(),
+                wo: Tensor2::new(weights.wo.as_slice().to_vec(), md, md).unwrap(),
+            };
+            let attn = CausalSelfAttention::new(attn_w, &config).with_sink_bias(sb.to_vec());
+            let resident = AttentionResident::from_attention(&attn, &config).expect("upload");
+            let mut kv = KvCacheResident::new(
+                1, config.num_kv_heads.get(), config.head_dim.get(), max_seq, md,
+            ).expect("alloc kv");
+            let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+            let mut out_dev = GpuVec::try_hip(md).expect("alloc out");
+            let mut scratch = AttentionScratch::new(
+                n_heads, config.head_dim.get(), kv_dim, max_seq,
+            ).expect("scratch");
+            let batch = HipBatch::new();
+            for p in 0..=position {
+                x_dev.copy_from(&inputs[p]);
+                resident.forward(&batch, &x_dev, &mut kv, 0, p, None, &rope,
+                    &mut scratch, &mut out_dev).expect("fwd");
+            }
+            batch.flush().expect("flush");
+            let mut out = vec![0.0f32; md];
+            out_dev.copy_to_host(&mut out);
+            out
+        };
+
+        // Analytical: forward + backward at sink_bias_init, get d_sink_bias.
+        let attn = CausalSelfAttention::new(AttentionWeights {
+            wq: Tensor2::new(weights.wq.as_slice().to_vec(), md, md).unwrap(),
+            wk: Tensor2::new(weights.wk.as_slice().to_vec(), kv_dim, md).unwrap(),
+            wv: Tensor2::new(weights.wv.as_slice().to_vec(), kv_dim, md).unwrap(),
+            wo: Tensor2::new(weights.wo.as_slice().to_vec(), md, md).unwrap(),
+        }, &config).with_sink_bias(sink_bias_init.clone());
+        let resident = AttentionResident::from_attention(&attn, &config).expect("upload");
+        assert!(resident.sink_bias_dev.is_some());
+        let mut kv = KvCacheResident::new(
+            1, config.num_kv_heads.get(), config.head_dim.get(), max_seq, md,
+        ).expect("alloc kv");
+        let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+        let mut out_dev = GpuVec::try_hip(md).expect("alloc out");
+        let mut scratch = AttentionScratch::new(
+            n_heads, config.head_dim.get(), kv_dim, max_seq,
+        ).expect("scratch");
+        let batch = HipBatch::new();
+        for p in 0..=position {
+            x_dev.copy_from(&inputs[p]);
+            resident.forward(&batch, &x_dev, &mut kv, 0, p, None, &rope,
+                &mut scratch, &mut out_dev).expect("fwd analytical");
+        }
+        let mut out_at_v = vec![0.0f32; md];
+        out_dev.copy_to_host(&mut out_at_v);
+        // Loss = 0.5 * |out|^2, so dL/d_out = out itself.
+        let mut dy_dev = GpuVec::try_hip(md).expect("alloc dy");
+        dy_dev.copy_from(&out_at_v);
+        let mut bwd = AttentionBackwardScratch::new(
+            n_heads, config.head_dim.get(), kv_dim, max_seq,
+        ).expect("bwd scratch");
+        let mut grads = AttentionResidentGrads::new(md, kv_dim).expect("grads")
+            .with_sink(n_heads).expect("alloc dsink");
+        let mut dx = GpuVec::try_hip(md).expect("dx");
+        resident.backward(
+            &batch, &x_dev, &dy_dev, &kv, 0, position, None, &rope,
+            &scratch, &mut bwd, &mut grads, &mut dx,
+        ).expect("backward analytical");
+        batch.flush().expect("flush");
+        let mut analytical = vec![0.0f32; n_heads];
+        grads.dsink_bias.as_ref().unwrap().copy_to_host(&mut analytical);
+
+        // Sanity: the sink gradient must be finite and not all zero
+        // (we installed a non-trivial sink, so it MUST influence the
+        // softmax — and hence the gradient).
+        for (h, &g) in analytical.iter().enumerate() {
+            assert!(g.is_finite(), "d_sink_bias[{h}] is non-finite: {g}");
+        }
+        let any_nonzero = analytical.iter().any(|&g| g.abs() > 1e-8);
+        assert!(any_nonzero, "d_sink_bias is all zero — backward not wired");
+
+        // Finite-difference gradient on the same loss. Coarse FD because
+        // float accumulation through the chain bounds tightness; we just
+        // check the sign and ballpark magnitude per head.
+        let eps = 1e-2_f32;
+        let loss_at = |out: &[f32]| -> f32 {
+            0.5 * out.iter().map(|&v| v * v).sum::<f32>()
+        };
+        let l0 = loss_at(&out_at_v);
+        eprintln!("sink gradcheck: loss at init = {l0}");
+        let mut max_rel = 0.0f32;
+        for h in 0..n_heads {
+            let mut sb_p = sink_bias_init.clone();
+            sb_p[h] += eps;
+            let mut sb_m = sink_bias_init.clone();
+            sb_m[h] -= eps;
+            let l_plus = loss_at(&run_forward(&sb_p));
+            let l_minus = loss_at(&run_forward(&sb_m));
+            let fd = (l_plus - l_minus) / (2.0 * eps);
+            let rel = (analytical[h] - fd).abs()
+                / analytical[h].abs().max(fd.abs()).max(1e-6);
+            eprintln!(
+                "head {h}: analytical={:+.6e}, fd={:+.6e}, rel={:.3e}",
+                analytical[h], fd, rel,
+            );
+            if rel > max_rel { max_rel = rel; }
+        }
+        // Loose tolerance — FD with eps=1e-2 + fp32 chain accumulation
+        // bounds us to a few percent. The point is to catch sign or
+        // magnitude bugs, not 1e-5 numerical agreement.
+        assert!(max_rel < 0.10,
+            "sink gradient FD vs analytical disagrees: max rel {max_rel}");
     }
 
     /// Attention sink validation: install a non-trivial per-head sink bias
