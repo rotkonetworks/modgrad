@@ -54,12 +54,27 @@ use modgrad_compute::backend::{GpuVec, ResidencyError};
 use modgrad_device::backend::{HipBatch, HipBuffer};
 
 /// Device-resident KV cache. See module docs.
+///
+/// **Per-layer rolling support.** Each layer has its own `slots` capacity
+/// (a row count). When `slots[layer] == max_seq_len` the layer behaves
+/// linearly: position p writes to slot p, and prior tokens sit in slot
+/// order (the default constructor wires this up). When `slots[layer] < max_seq_len`
+/// (opt-in via `with_layer_slots`), the layer is a ring buffer of capacity
+/// `slots[layer]`: position p writes to slot `p % slots[layer]`, evicting
+/// the oldest entry. Combined with sliding-window attention this gives
+/// per-layer KV memory ≈ `slots[layer] · head_dim · n_kv_heads` instead of
+/// `max_seq_len · head_dim · n_kv_heads` — the actual memory win SWA
+/// promises.
 pub struct KvCacheResident {
-    /// One `HipBuffer` per layer for K. Each is sized
-    /// `n_kv_heads * max_seq_len * head_dim * 4` bytes.
+    /// One `HipBuffer` per layer for K. Sized `n_kv_heads * slots[layer] *
+    /// head_dim * 4` bytes — varies per layer when the rolling-cache
+    /// constructor is used.
     pub k_dev: Vec<HipBuffer>,
-    /// One `HipBuffer` per layer for V. Same shape as `k_dev`.
+    /// One `HipBuffer` per layer for V. Same shape as the matching `k_dev[layer]`.
     pub v_dev: Vec<HipBuffer>,
+    /// Per-layer slot count. `slots[layer] == max_seq_len` means linear
+    /// cache (default); `slots[layer] < max_seq_len` means ring buffer.
+    pub slots: Vec<usize>,
     /// Previous-token embedding (for the smear path). `[model_dim]` on device.
     /// Allocated alongside the layers so the caller's smear pass can
     /// dispatch resident as well; safe to ignore if smear is host-side.
@@ -75,8 +90,14 @@ pub struct KvCacheResident {
 
 impl KvCacheResident {
     /// Allocate K and V buffers for every layer plus the smear scratch.
+    /// Every layer is sized for `max_seq_len` slots — i.e. linear cache
+    /// throughout, the default and historical behavior.
     /// Total VRAM cost: `2 * n_layers * n_kv_heads * max_seq_len * head_dim * 4`
     /// bytes plus `model_dim * 4` for the smear scratch.
+    ///
+    /// Use [`Self::with_layer_slots`] to opt into per-layer rolling caches
+    /// (e.g. a SWA layer with window=128 only needs 128 slots, regardless
+    /// of `max_seq_len`).
     pub fn new(
         n_layers: usize,
         n_kv_heads: usize,
@@ -84,24 +105,57 @@ impl KvCacheResident {
         max_seq_len: usize,
         model_dim: usize,
     ) -> Result<Self, ResidencyError> {
-        let layer_bytes = n_kv_heads * max_seq_len * head_dim * 4;
+        let slots = vec![max_seq_len; n_layers];
+        Self::with_layer_slots(slots, n_kv_heads, head_dim, max_seq_len, model_dim)
+    }
+
+    /// Allocate K and V buffers per-layer with caller-specified slot
+    /// counts. A layer with `layer_slots[i] < max_seq_len` is a ring
+    /// buffer: position `p` writes to slot `p % layer_slots[i]`. Sized
+    /// matching the SWA window of that layer gives the actual KV-memory
+    /// savings of sliding-window attention.
+    ///
+    /// Constraints:
+    /// - `layer_slots.len() == n_layers` (one entry per layer).
+    /// - Each `layer_slots[i] > 0` and `<= max_seq_len`.
+    /// - `max_seq_len` is still the cap on the *highest position index*
+    ///   the cache will ever see — used to size the smear scratch and
+    ///   bound the public `max_seq_len()` getter. Pass the same value
+    ///   you would to `new`.
+    pub fn with_layer_slots(
+        layer_slots: Vec<usize>,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        model_dim: usize,
+    ) -> Result<Self, ResidencyError> {
+        let n_layers = layer_slots.len();
+        debug_assert!(n_layers > 0, "n_layers > 0 required");
+        for (li, &s) in layer_slots.iter().enumerate() {
+            debug_assert!(s > 0,
+                "layer {li} has 0 slots — every layer needs at least 1");
+            debug_assert!(s <= max_seq_len,
+                "layer {li} slots ({s}) exceeds max_seq_len ({max_seq_len})");
+        }
+
         let mut k_dev = Vec::with_capacity(n_layers);
         let mut v_dev = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
+        for &slots in &layer_slots {
+            let layer_bytes = n_kv_heads * slots * head_dim * 4;
             let kb = HipBuffer::new(layer_bytes)?;
             // Zero the buffer so any "look at uninitialized cache slot"
             // bug surfaces as a deterministic zero rather than a HIP
             // sanitizer race.
-            zero_hip_buffer(&kb, n_kv_heads * max_seq_len * head_dim)?;
+            zero_hip_buffer(&kb, n_kv_heads * slots * head_dim)?;
             let vb = HipBuffer::new(layer_bytes)?;
-            zero_hip_buffer(&vb, n_kv_heads * max_seq_len * head_dim)?;
+            zero_hip_buffer(&vb, n_kv_heads * slots * head_dim)?;
             k_dev.push(kb);
             v_dev.push(vb);
         }
         let prev_embedding_dev = HipBuffer::new(model_dim * 4)?;
         zero_hip_buffer(&prev_embedding_dev, model_dim)?;
         Ok(Self {
-            k_dev, v_dev, prev_embedding_dev,
+            k_dev, v_dev, slots: layer_slots, prev_embedding_dev,
             n_layers, n_kv_heads, head_dim, max_seq_len,
             seq_len: 0,
         })
@@ -141,11 +195,11 @@ impl KvCacheResident {
     /// Reset and zero every KV buffer. Slow (one D2D memset per layer);
     /// only use when cache contents could leak into the next forward.
     pub fn reset_zero(&mut self) -> Result<(), ResidencyError> {
-        for buf in &self.k_dev {
-            zero_hip_buffer(buf, self.n_kv_heads * self.max_seq_len * self.head_dim)?;
+        for (buf, &slots) in self.k_dev.iter().zip(self.slots.iter()) {
+            zero_hip_buffer(buf, self.n_kv_heads * slots * self.head_dim)?;
         }
-        for buf in &self.v_dev {
-            zero_hip_buffer(buf, self.n_kv_heads * self.max_seq_len * self.head_dim)?;
+        for (buf, &slots) in self.v_dev.iter().zip(self.slots.iter()) {
+            zero_hip_buffer(buf, self.n_kv_heads * slots * self.head_dim)?;
         }
         self.seq_len = 0;
         Ok(())
@@ -156,9 +210,11 @@ impl KvCacheResident {
     /// n_kv_heads * head_dim` and laid out per-head-then-element
     /// (matching the host K/V projection output).
     ///
-    /// Per kv-head, copies `head_dim` floats from `k_dev[kv_h * head_dim..]`
-    /// into `self.k_dev[layer]` at offset `kv_h * max_seq_len * head_dim
-    /// + position * head_dim`. Same for V.
+    /// The destination slot is `position % self.slots[layer]`. For
+    /// linear layers (`slots[layer] == max_seq_len`) and `position <
+    /// max_seq_len` this is just `position` — same behavior as before.
+    /// For rolling layers (`slots[layer] < max_seq_len`) the modulus
+    /// implements the ring-buffer eviction.
     pub fn write(
         &mut self,
         batch: &HipBatch,
@@ -186,11 +242,13 @@ impl KvCacheResident {
             }),
         };
 
+        let layer_slots = self.slots[layer];
+        let slot = position % layer_slots;
         let head_bytes = self.head_dim * 4;
         for kv_h in 0..self.n_kv_heads {
             let src_off = kv_h * self.head_dim * 4;
-            let dst_off = kv_h * self.max_seq_len * self.head_dim * 4
-                        + position * self.head_dim * 4;
+            let dst_off = kv_h * layer_slots * self.head_dim * 4
+                        + slot * self.head_dim * 4;
             // K
             unsafe {
                 hip_memcpy_d2d(
@@ -230,20 +288,28 @@ impl KvCacheResident {
         self.v_dev[layer].device_ptr() as *const f32
     }
 
+    /// Number of slots allocated for `layer`. Equals `max_seq_len` for
+    /// linear layers (default constructor) and the SWA window size for
+    /// layers that opted into a rolling cache.
+    #[inline]
+    pub fn layer_slots(&self, layer: usize) -> usize { self.slots[layer] }
+
     /// Pointer to the K slab for a specific (layer, kv_head).
-    /// Slab shape `[max_seq_len × head_dim]` row-major; for matvec
-    /// scoring use `attn_len` rows and `head_dim` cols.
+    /// Slab shape `[slots[layer] × head_dim]` row-major; for matvec
+    /// scoring use `attn_len` rows and `head_dim` cols when the layer
+    /// is linear, or refer to [`Self::k_slab_view`] for a window-aware
+    /// (ptr, rows) pair that handles linear and rolling uniformly.
     #[inline]
     pub fn k_slab_ptr(&self, layer: usize, kv_head: usize) -> *const f32 {
-        let off = kv_head * self.max_seq_len * self.head_dim;
+        let off = kv_head * self.slots[layer] * self.head_dim;
         unsafe { (self.k_layer_ptr(layer)).add(off) }
     }
 
     /// Pointer to the V slab for a specific (layer, kv_head).
-    /// Slab shape `[max_seq_len × head_dim]` row-major.
+    /// Slab shape `[slots[layer] × head_dim]` row-major.
     #[inline]
     pub fn v_slab_ptr(&self, layer: usize, kv_head: usize) -> *const f32 {
-        let off = kv_head * self.max_seq_len * self.head_dim;
+        let off = kv_head * self.slots[layer] * self.head_dim;
         unsafe { (self.v_layer_ptr(layer)).add(off) }
     }
 }
@@ -320,10 +386,55 @@ mod tests {
         assert_eq!(cache.head_dim(), head_dim);
 
         // Sanity: download layer 0's K and verify it's all zero.
-        let total = n_kv * max_seq * head_dim;
+        let total = n_kv * cache.layer_slots(0) * head_dim;
         let mut buf = vec![1.0f32; total];
         cache.k_dev[0].copy_to_host(&mut buf).expect("d2h");
         assert!(buf.iter().all(|&v| v == 0.0), "fresh cache should be zero");
+    }
+
+    #[test]
+    fn rolling_cache_with_layer_slots_writes_modular_slot() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let n_kv = 1;
+        let head_dim = 4;
+        let max_seq = 16;
+        let model_dim = 4;
+        // Layer 0 linear (size = max_seq), layer 1 rolling (window = 3).
+        let mut cache = KvCacheResident::with_layer_slots(
+            vec![max_seq, 3], n_kv, head_dim, max_seq, model_dim,
+        ).expect("alloc");
+        assert_eq!(cache.layer_slots(0), max_seq);
+        assert_eq!(cache.layer_slots(1), 3);
+
+        let kv_dim = n_kv * head_dim;
+        let batch = HipBatch::new();
+        // Write 5 positions into the rolling layer 1; each carries a
+        // unique scalar so we can detect what survived.
+        for pos in 0..5 {
+            let k_host: Vec<f32> = vec![100.0 + pos as f32; kv_dim];
+            let v_host: Vec<f32> = vec![200.0 + pos as f32; kv_dim];
+            let mut k_dev = GpuVec::try_hip(kv_dim).expect("alloc k");
+            k_dev.copy_from(&k_host);
+            let mut v_dev = GpuVec::try_hip(kv_dim).expect("alloc v");
+            v_dev.copy_from(&v_host);
+            cache.write(&batch, 1, pos, &k_dev, &v_dev).expect("write");
+        }
+        batch.flush().expect("flush");
+
+        // Layer 1 ring (slots=3): position p went to slot p%3, evicting
+        // the oldest. After writing 0..5: slot 0 holds position 3 (most
+        // recent with p%3==0), slot 1 holds position 4, slot 2 holds
+        // position 2.
+        let total = n_kv * 3 * head_dim;
+        let mut full = vec![0.0f32; total];
+        cache.k_dev[1].copy_to_host(&mut full).expect("d2h");
+        assert_eq!(full[0], 103.0, "slot 0 should hold position 3 after eviction");
+        assert_eq!(full[head_dim], 104.0, "slot 1 should hold position 4");
+        assert_eq!(full[2 * head_dim], 102.0, "slot 2 should hold position 2");
     }
 
     #[test]
