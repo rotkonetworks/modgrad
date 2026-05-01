@@ -31,6 +31,14 @@ pub struct CausalSelfAttention {
     num_kv_heads: usize,
     head_dim: usize,
     gqa_ratio: usize,
+    /// Optional learnable per-head attention sink bias (length = num_heads).
+    /// When `Some`, the softmax over each head's scores is extended by one
+    /// "drain" slot whose pre-softmax score equals `sink_bias[h]`. The slot
+    /// has no associated V row, so it acts as a normalisation sponge: mass
+    /// the model would otherwise dump into legitimate tokens flows there
+    /// instead. Composes additively with sliding-window attention.
+    /// Default `None` (no sink — vanilla softmax).
+    pub sink_bias: Option<Vec<f32>>,
 }
 
 impl CausalSelfAttention {
@@ -43,7 +51,19 @@ impl CausalSelfAttention {
             num_kv_heads: config.num_kv_heads.get(),
             head_dim: config.head_dim.get(),
             gqa_ratio: config.gqa_ratio(),
+            sink_bias: None,
         }
+    }
+
+    /// Install a learnable per-head attention sink bias (length must equal
+    /// `num_heads`). The bias enters the softmax as one extra "drain" slot
+    /// per head that has no V contribution. Returns `Self` for builder-style
+    /// chaining. See the `sink_bias` field doc for semantics.
+    pub fn with_sink_bias(mut self, bias: Vec<f32>) -> Self {
+        debug_assert_eq!(bias.len(), self.num_heads,
+            "sink_bias length must equal num_heads");
+        self.sink_bias = Some(bias);
+        self
     }
 
     /// Forward pass for a single token position (decode mode).
@@ -121,8 +141,13 @@ impl CausalSelfAttention {
             // Apply RoPE to Q
             rope.apply(&mut q_normed, position);
 
-            // Compute attention scores
-            let mut scores = vec![f32::NEG_INFINITY; attn_len];
+            // Compute attention scores. With a sink installed we tack one
+            // extra slot onto the end of each head's score vector containing
+            // sink_bias[h]; softmax includes it but the V-sum doesn't —
+            // the sink has no associated V row, so its softmax weight just
+            // normalises out (the "drain" semantics).
+            let sink_slot = self.sink_bias.is_some() as usize;
+            let mut scores = vec![f32::NEG_INFINITY; attn_len + sink_slot];
 
             for t in start..attn_len {
                 // Get cached K for this KV head at position t
@@ -145,12 +170,18 @@ impl CausalSelfAttention {
                 }
                 scores[t] = dot;
             }
+            if let Some(sink) = &self.sink_bias {
+                scores[attn_len] = sink[h];
+            }
 
-            // Causal mask: positions > current are already NEG_INFINITY
-            // Softmax
-            backend.softmax_inplace(&mut scores[start..attn_len]);
+            // Causal mask: positions > current are already NEG_INFINITY.
+            // Softmax over the (windowed range + sink slot if present).
+            let sm_end = attn_len + sink_slot;
+            backend.softmax_inplace(&mut scores[start..sm_end]);
 
-            // Weighted sum of V
+            // Weighted sum of V — only over real positions [start, attn_len).
+            // The sink slot at index `attn_len` has no V row; its softmax
+            // weight simply doesn't contribute.
             head_out.fill(0.0);
             for t in start..attn_len {
                 let v_offset = t * kv_dim + kv_h * d;

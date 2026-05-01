@@ -122,6 +122,13 @@ pub struct AttentionResident {
     /// Zero `[head_dim]` buffer used as bias for matvecs that accept
     /// a bias pointer but expect 0.0 (per-head scoring matvec).
     pub zero_bias_dev: HipBuffer,
+    /// Optional per-head attention sink bias `[num_heads]` on device.
+    /// When `Some`, forward extends each head's softmax by one extra
+    /// "drain" slot whose pre-softmax score equals `sink_bias[h]`. The
+    /// slot has no V contribution. Mirrors `CausalSelfAttention.sink_bias`
+    /// — propagates from there in `from_attention` (and is `None` if the
+    /// host attention has none).
+    pub sink_bias_dev: Option<HipBuffer>,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -165,6 +172,13 @@ impl AttentionResident {
         // dispatches read only the first `out_dim` elements.
         let zero_bias_dev = upload_f32_buffer(&zero_bias)?;
 
+        // Mirror the host's optional sink bias onto device. None on host
+        // → None on device (no extra storage, no extra dispatch).
+        let sink_bias_dev = match &attn.sink_bias {
+            Some(bias) => Some(upload_f32_buffer(bias)?),
+            None => None,
+        };
+
         Ok(Self {
             q_proj: LinearResident::from_linear(&q)?,
             k_proj: LinearResident::from_linear(&k)?,
@@ -172,6 +186,7 @@ impl AttentionResident {
             o_proj: LinearResident::from_linear(&o)?,
             qk_norm_weight_dev,
             zero_bias_dev,
+            sink_bias_dev,
             num_heads: config.num_heads.get(),
             num_kv_heads: config.num_kv_heads.get(),
             head_dim,
@@ -339,11 +354,13 @@ impl AttentionResident {
         }
 
         // Stage 6: batched softmax — `n_rows = num_heads`, but each row is
-        // `windowed_len` wide while the underlying buffer is striped at
-        // `max_seq`. To keep the row layout contiguous we softmax in a
-        // dense `[num_heads × windowed_len]` scratch then copy back. For
-        // the test config (max_seq=16, windowed_len ≤ 16) the gather is
-        // one D2D copy per row — cheap.
+        // `extended_len = windowed_len + sink_slot` wide while the
+        // underlying scoring buffer is strided at `max_seq`. We gather
+        // each head's row into the dense `[num_heads × extended_len]`
+        // tight scratch (one D2D per head), append the sink bias if the
+        // attention has one installed, then softmax over the whole row.
+        let sink_slot = self.sink_bias_dev.is_some() as usize;
+        let extended_len = windowed_len + sink_slot;
         let scores_tight = &scratch.scores_tight;
         let scores_tight_buf = hip_buf(scores_tight)?;
         for h in 0..self.num_heads {
@@ -352,26 +369,43 @@ impl AttentionResident {
                 let src = (scores_base as *const u8)
                     .add(h * max_seq * 4) as *const c_void;
                 let dst = (scores_tight_buf.device_ptr() as *mut u8)
-                    .add(h * windowed_len * 4) as *mut c_void;
+                    .add(h * extended_len * 4) as *mut c_void;
                 hip_memcpy_d2d(dst, src, windowed_len * 4)?;
             }
             batch.note_dispatch()?;
+        }
+        // Append per-head sink bias if installed: one f32 per head copied
+        // from `sink_bias_dev[h]` to `scores_tight[h * extended_len + windowed_len]`.
+        // The slot has no V row, so it acts purely as a softmax drain.
+        if let Some(sink_dev) = self.sink_bias_dev.as_ref() {
+            let sink_base = sink_dev.device_ptr() as *const u8;
+            for h in 0..self.num_heads {
+                unsafe {
+                    use std::os::raw::c_void;
+                    let src = sink_base.add(h * 4) as *const c_void;
+                    let dst = (scores_tight_buf.device_ptr() as *mut u8)
+                        .add((h * extended_len + windowed_len) * 4) as *mut c_void;
+                    hip_memcpy_d2d(dst, src, 4)?;
+                }
+                batch.note_dispatch()?;
+            }
         }
         unsafe {
             softmax_resident(
                 scores_tight_buf.device_ptr() as *const f32,
                 scores_tight_buf.device_ptr() as *mut f32,
-                self.num_heads, windowed_len, false,
+                self.num_heads, extended_len, false,
             )?;
         }
         batch.note_dispatch()?;
 
         // Stage 7: weighted V sum per head, restricted to the window.
         //   head_out[h, :] = softmax[h, :windowed_len] @ V_slab_kv_h[start..attn_len, :]
-        // Using `matmul_resident_tn`: A is `V_slab[start..attn_len × head_dim]`
-        // (read transposed → `[head_dim × windowed_len]`), B is
-        // `softmax[h, :windowed_len]` viewed as `[windowed_len × 1]`, output is
-        // `[head_dim × 1]`. m=head_dim, k=windowed_len, n=1.
+        // The optional sink slot (at column `windowed_len` if present)
+        // has no V row and is skipped in this matmul — its softmax weight
+        // simply doesn't contribute to head_out, matching the host
+        // semantics in `forward_one`. Stride per head is `extended_len`,
+        // not `windowed_len`, when sink is installed.
         let head_out_base = hip_buf(&scratch.head_out)?.device_ptr() as *mut f32;
         let scores_tight_base = scores_tight_buf.device_ptr() as *const f32;
         for h in 0..self.num_heads {
@@ -380,7 +414,7 @@ impl AttentionResident {
             unsafe {
                 matmul_resident_tn(
                     v_slab.add(start * self.head_dim),       // [windowed_len × head_dim]
-                    scores_tight_base.add(h * windowed_len), // [windowed_len × 1]
+                    scores_tight_base.add(h * extended_len), // [windowed_len × 1] (sink column ignored)
                     head_out_base.add(h * self.head_dim),
                     self.head_dim, windowed_len, 1,
                 )?;
@@ -432,7 +466,10 @@ impl AttentionScratch {
             q_normed: GpuVec::try_hip(model_dim)?,
             k_normed: GpuVec::try_hip(kv_dim)?,
             scores: GpuVec::try_hip(num_heads * max_seq)?,
-            scores_tight: GpuVec::try_hip(num_heads * max_seq)?,
+            // +1 column per head reserves a slot for an optional attention
+            // sink. When no sink is installed the extra cells stay unused;
+            // when sink is present softmax runs over `windowed_len + 1`.
+            scores_tight: GpuVec::try_hip(num_heads * (max_seq + 1))?,
             head_out: GpuVec::try_hip(model_dim)?,
             q_normed_host: vec![0.0f32; model_dim],
             k_normed_host: vec![0.0f32; kv_dim],
@@ -3906,6 +3943,157 @@ mod tests {
                   window, n_positions);
         assert!(worst_rel < 5e-3,
             "SWA resident vs host: max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}");
+    }
+
+    /// Attention sink validation: install a non-trivial per-head sink bias
+    /// on both host and resident attention, run multi-position lockstep
+    /// (also with SWA enabled to verify sink composes with windowing),
+    /// and compare outputs. Also asserts the sink actually changes outputs
+    /// vs the no-sink baseline (so we know the bias plumbing is live).
+    #[test]
+    fn attention_resident_matches_host_sink() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let md = config.model_dim.get();
+        let kv_dim = config.num_kv_heads.get() * config.head_dim.get();
+        let max_seq = config.max_seq_len.get();
+        let n_positions: usize = 5;
+        let window: Option<usize> = Some(3);
+        let n_heads = config.num_heads.get();
+
+        let mut rng = modgrad_compute::neuron::SimpleRng::new(0xC0FFEE);
+        let randn = |rng: &mut modgrad_compute::neuron::SimpleRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.next_normal() * 0.05).collect()
+        };
+        let weights = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng, md * md), md, md).unwrap(),
+        };
+        // Per-head sink biases — large enough to noticeably steal mass.
+        let sink_bias: Vec<f32> = (0..n_heads).map(|h| 0.5 + 0.1 * h as f32).collect();
+
+        let attn_no_sink = CausalSelfAttention::new(weights, &config);
+        // Reproduce identical weights for the sinked attention (sink is the
+        // only difference). Use the same seeds.
+        let mut rng2 = modgrad_compute::neuron::SimpleRng::new(0xC0FFEE);
+        let weights2 = AttentionWeights {
+            wq: Tensor2::new(randn(&mut rng2, md * md), md, md).unwrap(),
+            wk: Tensor2::new(randn(&mut rng2, kv_dim * md), kv_dim, md).unwrap(),
+            wv: Tensor2::new(randn(&mut rng2, kv_dim * md), kv_dim, md).unwrap(),
+            wo: Tensor2::new(randn(&mut rng2, md * md), md, md).unwrap(),
+        };
+        let attn_sinked = CausalSelfAttention::new(weights2, &config)
+            .with_sink_bias(sink_bias.clone());
+
+        let resident_sinked = AttentionResident::from_attention(&attn_sinked, &config)
+            .expect("upload");
+        assert!(resident_sinked.sink_bias_dev.is_some(),
+            "sink_bias_dev should be Some after with_sink_bias propagates through from_attention");
+
+        let backend = CpuBackend::new();
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_base);
+
+        // Host KV state for both attentions (we run baseline + sinked
+        // separately to also verify sink actually changes outputs).
+        let mut kv_k = vec![0.0f32; max_seq * kv_dim];
+        let mut kv_v = vec![0.0f32; max_seq * kv_dim];
+        let mut kv_k_baseline = vec![0.0f32; max_seq * kv_dim];
+        let mut kv_v_baseline = vec![0.0f32; max_seq * kv_dim];
+        let mut sinked_host_outs: Vec<Vec<f32>> = Vec::with_capacity(n_positions);
+        let mut baseline_host_outs: Vec<Vec<f32>> = Vec::with_capacity(n_positions);
+
+        let mut kv_cache = KvCacheResident::new(
+            1, config.num_kv_heads.get(), config.head_dim.get(),
+            config.max_seq_len.get(), md,
+        ).expect("alloc kv");
+        let mut x_dev = GpuVec::try_hip(md).expect("alloc x");
+        let mut out_dev = GpuVec::try_hip(md).expect("alloc out");
+        let mut scratch = AttentionScratch::new(
+            n_heads, config.head_dim.get(), kv_dim, config.max_seq_len.get(),
+        ).expect("scratch");
+        let batch = HipBatch::new();
+        let mut sinked_dev_outs: Vec<Vec<f32>> = Vec::with_capacity(n_positions);
+
+        // Use the same input sequence for both runs.
+        let mut rng3 = modgrad_compute::neuron::SimpleRng::new(0xCABBA6E);
+        let inputs: Vec<Vec<f32>> = (0..n_positions).map(|_| randn(&mut rng3, md)).collect();
+
+        for position in 0..n_positions {
+            let host_x = &inputs[position];
+
+            // Sinked host.
+            let mut host_out = vec![0.0f32; md];
+            let mut cur_k = vec![0.0f32; kv_dim];
+            let mut cur_v = vec![0.0f32; kv_dim];
+            attn_sinked.forward_one(
+                host_x, &kv_k, &kv_v,
+                &mut cur_k, &mut cur_v,
+                &rope, position, position + 1, window,
+                &backend, &mut host_out,
+            );
+            kv_k[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_k);
+            kv_v[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_v);
+            sinked_host_outs.push(host_out);
+
+            // Baseline (no-sink) host with the same weights.
+            let mut baseline_out = vec![0.0f32; md];
+            let mut cur_k_b = vec![0.0f32; kv_dim];
+            let mut cur_v_b = vec![0.0f32; kv_dim];
+            attn_no_sink.forward_one(
+                host_x, &kv_k_baseline, &kv_v_baseline,
+                &mut cur_k_b, &mut cur_v_b,
+                &rope, position, position + 1, window,
+                &backend, &mut baseline_out,
+            );
+            kv_k_baseline[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_k_b);
+            kv_v_baseline[position * kv_dim..(position + 1) * kv_dim].copy_from_slice(&cur_v_b);
+            baseline_host_outs.push(baseline_out);
+
+            // Sinked resident.
+            x_dev.copy_from(host_x);
+            resident_sinked.forward(
+                &batch, &x_dev, &mut kv_cache, 0, position, window, &rope,
+                &mut scratch, &mut out_dev,
+            ).expect("resident forward");
+            batch.flush().expect("flush");
+            let mut device_out = vec![0.0f32; md];
+            out_dev.copy_to_host(&mut device_out);
+            sinked_dev_outs.push(device_out);
+        }
+
+        // Sanity 1: sink actually changed the output (else sink isn't wired).
+        let mut max_sink_effect = 0.0f32;
+        for position in 1..n_positions {
+            for (hs, base) in sinked_host_outs[position].iter().zip(baseline_host_outs[position].iter()) {
+                max_sink_effect = max_sink_effect.max((hs - base).abs());
+            }
+        }
+        eprintln!("sink effect on host outputs: max abs Δ vs no-sink = {max_sink_effect}");
+        assert!(max_sink_effect > 1e-4,
+            "sink should perturb outputs vs no-sink baseline; got {max_sink_effect} — wiring broken?");
+
+        // Sanity 2: sinked resident matches sinked host.
+        let mut worst_pos = 0usize;
+        let mut worst_rel = 0.0f32;
+        let mut worst_abs = 0.0f32;
+        for position in 0..n_positions {
+            for (h, &d) in sinked_host_outs[position].iter().zip(sinked_dev_outs[position].iter()) {
+                let abs = (h - d).abs();
+                let scale = h.abs().max(d.abs()).max(1e-6);
+                let rel = abs / scale;
+                if rel > worst_rel { worst_rel = rel; worst_pos = position; }
+                if abs > worst_abs { worst_abs = abs; }
+            }
+        }
+        eprintln!("sink resident vs host: max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}");
+        assert!(worst_rel < 5e-3,
+            "sink resident vs host diverge: max abs {worst_abs}, rel {worst_rel} at pos {worst_pos}");
     }
 
     #[test]
