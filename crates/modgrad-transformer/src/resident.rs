@@ -3547,9 +3547,10 @@ mod tests {
                 let kv_layer = kv.layer(li);
                 let kv_k = kv_layer.k_slice(pos).to_vec();
                 let kv_v = kv_layer.v_slice(pos).to_vec();
+                let window = config.window_size(li_idx);
                 block.attn.forward_one(
                     &normed, &kv_k, &kv_v, &mut cur_k, &mut cur_v,
-                    &model.rope, pos, pos + 1, None,
+                    &model.rope, pos, pos + 1, window,
                     &backend, &mut attn_out,
                 );
                 // Write KV.
@@ -3644,6 +3645,84 @@ mod tests {
         eprintln!("max abs Δ = {max_abs}, max rel Δ = {max_rel}");
         assert!(max_rel < 1e-2,
             "resident vs host logits diverge: max abs {max_abs}, max rel {max_rel}");
+    }
+
+    /// End-to-end SWA validation through GptModelResident: build a 2-layer
+    /// model with `WindowPattern::Custom([Some(W), None])` (mixed SWA + GA,
+    /// the Mimo-style alternation in miniature), run an 8-token decode in
+    /// lockstep host vs resident, and compare logits.
+    #[test]
+    fn gpt_model_resident_decode_matches_host_swa() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let mut config = tiny_config();
+        // Layer 0: SWA(window=3); Layer 1: full attention. Mixed pattern
+        // exercises both code paths inside one model — the resident path
+        // must pick the right window per layer via its `windows[]` table.
+        config.window_pattern = WindowPattern::Custom(vec![3, 0]);
+        let (model, swiglu_mlps) = build_test_model(&config);
+
+        // 8 tokens — enough that the SWA layer's window (3) clips earlier
+        // positions on most steps.
+        let token_ids: Vec<i64> = (0..8).map(|i| (i * 17) as i64 % 256).collect();
+        let positions: Vec<usize> = (0..8).collect();
+
+        let host_kv = KvCache::new(
+            config.num_layers, config.num_kv_heads,
+            config.head_dim, config.model_dim, config.max_seq_len,
+        );
+        let host_kv_prefilled = host_kv.prefill(0);
+        let mut host_kv = host_kv_prefilled.start_decode();
+        let host_logits = host_forward_swiglu(
+            &model, &swiglu_mlps, &token_ids, &positions, &mut host_kv,
+        );
+
+        let mut resident = GptModelResident::from_model(&model, &swiglu_mlps)
+            .expect("upload");
+        // Sanity: layer 0 must be SWA, layer 1 must be full attention.
+        assert_eq!(resident.windows[0], Some(3),
+            "layer 0 should be SWA per WindowPattern::Custom");
+        assert_eq!(resident.windows[1], None,
+            "layer 1 should be full attention per WindowPattern::Custom (0 → None)");
+
+        let mut kv_cache = KvCacheResident::new(
+            config.num_layers.get(),
+            config.num_kv_heads.get(),
+            config.head_dim.get(),
+            config.max_seq_len.get(),
+            config.model_dim.get(),
+        ).expect("alloc kv");
+
+        let n = token_ids.len();
+        let vocab = config.vocab_size.get();
+        let mut logits_dev = GpuVec::try_hip(n * vocab).expect("alloc logits");
+        let batch = HipBatch::new();
+        resident.forward(&batch, &token_ids, &positions, &mut kv_cache, &mut logits_dev)
+            .expect("resident forward");
+        batch.flush().expect("flush");
+
+        let mut device_logits = vec![0.0f32; n * vocab];
+        logits_dev.copy_to_host(&mut device_logits);
+
+        let mut max_rel = 0.0f32;
+        let mut max_abs = 0.0f32;
+        let mut worst_pos = 0usize;
+        for (t, host_row) in host_logits.iter().enumerate() {
+            for (v, &h) in host_row.iter().enumerate() {
+                let d = device_logits[t * vocab + v];
+                let abs = (h - d).abs();
+                let scale = h.abs().max(d.abs()).max(1e-6);
+                let rel = abs / scale;
+                if rel > max_rel { max_rel = rel; worst_pos = t; }
+                if abs > max_abs { max_abs = abs; }
+            }
+        }
+        eprintln!("SWA model: max abs Δ = {max_abs}, max rel Δ = {max_rel} at pos {worst_pos}");
+        assert!(max_rel < 1e-2,
+            "SWA resident vs host logits diverge: max abs {max_abs}, max rel {max_rel} at pos {worst_pos}");
     }
 
     #[test]
