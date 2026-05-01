@@ -53,6 +53,7 @@ use crate::cross_attn::CrossAttention;
 use crate::decoder::LocalDecoderConfig;
 use crate::encoder::LocalEncoderConfig;
 use crate::model::{BltConfig, BltLatentConfig, BltModel};
+use modgrad_transformer::config::WindowPattern;
 
 // ─── Constants ────────────────────────────────────────────────
 
@@ -321,6 +322,10 @@ fn read_config<R: Read>(r: &mut R) -> Result<BltConfig, CheckpointError> {
         ngram_min_n: read_u64(r)? as usize,
         ngram_max_n: read_u64(r)? as usize,
         ngram_vocab_per_n: read_u64(r)? as usize,
+        // window_pattern not yet persisted in checkpoint format; default
+        // to Full so existing checkpoints round-trip unchanged. Add a
+        // serialized variant when SWA-byte is actually used.
+        window_pattern: WindowPattern::Full,
     };
 
     // Latent: patch_dim is implied by encoder.patch_dim (validated via
@@ -353,6 +358,8 @@ fn read_config<R: Read>(r: &mut R) -> Result<BltConfig, CheckpointError> {
         norm_eps: read_f32(r)?,
         rope_base: read_f32(r)?,
         max_seq_len: read_u64(r)? as usize,
+        // window_pattern not yet persisted; default to Full (see encoder).
+        window_pattern: WindowPattern::Full,
     };
 
     Ok(BltConfig { encoder, latent, decoder })
@@ -598,6 +605,7 @@ mod tests {
                 max_seq_len: max_seq,
                 ngram_min_n: 3, ngram_max_n: 5,
                 ngram_vocab_per_n: 256,
+                window_pattern: WindowPattern::Full,
             },
             latent: BltLatentConfig {
                 n_layers: 2, patch_dim,
@@ -612,6 +620,7 @@ mod tests {
                 mlp_dim: byte_dim * 2,
                 norm_eps: 1e-5, rope_base: 10_000.0,
                 max_seq_len: max_seq,
+                window_pattern: WindowPattern::Full,
             },
         }
     }

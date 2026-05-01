@@ -23,6 +23,7 @@ use modgrad_blt::cerebellum::BltCerebellum;
 use modgrad_blt::decoder::LocalDecoderConfig;
 use modgrad_blt::encoder::LocalEncoderConfig;
 use modgrad_blt::model::{BltConfig, BltLatentConfig, BltModel};
+use modgrad_transformer::config::WindowPattern;
 use modgrad_ctm::cerebellum::{cerebellum_at_position, CerebProjection};
 use modgrad_device::backend::rocm::ffi::runtime_available;
 use modgrad_traits::cerebellum::FrozenCerebellum;
@@ -84,6 +85,7 @@ fn main() {
             ngram_min_n: NGRAM_MIN_N,
             ngram_max_n: NGRAM_MAX_N,
             ngram_vocab_per_n: NGRAM_VOCAB_PER_N,
+            window_pattern: WindowPattern::Full,
         },
         latent: BltLatentConfig {
             n_layers: N_LAYERS_LATENT,
@@ -105,6 +107,7 @@ fn main() {
             norm_eps: NORM_EPS,
             rope_base: ROPE_BASE,
             max_seq_len: MAX_SEQ_LEN,
+            window_pattern: WindowPattern::Full,
         },
     };
 

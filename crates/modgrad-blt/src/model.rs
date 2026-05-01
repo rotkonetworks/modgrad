@@ -1875,6 +1875,7 @@ mod tests {
                 ngram_min_n: 3,
                 ngram_max_n: 5,
                 ngram_vocab_per_n: 256,
+                window_pattern: WindowPattern::Full,
             },
             latent: BltLatentConfig {
                 n_layers: 2,
@@ -1896,6 +1897,7 @@ mod tests {
                 norm_eps: 1e-5,
                 rope_base: 10_000.0,
                 max_seq_len: max_seq,
+                window_pattern: WindowPattern::Full,
             },
         }
     }

@@ -79,6 +79,12 @@ pub struct LocalEncoderConfig {
     pub ngram_max_n: usize,
     /// Per-n hash table size. Paper §3.2.1 uses ~500K.
     pub ngram_vocab_per_n: usize,
+    /// Sliding-window attention pattern for the byte-level layers.
+    /// Defaults to `WindowPattern::Full` (no SWA) to match BLT's typical
+    /// byte-side configuration. Set to ::Sssl or ::Custom to enable SWA
+    /// per-layer; the encoder derives `byte_windows[]` from this at
+    /// construction and threads it through forward.
+    pub window_pattern: WindowPattern,
 }
 
 impl LocalEncoderConfig {
@@ -127,7 +133,7 @@ impl LocalEncoderConfig {
             rope_base: self.rope_base,
             qk_norm_scale: 1.0,
             use_qk_norm: false,
-            window_pattern: WindowPattern::Full,
+            window_pattern: self.window_pattern.clone(),
             mlp_activation: MlpActivation::SwiGlu,
             layer_overrides: Vec::new(),
             tie_embeddings: false,
@@ -164,6 +170,11 @@ pub struct LocalEncoder {
     pub ngram: NgramHashEmbeddings,
     /// `lE` byte-level transformer blocks.
     pub byte_layers: Vec<TransformerBlockResident>,
+    /// Per-byte-layer attention window (`None` = full attention). Derived
+    /// from `LocalEncoderConfig::window_pattern` at construction so the
+    /// pattern lives at the right scope: the encoder owns the byte-side
+    /// windowing decision; individual blocks stay config-agnostic.
+    pub byte_windows: Vec<Option<usize>>,
     /// One cross-attention bridge per byte layer.
     pub cross_attns: Vec<CrossAttention>,
     /// Byte-level KV cache. One slab per byte layer.
@@ -246,6 +257,13 @@ impl LocalEncoder {
             byte_layers.push(resident);
         }
 
+        // ── Per-layer windows from gpt_config (mirrors GptModelResident) ──
+        let byte_windows: Vec<Option<usize>> = (0..n_layers)
+            .map(|li| gpt_config.window_size(
+                LayerIdx::new(li, gpt_config.num_layers).unwrap()
+            ))
+            .collect();
+
         // ── Cross-attention bridges ──
         let cross_cfg = CrossAttnConfig {
             byte_dim,
@@ -282,6 +300,7 @@ impl LocalEncoder {
             byte_embed_dev,
             ngram,
             byte_layers,
+            byte_windows,
             cross_attns,
             byte_kv_cache,
             rope,
@@ -356,7 +375,8 @@ impl LocalEncoder {
         // Initial byte_reps = augmented embeddings.
         upload_byte_reps(&augmented, n_bytes, byte_dim, &mut scratch.byte_reps)?;
 
-        for (block, cross) in self.byte_layers.iter().zip(self.cross_attns.iter()) {
+        for (li, (block, cross)) in self.byte_layers.iter().zip(self.cross_attns.iter()).enumerate() {
+            let window = self.byte_windows[li];
             // Per-byte forward through this block. We reload `hidden_dev`
             // from the current byte_reps slab so each token sees the
             // post-previous-layer state.
@@ -366,16 +386,13 @@ impl LocalEncoder {
                 )?;
                 batch.note_dispatch()?;
 
-                // TODO(swa-byte): BLT byte layers are full-attention today;
-                // wire per-layer windows here if BLT needs SWA at the byte
-                // level (would mirror `GptModelResident::windows`).
                 block.forward(
                     batch,
                     &mut hidden_dev,
                     &x0_dev,
                     &mut self.byte_kv_cache,
                     t,
-                    None,
+                    window,
                     &self.rope,
                     &mut scratch.attn_scratch,
                     &mut scratch.mlp_scratch,
@@ -734,22 +751,20 @@ impl LocalEncoder {
 
         for (li, (block, cross)) in self.byte_layers.iter()
             .zip(self.cross_attns.iter()).enumerate() {
+            let window = self.byte_windows[li];
             for t in 0..n_bytes {
                 copy_byte_rep_to_hidden(
                     &scratch.byte_reps, t, byte_dim, &mut hidden_dev,
                 )?;
                 batch.note_dispatch()?;
 
-                // TODO(swa-byte): BLT byte layers are full-attention today;
-                // wire per-layer windows here if BLT needs SWA at the byte
-                // level (would mirror `GptModelResident::windows`).
                 block.forward_for_backward(
                     batch,
                     &mut hidden_dev,
                     &x0_dev,
                     &mut self.byte_kv_cache,
                     t,
-                    None,
+                    window,
                     &self.rope,
                     &mut scratch.attn_scratch,
                     &mut scratch.mlp_scratch,
@@ -1249,6 +1264,7 @@ mod tests {
             ngram_min_n: 3,
             ngram_max_n: 4,
             ngram_vocab_per_n: 16,
+            window_pattern: WindowPattern::Full,
         };
 
         let mut encoder = match LocalEncoder::new(cfg.clone()) {
@@ -1339,6 +1355,7 @@ mod tests {
             ngram_min_n: 3,
             ngram_max_n: 4,
             ngram_vocab_per_n: 16,
+            window_pattern: WindowPattern::Full,
         };
 
         let mut encoder = match LocalEncoder::new(cfg.clone()) {

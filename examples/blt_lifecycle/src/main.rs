@@ -30,6 +30,7 @@ use modgrad_blt::checkpoint::{load_blt_model_from_path, save_blt_model};
 use modgrad_blt::decoder::LocalDecoderConfig;
 use modgrad_blt::encoder::LocalEncoderConfig;
 use modgrad_blt::model::{BltConfig, BltLatentConfig, BltModel, BltScratch};
+use modgrad_transformer::config::WindowPattern;
 use modgrad_blt::trainer::{BltModelTrainer, BltTrainerConfig};
 use modgrad_device::backend::HipBatch;
 use modgrad_device::backend::rocm::ffi::runtime_available;
@@ -97,6 +98,7 @@ fn build_config() -> BltConfig {
             ngram_min_n: 3,
             ngram_max_n: 5,
             ngram_vocab_per_n: 256,
+            window_pattern: WindowPattern::Full,
         },
         latent: BltLatentConfig {
             n_layers: 2,
@@ -118,6 +120,7 @@ fn build_config() -> BltConfig {
             norm_eps: 1e-5,
             rope_base: 10_000.0,
             max_seq_len: MAX_SEQ,
+            window_pattern: WindowPattern::Full,
         },
     }
 }

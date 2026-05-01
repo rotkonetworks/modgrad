@@ -14,6 +14,7 @@ use modgrad_blt::decoder::LocalDecoderConfig;
 use modgrad_blt::encoder::LocalEncoderConfig;
 use modgrad_blt::model::{BltConfig, BltLatentConfig, BltModel};
 use modgrad_blt::trainer::{BltModelTrainer, BltTrainerConfig};
+use modgrad_transformer::config::WindowPattern;
 use modgrad_device::backend::rocm::ffi::runtime_available;
 
 fn main() {
@@ -54,6 +55,7 @@ fn main() {
             ngram_min_n: 3,
             ngram_max_n: 5,
             ngram_vocab_per_n: 256,
+            window_pattern: WindowPattern::Full,
         },
         latent: BltLatentConfig {
             n_layers: 2,
@@ -75,6 +77,7 @@ fn main() {
             norm_eps: 1e-5,
             rope_base: 10_000.0,
             max_seq_len: max_seq,
+            window_pattern: WindowPattern::Full,
         },
     };
     blt_cfg.validate().expect("tiny BLT config validates");
