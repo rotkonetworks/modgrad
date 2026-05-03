@@ -139,11 +139,38 @@ fn train_linear_probe(
     (train_acc, eval_acc)
 }
 
-fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "cifar".to_string());
-    eprintln!("cifar10_probe: mode={mode}");
+/// k-NN classification in V4 space. For each query, find k nearest
+/// references by Euclidean distance, return majority-vote label.
+/// Used for the held-out-class transfer test: if priors-on V4 clusters
+/// images of UNSEEN classes more semantically than random V4 does, the
+/// priors generalise beyond the classes any classifier was trained on.
+fn knn_accuracy(
+    refs: &[f32], ref_labs: &[usize],
+    queries: &[f32], query_labs: &[usize],
+    k: usize,
+) -> f32 {
+    let n_ref = ref_labs.len();
+    let n_q = query_labs.len();
+    let mut correct = 0usize;
+    for q in 0..n_q {
+        let qf = &queries[q * FEAT_DIM..(q + 1) * FEAT_DIM];
+        let mut dists: Vec<(f32, usize)> = (0..n_ref).map(|r| {
+            let rf = &refs[r * FEAT_DIM..(r + 1) * FEAT_DIM];
+            let d2: f32 = qf.iter().zip(rf).map(|(a, b)| (a - b).powi(2)).sum();
+            (d2, ref_labs[r])
+        }).collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut votes = [0usize; N_CLASSES];
+        for &(_, lab) in dists.iter().take(k) { votes[lab] += 1; }
+        let pred = (0..N_CLASSES).max_by_key(|&c| votes[c]).unwrap();
+        if pred == query_labs[q] { correct += 1; }
+    }
+    correct as f32 / n_q as f32
+}
 
-    let cortex = match mode.as_str() {
+fn run_one(mode: &str) -> (f32, f32, f32) {
+    eprintln!("\n────────── mode = {mode} ──────────");
+    let cortex = match mode {
         "cifar"  => { eprintln!("  cortex: VisualCortex::cifar() (standard priors)"); VisualCortex::cifar() }
         "random" => { eprintln!("  cortex: VisualCortex::random(32, 32) (no priors)"); VisualCortex::random(32, 32) }
         other    => panic!("unknown mode '{other}', want cifar|random"),
@@ -151,19 +178,86 @@ fn main() {
 
     let train = load_feat(TRAIN_PATH).expect("load train .feat");
     let eval  = load_feat(EVAL_PATH).expect("load eval .feat");
-    eprintln!("  loaded {} train + {} eval", train.len(), eval.len());
 
     let (train_feat, train_lab) = extract_features(&cortex, &train);
     let (eval_feat,  eval_lab)  = extract_features(&cortex, &eval);
-    eprintln!("  extracted V4 features: {} train, {} eval, dim={FEAT_DIM}",
-              train_lab.len(), eval_lab.len());
 
-    eprintln!("\n=== linear probe training ===");
-    let (train_acc, eval_acc) = train_linear_probe(
+    // ── Test 1: linear probe over all 10 classes (in-distribution) ──
+    eprintln!("test 1 — linear probe, all 10 classes:");
+    let (_, eval_acc_all) = train_linear_probe(
         &train_feat, &train_lab, &eval_feat, &eval_lab,
     );
+
+    // ── Test 2: k-NN classification on UNSEEN classes (held-out, generalization) ──
+    // Split classes into "seen" (0..5) and "unseen" (5..10). The probe
+    // never saw the unseen-class images at all; we ask whether V4
+    // features cluster the unseen classes by semantic content. If yes,
+    // the visual representation generalises beyond the classes any
+    // classifier was trained on.
+    let unseen_lo = 5;
+    let unseen_hi = 10;
+    let pick = |feats: &[f32], labs: &[usize]| -> (Vec<f32>, Vec<usize>) {
+        let mut f_sub = Vec::new();
+        let mut l_sub = Vec::new();
+        for (i, &l) in labs.iter().enumerate() {
+            if l >= unseen_lo && l < unseen_hi {
+                f_sub.extend_from_slice(&feats[i * FEAT_DIM..(i + 1) * FEAT_DIM]);
+                l_sub.push(l);
+            }
+        }
+        (f_sub, l_sub)
+    };
+    let (un_train_f, un_train_l) = pick(&train_feat, &train_lab);
+    let (un_eval_f,  un_eval_l)  = pick(&eval_feat,  &eval_lab);
     eprintln!(
-        "\n=== {} ===  final train_acc={:.1}%  eval_acc={:.1}%  (chance={:.1}%)",
-        mode, train_acc * 100.0, eval_acc * 100.0, 100.0 / N_CLASSES as f32,
+        "test 2 — k-NN(k=5) within unseen classes [{}..{}): {} train refs, {} eval queries",
+        unseen_lo, unseen_hi, un_train_l.len(), un_eval_l.len(),
     );
+    let knn_unseen = knn_accuracy(&un_train_f, &un_train_l, &un_eval_f, &un_eval_l, 5);
+    let unseen_chance = 1.0 / (unseen_hi - unseen_lo) as f32;
+
+    // ── Test 3: k-NN within SEEN classes for comparison (in-distribution baseline for k-NN) ──
+    let pick_seen = |feats: &[f32], labs: &[usize]| -> (Vec<f32>, Vec<usize>) {
+        let mut f_sub = Vec::new();
+        let mut l_sub = Vec::new();
+        for (i, &l) in labs.iter().enumerate() {
+            if l < unseen_lo {
+                f_sub.extend_from_slice(&feats[i * FEAT_DIM..(i + 1) * FEAT_DIM]);
+                l_sub.push(l);
+            }
+        }
+        (f_sub, l_sub)
+    };
+    let (s_train_f, s_train_l) = pick_seen(&train_feat, &train_lab);
+    let (s_eval_f,  s_eval_l)  = pick_seen(&eval_feat,  &eval_lab);
+    let knn_seen = knn_accuracy(&s_train_f, &s_train_l, &s_eval_f, &s_eval_l, 5);
+
+    eprintln!(
+        "  results: linear-probe 10cls eval={:.1}% | k-NN seen[0..5)={:.1}% | k-NN unseen[5..10)={:.1}% (chance={:.1}%)",
+        eval_acc_all * 100.0, knn_seen * 100.0, knn_unseen * 100.0, unseen_chance * 100.0,
+    );
+
+    (eval_acc_all, knn_seen, knn_unseen)
+}
+
+fn main() {
+    let mode_arg = std::env::args().nth(1).unwrap_or_else(|| "compare".to_string());
+
+    if mode_arg == "compare" {
+        let (l_c, ks_c, ku_c) = run_one("cifar");
+        let (l_r, ks_r, ku_r) = run_one("random");
+
+        eprintln!("\n══════════════════════════════════════════════════════════");
+        eprintln!("                           cifar    random   Δ");
+        eprintln!("──────────────────────────────────────────────────────────");
+        eprintln!("  linear probe, 10cls       {:5.1}%   {:5.1}%   {:+5.1} pp",
+                  l_c * 100.0, l_r * 100.0, (l_c - l_r) * 100.0);
+        eprintln!("  k-NN, seen [0..5)         {:5.1}%   {:5.1}%   {:+5.1} pp",
+                  ks_c * 100.0, ks_r * 100.0, (ks_c - ks_r) * 100.0);
+        eprintln!("  k-NN, UNSEEN [5..10)      {:5.1}%   {:5.1}%   {:+5.1} pp   ← generalization",
+                  ku_c * 100.0, ku_r * 100.0, (ku_c - ku_r) * 100.0);
+        eprintln!("══════════════════════════════════════════════════════════");
+    } else {
+        run_one(&mode_arg);
+    }
 }
