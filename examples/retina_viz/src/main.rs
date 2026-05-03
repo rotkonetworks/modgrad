@@ -612,6 +612,11 @@ fn main() -> std::io::Result<()> {
     // activations from a pretrained cortex on the test maze. Result
     // goes to <out-dir>/loaded/.
     let mut load_path: Option<String> = None;
+    // --imagenet PATH: skip mazes entirely; load N RGB images from a
+    // preprocessed ImageNet binary (see imagenet_preprocess.py) and
+    // run them through `VisualCortex::imagenet()`. One subdir per
+    // image + the same diagnostic prints as the maze conditions.
+    let mut imagenet_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -624,6 +629,7 @@ fn main() -> std::io::Result<()> {
             "--integration" => { integration = args[i+1].parse().unwrap(); i += 2; }
             "--out-dir" => { out_root = args[i+1].clone(); i += 2; }
             "--load" => { load_path = Some(args[i+1].clone()); i += 2; }
+            "--imagenet" => { imagenet_path = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!(
 "Usage: retina_viz [--size N (odd, ≥5)] [--seed N] [--upscale N]
@@ -658,6 +664,41 @@ Flat or pure noise tiles = broken layer.
     let pixels = maze_pixels(&cells, size);
 
     eprintln!("retina_viz: size={size} seed={seed} upscale={upscale}");
+
+    // ── --imagenet mode: dump activations from real ImageNet RGB photos. ──
+    // Bypasses the maze pipeline entirely; uses `VisualCortex::imagenet()`
+    // (224×224, stride-2 V1/V2/V4) on a binary written by
+    // `imagenet_preprocess.py` (header: u32 n, u32 h, u32 w, then
+    // n × 3 × h × w f32 pixels in [0, 1] CHW).
+    if let Some(path) = &imagenet_path {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut hdr = [0u8; 12];
+        f.read_exact(&mut hdr)?;
+        let n  = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        let ih = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let iw = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        eprintln!("[imagenet] {n} images at {ih}×{iw}, source: {path}");
+        let mut buf = vec![0u8; n * 3 * ih * iw * 4];
+        f.read_exact(&mut buf)?;
+        let pixels: Vec<f32> = buf.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let cortex = VisualCortex::new(ih, iw);
+        for img_idx in 0..n {
+            let img = &pixels[img_idx * 3 * ih * iw..(img_idx + 1) * 3 * ih * iw];
+            let label = format!("img{img_idx:02}");
+            let out_dir = root.join(&label);
+            // Use a small per-tile upscale here — output PPM size grows
+            // ~quadratically with input resolution, which is already 224.
+            let imagenet_upscale = 1usize;
+            dump_condition(&label, &cortex, img, &out_dir, imagenet_upscale)?;
+        }
+        eprintln!("\ndone.  open {}/img00/combined.ppm to see the first photo's V1/V2/V4.",
+                  root.display());
+        return Ok(());
+    }
 
     // ── --load mode: dump activations from a pretrained file, no training. ──
     if let Some(path) = &load_path {
