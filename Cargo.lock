@@ -2665,6 +2665,8 @@ name = "modgrad-attribution"
 version = "0.1.0"
 dependencies = [
  "modgrad-compute",
+ "modgrad-ctm",
+ "modgrad-traits",
  "serde",
 ]
 

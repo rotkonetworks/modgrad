@@ -8,3 +8,10 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 modgrad-compute = { path = "../modgrad-compute" }
+
+[dev-dependencies]
+# Integration test wiring: build a tiny brain, extract per-sample
+# gradients, prove the attribution pipeline works end-to-end on real
+# RegionalGradients. modgrad-attribution itself stays modality-agnostic.
+modgrad-ctm = { path = "../modgrad-ctm" }
+modgrad-traits = { path = "../modgrad-traits" }
