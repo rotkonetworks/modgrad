@@ -203,6 +203,16 @@ impl BlockGrads {
         for (d, s) in self.d_gamma.iter_mut().zip(&other.d_gamma) { *d += *s; }
         for (d, s) in self.d_beta.iter_mut().zip(&other.d_beta) { *d += *s; }
     }
+
+    /// Append every gradient slice into `buf` in a stable order.
+    /// Used by the public flatten path on RegionalGradients for
+    /// data-attribution gradient extraction.
+    fn flatten_into(&self, buf: &mut Vec<f32>) {
+        buf.extend_from_slice(&self.d_weight);
+        buf.extend_from_slice(&self.d_bias);
+        buf.extend_from_slice(&self.d_gamma);
+        buf.extend_from_slice(&self.d_beta);
+    }
 }
 
 fn block_forward_cached(block: &SynapseBlock, x: &[f32]) -> (Vec<f32>, BlockCache) {
@@ -281,6 +291,18 @@ impl UNetGrads {
             for (g, d) in unet.skip_ln_gamma[i].iter_mut().zip(dg) { *g -= lr * d; }
             for (b, d) in unet.skip_ln_beta[i].iter_mut().zip(db) { *b -= lr * d; }
         }
+    }
+
+    /// Append every UNet gradient slice into `buf` in stable order:
+    /// first projection, then down blocks (in declaration order), up
+    /// blocks, skip layer-norm scale, skip layer-norm shift. Used by
+    /// the public flatten path on RegionalGradients.
+    pub fn flatten_into(&self, buf: &mut Vec<f32>) {
+        self.first.flatten_into(buf);
+        for d in &self.downs { d.flatten_into(buf); }
+        for u in &self.ups { u.flatten_into(buf); }
+        for g in &self.skip_d_gamma { buf.extend_from_slice(g); }
+        for b in &self.skip_d_beta { buf.extend_from_slice(b); }
     }
 
     /// Element-wise accumulate `other`'s per-block gradients into
@@ -834,6 +856,36 @@ impl CtmGradients {
         self.out_proj_b.fill(0.0);
         if let Some(w) = &mut self.exit_gate_w { w.fill(0.0); }
         if let Some(b) = &mut self.exit_gate_b { b.fill(0.0); }
+    }
+
+    /// Append every gradient in this region's CtmGradients into `buf`
+    /// in stable order. Optional fields are skipped when `None`; for a
+    /// fixed model configuration the resulting length is constant
+    /// across calls (so the same projection matrix can be reused).
+    pub fn flatten_into(&self, buf: &mut Vec<f32>) {
+        self.unet.flatten_into(buf);
+        buf.extend_from_slice(&self.nlm_s1_w);
+        buf.extend_from_slice(&self.nlm_s1_b);
+        if let Some(w) = &self.nlm_s2_w { buf.extend_from_slice(w); }
+        if let Some(b) = &self.nlm_s2_b { buf.extend_from_slice(b); }
+        buf.extend_from_slice(&self.d_start_activated);
+        buf.extend_from_slice(&self.d_start_trace);
+        buf.extend_from_slice(&self.kv_proj_w);
+        buf.extend_from_slice(&self.kv_proj_b);
+        buf.extend_from_slice(&self.kv_ln_d_gamma);
+        buf.extend_from_slice(&self.kv_ln_d_beta);
+        buf.extend_from_slice(&self.q_proj_w);
+        buf.extend_from_slice(&self.q_proj_b);
+        buf.extend_from_slice(&self.mha_in_w);
+        buf.extend_from_slice(&self.mha_in_b);
+        buf.extend_from_slice(&self.mha_out_w);
+        buf.extend_from_slice(&self.mha_out_b);
+        buf.extend_from_slice(&self.d_decay_out);
+        buf.extend_from_slice(&self.d_decay_action);
+        buf.extend_from_slice(&self.out_proj_w);
+        buf.extend_from_slice(&self.out_proj_b);
+        if let Some(w) = &self.exit_gate_w { buf.extend_from_slice(w); }
+        if let Some(b) = &self.exit_gate_b { buf.extend_from_slice(b); }
     }
 
     /// Diagnostic: L2 norm across all public weight gradient fields of this region.

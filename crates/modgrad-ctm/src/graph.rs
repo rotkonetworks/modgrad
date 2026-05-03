@@ -484,6 +484,19 @@ impl RouterGradients {
         // Scratch buffers are fresh-zeroed at the start of each backward
         // call, not here — keeping `zero()` as "reset accumulators" only.
     }
+
+    /// Append router accumulator gradients into `buf` in stable order.
+    /// Scratch buffers are intentionally excluded — they hold transient
+    /// per-call state, not a learnable parameter's gradient.
+    pub fn flatten_into(&self, buf: &mut Vec<f32>) {
+        for v in &self.to_route_dw { buf.extend_from_slice(v); }
+        for v in &self.to_route_db { buf.extend_from_slice(v); }
+        for v in &self.from_route_dw { buf.extend_from_slice(v); }
+        for v in &self.from_route_db { buf.extend_from_slice(v); }
+        buf.extend_from_slice(&self.tick_embed_grad);
+        buf.extend_from_slice(&self.route_proj_dw);
+        buf.extend_from_slice(&self.route_proj_db);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
@@ -2294,6 +2307,49 @@ impl RegionalGradients {
         if let Some(w) = &mut self.cereb_proj_out_dw { w.fill(0.0); }
         if let Some(b) = &mut self.cereb_proj_out_db { b.fill(0.0); }
         if let Some(s) = &mut self.cereb_blend_scale_grad { *s = 0.0; }
+    }
+
+    /// Append every parameter gradient owned by this struct into `buf`
+    /// in a stable order. The order is: embedding, then per-region CTM
+    /// gradients (in declaration order), then connection synapses,
+    /// observation/output projections, global decay, optional sub-heads
+    /// (outer exit gate, router, cereb predict, BG value, cereb projection)
+    /// in the field declaration order. Optional fields are skipped when
+    /// `None`; for a fixed model configuration the resulting length is
+    /// constant across calls.
+    ///
+    /// Used by data attribution to extract a per-example gradient vector
+    /// suitable for Johnson-Lindenstrauss projection (see crate
+    /// `modgrad-attribution`).
+    pub fn flatten_into(&self, buf: &mut Vec<f32>) {
+        buf.extend_from_slice(&self.embed_grad);
+        for rg in &self.region_grads { rg.flatten_into(buf); }
+        for dw in &self.connection_dw { buf.extend_from_slice(dw); }
+        for db in &self.connection_db { buf.extend_from_slice(db); }
+        buf.extend_from_slice(&self.obs_proj_dw);
+        buf.extend_from_slice(&self.obs_proj_db);
+        buf.extend_from_slice(&self.global_decay_grad);
+        buf.extend_from_slice(&self.output_proj_dw);
+        buf.extend_from_slice(&self.output_proj_db);
+        if let Some(w) = &self.outer_exit_gate_dw { buf.extend_from_slice(w); }
+        if let Some(b) = &self.outer_exit_gate_db { buf.extend_from_slice(b); }
+        if let Some(rg) = &self.router_grads { rg.flatten_into(buf); }
+        if let Some(w) = &self.cereb_predict_dw { buf.extend_from_slice(w); }
+        if let Some(b) = &self.cereb_predict_db { buf.extend_from_slice(b); }
+        if let Some(w) = &self.bg_value_dw { buf.extend_from_slice(w); }
+        if let Some(b) = &self.bg_value_db { buf.extend_from_slice(b); }
+        if let Some(w) = &self.cereb_proj_out_dw { buf.extend_from_slice(w); }
+        if let Some(b) = &self.cereb_proj_out_db { buf.extend_from_slice(b); }
+        if let Some(s) = &self.cereb_blend_scale_grad { buf.push(*s); }
+    }
+
+    /// Convenience over [`Self::flatten_into`] returning a fresh `Vec<f32>`.
+    /// Prefer `flatten_into` on the hot path — caller can reuse the
+    /// allocation across samples.
+    pub fn flatten(&self) -> Vec<f32> {
+        let mut buf = Vec::new();
+        self.flatten_into(&mut buf);
+        buf
     }
 
     /// Diagnostic: L2 norm of the weight-gradient payload for each region.
@@ -6778,5 +6834,54 @@ mod tests {
         eprintln!("  host U-Net l2     = {host_unet_l2:.6}");
         eprintln!("  resident U-Net l2 = {res_unet_l2:.6}");
         eprintln!("  ratio             = {ratio:.4}");
+    }
+
+    /// Data-attribution support: flattening RegionalGradients must
+    /// produce a stable-length, non-empty Vec<f32> for a fixed brain
+    /// configuration. Two calls on the same struct return
+    /// the same length (so a JL projection matrix can be reused
+    /// across samples), and a backward pass that wrote some non-zero
+    /// gradients leaves at least one non-zero entry in the flattened
+    /// vector (so projection has signal to work with).
+    #[test]
+    fn flatten_regional_gradients_is_stable_and_carries_signal() {
+        let token_dim = 16usize;
+        let n_tokens = 4usize;
+        let out_dims = 64usize;
+        let ticks = 2usize;
+        let cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
+        let w = RegionalWeights::new(cfg);
+
+        let zero_grads = RegionalGradients::zeros(&w);
+        let len_a = zero_grads.flatten().len();
+        let len_b = zero_grads.flatten().len();
+        assert_eq!(len_a, len_b,
+            "flatten length must be stable across calls on the same struct");
+        assert!(len_a > 0, "flatten produced an empty vector — no parameters?");
+
+        // Run a real backward to populate gradients with non-zero values.
+        let tokens = modgrad_traits::TokenInput {
+            tokens: (0..n_tokens * token_dim).map(|i| (i as f32 * 0.01).sin()).collect(),
+            n_tokens,
+            token_dim,
+        };
+        let state = <RegionalBrain as modgrad_traits::Brain>::init_state(&w);
+        let (output, _state, cache) =
+            <RegionalBrain as modgrad_traits::Brain>::forward_cached(&w, state, &tokens);
+        let d_preds: Vec<Vec<f32>> = output.predictions.iter()
+            .map(|p| p.iter().map(|&v| v * 1e-3).collect()).collect();
+        let (grads, _) = RegionalBrain::backward_with_input_grad(&w, cache, &d_preds);
+
+        let flat = grads.flatten();
+        assert_eq!(flat.len(), len_a,
+            "post-backward flatten length must match zero-grads flatten length");
+        let nonzero = flat.iter().filter(|v| v.abs() > 0.0).count();
+        assert!(nonzero > 0,
+            "backward produced no non-zero flattened gradient — JL projection \
+             would have nothing to attribute");
+        eprintln!(
+            "RegionalGradients flatten: dim = {}, nonzero = {} ({:.1}%)",
+            len_a, nonzero, 100.0 * nonzero as f32 / len_a as f32,
+        );
     }
 }
