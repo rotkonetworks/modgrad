@@ -3475,6 +3475,140 @@ impl GptModelResident {
 
         Ok(())
     }
+
+    /// Forward with a pre-embedded prefix prepended before the text
+    /// tokens. The prefix is `n_prefix` tokens already in `model_dim`
+    /// embedding space — typically the output of a vision projector
+    /// (see `modgrad_codec::vlm_projector::VisualProjector`) so a frozen
+    /// LLM can consume "visual tokens" without going through its
+    /// embedding table. This is the canonical small-VLM connector
+    /// pattern used by Idefics3 / SmolVLM / LLaVA-OneVision /
+    /// Qwen2.5-VL.
+    ///
+    /// `prefix_embeds`: `[n_prefix × model_dim]` flat row-major,
+    /// already on device.
+    /// `token_ids`: text tokens **after** the prefix.
+    /// `positions`: for ALL `n_prefix + token_ids.len()` positions, in
+    /// causal order (prefix first). Caller picks the position scheme;
+    /// e.g. `0..total` for fresh decode.
+    /// `logits_out`: `[(n_prefix + n_text) × vocab]` — contains logits
+    /// at every position, including prefix positions (caller can
+    /// ignore those if not needed).
+    ///
+    /// TODO: refactor with `forward` to share the inner loop once a
+    /// third variant lands. Current duplication is deliberate — one
+    /// variant is hard to be wrong about; three would tempt over-
+    /// abstraction.
+    pub fn forward_with_prefix(
+        &mut self,
+        batch: &HipBatch,
+        prefix_embeds: &GpuVec,
+        n_prefix: usize,
+        token_ids: &[i64],
+        positions: &[usize],
+        kv_cache: &mut KvCacheResident,
+        logits_out: &mut GpuVec,
+    ) -> Result<(), ResidencyError> {
+        let n_text = token_ids.len();
+        let n_total = n_prefix + n_text;
+        debug_assert_eq!(positions.len(), n_total,
+            "positions.len {} != n_prefix {} + n_text {} = {}",
+            positions.len(), n_prefix, n_text, n_total);
+        debug_assert_eq!(prefix_embeds.len(), n_prefix * self.model_dim,
+            "prefix_embeds len {} != n_prefix {} × model_dim {} = {}",
+            prefix_embeds.len(), n_prefix, self.model_dim,
+            n_prefix * self.model_dim);
+        debug_assert_eq!(logits_out.len(), n_total * self.vocab);
+
+        let max_kv = kv_cache.n_kv_heads() * kv_cache.head_dim();
+        let max_seq = kv_cache.max_seq_len();
+        let n_heads = self.blocks.first()
+            .map(|b| b.attn.num_heads).unwrap_or(0);
+        let head_dim = kv_cache.head_dim();
+        let mut attn_scratch = AttentionScratch::new(n_heads, head_dim, max_kv, max_seq)?;
+        let mut mlp_scratch = SwigluScratch::new(
+            self.model_dim,
+            self.blocks.first().map(|b| b.mlp.mlp_dim()).unwrap_or(self.model_dim),
+        )?;
+        let mut block_scratch = TransformerBlockScratch::new(self.model_dim)?;
+
+        let mut hidden_dev = GpuVec::try_hip(self.model_dim)?;
+        let mut x0_dev = GpuVec::try_hip(self.model_dim)?;
+        let normed_dev = GpuVec::try_hip(self.model_dim)?;
+        let logits_buf = hip_buf_mut(logits_out)?;
+        let logits_base = logits_buf.device_ptr() as *mut f32;
+
+        let prefix_buf = hip_buf(prefix_embeds)?;
+        let prefix_base = prefix_buf.device_ptr() as *const u8;
+
+        for t in 0..n_total {
+            let pos = positions[t];
+            let bytes = self.model_dim * 4;
+
+            // Stage 1: source the hidden state for position `t`.
+            //   - t < n_prefix: copy from `prefix_embeds[t]` (visual)
+            //   - else:         embed-table lookup at `token_ids[t-n_prefix]`
+            unsafe {
+                use std::os::raw::c_void;
+                let src = if t < n_prefix {
+                    prefix_base.add(t * self.model_dim * 4) as *const c_void
+                } else {
+                    let tid = token_ids[t - n_prefix];
+                    (self.embed_dev.device_ptr() as *const u8)
+                        .add(tid as usize * self.model_dim * 4) as *const c_void
+                };
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut hidden_dev)?.device_ptr(),
+                    src,
+                    bytes,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut x0_dev)?.device_ptr(),
+                    hip_buf(&hidden_dev)?.device_ptr() as *const std::os::raw::c_void,
+                    bytes,
+                )?;
+            }
+            batch.note_dispatch()?;
+
+            // Stage 2: blocks (identical to `forward`).
+            for (li, block) in self.blocks.iter().enumerate() {
+                let window = self.windows[li];
+                block.forward(
+                    batch,
+                    &mut hidden_dev, &x0_dev,
+                    kv_cache, pos, window, &self.rope,
+                    &mut attn_scratch, &mut mlp_scratch,
+                    &mut block_scratch,
+                )?;
+            }
+
+            // Stage 3: final norm + lm_head.
+            unsafe {
+                rms_norm_resident(
+                    hip_buf(&hidden_dev)?.device_ptr() as *const f32,
+                    self.final_norm_weight_dev.device_ptr() as *const f32,
+                    hip_buf(&normed_dev)?.device_ptr() as *mut f32,
+                    1, self.model_dim, self.norm_eps,
+                )?;
+            }
+            batch.note_dispatch()?;
+            unsafe {
+                matvec_resident(
+                    hip_buf(&normed_dev)?.device_ptr() as *const f32,
+                    self.lm_head.weight_dev.device_ptr() as *const f32,
+                    self.lm_head.bias_dev.device_ptr() as *const f32,
+                    logits_base.add(t * self.vocab),
+                    self.vocab, self.model_dim,
+                )?;
+            }
+            batch.note_dispatch()?;
+        }
+
+        Ok(())
+    }
 }
 
 /// HIP D2D memcpy — same helper as kv_cache_resident.rs but copied here
@@ -3801,6 +3935,98 @@ mod tests {
         eprintln!("max abs Δ = {max_abs}, max rel Δ = {max_rel}");
         assert!(max_rel < 1e-2,
             "resident vs host logits diverge: max abs {max_abs}, max rel {max_rel}");
+    }
+
+    /// `forward_with_prefix` correctness: when the prefix embeddings are
+    /// constructed by copying the same rows the embed-table lookup would
+    /// have produced, the prefix-path output is bit-identical to the
+    /// token-path output. Validates the new VLM-connector entry point
+    /// against the existing forward — same operations, same data, just
+    /// differently sourced.
+    #[test]
+    fn forward_with_prefix_matches_forward_when_prefix_is_embed_lookup() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let (model, swiglu_mlps) = build_test_model(&config);
+        let md = config.model_dim.get();
+        let vocab = config.vocab_size.get();
+
+        // 6-token synthetic decode; first 2 will go through the prefix
+        // path, last 4 through the token path.
+        let token_ids: Vec<i64> = (0..6).map(|i| (i * 23) as i64 % 256).collect();
+        let positions: Vec<usize> = (0..6).collect();
+        let n_prefix = 2usize;
+        let n_text = token_ids.len() - n_prefix;
+
+        let mut resident_a = GptModelResident::from_model(&model, &swiglu_mlps)
+            .expect("upload A");
+        let mut resident_b = GptModelResident::from_model(&model, &swiglu_mlps)
+            .expect("upload B");
+
+        // ── Reference: forward(all tokens) ──
+        let mut kv_a = KvCacheResident::new(
+            config.num_layers.get(), config.num_kv_heads.get(),
+            config.head_dim.get(), config.max_seq_len.get(),
+            config.model_dim.get(),
+        ).expect("alloc kv A");
+        let mut logits_a_dev = GpuVec::try_hip(token_ids.len() * vocab).expect("alloc A");
+        let batch_a = HipBatch::new();
+        resident_a.forward(&batch_a, &token_ids, &positions, &mut kv_a, &mut logits_a_dev)
+            .expect("forward A");
+        batch_a.flush().expect("flush A");
+        let mut logits_a = vec![0.0f32; token_ids.len() * vocab];
+        logits_a_dev.copy_to_host(&mut logits_a);
+
+        // ── Test: forward_with_prefix(embeds for first 2 tokens, last 4 tokens) ──
+        // Build prefix_embeds by copying the host embedding rows for the
+        // first n_prefix tokens.
+        let mut prefix_host = vec![0.0f32; n_prefix * md];
+        for (i, &tid) in token_ids[..n_prefix].iter().enumerate() {
+            let row = model.embed.row(tid as usize);
+            prefix_host[i * md..(i + 1) * md].copy_from_slice(row);
+        }
+        let mut prefix_dev = GpuVec::try_hip(n_prefix * md).expect("alloc prefix");
+        prefix_dev.copy_from(&prefix_host);
+
+        let mut kv_b = KvCacheResident::new(
+            config.num_layers.get(), config.num_kv_heads.get(),
+            config.head_dim.get(), config.max_seq_len.get(),
+            config.model_dim.get(),
+        ).expect("alloc kv B");
+        let mut logits_b_dev = GpuVec::try_hip(token_ids.len() * vocab).expect("alloc B");
+        let text_tokens: Vec<i64> = token_ids[n_prefix..].to_vec();
+        let batch_b = HipBatch::new();
+        resident_b.forward_with_prefix(
+            &batch_b, &prefix_dev, n_prefix,
+            &text_tokens, &positions, &mut kv_b, &mut logits_b_dev,
+        ).expect("forward_with_prefix");
+        batch_b.flush().expect("flush B");
+        let mut logits_b = vec![0.0f32; token_ids.len() * vocab];
+        logits_b_dev.copy_to_host(&mut logits_b);
+
+        // Bit-equivalence: same hidden states are routed through the
+        // same blocks, so logits should match exactly. Allow a sub-eps
+        // tolerance for any non-determinism in dispatch ordering.
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (a, b) in logits_a.iter().zip(logits_b.iter()) {
+            let abs = (a - b).abs();
+            let scale = a.abs().max(b.abs()).max(1e-6);
+            let rel = abs / scale;
+            if abs > max_abs { max_abs = abs; }
+            if rel > max_rel { max_rel = rel; }
+        }
+        eprintln!(
+            "prefix-vs-token forward: n_prefix={n_prefix}, n_text={n_text}, \
+             max abs Δ={max_abs:.2e}, max rel Δ={max_rel:.2e}",
+        );
+        assert!(max_rel < 1e-4,
+            "forward_with_prefix should match forward when prefix is embed lookup; \
+             max rel Δ={max_rel}, max abs Δ={max_abs}");
     }
 
     /// End-to-end SWA validation through GptModelResident: build a 2-layer
