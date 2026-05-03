@@ -505,6 +505,141 @@ fn retina_forward(retina: &VisualCortex, pixels: &[f32]) -> (LayerOut, LayerOut,
 }
 
 // ────────────────────────────────────────────────────────────────
+// Ganglion-only diagnostic. Bypasses V1/V2/V4 entirely and asks
+// the upstream question: do the FIXED 12 retinal channels
+// produce edge-rich features or brightness-dominated features?
+// ────────────────────────────────────────────────────────────────
+
+/// Per-channel stats for one image through the ganglion layer.
+struct GanglionChannelStat {
+    mean: f32,
+    std: f32,
+    corr_input: f32, // |Pearson| with greyscale intensity
+    corr_edges: f32, // |Pearson| with Sobel magnitude
+}
+
+/// Forward `pixels` (CHW, [3 × ih × iw], values in [0,1]) through
+/// ONLY `cortex.retina` (the fixed 12-channel DoG bank). No
+/// activation, no V1/V2/V4. Returns one [GanglionChannelStat] per
+/// channel.
+fn ganglion_only_stats(
+    cortex: &VisualCortex, pixels: &[f32], ih: usize, iw: usize,
+) -> Vec<GanglionChannelStat> {
+    let (g, gh, gw) = cortex.retina.forward(pixels, 1, ih, iw);
+    let c = cortex.retina.out_channels;
+    debug_assert_eq!(g.len(), c * gh * gw);
+
+    // Greyscale and Sobel of the full-res input, then mean-pool to (gh, gw).
+    let chan = ih * iw;
+    let mut grey_full = vec![0.0f32; chan];
+    for i in 0..chan {
+        grey_full[i] = (pixels[i] + pixels[chan + i] + pixels[2 * chan + i]) / 3.0;
+    }
+    let edges_full = sobel_edges(pixels, ih, iw);
+    let grey  = resize_pool(&grey_full,  ih, iw, gh, gw);
+    let edges = resize_pool(&edges_full, ih, iw, gh, gw);
+
+    let mut out = Vec::with_capacity(c);
+    for ch in 0..c {
+        let slice = &g[ch * gh * gw..(ch + 1) * gh * gw];
+        let n = slice.len() as f32;
+        let mean = slice.iter().sum::<f32>() / n;
+        let var = slice.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+        let std = var.sqrt();
+        let corr_input = pearson(slice, &grey).abs();
+        let corr_edges = pearson(slice, &edges).abs();
+        out.push(GanglionChannelStat { mean, std, corr_input, corr_edges });
+    }
+    out
+}
+
+/// Channel labels — see init_retinal_ganglion_filters in
+/// crates/modgrad-codec/src/retina.rs (line ~660).
+const GANGLION_LABELS: [&str; 12] = [
+    "lum_ON   ", "lum_OFF  ",
+    "red_ON   ", "green_ON ", "blue_ON  ",
+    "RonGoff  ", "GonRoff  ",
+    "BonYoff  ", "YonBoff  ",
+    "wide_ON  ", "wide_OFF ",
+    "lum_int  ",
+];
+
+/// Run the ganglion-only diagnostic on a batch of images of shape
+/// [n × 3 × ih × iw] and report a per-channel table averaged across
+/// images, plus the across-channel aggregate. `label` tags the print.
+fn run_ganglion_diagnostic(label: &str, pixels: &[f32], n: usize, ih: usize, iw: usize) {
+    let cortex = VisualCortex::new(ih, iw);
+    let c = cortex.retina.out_channels;
+    debug_assert_eq!(c, 12);
+
+    // Accumulators: per-channel sums across images.
+    let mut acc_mean = vec![0.0f32; c];
+    let mut acc_std  = vec![0.0f32; c];
+    let mut acc_ci   = vec![0.0f32; c];
+    let mut acc_ce   = vec![0.0f32; c];
+
+    let chunk = 3 * ih * iw;
+    for k in 0..n {
+        let img = &pixels[k * chunk..(k + 1) * chunk];
+        let stats = ganglion_only_stats(&cortex, img, ih, iw);
+        for (ch, s) in stats.iter().enumerate() {
+            acc_mean[ch] += s.mean;
+            acc_std[ch]  += s.std;
+            acc_ci[ch]   += s.corr_input;
+            acc_ce[ch]   += s.corr_edges;
+        }
+    }
+    let nf = n as f32;
+    eprintln!(
+        "\n=== Ganglion-only diagnostic :: {label} ({n} image{}) ===",
+        if n == 1 { "" } else { "s" },
+    );
+    eprintln!("  ch  name        mean      std       |corr_input|  |corr_edges|  edge>input?");
+    let mut total_ci = 0.0f32;
+    let mut total_ce = 0.0f32;
+    for ch in 0..c {
+        let m  = acc_mean[ch] / nf;
+        let s  = acc_std[ch]  / nf;
+        let ci = acc_ci[ch]   / nf;
+        let ce = acc_ce[ch]   / nf;
+        let arrow = if ce > ci { "EDGE" } else { "BRIGHT" };
+        eprintln!(
+            "  {ch:>2}  {}  {m:>8.4}  {s:>8.4}  {ci:>11.3}   {ce:>11.3}   {arrow}",
+            GANGLION_LABELS[ch],
+        );
+        total_ci += ci;
+        total_ce += ce;
+    }
+    let mean_ci = total_ci / c as f32;
+    let mean_ce = total_ce / c as f32;
+    let verdict = if mean_ce > mean_ci { "EDGES" } else { "BRIGHTNESS" };
+    eprintln!(
+        "  ──────────────────────────────────────────────────────────────────────",
+    );
+    eprintln!(
+        "  AGGREGATE   mean |corr_input|={mean_ci:.3}, mean |corr_edges|={mean_ce:.3}  →  tracks {verdict}",
+    );
+}
+
+/// Read the ImageNet binary written by imagenet_preprocess.py:
+/// header u32 n, u32 h, u32 w, then n × 3 × h × w f32 (CHW) in [0,1].
+fn load_imagenet_bin(path: &str) -> std::io::Result<(Vec<f32>, usize, usize, usize)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hdr = [0u8; 12];
+    f.read_exact(&mut hdr)?;
+    let n  = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    let ih = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+    let iw = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let mut buf = vec![0u8; n * 3 * ih * iw * 4];
+    f.read_exact(&mut buf)?;
+    let pixels: Vec<f32> = buf.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Ok((pixels, n, ih, iw))
+}
+
+// ────────────────────────────────────────────────────────────────
 // Pretraining helpers.
 // ────────────────────────────────────────────────────────────────
 
@@ -617,6 +752,14 @@ fn main() -> std::io::Result<()> {
     // run them through `VisualCortex::imagenet()`. One subdir per
     // image + the same diagnostic prints as the maze conditions.
     let mut imagenet_path: Option<String> = None;
+    // --ganglion-only: bypass V1/V2/V4. Runs ONLY the fixed retinal
+    // DoG bank on (a) the ImageNet binary at --imagenet (default
+    // /tmp/retina_imagenet.bin if --imagenet not given) and (b) one
+    // synthetic maze of size --size. Reports per-channel mean/std +
+    // |Pearson| against intensity vs Sobel edges, averaged across
+    // images. Answers: do the 12 ganglion channels track edges or
+    // brightness?
+    let mut ganglion_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -630,6 +773,7 @@ fn main() -> std::io::Result<()> {
             "--out-dir" => { out_root = args[i+1].clone(); i += 2; }
             "--load" => { load_path = Some(args[i+1].clone()); i += 2; }
             "--imagenet" => { imagenet_path = Some(args[i+1].clone()); i += 2; }
+            "--ganglion-only" => { ganglion_only = true; i += 1; }
             "--help" | "-h" => {
                 eprintln!(
 "Usage: retina_viz [--size N (odd, ≥5)] [--seed N] [--upscale N]
@@ -664,6 +808,38 @@ Flat or pure noise tiles = broken layer.
     let pixels = maze_pixels(&cells, size);
 
     eprintln!("retina_viz: size={size} seed={seed} upscale={upscale}");
+
+    // ── --ganglion-only mode: per-channel diagnostic on the FIXED
+    //    12-channel DoG bank, comparing natural ImageNet vs maze. ──
+    if ganglion_only {
+        let bin_path = imagenet_path.as_deref().unwrap_or("/tmp/retina_imagenet.bin");
+        let (img_pixels, n, ih, iw) = load_imagenet_bin(bin_path)?;
+        eprintln!("[ganglion] {n} images at {ih}×{iw}, source: {bin_path}");
+        run_ganglion_diagnostic("imagenet", &img_pixels, n, ih, iw);
+
+        // Maze: single image, same algorithm as the rest of this binary.
+        run_ganglion_diagnostic("maze", &pixels, 1, size, size);
+
+        // Maze upscaled to 224×224 so the ganglion sees the same
+        // resolution as ImageNet — controls for input size.
+        let upscaled = {
+            let target = 224usize;
+            let mut out = vec![0.0f32; 3 * target * target];
+            for c in 0..3 {
+                for y in 0..target {
+                    for x in 0..target {
+                        let sy = y * size / target;
+                        let sx = x * size / target;
+                        out[c * target * target + y * target + x]
+                            = pixels[c * size * size + sy * size + sx];
+                    }
+                }
+            }
+            out
+        };
+        run_ganglion_diagnostic("maze_224", &upscaled, 1, 224, 224);
+        return Ok(());
+    }
 
     // ── --imagenet mode: dump activations from real ImageNet RGB photos. ──
     // Bypasses the maze pipeline entirely; uses `VisualCortex::imagenet()`
