@@ -75,12 +75,25 @@ pub struct BrainLogitModulator {
     /// row-major (matches the rest of the codebase's `Linear` layout).
     pub proj: Linear,
     /// Scalar gate. Set to 0.0 at init so the modulator is a no-op
-    /// until training warms it up.
+    /// until training warms it up. When `tanh_gated == true` this is
+    /// interpreted as the *pre-tanh* gate value (Flamingo pattern):
+    /// effective gate = tanh(alpha), bounded in (-1, 1).
     pub alpha: f32,
     /// Brain-output vector dimension expected at `modulate` time.
     pub brain_dim: usize,
     /// Vocab size — must match the LLM's logit length.
     pub vocab: usize,
+    /// When true, `alpha` is interpreted as the *pre-tanh* gate value
+    /// (Flamingo / bias-only-steering pattern). At init `alpha = 0` →
+    /// `tanh(0) = 0` → modulator is identity; the gate is bounded so
+    /// training cannot blow up the modulator's contribution beyond
+    /// ±|proj·brain + bias|. Validated by arxiv 2505.18706 (ICLR-25)
+    /// as the SOTA bias-only-steering at small-LLM scale.
+    ///
+    /// Default `false` for backward compatibility — existing trained
+    /// modulators keep the unbounded scalar-gate semantic.
+    #[serde(default)]
+    pub tanh_gated: bool,
 }
 
 impl BrainLogitModulator {
@@ -94,6 +107,7 @@ impl BrainLogitModulator {
             alpha: 0.0,
             brain_dim,
             vocab,
+            tanh_gated: false,
         }
     }
 
@@ -105,6 +119,27 @@ impl BrainLogitModulator {
         s.proj.weight.iter_mut().for_each(|w| *w = 0.0);
         s.proj.bias.iter_mut().for_each(|b| *b = 0.0);
         s
+    }
+
+    /// Flamingo-style tanh-gated modulator (per arxiv 2505.18706).
+    /// `alpha = 0.0`, `tanh_gated = true`. At init the modulator is
+    /// the identity (tanh(0) = 0); during training the gate stays
+    /// bounded in (-1, 1) so the modulator cannot dominate Qwen's
+    /// own signal. The right primitive when adding a learned
+    /// "steering" path on top of a frozen LLM and you want the
+    /// frozen behaviour preserved at step 0.
+    pub fn flamingo_gated(brain_dim: usize, vocab: usize) -> Self {
+        let mut s = Self::new(brain_dim, vocab);
+        s.tanh_gated = true;
+        s
+    }
+
+    /// Effective scalar gate applied to `proj·brain + bias` before
+    /// adding to the qwen logits. `tanh(alpha)` when `tanh_gated`,
+    /// else just `alpha`. Cheap and pure — call freely.
+    #[inline]
+    pub fn effective_alpha(&self) -> f32 {
+        if self.tanh_gated { self.alpha.tanh() } else { self.alpha }
     }
 
     /// Compute modulated logits: `qwen_logits + alpha · (W_proj · o + b)`.
@@ -134,8 +169,11 @@ impl BrainLogitModulator {
         debug_assert_eq!(brain_output.len(), self.brain_dim);
         debug_assert_eq!(out.len(), self.vocab);
 
-        // Fast path: alpha == 0 → just copy qwen_logits.
-        if self.alpha == 0.0 {
+        // Fast path: effective gate == 0 → just copy qwen_logits.
+        // tanh(0) = 0 so flamingo-gated modulators with alpha=0 take
+        // this path too, matching "frozen behaviour at init".
+        let alpha_eff = self.effective_alpha();
+        if alpha_eff == 0.0 {
             out.copy_from_slice(qwen_logits);
             return;
         }
@@ -151,7 +189,7 @@ impl BrainLogitModulator {
             for i in 0..bd {
                 acc += row[i] * brain_output[i];
             }
-            out[v] = qwen_logits[v] + self.alpha * acc;
+            out[v] = qwen_logits[v] + alpha_eff * acc;
         }
     }
 }
@@ -182,11 +220,16 @@ impl BrainLogitModulator {
         debug_assert_eq!(d_proj_weight.len(), self.vocab * self.brain_dim);
         debug_assert_eq!(d_proj_bias.len(), self.vocab);
 
-        if self.alpha == 0.0 { return; } // gradient is zero w.r.t. proj params
+        // Effective gate (tanh(alpha) for flamingo, else alpha). Same
+        // factor that scaled the forward output scales the gradient
+        // w.r.t. proj params — we don't yet backprop through the gate
+        // itself (alpha trained externally as a hyper if at all).
+        let alpha_eff = self.effective_alpha();
+        if alpha_eff == 0.0 { return; }
 
         let bd = self.brain_dim;
         for v in 0..self.vocab {
-            let scale = d_modulated[v] * self.alpha;
+            let scale = d_modulated[v] * alpha_eff;
             d_proj_bias[v] += scale;
             let row = &mut d_proj_weight[v * bd..(v + 1) * bd];
             for b in 0..bd {
@@ -223,15 +266,15 @@ impl BrainLogitModulator {
         // Param grads first (same as `backward`).
         self.backward(brain_output, d_modulated, d_proj_weight, d_proj_bias);
 
-        if self.alpha == 0.0 { return; }
+        let alpha_eff = self.effective_alpha();
+        if alpha_eff == 0.0 { return; }
 
         let bd = self.brain_dim;
-        // d_brain[b] += alpha · sum_v d_modulated[v] · W[v, b]
-        // Scan column-wise over W: for each v, scale row-times-alpha and
-        // add to the column accumulator. Equivalent to W^T · (alpha ·
-        // d_modulated), accumulated.
+        // d_brain[b] += alpha_eff · sum_v d_modulated[v] · W[v, b]
+        // Scan column-wise over W: for each v, scale row-times-alpha_eff
+        // and add to the column accumulator.
         for v in 0..self.vocab {
-            let scale = self.alpha * d_modulated[v];
+            let scale = alpha_eff * d_modulated[v];
             let row = &self.proj.weight[v * bd..(v + 1) * bd];
             for b in 0..bd {
                 d_brain_output[b] += scale * row[b];
@@ -642,6 +685,57 @@ mod tests {
         let modulated = m.modulate(&qwen, &brain_out);
         assert_eq!(modulated, qwen,
             "alpha=0 must be bit-identical to qwen_logits");
+    }
+
+    /// Flamingo-gated init must also be a no-op at alpha=0 (because
+    /// tanh(0) = 0). Validates the bias-only-steering pattern: wiring
+    /// the modulator preserves frozen-LLM behaviour at step 0.
+    #[test]
+    fn flamingo_gated_zero_is_no_op() {
+        let m = BrainLogitModulator::flamingo_gated(8, 16);
+        assert_eq!(m.alpha, 0.0);
+        assert!(m.tanh_gated);
+        assert_eq!(m.effective_alpha(), 0.0);
+        let qwen = vec![0.1f32, -0.5, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0,
+                        2.1, -1.3, 0.7, 0.4, -0.2, 0.9, 0.0, 0.5];
+        let brain_out = vec![0.3f32, -0.7, 1.1, 0.0, 0.5, -0.4, 0.2, 0.8];
+        let modulated = m.modulate(&qwen, &brain_out);
+        assert_eq!(modulated, qwen,
+            "flamingo-gated alpha=0 must equal qwen_logits");
+    }
+
+    /// `effective_alpha` saturates: large `alpha` → tanh(alpha) close
+    /// to ±1, regardless of magnitude. This is the bound the
+    /// Flamingo / arxiv 2505.18706 pattern provides — the modulator
+    /// cannot overpower Qwen's signal even if the (externally-trained)
+    /// gate value runs away.
+    #[test]
+    fn flamingo_gated_saturates_for_large_alpha() {
+        let mut m = BrainLogitModulator::flamingo_gated(4, 8);
+        m.alpha = 100.0;
+        let eff = m.effective_alpha();
+        assert!(eff > 0.999 && eff <= 1.0,
+            "tanh(100) should saturate to ~1, got {eff}");
+        m.alpha = -50.0;
+        let eff = m.effective_alpha();
+        assert!(eff < -0.999 && eff >= -1.0,
+            "tanh(-50) should saturate to ~-1, got {eff}");
+    }
+
+    /// Backward through a flamingo-gated modulator scales gradients by
+    /// `tanh(alpha)`, not raw `alpha`. At init (alpha=0) the gradient
+    /// w.r.t. proj weights is also zero — same no-op semantic as
+    /// forward. Mirrors the forward fast-path.
+    #[test]
+    fn flamingo_gated_backward_zero_when_alpha_zero() {
+        let m = BrainLogitModulator::flamingo_gated(4, 8);
+        let brain = vec![0.5f32, -0.3, 0.7, 0.1];
+        let d_mod = vec![1.0f32; 8];
+        let mut dw = vec![0.0f32; 8 * 4];
+        let mut db = vec![0.0f32; 8];
+        m.backward(&brain, &d_mod, &mut dw, &mut db);
+        assert!(dw.iter().all(|&v| v == 0.0), "dw should be all zero at init");
+        assert!(db.iter().all(|&v| v == 0.0), "db should be all zero at init");
     }
 
     /// With non-zero alpha + non-zero projection, different brain
