@@ -16,6 +16,7 @@ members = [
     "crates/modgrad-io",
     "crates/modgrad-substrate",
     "crates/modgrad-blt",
+    "crates/modgrad-attribution",
     "isis",
     "isis/runtime",
     "examples/minictm",

@@ -2661,6 +2661,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "modgrad-attribution"
+version = "0.1.0"
+dependencies = [
+ "modgrad-compute",
+ "serde",
+]
+
+[[package]]
 name = "modgrad-blt"
 version = "0.1.0"
 dependencies = [
