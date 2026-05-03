@@ -1,0 +1,11 @@
+[package]
+name = "cifar10_probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
+
+[[bin]]
+name = "cifar10_probe"
+path = "src/main.rs"

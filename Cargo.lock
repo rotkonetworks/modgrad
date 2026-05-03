@@ -606,6 +606,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cifar10_probe"
+version = "0.1.0"
+dependencies = [
+ "modgrad-codec",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

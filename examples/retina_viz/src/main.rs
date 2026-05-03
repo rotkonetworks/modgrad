@@ -183,6 +183,133 @@ fn layer_norm_map(data: &[f32], channels: usize, h: usize, w: usize) -> Vec<f32>
     m
 }
 
+/// PCA-RGB false-colour composite of a `[channels × h × w]` activation
+/// tensor. Reduces the high-dimensional channel space to the top 3
+/// principal components and maps them to R/G/B. Similar features
+/// across space share a colour; orthogonal features get different
+/// colours. Gives a single naturally-coloured image per layer that
+/// preserves visual structure without the per-channel-tile clutter.
+///
+/// Power iteration with rank-1 deflation — exact algorithm matters
+/// less than determinism and bounded compute. ~50 iters per component,
+/// 3 components, on a `channels × channels` covariance, is well under
+/// 1 ms for our channel counts.
+fn pca_rgb_composite(data: &[f32], channels: usize, h: usize, w: usize, upscale: usize) -> Vec<u8> {
+    let n_pix = h * w;
+    if n_pix == 0 || channels == 0 {
+        return vec![0u8; 3 * h * w * upscale * upscale];
+    }
+    // Per-channel mean; centre features.
+    let mut means = vec![0.0f32; channels];
+    for c in 0..channels {
+        let base = c * n_pix;
+        let s: f32 = (0..n_pix).map(|p| data[base + p]).sum();
+        means[c] = s / n_pix as f32;
+    }
+    // Covariance [channels × channels] (sum of outer products of
+    // centred per-pixel feature vectors).
+    let mut cov = vec![0.0f32; channels * channels];
+    for p in 0..n_pix {
+        for i in 0..channels {
+            let xi = data[i * n_pix + p] - means[i];
+            for j in i..channels {
+                let xj = data[j * n_pix + p] - means[j];
+                cov[i * channels + j] += xi * xj;
+            }
+        }
+    }
+    let scale = 1.0 / (n_pix.max(2) - 1) as f32;
+    for i in 0..channels {
+        for j in i..channels {
+            cov[i * channels + j] *= scale;
+            cov[j * channels + i] = cov[i * channels + j]; // symmetrise
+        }
+    }
+    // Power iteration with rank-1 deflation for top 3 eigenvectors.
+    let mut rng_state: u64 = 0xC0FFEE;
+    let mut rand01 = || {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((rng_state >> 32) as i32 as f32) / (i32::MAX as f32)
+    };
+    let mut cov_def = cov.clone();
+    let mut eigs: Vec<Vec<f32>> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let mut v: Vec<f32> = (0..channels).map(|_| rand01()).collect();
+        let n0 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        for x in v.iter_mut() { *x /= n0; }
+        for _ in 0..50 {
+            let mut nv = vec![0.0f32; channels];
+            for i in 0..channels {
+                for j in 0..channels {
+                    nv[i] += cov_def[i * channels + j] * v[j];
+                }
+            }
+            let n: f32 = nv.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in nv.iter_mut() { *x /= n; }
+            v = nv;
+        }
+        // Eigenvalue λ = vᵀ C v
+        let mut cv = vec![0.0f32; channels];
+        for i in 0..channels {
+            for j in 0..channels {
+                cv[i] += cov_def[i * channels + j] * v[j];
+            }
+        }
+        let lambda: f32 = cv.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+        // Deflate: C ← C − λ v vᵀ
+        for i in 0..channels {
+            for j in 0..channels {
+                cov_def[i * channels + j] -= lambda * v[i] * v[j];
+            }
+        }
+        eigs.push(v);
+    }
+    // Project each pixel's centred feature vector onto the 3 eigenvectors.
+    let mut comp = vec![[0.0f32; 3]; n_pix];
+    for p in 0..n_pix {
+        for k in 0..3 {
+            let mut s = 0.0f32;
+            for c in 0..channels {
+                s += (data[c * n_pix + p] - means[c]) * eigs[k][c];
+            }
+            comp[p][k] = s;
+        }
+    }
+    // Per-component min-max normalise → [0, 1].
+    let mut mins = [f32::INFINITY; 3];
+    let mut maxs = [f32::NEG_INFINITY; 3];
+    for p in 0..n_pix {
+        for k in 0..3 {
+            mins[k] = mins[k].min(comp[p][k]);
+            maxs[k] = maxs[k].max(comp[p][k]);
+        }
+    }
+    // Compose RGB and upscale.
+    let oh = h * upscale;
+    let ow = w * upscale;
+    let mut out = vec![0u8; 3 * oh * ow];
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * w + x;
+            let span_r = (maxs[0] - mins[0]).max(1e-6);
+            let span_g = (maxs[1] - mins[1]).max(1e-6);
+            let span_b = (maxs[2] - mins[2]).max(1e-6);
+            let r = ((comp[p][0] - mins[0]) / span_r * 255.0).clamp(0.0, 255.0) as u8;
+            let g = ((comp[p][1] - mins[1]) / span_g * 255.0).clamp(0.0, 255.0) as u8;
+            let b = ((comp[p][2] - mins[2]) / span_b * 255.0).clamp(0.0, 255.0) as u8;
+            for dy in 0..upscale {
+                for dx in 0..upscale {
+                    let off = ((y * upscale + dy) * ow + (x * upscale + dx)) * 3;
+                    out[off] = r;
+                    out[off + 1] = g;
+                    out[off + 2] = b;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Convert a `h × w` scalar heatmap into an upscaled RGB image with
 /// a diverging blue-to-red palette (low=blue, high=red) so intensity
 /// is visible at a glance.

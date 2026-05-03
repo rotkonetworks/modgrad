@@ -27,6 +27,7 @@ members = [
     "examples/maze_viz",
     "examples/multimodal_smoke",
     "examples/retina_viz",
+    "examples/cifar10_probe",
     "examples/filter_viz",
     "examples/hebbian_sanity",
     "examples/pretrain_retina",
