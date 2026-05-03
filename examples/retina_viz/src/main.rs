@@ -341,6 +341,149 @@ struct LayerOut {
     w: usize,
 }
 
+/// Sobel-magnitude edge map of one greyscale image, returned at the
+/// SAME `(h, w)` shape as the input. Used as a ground-truth "where are
+/// the edges" reference to correlate with V1/V2/V4 channels — if a
+/// retinal channel is actually doing edge detection, its activation
+/// at downsampled (h/s, w/s) should correlate with this map (after
+/// matching downsample). For our 21×21 maze with stride-2 retina, V1
+/// arrives at h/2 × w/2; we resample the edge map by mean-pool to
+/// match before correlating.
+fn sobel_edges(pixels: &[f32], h: usize, w: usize) -> Vec<f32> {
+    // Average the 3 colour channels into greyscale.
+    let mut grey = vec![0.0f32; h * w];
+    let chan = h * w;
+    for i in 0..chan {
+        grey[i] = (pixels[i] + pixels[chan + i] + pixels[2 * chan + i]) / 3.0;
+    }
+    let mut edges = vec![0.0f32; h * w];
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let g = |yy: usize, xx: usize| grey[yy * w + xx];
+            let gx = -g(y - 1, x - 1) - 2.0 * g(y, x - 1) - g(y + 1, x - 1)
+                   +  g(y - 1, x + 1) + 2.0 * g(y, x + 1) + g(y + 1, x + 1);
+            let gy = -g(y - 1, x - 1) - 2.0 * g(y - 1, x) - g(y - 1, x + 1)
+                   +  g(y + 1, x - 1) + 2.0 * g(y + 1, x) + g(y + 1, x + 1);
+            edges[y * w + x] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    edges
+}
+
+/// Mean-pool a `(h, w)` map down to `(out_h, out_w)`. Cheap nearest-
+/// neighbour pooling — fine for the diagnostic, we don't need a clean
+/// Gaussian pyramid here.
+fn resize_pool(map: &[f32], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; out_h * out_w];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let y0 = oy * h / out_h;
+            let y1 = ((oy + 1) * h / out_h).max(y0 + 1);
+            let x0 = ox * w / out_w;
+            let x1 = ((ox + 1) * w / out_w).max(x0 + 1);
+            let mut s = 0.0f32;
+            let mut n = 0usize;
+            for yy in y0..y1.min(h) {
+                for xx in x0..x1.min(w) {
+                    s += map[yy * w + xx];
+                    n += 1;
+                }
+            }
+            out[oy * out_w + ox] = if n > 0 { s / n as f32 } else { 0.0 };
+        }
+    }
+    out
+}
+
+/// Pearson correlation between two equal-length vectors. Returns 0
+/// for zero-variance inputs (avoids NaN for dead channels).
+fn pearson(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len() as f32;
+    let ma = a.iter().sum::<f32>() / n;
+    let mb = b.iter().sum::<f32>() / n;
+    let mut num = 0.0f32;
+    let mut da = 0.0f32;
+    let mut db = 0.0f32;
+    for (av, bv) in a.iter().zip(b.iter()) {
+        let x = av - ma;
+        let y = bv - mb;
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    let denom = (da * db).sqrt();
+    if denom > 1e-12 { num / denom } else { 0.0 }
+}
+
+/// Quantitative per-layer diagnostic: how do channels' activations
+/// relate to the input image's edge structure?
+///
+/// Reports:
+///   - `dead_frac`        — fraction of channels with zero spatial
+///                          variance (broken / collapsed).
+///   - `edge_corr_mean`   — mean |corr| across channels with the input
+///                          Sobel edge map. ≥ 0.3 is a respectable
+///                          edge-detector population; ~ 0 is noise.
+///   - `edge_corr_top10`  — best-channel |corr|. Reveals if at least
+///                          SOME channels are doing edge detection,
+///                          even if most aren't.
+///   - `input_corr_mean`  — control: |corr| with raw input intensity.
+///                          A high value with low edge_corr means the
+///                          channel is doing brightness, not edges.
+fn log_layer_diagnostics(
+    cond: &str,
+    layer: &str,
+    out: &LayerOut,
+    pixels: &[f32],
+    in_h: usize,
+    in_w: usize,
+) {
+    let (c, h, w) = (out.channels, out.h, out.w);
+    let edges_full = sobel_edges(pixels, in_h, in_w);
+    let edges = resize_pool(&edges_full, in_h, in_w, h, w);
+
+    // Resize input intensity (greyscale) to layer resolution as a
+    // control comparison.
+    let mut grey_full = vec![0.0f32; in_h * in_w];
+    let chan = in_h * in_w;
+    for i in 0..chan {
+        grey_full[i] = (pixels[i] + pixels[chan + i] + pixels[2 * chan + i]) / 3.0;
+    }
+    let grey = resize_pool(&grey_full, in_h, in_w, h, w);
+
+    let mut edge_corrs: Vec<f32> = Vec::with_capacity(c);
+    let mut input_corrs: Vec<f32> = Vec::with_capacity(c);
+    let mut dead = 0usize;
+    for ch in 0..c {
+        let slice = &out.data[ch * h * w..(ch + 1) * h * w];
+        // Variance check.
+        let mean = slice.iter().sum::<f32>() / (h * w) as f32;
+        let var = slice.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (h * w) as f32;
+        if var < 1e-10 {
+            dead += 1;
+            edge_corrs.push(0.0);
+            input_corrs.push(0.0);
+            continue;
+        }
+        edge_corrs.push(pearson(slice, &edges).abs());
+        input_corrs.push(pearson(slice, &grey).abs());
+    }
+    let dead_frac = dead as f32 / c as f32;
+    let edge_mean = edge_corrs.iter().sum::<f32>() / c as f32;
+    let mut edge_sorted = edge_corrs.clone();
+    edge_sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top10_count = (c / 10).max(1);
+    let edge_top10: f32 = edge_sorted.iter().take(top10_count).sum::<f32>() / top10_count as f32;
+    let input_mean = input_corrs.iter().sum::<f32>() / c as f32;
+
+    eprintln!(
+        "[{cond}] {layer}: channels={c}, dead={dead}/{c} ({:.0}%), \
+         |corr_edges| mean={:.3} top10%={:.3}, |corr_input| mean={:.3}",
+        100.0 * dead_frac, edge_mean, edge_top10, input_mean,
+    );
+}
+
 fn retina_forward(retina: &VisualCortex, pixels: &[f32]) -> (LayerOut, LayerOut, LayerOut) {
     let (h, w) = (retina.input_h, retina.input_w);
     // Retina ganglion (fixed DoG + color opponents, 3→12)
@@ -394,6 +537,16 @@ fn dump_condition(
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     let (v1, v2, v4) = retina_forward(retina, pixels);
+
+    // Quantitative probe: does V1 actually respond to the input's edge
+    // structure, or are the channels all baseline noise? The visual
+    // heatmap can be misleading (per-tile min-max normalisation can
+    // make "low signal + few outliers" look loud), so compute a real
+    // edge-correlation score per channel.
+    log_layer_diagnostics(label, "V1", &v1, pixels, retina.input_h, retina.input_w);
+    log_layer_diagnostics(label, "V2", &v2, pixels, retina.input_h, retina.input_w);
+    log_layer_diagnostics(label, "V4", &v4, pixels, retina.input_h, retina.input_w);
+
     render_input(&out_dir.join("input.ppm"), pixels, retina.input_h, retina.input_w, upscale)?;
     // Tile layout choices: 32 = 8×4, 64 = 8×8, 128 = 16×8.
     // Use smaller per-tile upscale for deep layers so files stay manageable.
