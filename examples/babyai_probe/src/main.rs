@@ -35,6 +35,9 @@ use modgrad_ctm::graph::{
 use modgrad_traits::{Brain, Encoder, LossFn, StepwiseCE, TokenInput};
 
 const N_ACTIONS: usize = 7;
+/// Variant A (no-retina) patch size. 56/8 = 7 → 49 tokens × (8×8×3=192) dim.
+/// Token count matches the V4 layout the cortex variants produce.
+const RAW_PATCH: usize = 8;
 // Ticks of CTM "thinking" per sample. With d_model=1024 cortical, each
 // tick is heavy; 4 keeps wall-clock manageable while still giving
 // enough recurrent depth.
@@ -108,6 +111,53 @@ fn shuffle_idx(idx: &mut [usize], seed: &mut u64) {
         let r = ((*seed >> 33) as usize) % (i + 1);
         idx.swap(i, r);
     }
+}
+
+/// Per-token observation dim for the brain's `obs_proj`. Falls back
+/// to the patchify layout (49 × 192) when the cortex is absent
+/// (Variant A — raw RGB).
+fn obs_dim_of(cortex: &Option<VisualCortex>) -> usize {
+    cortex.as_ref()
+        .map(|c| c.token_dim())
+        .unwrap_or(3 * RAW_PATCH * RAW_PATCH)
+}
+
+/// Encode a CHW RGB frame into a `TokenInput` for the brain.
+/// With cortex = `Some`, runs the visual hierarchy. With cortex =
+/// `None`, splits the frame into non-overlapping 8×8×3 patches —
+/// 49 tokens × 192 dim, matching the cortex's spatial layout but
+/// with no learned visual features.
+fn encode_for_brain(cortex: &Option<VisualCortex>, rgb: &[f32]) -> TokenInput {
+    use modgrad_traits::Encoder;
+    if let Some(c) = cortex {
+        return c.encode(rgb);
+    }
+    let h_p = IMG_H / RAW_PATCH;
+    let w_p = IMG_W / RAW_PATCH;
+    let n_tokens = h_p * w_p;
+    let token_dim = 3 * RAW_PATCH * RAW_PATCH;
+    let mut tokens = vec![0.0f32; n_tokens * token_dim];
+    for py in 0..h_p {
+        for px in 0..w_p {
+            let token_idx = py * w_p + px;
+            let token_base = token_idx * token_dim;
+            for c in 0..3 {
+                for dy in 0..RAW_PATCH {
+                    for dx in 0..RAW_PATCH {
+                        let src_y = py * RAW_PATCH + dy;
+                        let src_x = px * RAW_PATCH + dx;
+                        let src = c * IMG_H * IMG_W + src_y * IMG_W + src_x;
+                        let dst = token_base
+                                + c * RAW_PATCH * RAW_PATCH
+                                + dy * RAW_PATCH
+                                + dx;
+                        tokens[dst] = rgb[src];
+                    }
+                }
+            }
+        }
+    }
+    TokenInput { tokens, n_tokens, token_dim }
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -220,19 +270,35 @@ fn main() {
         action: ds.steps[i].action,
     }).collect();
 
-    let (variant_name, cortex) = match &cortex_path {
-        Some(p) => {
+    // Pick the retina variant for the visual-priors experiment. The
+    // four conditions are designed to isolate where (if anywhere) the
+    // visual hierarchy adds value over raw pixels:
+    //   none       — raw RGB patchified (49 tokens × 192 dim, no cortex)
+    //   random     — VisualCortex::random — architecture, zero priors
+    //   gabor      — VisualCortex::new — Gabor V1 + random V2/V4 (default)
+    //   pretrained — VisualCortex::load — Gabor V1 + STL-10-trained V2/V4
+    // Same brain config + training across all four for apples-to-apples.
+    let variant = std::env::var("MODGRAD_RETINA_VARIANT").unwrap_or_else(|_| "gabor".into());
+    let (variant_name, cortex): (&'static str, Option<VisualCortex>) = match variant.as_str() {
+        "none" => {
+            eprintln!("\n[Variant A] NO RETINA  (raw RGB patchified into 49×192-dim tokens)");
+            ("A — no retina", None)
+        }
+        "random" => {
+            eprintln!("\n[Variant B] RANDOM  (VisualCortex::random({IMG_H}, {IMG_W}) — architecture, no priors)");
+            ("B — random", Some(VisualCortex::random(IMG_H, IMG_W)))
+        }
+        "pretrained" => {
+            let p = cortex_path.as_deref().unwrap_or("/tmp/retina_stl10.bin");
             eprintln!("\n[Variant D] PRETRAINED  (loaded from {p})");
             let mut c = VisualCortex::load(p).expect("load pretrained cortex");
-            // Pretrain saves at the training resolution; reset spatial
-            // dims so the same weights work at our 56×56 input.
             c.input_h = IMG_H;
             c.input_w = IMG_W;
-            ("Variant D — pretrained", c)
+            ("D — pretrained", Some(c))
         }
-        None => {
-            eprintln!("\n[Variant C] Gabor priors  (VisualCortex::new({IMG_H}, {IMG_W}))");
-            ("Variant C — Gabor priors", VisualCortex::new(IMG_H, IMG_W))
+        "gabor" | _ => {
+            eprintln!("\n[Variant C] GABOR PRIORS  (VisualCortex::new({IMG_H}, {IMG_W}) — DoG + Gabor V1 + random V2/V4)");
+            ("C — gabor", Some(VisualCortex::new(IMG_H, IMG_W)))
         }
     };
     let _ = variant_name;
@@ -249,12 +315,12 @@ fn main() {
         let n = n.min(train.len()).max(1);
         let size = std::env::var("MODGRAD_BRAIN_SIZE").unwrap_or_else(|_| "billion".into());
         eprintln!("\n[phase5-profile] brain size = {size}, {n} forward passes per path");
-        let w = build_brain(cortex.token_dim());
+        let w = build_brain(obs_dim_of(&cortex));
 
         // ── Host path. ──
         let t_host = std::time::Instant::now();
         for i in 0..n {
-            let input = cortex.encode(&train[i].rgb);
+            let input = encode_for_brain(&cortex, &train[i].rgb);
             let state = RegionalBrain::init_state(&w);
             let _ = RegionalBrain::forward(&w, state, &input);
         }
@@ -270,7 +336,7 @@ fn main() {
             let batch = HipBatch::new();
             let t = std::time::Instant::now();
             for i in 0..n {
-                let input = cortex.encode(&train[i].rgb);
+                let input = encode_for_brain(&cortex, &train[i].rgb);
                 let fresh = cache.fresh(&w).expect("cache fresh");
                 let _ = modgrad_ctm::RegionalBrain::forward_cached_resident(
                     &w, fresh, &batch, &input,
@@ -296,9 +362,9 @@ fn main() {
 
     // Sanity: cortex output magnitude + cross-sample diversity.
     {
-        let probe0 = cortex.encode(&train[0].rgb);
-        let probe1 = cortex.encode(&train[1].rgb);
-        let probe7 = cortex.encode(&train[7].rgb);
+        let probe0 = encode_for_brain(&cortex, &train[0].rgb);
+        let probe1 = encode_for_brain(&cortex, &train[1].rgb);
+        let probe7 = encode_for_brain(&cortex, &train[7].rgb);
         let n = probe0.tokens.len() as f32;
         let mean = probe0.tokens.iter().sum::<f32>() / n;
         let var = probe0.tokens.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
@@ -343,12 +409,12 @@ fn main() {
 ///   then  n_train × (feat_dim f32 + label u32)
 ///   then  n_eval  × (feat_dim f32 + label u32)
 fn dump_cortex_features(
-    cortex: &VisualCortex,
+    cortex: &Option<VisualCortex>,
     train: &[Step], eval: &[Step],
     path: &str,
 ) {
     use std::io::Write;
-    let probe = cortex.encode(&train[0].rgb);
+    let probe = encode_for_brain(&cortex, &train[0].rgb);
     let feat_dim = probe.tokens.len();
     let mut f = std::fs::File::create(path).expect("create feats file");
     f.write_all(b"FCDS").unwrap();
@@ -357,7 +423,7 @@ fn dump_cortex_features(
     f.write_all(&(feat_dim     as u32).to_le_bytes()).unwrap();
     let dump = |steps: &[Step], f: &mut std::fs::File| {
         for s in steps {
-            let inp = cortex.encode(&s.rgb);
+            let inp = encode_for_brain(&cortex, &s.rgb);
             for v in &inp.tokens {
                 f.write_all(&v.to_le_bytes()).unwrap();
             }
@@ -379,11 +445,11 @@ fn dump_cortex_features(
 ///     ([HIP queue overflow] memory).
 ///   - Otherwise the host path: `forward_cached` + `backward`.
 fn study_brain(
-    cortex: &VisualCortex,
+    cortex: &Option<VisualCortex>,
     train: &[Step], eval: &[Step],
     epochs: usize, batch_size: usize, lr: f32,
 ) -> RegionalWeights {
-    let obs_dim = cortex.token_dim();
+    let obs_dim = obs_dim_of(&cortex);
     let mut w = build_brain(obs_dim);
     let mut opt = RegionalAdamW::new(&w).with_lr(lr).with_clip(5.0);
     let loss_fn = StepwiseCE { n_classes: N_ACTIONS, lookahead: 1 };
@@ -439,7 +505,7 @@ fn study_brain(
                     let step = &train[i];
 
                     let t = Instant::now();
-                    let input = cortex.encode(&step.rgb);
+                    let input = encode_for_brain(&cortex, &step.rgb);
                     t_encode += t.elapsed();
 
                     let t = Instant::now();
@@ -539,7 +605,7 @@ fn study_brain(
             let mut batch_loss = 0.0f32;
             for &i in chunk {
                 let step = &train[i];
-                let input = cortex.encode(&step.rgb);
+                let input = encode_for_brain(&cortex, &step.rgb);
                 let state = RegionalBrain::init_state(&w);
                 let (output, _state, cache) = RegionalBrain::forward_cached(&w, state, &input);
                 let target = [step.action as usize];
@@ -567,10 +633,10 @@ fn study_brain(
     w
 }
 
-fn eval_accuracy_silent(w: &RegionalWeights, cortex: &VisualCortex, steps: &[Step]) -> f32 {
+fn eval_accuracy_silent(w: &RegionalWeights, cortex: &Option<VisualCortex>, steps: &[Step]) -> f32 {
     let mut correct = 0usize;
     for step in steps {
-        let input = cortex.encode(&step.rgb);
+        let input = encode_for_brain(&cortex, &step.rgb);
         let state = RegionalBrain::init_state(w);
         let (output, _state) = RegionalBrain::forward(w, state, &input);
         if let Some(last) = output.predictions.last() {
@@ -581,14 +647,14 @@ fn eval_accuracy_silent(w: &RegionalWeights, cortex: &VisualCortex, steps: &[Ste
 }
 
 /// Five focused diagnostics on the trained brain.
-fn diagnose(w: &RegionalWeights, cortex: &VisualCortex, train: &[Step], eval: &[Step]) {
+fn diagnose(w: &RegionalWeights, cortex: &Option<VisualCortex>, train: &[Step], eval: &[Step]) {
     let names = ["L", "R", "F", "pickup", "drop", "toggle", "done"];
 
     // ── 1. Per-tick predictions on 5 train samples ──────────────
     eprintln!("\n[1] per-tick logits/argmax on 5 train samples — does the model 'think' or freeze?");
     for i in 0..5usize.min(train.len()) {
         let s = &train[i];
-        let input = cortex.encode(&s.rgb);
+        let input = encode_for_brain(&cortex, &s.rgb);
         let state = RegionalBrain::init_state(w);
         let (output, _) = RegionalBrain::forward(w, state, &input);
         eprint!("  sample {} (true={}): per-tick argmax = [", i, names[s.action as usize]);
@@ -614,7 +680,7 @@ fn diagnose(w: &RegionalWeights, cortex: &VisualCortex, train: &[Step], eval: &[
     // ── 2. Does input matter? Compare predictions on real vs zero vs random input ──
     eprintln!("\n[2] does the input matter? (compare predictions on real / zero / random / shuffled)");
     let s0 = &train[0];
-    let real_input = cortex.encode(&s0.rgb);
+    let real_input = encode_for_brain(&cortex, &s0.rgb);
     let token_dim = real_input.token_dim;
     let n_tokens  = real_input.n_tokens;
     let zero_input = TokenInput {
@@ -671,7 +737,7 @@ fn diagnose(w: &RegionalWeights, cortex: &VisualCortex, train: &[Step], eval: &[
     eprintln!("\n[4] cortex output stats across 50 samples (variance across samples = useful signal)");
     let mut feats: Vec<Vec<f32>> = Vec::new();
     for i in 0..50.min(train.len()) {
-        let inp = cortex.encode(&train[i].rgb);
+        let inp = encode_for_brain(&cortex, &train[i].rgb);
         feats.push(inp.tokens);
     }
     let dim = feats[0].len();
@@ -695,7 +761,7 @@ fn diagnose(w: &RegionalWeights, cortex: &VisualCortex, train: &[Step], eval: &[
     let mut pred_hist = [0usize; N_ACTIONS];
     let n_eval = eval.len().min(400);
     for s in eval.iter().take(n_eval) {
-        let inp = cortex.encode(&s.rgb);
+        let inp = encode_for_brain(&cortex, &s.rgb);
         let st = RegionalBrain::init_state(w);
         let (out, _) = RegionalBrain::forward(w, st, &inp);
         let p = out.predictions.last().unwrap();
