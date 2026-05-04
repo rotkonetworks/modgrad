@@ -78,6 +78,11 @@ shaders/*.spv
 benchmarks/fusion-blossom/
 benchmarks/.venv/
 
+# Python venv + un-vendored third-party clones under extra/
+# (vendored deps like extra/remu/ are committed deliberately)
+/extra/venv/
+/extra/Minigrid/
+
 # QEC generated data
 data/qec/Data_PAEMS*
 

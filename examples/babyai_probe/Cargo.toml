@@ -1,0 +1,24 @@
+[package]
+name = "babyai_probe"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rocm = [
+    "modgrad-compute/rocm",
+    "modgrad-codec/rocm",
+    "modgrad-ctm/rocm",
+    "modgrad-device/rocm",
+]
+
+[dependencies]
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+modgrad-codec   = { path = "../../crates/modgrad-codec" }
+modgrad-ctm     = { path = "../../crates/modgrad-ctm" }
+modgrad-device  = { path = "../../crates/modgrad-device" }
+modgrad-traits  = { path = "../../crates/modgrad-traits" }
+
+[[bin]]
+name = "babyai_probe"
+path = "src/main.rs"
