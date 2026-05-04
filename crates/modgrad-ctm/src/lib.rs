@@ -13,6 +13,10 @@ pub mod weights;
 pub mod forward;
 pub mod train;
 pub mod loss;
+/// Per-dispatch-type timing for the brain forward path. Activated by
+/// env var `MODGRAD_PROFILE_DISPATCH=1`. Off by default — zero
+/// overhead on the production path.
+pub mod dispatch_profile;
 // FFN architecture moved to the `modgrad-ffn` crate — parallel to
 // `modgrad-transformer`. Depend on it directly for SwiGLU language models.
 pub mod graph;
