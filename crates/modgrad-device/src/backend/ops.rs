@@ -160,6 +160,60 @@ pub unsafe fn super_linear_fwd_resident(
     Ok(())
 }
 
+/// Device-resident batched per-neuron SuperLinear backward — gradient w.r.t. weights.
+/// See [`Op::SuperLinearBwdDwResident`](super::Op::SuperLinearBwdDwResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `d_out_dev`    covers at least `n_neurons * out_per * 4` bytes.
+/// - `trace_dev`    covers at least `n_neurons * in_per * 4` bytes.
+/// - `d_weight_dev` covers at least `n_neurons * out_per * in_per * 4` bytes (writable, accumulated).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn super_linear_bwd_dw_resident(
+    d_out_dev: *const f32,
+    trace_dev: *const f32,
+    d_weight_dev: *mut f32,
+    n_neurons: usize,
+    in_per: usize,
+    out_per: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::SuperLinearBwdDwResident {
+        d_out_dev, trace_dev, d_weight_dev,
+        n_neurons, in_per, out_per,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident batched per-neuron SuperLinear backward — gradient w.r.t. input trace.
+/// See [`Op::SuperLinearBwdDxResident`](super::Op::SuperLinearBwdDxResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `d_out_dev`   covers at least `n_neurons * out_per * 4` bytes.
+/// - `weight_dev`  covers at least `n_neurons * out_per * in_per * 4` bytes.
+/// - `d_trace_dev` covers at least `n_neurons * in_per * 4` bytes (writable, overwritten).
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn super_linear_bwd_dx_resident(
+    d_out_dev: *const f32,
+    weight_dev: *const f32,
+    d_trace_dev: *mut f32,
+    n_neurons: usize,
+    in_per: usize,
+    out_per: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::SuperLinearBwdDxResident {
+        d_out_dev, weight_dev, d_trace_dev,
+        n_neurons, in_per, out_per,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident matmul `C = A @ B`.
 /// See [`Op::MatmulResidentNN`](super::Op::MatmulResidentNN).
 ///

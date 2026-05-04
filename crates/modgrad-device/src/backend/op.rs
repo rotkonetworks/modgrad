@@ -231,6 +231,44 @@ pub enum Op<'a> {
         out_per: usize,
     },
 
+    /// **Device-resident** SuperLinear backward — gradient w.r.t.
+    /// weights. Mirrors `SuperLinearBwdDw` but every operand is a
+    /// hip-device pointer. Implemented as one strided-batched SGEMM
+    /// over `n_neurons` outer products, `beta=1.0` accumulating into
+    /// `d_weight_dev`. CPU + vulkan return `Unsupported`.
+    ///
+    /// Layout (all device pointers, contiguous f32):
+    ///   d_out_dev:    [n_neurons × out_per]
+    ///   trace_dev:    [n_neurons × in_per]   (in_per = memory_length)
+    ///   d_weight_dev: [n_neurons × out_per × in_per] row-major per neuron
+    SuperLinearBwdDwResident {
+        d_out_dev: *const f32,
+        trace_dev: *const f32,
+        d_weight_dev: *mut f32,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    },
+
+    /// **Device-resident** SuperLinear backward — gradient w.r.t.
+    /// input trace. Mirrors `SuperLinearBwdDx` but every operand is a
+    /// hip-device pointer. Implemented as one strided-batched SGEMM
+    /// over `n_neurons` matvecs (W^T·d_out), `beta=0.0` overwriting
+    /// `d_trace_dev`. CPU + vulkan return `Unsupported`.
+    ///
+    /// Layout (all device pointers, contiguous f32):
+    ///   d_out_dev:    [n_neurons × out_per]
+    ///   weight_dev:   [n_neurons × out_per × in_per]
+    ///   d_trace_dev:  [n_neurons × in_per]
+    SuperLinearBwdDxResident {
+        d_out_dev: *const f32,
+        weight_dev: *const f32,
+        d_trace_dev: *mut f32,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    },
+
     /// **Device-resident** matmul: `C = A @ B`. Same math as
     /// [`Op::MatmulNN`] but every operand is a hip-device pointer.
     /// Backends that cannot consume device pointers (CPU, vulkan-
@@ -1024,6 +1062,8 @@ impl<'a> Op<'a> {
             Op::Matvec { .. } => "matvec",
             Op::MatvecResident { .. } => "matvec_resident",
             Op::SuperLinearFwdResident { .. } => "super_linear_fwd_resident",
+            Op::SuperLinearBwdDwResident { .. } => "super_linear_bwd_dw_resident",
+            Op::SuperLinearBwdDxResident { .. } => "super_linear_bwd_dx_resident",
             Op::MatmulResidentNN { .. } => "matmul_resident_nn",
             Op::MatmulResidentNT { .. } => "matmul_resident_nt",
             Op::MatmulResidentTN { .. } => "matmul_resident_tn",

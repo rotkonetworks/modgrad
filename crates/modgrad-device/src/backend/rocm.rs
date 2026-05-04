@@ -1072,6 +1072,8 @@ impl Backend for RocmBackend {
                 // when weights and activations are already on device.
                 Op::MatvecResident { .. } => true,
                 Op::SuperLinearFwdResident { .. } => true,
+                Op::SuperLinearBwdDwResident { .. } => true,
+                Op::SuperLinearBwdDxResident { .. } => true,
                 Op::MatmulResidentNN { .. }
                 | Op::MatmulResidentNT { .. }
                 | Op::MatmulResidentTN { .. } => true,
@@ -1173,6 +1175,24 @@ impl Backend for RocmBackend {
                     *weight_dev as *const std::os::raw::c_void,
                     *bias_dev as *const std::os::raw::c_void,
                     *out_dev as *mut std::os::raw::c_void,
+                    *n_neurons, *in_per, *out_per,
+                ),
+                Op::SuperLinearBwdDwResident {
+                    d_out_dev, trace_dev, d_weight_dev,
+                    n_neurons, in_per, out_per,
+                } => self.super_linear_bwd_dw_resident_batched_f32(
+                    *d_out_dev as *const std::os::raw::c_void,
+                    *trace_dev as *const std::os::raw::c_void,
+                    *d_weight_dev as *mut std::os::raw::c_void,
+                    *n_neurons, *in_per, *out_per,
+                ),
+                Op::SuperLinearBwdDxResident {
+                    d_out_dev, weight_dev, d_trace_dev,
+                    n_neurons, in_per, out_per,
+                } => self.super_linear_bwd_dx_resident_batched_f32(
+                    *d_out_dev as *const std::os::raw::c_void,
+                    *weight_dev as *const std::os::raw::c_void,
+                    *d_trace_dev as *mut std::os::raw::c_void,
                     *n_neurons, *in_per, *out_per,
                 ),
                 Op::MatmulResidentNN {
@@ -1628,6 +1648,140 @@ impl RocmBackend {
         if status != 0 {
             return Err(BackendError::Runtime(format!(
                 "hipblasSgemmStridedBatched (super_linear): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Per-neuron SuperLinear backward — gradient w.r.t. weights.
+    ///
+    /// Math (per neuron `n`):
+    ///   `dW[n][i, k] += d_out[n][i] * trace[n][k]`
+    /// where `dW[n]` is row-major `[out_per × in_per]`, `d_out[n]` is
+    /// `out_per`-vector, `trace[n]` is `in_per`-vector. This is an
+    /// outer product. Across neurons, the operation batches naturally
+    /// because each neuron's weight slab is independent.
+    ///
+    /// Layout (all device pointers, contiguous f32):
+    ///   d_out:    [n_neurons × out_per]
+    ///   trace:    [n_neurons × in_per]
+    ///   d_weight: [n_neurons × out_per × in_per] row-major per neuron
+    ///
+    /// Implemented as one strided-batched SGEMM with `beta=1.0` so we
+    /// accumulate into existing dW. Same column-major-via-trick as
+    /// `super_linear_fwd_resident_batched_f32`: row-major
+    /// `dW[out_per × in_per]` is column-major `[in_per × out_per]`. We
+    /// compute `(dW^T)_col = trace_col · d_out_col^T` with
+    /// trace as a [in_per × 1] col vector and d_out as a [1 × out_per]
+    /// row vector — i.e. m=in_per, n=out_per, k=1.
+    pub(crate) fn super_linear_bwd_dw_resident_batched_f32(
+        &self,
+        d_out_dev: *const std::os::raw::c_void,
+        trace_dev: *const std::os::raw::c_void,
+        d_weight_dev: *mut std::os::raw::c_void,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    ) -> Result<(), BackendError> {
+        let in_per_i32  = as_i32(in_per,  "in_per")?;
+        let out_per_i32 = as_i32(out_per, "out_per")?;
+        let batch_i32   = as_i32(n_neurons, "n_neurons")?;
+        let alpha: f32 = 1.0;
+        let beta:  f32 = 1.0;
+        // Strides per neuron in the batch.
+        let stride_a: i64 = in_per as i64;          // trace per neuron
+        let stride_b: i64 = out_per as i64;          // d_out per neuron
+        let stride_c: i64 = (out_per * in_per) as i64; // d_weight per neuron
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemmStridedBatched(
+                *handle,
+                ffi::HIPBLAS_OP_N, // A = trace, no transpose
+                ffi::HIPBLAS_OP_N, // B = d_out, no transpose
+                in_per_i32,        // m (col-major rows of C = row-major cols of dW = in_per)
+                out_per_i32,       // n (col-major cols of C = row-major rows of dW = out_per)
+                1,                 // k (outer-product contraction)
+                &alpha,
+                trace_dev as *const f32,
+                in_per_i32,        // lda
+                stride_a,
+                d_out_dev as *const f32,
+                1,                 // ldb (k=1)
+                stride_b,
+                &beta,
+                d_weight_dev as *mut f32,
+                in_per_i32,        // ldc
+                stride_c,
+                batch_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemmStridedBatched (super_linear_bwd_dw): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Per-neuron SuperLinear backward — gradient w.r.t. input trace.
+    ///
+    /// Math (per neuron `n`):
+    ///   `d_trace[n][k] = sum_i W[n][i, k] * d_out[n][i]`  (overwrite)
+    /// which is `d_trace[n] = W[n]^T · d_out[n]`. With `W[n]` row-major
+    /// `[out_per × in_per]`, `W[n]^T` is row-major `[in_per × out_per]`,
+    /// which is column-major `[out_per × in_per]`. So: in column-major
+    /// view, we compute `d_trace_col = W_col · d_out_col` directly with
+    /// no transpose — a standard matvec, m=in_per, k=out_per, n=1.
+    ///
+    /// `beta=0` (overwrite) to match the CPU semantics
+    /// `d_trace[t_off + k] = acc;`.
+    pub(crate) fn super_linear_bwd_dx_resident_batched_f32(
+        &self,
+        d_out_dev: *const std::os::raw::c_void,
+        weight_dev: *const std::os::raw::c_void,
+        d_trace_dev: *mut std::os::raw::c_void,
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    ) -> Result<(), BackendError> {
+        let in_per_i32  = as_i32(in_per,  "in_per")?;
+        let out_per_i32 = as_i32(out_per, "out_per")?;
+        let batch_i32   = as_i32(n_neurons, "n_neurons")?;
+        let alpha: f32 = 1.0;
+        let beta:  f32 = 0.0;
+        let stride_a: i64 = (in_per * out_per) as i64; // weight per neuron
+        let stride_b: i64 = out_per as i64;             // d_out per neuron
+        let stride_c: i64 = in_per as i64;              // d_trace per neuron
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemmStridedBatched(
+                *handle,
+                ffi::HIPBLAS_OP_N, // A = W (col-major in_per × out_per)
+                ffi::HIPBLAS_OP_N, // B = d_out (col-major out_per × 1)
+                in_per_i32,        // m
+                1,                 // n
+                out_per_i32,       // k
+                &alpha,
+                weight_dev as *const f32,
+                in_per_i32,        // lda
+                stride_a,
+                d_out_dev as *const f32,
+                out_per_i32,       // ldb
+                stride_b,
+                &beta,
+                d_trace_dev as *mut f32,
+                in_per_i32,        // ldc
+                stride_c,
+                batch_i32,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemmStridedBatched (super_linear_bwd_dx): status {status}"
             )));
         }
         Ok(())
