@@ -127,6 +127,13 @@ fn obs_dim_of(cortex: &Option<VisualCortex>) -> usize {
 /// `None`, splits the frame into non-overlapping 8×8×3 patches —
 /// 49 tokens × 192 dim, matching the cortex's spatial layout but
 /// with no learned visual features.
+///
+/// Patches are centred to ≈zero-mean ((x−0.5)·2 → [−1,1]) so the
+/// brain's obs_proj sees a distribution comparable to the cortex's
+/// leaky-ReLU output (mean ≈0.04, std ≈0.10 measured). Without this
+/// centering Variant A's brain stayed below the always-F floor —
+/// obs_proj init scaled for zero-mean input mishandles raw [0,1]
+/// pixel range.
 fn encode_for_brain(cortex: &Option<VisualCortex>, rgb: &[f32]) -> TokenInput {
     use modgrad_traits::Encoder;
     if let Some(c) = cortex {
@@ -151,7 +158,7 @@ fn encode_for_brain(cortex: &Option<VisualCortex>, rgb: &[f32]) -> TokenInput {
                                 + c * RAW_PATCH * RAW_PATCH
                                 + dy * RAW_PATCH
                                 + dx;
-                        tokens[dst] = rgb[src];
+                        tokens[dst] = (rgb[src] - 0.5) * 2.0;
                     }
                 }
             }
