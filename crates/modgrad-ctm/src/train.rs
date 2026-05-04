@@ -913,6 +913,32 @@ impl CtmGradients {
 
     /// SGD update: w -= lr * grad. Clips gradients by norm.
     /// GPU-accelerated for large parameter arrays.
+    /// Apply ONLY the tensors that stay on raw clip-SGD: U-Net synapse,
+    /// the small init params (`start_activated`, `start_trace`), the
+    /// kv-LayerNorm gamma/beta, and the optional exit gate. The
+    /// caller (`RegionalAdamW::step`) handles the major tensors via
+    /// `RegionInnerAdamW::step`.
+    ///
+    /// Caller passes the already-globally-clipped `lr`. We don't
+    /// recompute clip norm here — that scale was already folded in.
+    pub fn apply_minor(&mut self, w: &mut CtmWeights, lr: f32) {
+        use modgrad_device::backend::ops;
+        let sgd = |w: &mut [f32], g: &mut [f32]| {
+            ops::sgd_update(w, g, lr).expect("sgd_update dispatch");
+        };
+        self.unet.apply(&mut w.synapse, lr);
+        sgd(&mut w.start_activated, &mut self.d_start_activated);
+        sgd(&mut w.start_trace, &mut self.d_start_trace);
+        sgd(&mut w.kv_ln_gamma, &mut self.kv_ln_d_gamma);
+        sgd(&mut w.kv_ln_beta, &mut self.kv_ln_d_beta);
+        if let Some(gate) = &mut w.exit_gate {
+            if let (Some(gw), Some(gb)) = (&mut self.exit_gate_w, &mut self.exit_gate_b) {
+                sgd(&mut gate.weight, gw);
+                sgd(&mut gate.bias, gb);
+            }
+        }
+    }
+
     pub fn apply(&mut self, w: &mut CtmWeights, lr: f32, clip_norm: f32) {
         let scale = {
             let grads: &[&[f32]] = &[

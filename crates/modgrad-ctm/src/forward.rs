@@ -67,7 +67,11 @@ pub fn ctm_forward(
             let mut kv = Vec::with_capacity(n_tokens * d_in);
             for t in 0..n_tokens {
                 let tok = &obs[t * raw_dim..(t + 1) * raw_dim];
-                let mut projected = w.kv_proj.forward(tok);
+                let mut projected = {
+                    let _g = crate::dispatch_profile::Guard::new(
+                        crate::dispatch_profile::DispatchKind::KvProj);
+                    w.kv_proj.forward(tok)
+                };
                 affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
                 kv.extend_from_slice(&projected);
             }
@@ -170,16 +174,32 @@ fn ctm_forward_with_kv(
                 &mut alpha_action, &mut beta_action, &r_action)
         };
 
-        let q = w.q_proj.forward(&sync_action);
-        let attn_out = multihead_attention(
-            &q, kv, n_tokens, d_in, cfg.heads,
-            &w.mha_in_proj, &w.mha_out_proj,
-        );
+        let q = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::QProj);
+            w.q_proj.forward(&sync_action)
+        };
+        let attn_out = {
+            // MhaIn covers internal Q/K/V proj + softmax; MhaOut is the
+            // output projection. We instrument the whole call here and
+            // accept that the breakdown is coarser than per-sub-op for
+            // Phase 0 — sufficient to see the MHA bucket size.
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::MhaIn);
+            multihead_attention(
+                &q, kv, n_tokens, d_in, cfg.heads,
+                &w.mha_in_proj, &w.mha_out_proj,
+            )
+        };
 
         let mut pre_syn = Vec::with_capacity(d_in + d);
         pre_syn.extend_from_slice(&attn_out);
         pre_syn.extend_from_slice(&state.activated);
-        let pre_act = w.synapse.forward(&pre_syn);
+        let pre_act = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::Synapse);
+            w.synapse.forward(&pre_syn)
+        };
 
         for n in 0..d {
             let base = n * m;
@@ -187,7 +207,11 @@ fn ctm_forward_with_kv(
             state.trace[base + m - 1] = pre_act[n];
         }
 
-        state.activated = nlm_forward(&state.trace, &w.nlm_stage1, w.nlm_stage2.as_ref(), d);
+        state.activated = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::NlmS1);
+            nlm_forward(&state.trace, &w.nlm_stage1, w.nlm_stage2.as_ref(), d)
+        };
 
         if collect_traj {
             trajectory.extend_from_slice(&state.activated);
@@ -196,7 +220,11 @@ fn ctm_forward_with_kv(
         let sync_out = sync_update(&state.activated, &w.sync_out_left, &w.sync_out_right,
             &mut state.alpha_out, &mut state.beta_out, &r_out);
 
-        let pred = w.output_proj.forward(&sync_out);
+        let pred = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::OutProjRegion);
+            w.output_proj.forward(&sync_out)
+        };
         let cert = compute_certainty(&pred);
         predictions.push(pred);
         certainties.push(cert);
@@ -204,6 +232,8 @@ fn ctm_forward_with_kv(
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let Some(ref gate) = w.exit_gate {
+                    let _g = crate::dispatch_profile::Guard::new(
+                        crate::dispatch_profile::DispatchKind::ExitGateRegion);
                     let gate_logit = gate.forward(&sync_out);
                     let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
                     exit_lambdas.push(lambda);
@@ -1126,6 +1156,33 @@ pub fn ctm_backward_resident(
     cache: &CtmCacheResident,
     d_external: &[f32],
 ) -> RegionBackwardResultResident {
+    ctm_backward_resident_inner(w, cache, d_external, None)
+}
+
+/// Phase 3c variant: when `resident_grads` is `Some((rg, region_idx))`,
+/// the heavy SuperLinear dW backward goes through the resident kernel,
+/// accumulating into device buffers in `rg`. The host
+/// `RegionBackwardResultResident.grads.nlm_s1_w` / `nlm_s2_w` slices
+/// stay zero in that case — caller must merge them in via
+/// `RegionalGradientsResident::add_to_host` after backward completes.
+#[cfg(feature = "rocm")]
+pub fn ctm_backward_resident_with_grads_resident(
+    w: &CtmWeights,
+    cache: &CtmCacheResident,
+    d_external: &[f32],
+    resident_grads: &crate::resident::RegionalGradientsResident,
+    region_idx: usize,
+) -> RegionBackwardResultResident {
+    ctm_backward_resident_inner(w, cache, d_external, Some((resident_grads, region_idx)))
+}
+
+#[cfg(feature = "rocm")]
+fn ctm_backward_resident_inner(
+    w: &CtmWeights,
+    cache: &CtmCacheResident,
+    d_external: &[f32],
+    resident_grads: Option<(&crate::resident::RegionalGradientsResident, usize)>,
+) -> RegionBackwardResultResident {
     let cfg = &w.config;
     let d = cfg.d_model;
     let d_in = cache.d_input;
@@ -1154,10 +1211,14 @@ pub fn ctm_backward_resident(
         let tc = &cache.tick_caches[tick];
 
         // ── Sync-out backward (host scalar, identical to host path). ──
-        let d_from_sync = sync_backward_host(
-            &d_activated, &tc.activated_post, &tc.beta_out,
-            &w.sync_out_left, &w.sync_out_right, d,
-        );
+        let d_from_sync = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerSyncOut);
+            sync_backward_host(
+                &d_activated, &tc.activated_post, &tc.beta_out,
+                &w.sync_out_left, &w.sync_out_right, d,
+            )
+        };
 
         // External gradient is injected at the LAST tick only (matches
         // host `backward_from_activated`). Earlier ticks see only the
@@ -1170,49 +1231,49 @@ pub fn ctm_backward_resident(
             }
         }
 
-        // ── NLM backward (host helpers — `train::nlm_backward` is
-        // private; we replicate the call signature using public
-        // SuperLinear API). ──
-        let d_trace = nlm_backward_resident(
-            &d_act_total,
-            tc,
-            &w.nlm_stage1, w.nlm_stage2.as_ref(),
-            &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
-            &mut grads.nlm_s2_w, &mut grads.nlm_s2_b,
-        );
+        // ── NLM backward ──
+        let d_trace = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerNlm);
+            nlm_backward_resident(
+                &d_act_total, tc,
+                &w.nlm_stage1, w.nlm_stage2.as_ref(),
+                &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
+                &mut grads.nlm_s2_w, &mut grads.nlm_s2_b,
+                resident_grads,
+            )
+        };
 
-        // d_pre_act is the last column of the trace (the freshest
-        // entry that came from the synapse).
         let mut d_pre_act = vec![0.0f32; d];
         for n in 0..d { d_pre_act[n] = d_trace[n * m + m - 1]; }
 
         // ── Synapse U-Net backward (Path B — host re-cache). ──
-        // Reconstruct per-block intermediates host-side via the now
-        // pub(crate) `train::unet_forward_cached`, then run
-        // `train::unet_backward` directly into `grads.unet`. Weight,
-        // bias, gamma, beta gradients all accumulate correctly; the
-        // returned `d_pre_syn` keeps the cross-tick BPTT chain intact.
-        // (See module-level GAP doc for why Path B vs Path A.)
-        let (_unet_out, unet_cache) = crate::train::unet_forward_cached(
-            &w.synapse, &tc.pre_syn,
-        );
-        let d_pre_syn = crate::train::unet_backward(
-            &w.synapse, &d_pre_act, &unet_cache, &mut grads.unet,
-        );
+        let d_pre_syn = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerUnet);
+            let (_unet_out, unet_cache) = crate::train::unet_forward_cached(
+                &w.synapse, &tc.pre_syn,
+            );
+            crate::train::unet_backward(
+                &w.synapse, &d_pre_act, &unet_cache, &mut grads.unet,
+            )
+        };
 
         let d_attn_out = &d_pre_syn[..d_in];
         let d_act_from_syn = &d_pre_syn[d_in..];
 
-        // ── MHA backward (host helpers — `train::mha_backward` is
-        // private; we replicate inline). ──
-        let (d_q, d_kv_tokens) = mha_backward_resident(
-            d_attn_out, tc, n_tokens, d_in, cfg.heads,
-            &w.mha_in_proj, &w.mha_out_proj,
-            &mut grads.mha_in_w, &mut grads.mha_in_b,
-            &mut grads.mha_out_w, &mut grads.mha_out_b,
-        );
+        // ── MHA backward ──
+        let (d_q, d_kv_tokens) = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerMha);
+            mha_backward_resident(
+                d_attn_out, tc, n_tokens, d_in, cfg.heads,
+                &w.mha_in_proj, &w.mha_out_proj,
+                &mut grads.mha_in_w, &mut grads.mha_in_b,
+                &mut grads.mha_out_w, &mut grads.mha_out_b,
+            )
+        };
 
-        // Accumulate d_kv across ticks.
         for (t, d_tok) in d_kv_tokens.iter().enumerate() {
             let offset = t * d_in;
             for j in 0..d_in.min(d_tok.len()) {
@@ -1222,23 +1283,28 @@ pub fn ctm_backward_resident(
             }
         }
 
-        // ── q_proj backward (`Linear` backward via train.rs helper).
-        // Reconstruct the LinearCache from the resident-cache field
-        // (we saved q_proj_out's INPUT = sync_action). ──
-        let q_lin_cache = crate::train::LinearCache { input: tc.sync_action.clone() };
-        crate::train::linear_backward(
-            &w.q_proj, &d_q, &q_lin_cache,
-            &mut grads.q_proj_w, &mut grads.q_proj_b,
-            &mut d_sync_action_scratch,
-        );
+        // ── q_proj backward ──
+        {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerQProj);
+            let q_lin_cache = crate::train::LinearCache { input: tc.sync_action.clone() };
+            crate::train::linear_backward(
+                &w.q_proj, &d_q, &q_lin_cache,
+                &mut grads.q_proj_w, &mut grads.q_proj_b,
+                &mut d_sync_action_scratch,
+            );
+        }
         let d_sync_action: &[f32] = &d_sync_action_scratch;
 
-        // ── Sync-action backward — feeds back into d_activated for
-        // the previous tick. ──
-        let d_from_sync_action = sync_backward_host(
-            d_sync_action, &tc.activated_prev, &tc.beta_action,
-            &w.sync_action_left, &w.sync_action_right, d,
-        );
+        // ── Sync-action backward ──
+        let d_from_sync_action = {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::BwdInnerSyncAction);
+            sync_backward_host(
+                d_sync_action, &tc.activated_prev, &tc.beta_action,
+                &w.sync_action_left, &w.sync_action_right, d,
+            )
+        };
 
         // Combined gradient for the previous tick's d_activated.
         d_activated = vec![0.0f32; d];
@@ -1253,12 +1319,16 @@ pub fn ctm_backward_resident(
     // `backward_from_activated`). ──
     let raw_dim = w.kv_proj.in_dim;
     let mut d_observation = vec![0.0f32; n_tokens * raw_dim];
-    for t in 0..n_tokens {
-        let d_kv_t = &d_kv_accumulated[t * d_in..(t + 1).min(n_tokens) * d_in];
-        for j in 0..raw_dim {
-            for i in 0..d_in.min(d_kv_t.len()) {
-                d_observation[t * raw_dim + j] +=
-                    d_kv_t[i] * w.kv_proj.weight[i * raw_dim + j];
+    {
+        let _g = crate::dispatch_profile::Guard::new(
+            crate::dispatch_profile::DispatchKind::BwdInnerKvProj);
+        for t in 0..n_tokens {
+            let d_kv_t = &d_kv_accumulated[t * d_in..(t + 1).min(n_tokens) * d_in];
+            for j in 0..raw_dim {
+                for i in 0..d_in.min(d_kv_t.len()) {
+                    d_observation[t * raw_dim + j] +=
+                        d_kv_t[i] * w.kv_proj.weight[i * raw_dim + j];
+                }
             }
         }
     }
@@ -1309,6 +1379,18 @@ fn nlm_backward_resident(
     stage2: Option<&modgrad_compute::neuron::SuperLinear>,
     d_s1_w: &mut [f32], d_s1_b: &mut [f32],
     d_s2_w: &mut Option<Vec<f32>>, d_s2_b: &mut Option<Vec<f32>>,
+    // Phase 3c: when Some, route the heavy super_linear_bwd_dw calls
+    // through the resident kernel (accumulating into device buffers
+    // owned by `RegionalGradientsResident`) instead of the host CPU
+    // dispatch. The caller is responsible for calling `add_to_host`
+    // on the resident grads at end-of-batch to consolidate the device
+    // dW into the host slices that the optimizer reads.
+    //
+    // When the resident path is taken, the host `d_s1_w` / `d_s2_w`
+    // slices stay untouched here — they're populated later by
+    // `add_to_host`. The bias and `d_trace` paths remain host because
+    // they're tiny and not the hot bucket.
+    resident_grads: Option<(&crate::resident::RegionalGradientsResident, usize)>,
 ) -> Vec<f32> {
     use modgrad_device::backend::ops;
     let d_model = stage1.n_neurons;
@@ -1322,16 +1404,21 @@ fn nlm_backward_resident(
         ops::per_neuron_glu_bwd(d_out, s2_out_raw, &mut d_s2_in, d_model, s2_half)
             .expect("per_neuron_glu_bwd dispatch (s2)");
         // SuperLinear stage2 backward — input was tc.nlm_s1_glu.
-        let dw_s2 = d_s2_w.as_mut().expect("d_s2_w present when stage2 present");
-        let db_s2 = d_s2_b.as_mut().expect("d_s2_b present when stage2 present");
         let n = s2.n_neurons;
         let ip = s2.in_per;
         let op = s2.out_per;
-        // d_bias accumulate.
+        let db_s2 = d_s2_b.as_mut().expect("d_s2_b present when stage2 present");
         for i in 0..n * op { db_s2[i] += d_s2_in[i]; }
+        // dW: resident if available, host otherwise.
+        if let Some((rg, region_idx)) = resident_grads {
+            rg.accumulate_super_linear_dw(region_idx, true, &d_s2_in, &tc.nlm_s1_glu, n, ip, op)
+                .expect("accumulate_super_linear_dw (s2 resident)");
+        } else {
+            let dw_s2 = d_s2_w.as_mut().expect("d_s2_w present when stage2 present");
+            ops::super_linear_bwd_dw(&d_s2_in, &tc.nlm_s1_glu, dw_s2, n, ip, op)
+                .expect("super_linear_bwd_dw (s2)");
+        }
         let mut d_s1_glu = vec![0.0f32; n * ip];
-        ops::super_linear_bwd_dw(&d_s2_in, &tc.nlm_s1_glu, dw_s2, n, ip, op)
-            .expect("super_linear_bwd_dw (s2)");
         ops::super_linear_bwd_dx(&d_s2_in, &s2.weights, &mut d_s1_glu, n, ip, op)
             .expect("super_linear_bwd_dx (s2)");
         // GLU1 backward: invert per-neuron GLU on tc.nlm_s1_out.
@@ -1353,8 +1440,13 @@ fn nlm_backward_resident(
     let op = stage1.out_per;
     for i in 0..n * op { d_s1_b[i] += d_s1_in[i]; }
     let mut d_trace = vec![0.0f32; n * ip];
-    ops::super_linear_bwd_dw(&d_s1_in, &tc.trace, d_s1_w, n, ip, op)
-        .expect("super_linear_bwd_dw (s1)");
+    if let Some((rg, region_idx)) = resident_grads {
+        rg.accumulate_super_linear_dw(region_idx, false, &d_s1_in, &tc.trace, n, ip, op)
+            .expect("accumulate_super_linear_dw (s1 resident)");
+    } else {
+        ops::super_linear_bwd_dw(&d_s1_in, &tc.trace, d_s1_w, n, ip, op)
+            .expect("super_linear_bwd_dw (s1)");
+    }
     ops::super_linear_bwd_dx(&d_s1_in, &stage1.weights, &mut d_trace, n, ip, op)
         .expect("super_linear_bwd_dx (s1)");
     d_trace

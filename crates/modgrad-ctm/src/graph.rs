@@ -1810,7 +1810,11 @@ pub fn regional_forward(
 
     // Pre-allocated buffers for the hot loop
     let mut obs_projected = vec![0.0f32; w.obs_proj.out_dim];
-    w.obs_proj.forward_into(observation, &mut obs_projected);
+    {
+        let _g = crate::dispatch_profile::Guard::new(
+            crate::dispatch_profile::DispatchKind::ObsProj);
+        w.obs_proj.forward_into(observation, &mut obs_projected);
+    }
     let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
     let mut all_act_buf = vec![0.0f32; total_neurons];
     let n_sync = cfg.n_global_sync;
@@ -1860,7 +1864,11 @@ pub fn regional_forward(
                         if conn.receives_observation {
                             src.extend_from_slice(observation);
                         }
-                        let projected = w.connection_synapses[ci].forward(&src);
+                        let projected = {
+                            let _g = crate::dispatch_profile::Guard::new(
+                                crate::dispatch_profile::DispatchKind::ConnSynapse);
+                            w.connection_synapses[ci].forward(&src)
+                        };
                         merge_into_region_obs(&mut slot, projected);
                     }
                 }
@@ -1914,7 +1922,11 @@ pub fn regional_forward(
         }
 
         // Phase 4: Output prediction — reuse buffer
-        w.output_proj.forward_into(&gs_buf, &mut pred_buf);
+        {
+            let _g = crate::dispatch_profile::Guard::new(
+                crate::dispatch_profile::DispatchKind::OutputProj);
+            w.output_proj.forward_into(&gs_buf, &mut pred_buf);
+        }
         let prediction = pred_buf.clone(); // need owned copy for predictions vec
         predictions.push(prediction);
 
@@ -1922,6 +1934,8 @@ pub fn regional_forward(
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let Some(ref gate) = w.outer_exit_gate {
+                    let _g = crate::dispatch_profile::Guard::new(
+                        crate::dispatch_profile::DispatchKind::OuterExitGate);
                     let gate_logit = gate.forward(&gs_buf);
                     let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
                     exit_lambdas.push(lambda);
@@ -2070,7 +2084,11 @@ pub fn regional_forward_with_service(
                         if conn.receives_observation {
                             src.extend_from_slice(observation);
                         }
-                        let projected = w.connection_synapses[ci].forward(&src);
+                        let projected = {
+                            let _g = crate::dispatch_profile::Guard::new(
+                                crate::dispatch_profile::DispatchKind::ConnSynapse);
+                            w.connection_synapses[ci].forward(&src)
+                        };
                         merge_into_region_obs(&mut slot, projected);
                     }
                 }
@@ -3864,9 +3882,9 @@ fn regional_train_step_inner(
 
 /// Per-parameter AdamW state: first moment, second moment.
 #[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
-struct AdamWBuf {
-    m: Vec<f32>,
-    v: Vec<f32>,
+pub(crate) struct AdamWBuf {
+    pub(crate) m: Vec<f32>,
+    pub(crate) v: Vec<f32>,
 }
 
 impl AdamWBuf {
@@ -3874,13 +3892,112 @@ impl AdamWBuf {
         Self { m: vec![0.0; n], v: vec![0.0; n] }
     }
 
-    fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
+    pub(crate) fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
         use modgrad_device::backend::{ops, AdamWArgs};
         ops::adamw(AdamWArgs {
             w: weights, g: grads, m: &mut self.m, v: &mut self.v,
             lr, beta1: b1, beta2: b2, eps, weight_decay: wd,
             bc1_inv: 1.0 / bc1, bc2_inv: 1.0 / bc2,
         }).expect("adamw dispatch");
+    }
+}
+
+/// Phase 4: AdamW state for the per-region inner CTM tensors that the
+/// existing `CtmGradients::apply` updated with raw clip-SGD. One
+/// `RegionInnerAdamW` per region, held by `RegionalAdamW`. Covers the
+/// big tensors (NLM, Q/KV/MHA projections, region output_proj). The
+/// U-Net synapse and small init/scalar tensors stay on SGD for now —
+/// their gradient distributions are different and Adam is less
+/// universally a win there.
+///
+/// State sizing matches the corresponding `CtmWeights` tensors at
+/// build time. After an opt.step that resized weights (none today —
+/// region shapes are static post-construction), the bufs would need
+/// rebuild; that's out of scope for the static-graph training path.
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub(crate) struct RegionInnerAdamW {
+    nlm_s1_w: AdamWBuf,
+    nlm_s1_b: AdamWBuf,
+    nlm_s2_w: Option<AdamWBuf>,
+    nlm_s2_b: Option<AdamWBuf>,
+    kv_proj_w: AdamWBuf,
+    kv_proj_b: AdamWBuf,
+    q_proj_w: AdamWBuf,
+    q_proj_b: AdamWBuf,
+    mha_in_w: AdamWBuf,
+    mha_in_b: AdamWBuf,
+    mha_out_w: AdamWBuf,
+    mha_out_b: AdamWBuf,
+    out_proj_w: AdamWBuf,
+    out_proj_b: AdamWBuf,
+}
+
+impl RegionInnerAdamW {
+    pub(crate) fn zeros(rw: &CtmWeights) -> Self {
+        Self {
+            nlm_s1_w: AdamWBuf::zeros(rw.nlm_stage1.weights.len()),
+            nlm_s1_b: AdamWBuf::zeros(rw.nlm_stage1.biases.len()),
+            nlm_s2_w: rw.nlm_stage2.as_ref().map(|s| AdamWBuf::zeros(s.weights.len())),
+            nlm_s2_b: rw.nlm_stage2.as_ref().map(|s| AdamWBuf::zeros(s.biases.len())),
+            kv_proj_w: AdamWBuf::zeros(rw.kv_proj.weight.len()),
+            kv_proj_b: AdamWBuf::zeros(rw.kv_proj.bias.len()),
+            q_proj_w: AdamWBuf::zeros(rw.q_proj.weight.len()),
+            q_proj_b: AdamWBuf::zeros(rw.q_proj.bias.len()),
+            mha_in_w: AdamWBuf::zeros(rw.mha_in_proj.weight.len()),
+            mha_in_b: AdamWBuf::zeros(rw.mha_in_proj.bias.len()),
+            mha_out_w: AdamWBuf::zeros(rw.mha_out_proj.weight.len()),
+            mha_out_b: AdamWBuf::zeros(rw.mha_out_proj.bias.len()),
+            out_proj_w: AdamWBuf::zeros(rw.output_proj.weight.len()),
+            out_proj_b: AdamWBuf::zeros(rw.output_proj.bias.len()),
+        }
+    }
+
+    /// Apply AdamW update to the major inner tensors. Bias-style and
+    /// LayerNorm tensors get `wd=0` (no weight decay), weight tensors
+    /// get the caller's `wd`. Mirrors the convention used by
+    /// `RegionalAdamW::step` for outer weights.
+    pub(crate) fn step(
+        &mut self,
+        rw: &mut CtmWeights,
+        rg: &mut crate::train::CtmGradients,
+        lr: f32, wd: f32,
+        b1: f32, b2: f32, eps: f32,
+        bc1: f32, bc2: f32,
+    ) {
+        self.nlm_s1_w.step(&mut rw.nlm_stage1.weights, &mut rg.nlm_s1_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.nlm_s1_b.step(&mut rw.nlm_stage1.biases, &mut rg.nlm_s1_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
+        if let (Some(s2w), Some(buf_w), Some(grad_w)) = (
+            rw.nlm_stage2.as_mut(), self.nlm_s2_w.as_mut(), rg.nlm_s2_w.as_mut(),
+        ) {
+            buf_w.step(&mut s2w.weights, grad_w, lr, wd, b1, b2, eps, bc1, bc2);
+        }
+        if let (Some(s2w), Some(buf_b), Some(grad_b)) = (
+            rw.nlm_stage2.as_mut(), self.nlm_s2_b.as_mut(), rg.nlm_s2_b.as_mut(),
+        ) {
+            buf_b.step(&mut s2w.biases, grad_b, lr, 0.0, b1, b2, eps, bc1, bc2);
+        }
+        self.kv_proj_w.step(&mut rw.kv_proj.weight, &mut rg.kv_proj_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.kv_proj_b.step(&mut rw.kv_proj.bias, &mut rg.kv_proj_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.q_proj_w.step(&mut rw.q_proj.weight, &mut rg.q_proj_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.q_proj_b.step(&mut rw.q_proj.bias, &mut rg.q_proj_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.mha_in_w.step(&mut rw.mha_in_proj.weight, &mut rg.mha_in_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.mha_in_b.step(&mut rw.mha_in_proj.bias, &mut rg.mha_in_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.mha_out_w.step(&mut rw.mha_out_proj.weight, &mut rg.mha_out_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.mha_out_b.step(&mut rw.mha_out_proj.bias, &mut rg.mha_out_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
+        self.out_proj_w.step(&mut rw.output_proj.weight, &mut rg.out_proj_w,
+            lr, wd, b1, b2, eps, bc1, bc2);
+        self.out_proj_b.step(&mut rw.output_proj.bias, &mut rg.out_proj_b,
+            lr, 0.0, b1, b2, eps, bc1, bc2);
     }
 }
 
@@ -3911,6 +4028,13 @@ pub struct RegionalAdamW {
     cereb_proj_out_w: Option<AdamWBuf>,
     cereb_proj_out_b: Option<AdamWBuf>,
     cereb_blend_logit: Option<AdamWBuf>,
+    /// Phase 4: per-region AdamW state for the major inner CTM
+    /// tensors (NLM, kv/q/mha/out projections). Used by `step` to
+    /// replace the previous SGD-only `CtmGradients::apply`. UNet +
+    /// scalar tensors continue to flow through `apply_minor` (raw
+    /// clip-SGD). One entry per `weights.regions[r]`.
+    #[serde(default)]
+    region_inner_adams: Vec<RegionInnerAdamW>,
 }
 
 impl RegionalAdamW {
@@ -3938,6 +4062,7 @@ impl RegionalAdamW {
             cereb_proj_out_w: w.cereb_projection.as_ref().map(|p| AdamWBuf::zeros(p.proj_out_w.len())),
             cereb_proj_out_b: w.cereb_projection.as_ref().map(|p| AdamWBuf::zeros(p.proj_out_b.len())),
             cereb_blend_logit: w.cereb_blend_logit.map(|_| AdamWBuf::zeros(1)),
+            region_inner_adams: w.regions.iter().map(RegionInnerAdamW::zeros).collect(),
         }
     }
 
@@ -3975,9 +4100,22 @@ impl RegionalAdamW {
         // Embeddings — AdamW (no weight decay)
         self.embed.step(&mut w.embeddings, &mut grads.embed_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
 
-        // Per-region CTM weights — SDK SGD (handles complex UNet + NLM structure)
-        for (rw, rg) in w.regions.iter_mut().zip(grads.region_grads.iter_mut()) {
-            rg.apply(rw, lr, self.grad_clip);
+        // Per-region CTM weights:
+        //   - Major tensors (NLM, kv/q/mha/out projections) — AdamW via region_inner_adams.
+        //   - U-Net synapse + start-state + LN + exit-gate — raw clip-SGD via apply_minor.
+        // Maintains the same global-norm clip already folded into `lr`.
+        // Backfill region_inner_adams when missing (deserialised from older RegionalAdamW
+        // checkpoints that pre-date Phase 4 — `#[serde(default)]` gives an empty Vec).
+        if self.region_inner_adams.len() != w.regions.len() {
+            self.region_inner_adams = w.regions.iter()
+                .map(RegionInnerAdamW::zeros)
+                .collect();
+        }
+        for (r, (rw, rg)) in w.regions.iter_mut()
+            .zip(grads.region_grads.iter_mut()).enumerate()
+        {
+            self.region_inner_adams[r].step(rw, rg, lr, wd, b1, b2, eps, bc1, bc2);
+            rg.apply_minor(rw, lr);
         }
 
         // Connections — AdamW
@@ -4430,6 +4568,36 @@ pub struct RegionalCache {
 pub struct RegionalBrain;
 
 impl RegionalBrain {
+    /// Returns `true` when the resident forward+backward path is
+    /// likely faster than the host path for this brain's shape on
+    /// AMD ROCm hardware.
+    ///
+    /// The heuristic encodes the Phase 5 crossover measurement on
+    /// gfx1102 (RX 7600M XT): the resident path is profitable only
+    /// when the *cortical* per-region `d_model ≥ 1024`. Below that,
+    /// MIOpen + hipBLAS launch overhead exceeds the kernel work and
+    /// the host path is faster — sometimes dramatically (5× regression
+    /// at maze-scale d_model=32).
+    ///
+    /// Callers that opt into the resident path (`forward_cached_resident`,
+    /// `backward_cached_resident_with_grads_resident`) should consult
+    /// this first to avoid silently slowing down small-brain training.
+    /// See memory `feedback_residency_dispatch_overhead.md` for the
+    /// measured speedup table at small/medium/large/billion configs
+    /// (0.18×, 0.50×, 0.85×, 1.83× respectively).
+    pub fn is_resident_likely_faster(weights: &RegionalWeights) -> bool {
+        // Take the maximum cortical d_model across regions. The big
+        // regions (input, attention, output, motor) are what drive
+        // the GPU dispatch ratio; small subcortical regions
+        // (cerebellum, basal_ganglia, etc.) are fast either way.
+        const RESIDENT_DMODEL_THRESHOLD: usize = 1024;
+        weights.regions.iter()
+            .map(|r| r.config.d_model)
+            .max()
+            .map(|d| d >= RESIDENT_DMODEL_THRESHOLD)
+            .unwrap_or(false)
+    }
+
     /// Forward with caching + frozen cerebellum override.
     ///
     /// Same as `forward_cached` from the Brain trait, but after each outer tick,
@@ -4972,6 +5140,34 @@ impl RegionalBrain {
         cache: RegionalCache,
         d_predictions: &[Vec<f32>],
     ) -> RegionalGradients {
+        Self::backward_cached_resident_inner(weights, cache, d_predictions, None)
+    }
+
+    /// Phase 3c variant: when `resident_grads` is `Some(rg)`, the
+    /// per-region NLM `super_linear_bwd_dw` calls dispatch through
+    /// the resident kernel, accumulating into `rg`'s device buffers.
+    /// The returned host `RegionalGradients` will have zero
+    /// `region_grads[r].nlm_s1_w` / `nlm_s2_w` — caller must merge
+    /// device-accumulated values via `rg.add_to_host(&mut grads)`
+    /// before opt.step.
+    #[cfg(feature = "rocm")]
+    pub fn backward_cached_resident_with_grads_resident(
+        weights: &RegionalWeights,
+        cache: RegionalCache,
+        d_predictions: &[Vec<f32>],
+        resident_grads: &crate::resident::RegionalGradientsResident,
+    ) -> RegionalGradients {
+        Self::backward_cached_resident_inner(weights, cache, d_predictions, Some(resident_grads))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn backward_cached_resident_inner(
+        weights: &RegionalWeights,
+        cache: RegionalCache,
+        d_predictions: &[Vec<f32>],
+        resident_grads: Option<&crate::resident::RegionalGradientsResident>,
+    ) -> RegionalGradients {
+        use crate::dispatch_profile::{Guard, DispatchKind};
         let cfg = &weights.config;
         let n_regions = cfg.regions.len();
         let mut grads = RegionalGradients::zeros(weights);
@@ -5009,30 +5205,31 @@ impl RegionalBrain {
             let d_logits = &d_predictions[t];
 
             // ── output_proj backward (host registry dispatch). ──
-            // Routed through `outer_product_acc` + `matvec_t`, which
-            // each pick the fastest registered backend at runtime.
-            // Lifting to `Op::MatmulResidentTN` (= dW shape) and
-            // `matvec_resident` with transpose (= W^T·dy shape) is
-            // mechanical — same op variants already wired in PART A.
             let out_dim = weights.output_proj.out_dim;
             let in_dim = weights.output_proj.in_dim;
             let mut d_global_sync = vec![0.0f32; in_dim];
-            for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
-            modgrad_device::backend::ops::outer_product_acc(
-                d_logits, &tc.global_sync, &mut grads.output_proj_dw,
-                out_dim, in_dim,
-            ).expect("output_proj backward: outer_product_acc dispatch");
-            modgrad_device::backend::ops::matvec_t(
-                d_logits, &weights.output_proj.weight, &mut d_global_sync,
-                out_dim, in_dim,
-            ).expect("output_proj backward: matvec_t dispatch");
+            {
+                let _g = Guard::new(DispatchKind::BwdOutputProj);
+                for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+                modgrad_device::backend::ops::outer_product_acc(
+                    d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+                    out_dim, in_dim,
+                ).expect("output_proj backward: outer_product_acc dispatch");
+                modgrad_device::backend::ops::matvec_t(
+                    d_logits, &weights.output_proj.weight, &mut d_global_sync,
+                    out_dim, in_dim,
+                ).expect("output_proj backward: matvec_t dispatch");
+            }
 
             // ── Global sync backward (host scalar). ──
             let total_act_dim = tc.all_activations.len();
-            let d_all_activations = global_sync_backward(
-                &d_global_sync, &tc.all_activations, &tc.global_beta,
-                &weights.global_sync_left, &weights.global_sync_right, total_act_dim,
-            );
+            let d_all_activations = {
+                let _g = Guard::new(DispatchKind::BwdGlobalSync);
+                global_sync_backward(
+                    &d_global_sync, &tc.all_activations, &tc.global_beta,
+                    &weights.global_sync_left, &weights.global_sync_right, total_act_dim,
+                )
+            };
 
             // Split per region.
             let mut offset = 0;
@@ -5051,10 +5248,21 @@ impl RegionalBrain {
             let mut region_caches_resident = tc.region_caches_resident;
             for r in 0..n_regions {
                 if let Some(rcache_resident) = region_caches_resident[r].take() {
-                    let result = crate::forward::ctm_backward_resident(
-                        &weights.regions[r], &rcache_resident,
-                        &d_region_activated[r],
-                    );
+                    let result = {
+                        let _g = Guard::new(DispatchKind::BwdInnerCtm);
+                        match resident_grads {
+                            Some(rg) => crate::forward::ctm_backward_resident_with_grads_resident(
+                                &weights.regions[r], &rcache_resident,
+                                &d_region_activated[r],
+                                rg, r,
+                            ),
+                            None => crate::forward::ctm_backward_resident(
+                                &weights.regions[r], &rcache_resident,
+                                &d_region_activated[r],
+                            ),
+                        }
+                    };
+                    let _g = Guard::new(DispatchKind::BwdAccumGrads);
                     let dst = &mut grads.region_grads[r];
                     add(&mut dst.nlm_s1_w, &result.grads.nlm_s1_w);
                     add(&mut dst.nlm_s1_b, &result.grads.nlm_s1_b);
@@ -5076,31 +5284,27 @@ impl RegionalBrain {
                     add(&mut dst.mha_out_b, &result.grads.mha_out_b);
                     add(&mut dst.out_proj_w, &result.grads.out_proj_w);
                     add(&mut dst.out_proj_b, &result.grads.out_proj_b);
-                    // U-Net grads now flow through Path B in
-                    // `ctm_backward_resident` (host re-cache via
-                    // `train::unet_forward_cached`). Mirror the
-                    // host backward's UNetGrads accumulation.
                     dst.unet.add_from(&result.grads.unet);
                     d_region_obs[r] = result.d_observation;
                 }
             }
 
-            // ── Connection synapse backward (host scalar — same as
-            // <Brain as RegionalBrain>::backward). Lifting to
-            // `Op::MatmulResidentTN` for dW and `matvec_resident`
-            // (transposed) for d_input is a follow-up. ──
-            for (ci, conn) in cfg.connections.iter().enumerate() {
-                let r = conn.to;
-                if d_region_obs[r].is_empty() { continue; }
-                let d_proj_out = &d_region_obs[r];
-                let syn = &weights.connection_synapses[ci];
-                let syn_input = &tc.connection_inputs.get(ci);
-                if let Some(input) = syn_input {
-                    for i in 0..syn.out_dim.min(d_proj_out.len()) {
-                        grads.connection_db[ci][i] += d_proj_out[i];
-                        for j in 0..syn.in_dim.min(input.len()) {
-                            grads.connection_dw[ci][i * syn.in_dim + j] +=
-                                d_proj_out[i] * input[j];
+            // ── Connection synapse backward (host scalar) ──
+            {
+                let _g = Guard::new(DispatchKind::BwdConnSynapse);
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    let r = conn.to;
+                    if d_region_obs[r].is_empty() { continue; }
+                    let d_proj_out = &d_region_obs[r];
+                    let syn = &weights.connection_synapses[ci];
+                    let syn_input = &tc.connection_inputs.get(ci);
+                    if let Some(input) = syn_input {
+                        for i in 0..syn.out_dim.min(d_proj_out.len()) {
+                            grads.connection_db[ci][i] += d_proj_out[i];
+                            for j in 0..syn.in_dim.min(input.len()) {
+                                grads.connection_dw[ci][i * syn.in_dim + j] +=
+                                    d_proj_out[i] * input[j];
+                            }
                         }
                     }
                 }
@@ -6678,6 +6882,142 @@ mod tests {
         eprintln!("  ticks = {n_host_ticks}");
         eprintln!("  output_proj_dw |Δ|max = {dw_diff:.6}");
         eprintln!("  output_proj_db |Δ|max = {db_diff:.6}");
+    }
+
+    /// Phase 5 calibration: `is_resident_likely_faster` returns `true`
+    /// only at d_model ≥ 1024 (billion config). All smaller standard
+    /// configs (small / medium / large) return `false`. Encodes the
+    /// measured crossover so callers don't silently regress on small
+    /// brains.
+    #[test]
+    fn is_resident_likely_faster_crossover_matches_phase5() {
+        // small (d=32) — host wins by 5× per measurement
+        let cfg = RegionalConfig::eight_region_small(64, 25, 3);
+        let w = RegionalWeights::new(cfg);
+        assert!(!RegionalBrain::is_resident_likely_faster(&w),
+            "small (d_model=32): resident measured 0.18× — heuristic must say false");
+
+        // medium (d=256) — even-ish but resident loses
+        let cfg = RegionalConfig::eight_region_medium(64, 25, 3);
+        let w = RegionalWeights::new(cfg);
+        assert!(!RegionalBrain::is_resident_likely_faster(&w),
+            "medium (d_model=256): resident measured 0.50× — heuristic must say false");
+
+        // large (d=512) — close but still loss
+        let cfg = RegionalConfig::eight_region_large(64, 25, 3);
+        let w = RegionalWeights::new(cfg);
+        assert!(!RegionalBrain::is_resident_likely_faster(&w),
+            "large (d_model=512): resident measured 0.85× — heuristic must say false");
+
+        // billion (d=1024) — first size where resident wins
+        let cfg = RegionalConfig::eight_region_billion(64, 25, 3);
+        let w = RegionalWeights::new(cfg);
+        assert!(RegionalBrain::is_resident_likely_faster(&w),
+            "billion (d_model=1024): resident measured 1.83× — heuristic must say true");
+    }
+
+    /// Phase 3c parity: `backward_cached_resident_with_grads_resident`
+    /// (which routes the per-region NLM dW through the new resident
+    /// kernel and the long-lived `RegionalGradientsResident` device
+    /// buffers) must produce the same per-region `nlm_s1_w` /
+    /// `nlm_s2_w` host gradients as the WITHOUT-resident-grads path,
+    /// once `add_to_host` consolidates the device-accumulated values.
+    /// All other gradient fields (q_proj, mha, output_proj, etc.) go
+    /// through the same code path, so their parity continues to hold.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn backward_cached_resident_with_resident_grads_matches() {
+        use modgrad_device::backend::rocm::ffi::runtime_available;
+        use modgrad_device::backend::HipBatch;
+        use crate::resident::{RegionalResidentCache, RegionalGradientsResident};
+
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+
+        let token_dim = 16usize;
+        let n_tokens = 4usize;
+        let out_dims = 64usize;
+        let ticks = 2usize;
+        let mut cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
+        cfg.exit_strategy = crate::config::ExitStrategy::None;
+        for r in cfg.regions.iter_mut() {
+            r.exit_strategy = crate::config::ExitStrategy::None;
+        }
+        let weights = RegionalWeights::new(cfg);
+        let tokens = modgrad_traits::TokenInput {
+            tokens: (0..n_tokens * token_dim)
+                .map(|i| (i as f32 * 0.013 - 0.21).sin())
+                .collect(),
+            n_tokens, token_dim,
+        };
+
+        let cache = RegionalResidentCache::from_weights(&weights)
+            .expect("RegionalResidentCache::from_weights");
+        let batch = HipBatch::new();
+
+        // ── Path A: backward_cached_resident (host nlm dW). ──
+        let fresh_a = cache.fresh(&weights).expect("fresh A");
+        let (out_a, _state_a, cache_a) = RegionalBrain::forward_cached_resident(
+            &weights, fresh_a, &batch, &tokens,
+        ).expect("forward_cached_resident A");
+        batch.flush().expect("flush A");
+        let n_ticks = out_a.predictions.len();
+        let d_predictions: Vec<Vec<f32>> = (0..n_ticks).map(|t| {
+            (0..out_dims).map(|i| ((t * out_dims + i) as f32 * 0.011).sin() * 0.3)
+                .collect()
+        }).collect();
+        let grads_a = RegionalBrain::backward_cached_resident(
+            &weights, cache_a, &d_predictions,
+        );
+
+        // ── Path B: backward_cached_resident_with_grads_resident
+        //    (resident nlm dW). ──
+        let resident_grads = RegionalGradientsResident::from_weights(&weights)
+            .expect("RegionalGradientsResident");
+        resident_grads.zero().expect("zero resident grads");
+        let fresh_b = cache.fresh(&weights).expect("fresh B");
+        let (_out_b, _state_b, cache_b) = RegionalBrain::forward_cached_resident(
+            &weights, fresh_b, &batch, &tokens,
+        ).expect("forward_cached_resident B");
+        batch.flush().expect("flush B");
+        let mut grads_b = RegionalBrain::backward_cached_resident_with_grads_resident(
+            &weights, cache_b, &d_predictions, &resident_grads,
+        );
+        // Path B's grads_b has zero nlm_s1_w / nlm_s2_w until we
+        // download from the device buffers.
+        for r in 0..weights.regions.len() {
+            for &v in &grads_b.region_grads[r].nlm_s1_w {
+                assert_eq!(v, 0.0, "resident path should leave host nlm_s1_w zero pre-merge");
+            }
+        }
+        resident_grads.add_to_host(&mut grads_b).expect("add_to_host");
+
+        // ── Compare nlm_s1_w / nlm_s2_w per region. ──
+        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
+            assert_eq!(a.len(), b.len(), "shape");
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        let tol = 5e-2f32; // matches existing parity test budget
+        let mut max_overall = 0.0f32;
+        for r in 0..weights.regions.len() {
+            let d1 = max_diff(&grads_a.region_grads[r].nlm_s1_w,
+                              &grads_b.region_grads[r].nlm_s1_w);
+            assert!(d1 < tol,
+                "region {r} nlm_s1_w mismatch: |Δ|max = {d1}");
+            if d1 > max_overall { max_overall = d1; }
+            if let (Some(a), Some(b)) = (
+                grads_a.region_grads[r].nlm_s2_w.as_ref(),
+                grads_b.region_grads[r].nlm_s2_w.as_ref(),
+            ) {
+                let d2 = max_diff(a, b);
+                assert!(d2 < tol,
+                    "region {r} nlm_s2_w mismatch: |Δ|max = {d2}");
+                if d2 > max_overall { max_overall = d2; }
+            }
+        }
+        eprintln!("  nlm_s*_w resident-vs-host max |Δ| = {max_overall:.6}");
     }
 
     /// Resident inner-CTM backward populates `grads.unet` (Path B fix).

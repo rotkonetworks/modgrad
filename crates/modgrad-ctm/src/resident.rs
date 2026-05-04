@@ -231,13 +231,294 @@ impl<'a> FreshCache<'a> {
     pub fn ctm_caches(&self) -> &'a [CtmResidentCache] { &self.cache.ctm_caches }
 }
 
+// ─── Device-resident gradient accumulators ──────────────────────────
+//
+// Phase 3b of the brain-on-GPU plan: the per-region NLM weight gradient
+// (nlm_s1_w, optional nlm_s2_w) is the hot-path accumulator that the
+// new SuperLinearBwdDw resident kernel writes into. Keeping it on
+// device avoids the 128 MB-per-call PCIe download at billion config.
+//
+// One `RegionalGradientsResident` lives for the duration of training.
+// At training start: allocate, zero. Per backward: kernels accumulate
+// (beta=1.0). At opt.step: download to host RegionalGradients,
+// optimizer updates host weights, host-side cache.sync_from_weights
+// re-uploads. Then `zero()` resets the device gradient buffers.
+
+use modgrad_device::backend::HipBuffer;
+
+/// Device-resident accumulators for the hot NLM weight gradients.
+/// Follows the same allocate-once / sync-per-step pattern as
+/// `RegionalResidentCache`. Only carries the buckets that Phase 0
+/// profiling identified as dominant (nlm_s1_w/nlm_s2_w); other
+/// gradient tensors stay host-resident in `RegionalGradients`
+/// because their compute is not on the hot path.
+pub struct RegionalGradientsResident {
+    /// Per-region NLM stage1 weight gradients on device.
+    /// Layout: `[n_neurons × out_per × memory_length]` per region,
+    /// flat row-major (matches `SuperLinear.weights`).
+    pub(crate) region_nlm_s1_dw: Vec<HipBuffer>,
+    /// Per-region NLM stage2 weight gradients on device. `None` for
+    /// regions whose `deep_nlms=false`.
+    pub(crate) region_nlm_s2_dw: Vec<Option<HipBuffer>>,
+}
+
+impl RegionalGradientsResident {
+    /// Allocate device buffers sized to match each region's NLM stage
+    /// weights, and zero-initialize them. Returns
+    /// `ResidencyError::Backend(_)` on hipMalloc / hipMemcpy failure.
+    pub fn from_weights(w: &RegionalWeights) -> Result<Self, ResidencyError> {
+        let mut s1 = Vec::with_capacity(w.regions.len());
+        let mut s2 = Vec::with_capacity(w.regions.len());
+        for rw in &w.regions {
+            let s1_len = rw.nlm_stage1.weights.len();
+            let buf = HipBuffer::new(s1_len * 4)?;
+            // Zero-init via host upload. ~ms-scale at typical sizes;
+            // happens once at training start so cost is negligible.
+            let zeros = vec![0.0f32; s1_len];
+            buf.copy_from_host(&zeros)?;
+            s1.push(buf);
+
+            let s2_buf = match &rw.nlm_stage2 {
+                Some(s2w) => {
+                    let len = s2w.weights.len();
+                    let buf = HipBuffer::new(len * 4)?;
+                    let zeros = vec![0.0f32; len];
+                    buf.copy_from_host(&zeros)?;
+                    Some(buf)
+                }
+                None => None,
+            };
+            s2.push(s2_buf);
+        }
+        Ok(Self { region_nlm_s1_dw: s1, region_nlm_s2_dw: s2 })
+    }
+
+    /// Zero all device buffers. Called between batches when the host
+    /// optimizer has consumed accumulated gradients and we want a
+    /// fresh accumulator for the next batch.
+    ///
+    /// Implementation uploads zero vectors. A future optimization is
+    /// `hipMemset` (one fast device-side fill) — keeping the simple
+    /// path for now since this runs once per opt.step, not per sample.
+    pub fn zero(&self) -> Result<(), ResidencyError> {
+        for buf in &self.region_nlm_s1_dw {
+            let zeros = vec![0.0f32; buf.len_f32()];
+            buf.copy_from_host(&zeros)?;
+        }
+        for opt in &self.region_nlm_s2_dw {
+            if let Some(buf) = opt {
+                let zeros = vec![0.0f32; buf.len_f32()];
+                buf.copy_from_host(&zeros)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add device-accumulated gradients into host `RegionalGradients`
+    /// fields. This is called once per opt.step, after the resident
+    /// backward has run for the whole batch. The host-side optimizer
+    /// then consumes `host_grads.region_grads[r].nlm_s1_w` etc.
+    /// normally.
+    pub fn add_to_host(
+        &self,
+        host_grads: &mut crate::graph::RegionalGradients,
+    ) -> Result<(), ResidencyError> {
+        for (r, buf) in self.region_nlm_s1_dw.iter().enumerate() {
+            let dst = &mut host_grads.region_grads[r].nlm_s1_w;
+            // Download into a scratch, then add. Avoids overwriting any
+            // pre-existing gradient (e.g. if some region's nlm_s1_w
+            // also had host-side contributions during this batch).
+            let mut scratch = vec![0.0f32; dst.len()];
+            buf.copy_to_host(&mut scratch)?;
+            for (d, s) in dst.iter_mut().zip(scratch.iter()) { *d += s; }
+        }
+        for (r, opt) in self.region_nlm_s2_dw.iter().enumerate() {
+            if let (Some(buf), Some(dst)) =
+                (opt, host_grads.region_grads[r].nlm_s2_w.as_mut())
+            {
+                let mut scratch = vec![0.0f32; dst.len()];
+                buf.copy_to_host(&mut scratch)?;
+                for (d, s) in dst.iter_mut().zip(scratch.iter()) { *d += s; }
+            }
+        }
+        Ok(())
+    }
+
+    /// Accumulate one SuperLinear-backward dW into the per-region
+    /// device buffer using the new resident kernel.
+    /// `d_out` is the gradient w.r.t. the SuperLinear *post-projection*
+    /// (the same `d_out` that `super_linear_bwd_dw` host takes as
+    /// input); `trace` is the SuperLinear input. Both are host slices
+    /// today — they're uploaded into temporary device scratch buffers
+    /// by this function, while `dW` stays on device throughout.
+    ///
+    /// `region` indexes into `region_nlm_s1_dw`; `stage` selects
+    /// stage1 vs stage2 (use `false` for stage1, `true` for stage2).
+    pub fn accumulate_super_linear_dw(
+        &self,
+        region: usize,
+        stage2: bool,
+        d_out: &[f32],
+        trace: &[f32],
+        n_neurons: usize,
+        in_per: usize,
+        out_per: usize,
+    ) -> Result<(), ResidencyError> {
+        // Pick the destination buffer.
+        use modgrad_device::backend::BackendError;
+        let dst_buf = if stage2 {
+            self.region_nlm_s2_dw[region].as_ref()
+                .ok_or_else(|| ResidencyError::Backend(
+                    BackendError::Runtime(
+                        format!("region {region} has no nlm_s2 buffer (deep_nlms=false?)"),
+                    )
+                ))?
+        } else {
+            &self.region_nlm_s1_dw[region]
+        };
+        // Upload host inputs into temporary device scratches.
+        let d_out_buf = HipBuffer::new(d_out.len() * 4)?;
+        d_out_buf.copy_from_host(d_out)?;
+        let trace_buf = HipBuffer::new(trace.len() * 4)?;
+        trace_buf.copy_from_host(trace)?;
+        // Dispatch the resident bwd_dw kernel — accumulates (beta=1)
+        // into `dst_buf`. Backend errors auto-convert via `?`.
+        unsafe {
+            modgrad_device::backend::ops::super_linear_bwd_dw_resident(
+                d_out_buf.device_ptr() as *const f32,
+                trace_buf.device_ptr() as *const f32,
+                dst_buf.device_ptr() as *mut f32,
+                n_neurons, in_per, out_per,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{RegionalConfig, RegionalWeights};
+    use crate::graph::{RegionalConfig, RegionalGradients, RegionalWeights};
     use modgrad_compute::backend::GpuVec;
     use modgrad_device::backend::HipBatch;
     use modgrad_device::backend::rocm::ffi::runtime_available;
+
+    /// Phase 3b: `RegionalGradientsResident` allocates per-region NLM
+    /// gradient buffers on device, can be zeroed, and `add_to_host`
+    /// correctly accumulates into a host `RegionalGradients`. Exercises
+    /// the buffer lifecycle before any consumer wires it.
+    #[test]
+    fn regional_gradients_resident_lifecycle() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let cfg = RegionalConfig::eight_region_small(64, 25, 3);
+        let weights = RegionalWeights::new(cfg);
+        let resident = RegionalGradientsResident::from_weights(&weights)
+            .expect("alloc resident grads");
+
+        // Buffers should match the per-region nlm_s1 weight sizes.
+        assert_eq!(resident.region_nlm_s1_dw.len(), weights.regions.len());
+        for (rw, buf) in weights.regions.iter().zip(&resident.region_nlm_s1_dw) {
+            assert_eq!(buf.len_f32(), rw.nlm_stage1.weights.len());
+        }
+
+        // After allocation, buffers are zero — add_to_host into a fresh
+        // host grads must leave the host side at zero.
+        let mut host = RegionalGradients::zeros(&weights);
+        resident.add_to_host(&mut host).expect("add_to_host (post-alloc)");
+        for r in 0..weights.regions.len() {
+            for &v in &host.region_grads[r].nlm_s1_w {
+                assert_eq!(v, 0.0, "post-alloc add_to_host should be zero");
+            }
+        }
+
+        // Manually upload non-zero data into the first region's buffer
+        // and verify add_to_host folds it into host correctly.
+        let r0_len = weights.regions[0].nlm_stage1.weights.len();
+        let payload: Vec<f32> = (0..r0_len).map(|i| (i as f32 * 0.001) - 0.5).collect();
+        resident.region_nlm_s1_dw[0].copy_from_host(&payload).expect("upload payload");
+        let mut host2 = RegionalGradients::zeros(&weights);
+        resident.add_to_host(&mut host2).expect("add_to_host (with payload)");
+        for (i, &v) in host2.region_grads[0].nlm_s1_w.iter().enumerate() {
+            assert_eq!(v, payload[i], "add_to_host should match uploaded payload");
+        }
+
+        // After zero(), all buffers are back to zero.
+        resident.zero().expect("zero buffers");
+        let mut host3 = RegionalGradients::zeros(&weights);
+        resident.add_to_host(&mut host3).expect("add_to_host (post-zero)");
+        for r in 0..weights.regions.len() {
+            for &v in &host3.region_grads[r].nlm_s1_w {
+                assert_eq!(v, 0.0, "post-zero add_to_host should be zero");
+            }
+        }
+    }
+
+    /// Phase 3c: `accumulate_super_linear_dw` on the resident path
+    /// produces the same dW that the host `Op::SuperLinearBwdDw`
+    /// produces, modulo fp32 reorder noise. Validates the full
+    /// upload→kernel→download pattern that nlm_backward_resident's
+    /// future refactor will use.
+    #[test]
+    fn accumulate_super_linear_dw_matches_host() {
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let cfg = RegionalConfig::eight_region_small(64, 25, 3);
+        let weights = RegionalWeights::new(cfg);
+        let resident = RegionalGradientsResident::from_weights(&weights)
+            .expect("alloc resident grads");
+
+        // Operate on region 0 stage1.
+        let r = 0usize;
+        let s1 = &weights.regions[r].nlm_stage1;
+        let n_neurons = s1.n_neurons;
+        let in_per = s1.in_per;
+        let out_per = s1.out_per;
+
+        // Synthetic d_out and trace (deterministic).
+        let d_out: Vec<f32> = (0..n_neurons * out_per)
+            .map(|i| ((i as f32) * 0.013 - 0.5).sin())
+            .collect();
+        let trace: Vec<f32> = (0..n_neurons * in_per)
+            .map(|i| ((i as f32) * 0.021 + 0.3).cos())
+            .collect();
+
+        // Host reference — populate a fresh dW slice via the existing
+        // host op (no accumulation, starts at zero).
+        let mut host_dw = vec![0.0f32; n_neurons * out_per * in_per];
+        modgrad_device::backend::ops::super_linear_bwd_dw(
+            &d_out, &trace, &mut host_dw, n_neurons, in_per, out_per,
+        ).expect("host super_linear_bwd_dw");
+
+        // Resident path — accumulate into device buffer (which is
+        // already zeroed by from_weights).
+        resident.accumulate_super_linear_dw(
+            r, false, &d_out, &trace, n_neurons, in_per, out_per,
+        ).expect("accumulate_super_linear_dw");
+
+        // Download device dW into a fresh host RegionalGradients.
+        let mut host_grads = RegionalGradients::zeros(&weights);
+        resident.add_to_host(&mut host_grads).expect("add_to_host");
+        let resident_dw = &host_grads.region_grads[r].nlm_s1_w;
+
+        // Compare element-wise.
+        let abs_tol = 1e-3f32;
+        let rel_tol = 1e-3f32;
+        let mut max_abs = 0.0f32;
+        for (i, (h, d)) in host_dw.iter().zip(resident_dw.iter()).enumerate() {
+            let diff = (h - d).abs();
+            let scale = h.abs().max(d.abs()).max(1.0);
+            if diff > abs_tol && diff / scale > rel_tol {
+                panic!("dw[{i}] mismatch: host={h} resident={d} (|Δ|={diff})");
+            }
+            if diff > max_abs { max_abs = diff; }
+        }
+        eprintln!("  accumulate_super_linear_dw |Δ|max = {max_abs:.6}");
+    }
 
     /// Build a small RegionalWeights, mirror it as a cache, and
     /// verify that running output_proj resident produces the same
