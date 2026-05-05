@@ -297,8 +297,28 @@ fn run_one(mode: &str) -> (f32, f32, f32) {
     let train = load_feat(TRAIN_PATH).expect("load train .feat");
     let eval  = load_feat(EVAL_PATH).expect("load eval .feat");
 
-    let (train_feat, train_lab) = extract_features(&cortex, &train);
-    let (eval_feat,  eval_lab)  = extract_features(&cortex, &eval);
+    // MODGRAD_FEATURE_MODE=first_token: use first-token V4 features (no
+    // mean pool) for linear-probe + k-NN downstream. Tests whether mean-
+    // pool is part of the rank collapse or innocent. Per-token features
+    // showed eff_rank 2.3 vs pooled 1.7 in test 0 — slightly better but
+    // still degenerate without LN. With LN both exceed 8/128.
+    let use_first_token = std::env::var("MODGRAD_FEATURE_MODE")
+        .map(|v| v == "first_token").unwrap_or(false);
+    let (train_feat, train_lab) = if use_first_token {
+        let labs: Vec<usize> = train.iter().map(|i| i.label).collect();
+        (extract_features_first_token(&cortex, &train), labs)
+    } else {
+        extract_features(&cortex, &train)
+    };
+    let (eval_feat, eval_lab) = if use_first_token {
+        let labs: Vec<usize> = eval.iter().map(|i| i.label).collect();
+        (extract_features_first_token(&cortex, &eval), labs)
+    } else {
+        extract_features(&cortex, &eval)
+    };
+    if use_first_token {
+        eprintln!("  feature mode: FIRST-TOKEN (no mean pool)");
+    }
 
     // ── Test 0: subspace structure (priors-as-W_p alignment with data) ──
     // The right level-of-abstraction question for "do priors help": does
