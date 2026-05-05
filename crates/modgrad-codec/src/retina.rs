@@ -3608,6 +3608,74 @@ mod tests {
              got no_ln={cos_no:.3} ln={cos_ln:.3}");
     }
 
+    /// `per_token_layernorm` (token-row layout, applied via the
+    /// `per_token_ln_v4` struct field) and `spatial_layernorm_chw`
+    /// (CHW layout, applied via env var) MUST produce equivalent V4
+    /// output. They operate on different memory layouts but the math
+    /// is the same: zero-mean unit-std across channels at each spatial
+    /// position.
+    ///
+    /// Locks the equivalence because the SDK exposes both paths
+    /// (struct field for saved-cortex config, env var for ablation
+    /// sweeps without modifying the saved file) and they could
+    /// silently drift if one is touched without the other.
+    #[test]
+    fn token_layernorm_and_spatial_layernorm_chw_agree() {
+        // Build a CHW buffer of known shape with a deterministic
+        // pattern. Use a per-position offset so LN has something to
+        // strip — without that the test is vacuous.
+        let channels = 8;
+        let h = 4;
+        let w = 5;
+        let n = h * w;
+        let mut chw = vec![0.0f32; channels * n];
+        let mut s: u64 = 0xDEADBEEF;
+        for v in &mut chw {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *v = ((s >> 32) as f32 / u32::MAX as f32) * 4.0 - 2.0;
+        }
+        // Add a per-position bias so each spatial position has a
+        // non-zero mean across channels.
+        for pos in 0..n {
+            let bias = (pos as f32) * 0.3 - 1.0;
+            for c in 0..channels { chw[c * n + pos] += bias; }
+        }
+
+        // Path A: spatial_layernorm_chw applied directly, then
+        // transposed to token layout.
+        let mut chw_a = chw.clone();
+        spatial_layernorm_chw(&mut chw_a, channels, h, w);
+        let mut tokens_a = vec![0.0f32; n * channels];
+        for y in 0..h {
+            for x in 0..w {
+                let ti = y * w + x;
+                for c in 0..channels {
+                    tokens_a[ti * channels + c] = chw_a[c * n + y * w + x];
+                }
+            }
+        }
+
+        // Path B: transpose first, then per_token_layernorm on the
+        // token-row layout (matches what `per_token_ln_v4` does).
+        let mut tokens_b = vec![0.0f32; n * channels];
+        for y in 0..h {
+            for x in 0..w {
+                let ti = y * w + x;
+                for c in 0..channels {
+                    tokens_b[ti * channels + c] = chw[c * n + y * w + x];
+                }
+            }
+        }
+        per_token_layernorm(&mut tokens_b, n, channels);
+
+        // Element-wise equivalence within fp32 noise.
+        for (i, (&a, &b)) in tokens_a.iter().zip(&tokens_b).enumerate() {
+            assert!((a - b).abs() < 1e-5,
+                "token layout LN and CHW LN diverged at i={i}: \
+                 chw_path={a} token_path={b}");
+        }
+    }
+
     /// Structural test for `cifar_retina_only_ln`: the constructor must
     /// (a) install the fixed DoG ganglion priors at the retina,
     /// (b) leave V1 as random Kaiming (NO Gabor priors applied),
