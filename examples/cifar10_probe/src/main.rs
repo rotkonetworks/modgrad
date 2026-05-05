@@ -36,16 +36,35 @@ fn extract_features(cortex: &VisualCortex, images: &[modgrad_codec::cifar::Cifar
     let n = images.len();
     let mut feats = vec![0.0f32; n * FEAT_DIM];
     let mut labels = Vec::with_capacity(n);
+    // MODGRAD_PER_TOKEN_LN=1: apply LayerNorm-style z-score per token
+    // (across channels) BEFORE mean-pooling. Tests whether normalization
+    // can lift the rank-1 collapse — if yes, in-chain LayerNorm is worth
+    // wiring; if no, the collapse is upstream of any post-hoc rescaling.
+    let per_token_ln = std::env::var_os("MODGRAD_PER_TOKEN_LN").is_some();
     for (i, img) in images.iter().enumerate() {
         let scales = cortex.spatial_tokens_multiscale(&img.pixels);
         // scales[2] is V4 (per-token feature, n_tokens × channels)
         let (v4_tok, n_tok, channels) = (&scales[2].0, scales[2].1, scales[2].2);
         debug_assert_eq!(channels, FEAT_DIM);
+        let mut tokens_owned: Vec<f32>;
+        let v4_tok_norm: &[f32] = if per_token_ln {
+            tokens_owned = v4_tok.clone();
+            for t in 0..n_tok {
+                let slice = &mut tokens_owned[t * channels..(t + 1) * channels];
+                let m: f32 = slice.iter().sum::<f32>() / channels as f32;
+                let var: f32 = slice.iter().map(|x| (x - m).powi(2)).sum::<f32>() / channels as f32;
+                let inv_std = (var + 1e-5).sqrt().recip();
+                for x in slice.iter_mut() { *x = (*x - m) * inv_std; }
+            }
+            &tokens_owned
+        } else {
+            v4_tok.as_slice()
+        };
         // Mean-pool spatially → 128-D vector
         let f = &mut feats[i * FEAT_DIM..(i + 1) * FEAT_DIM];
         for t in 0..n_tok {
             for c in 0..channels {
-                f[c] += v4_tok[t * channels + c];
+                f[c] += v4_tok_norm[t * channels + c];
             }
         }
         let inv = 1.0 / n_tok.max(1) as f32;
