@@ -55,6 +55,24 @@ fn extract_features(cortex: &VisualCortex, images: &[modgrad_codec::cifar::Cifar
     (feats, labels)
 }
 
+/// Same as `extract_features` but returns **first-token-only** V4 (no
+/// mean pooling). Used to disentangle "mean-pool collapses things" from
+/// "V4 itself collapses things." If `first_token_cosine ≈ pooled_cosine`,
+/// V4 is the collapser and pooling is innocent.
+fn extract_features_first_token(cortex: &VisualCortex, images: &[modgrad_codec::cifar::CifarImage])
+    -> Vec<f32>
+{
+    let n = images.len();
+    let mut feats = vec![0.0f32; n * FEAT_DIM];
+    for (i, img) in images.iter().enumerate() {
+        let scales = cortex.spatial_tokens_multiscale(&img.pixels);
+        let (v4_tok, _n_tok, channels) = (&scales[2].0, scales[2].1, scales[2].2);
+        let f = &mut feats[i * FEAT_DIM..(i + 1) * FEAT_DIM];
+        f.copy_from_slice(&v4_tok[..channels]);
+    }
+    feats
+}
+
 /// Plain softmax classifier with cross-entropy loss + SGD.
 fn train_linear_probe(
     train_feat: &[f32], train_lab: &[usize],
@@ -168,12 +186,91 @@ fn knn_accuracy(
     correct as f32 / n_q as f32
 }
 
+/// Mean (and std) of pairwise cosine similarity over the first `m_max`
+/// samples in `feats`. High mean ⇒ features collapsed onto a single
+/// direction (priors over-compressed the input). Low mean ⇒ features
+/// preserve sample diversity.
+fn mean_cross_sample_cosine(feats: &[f32], n: usize, m_max: usize) -> (f32, f32) {
+    let m = n.min(m_max);
+    if m < 2 { return (0.0, 0.0); }
+    // L2-normalize each row.
+    let mut norm_feats = vec![0.0f32; m * FEAT_DIM];
+    for i in 0..m {
+        let src = &feats[i * FEAT_DIM..(i + 1) * FEAT_DIM];
+        let l2: f32 = src.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        let dst = &mut norm_feats[i * FEAT_DIM..(i + 1) * FEAT_DIM];
+        for j in 0..FEAT_DIM { dst[j] = src[j] / l2; }
+    }
+    // Pairwise dot products = cosine since normalized.
+    let mut sum = 0.0f64;
+    let mut sq = 0.0f64;
+    let mut count = 0u64;
+    for i in 0..m {
+        let xi = &norm_feats[i * FEAT_DIM..(i + 1) * FEAT_DIM];
+        for j in (i + 1)..m {
+            let xj = &norm_feats[j * FEAT_DIM..(j + 1) * FEAT_DIM];
+            let dot: f32 = xi.iter().zip(xj).map(|(a, b)| a * b).sum();
+            sum += dot as f64;
+            sq  += (dot as f64) * (dot as f64);
+            count += 1;
+        }
+    }
+    let mean = (sum / count as f64) as f32;
+    let var = (sq / count as f64 - (sum / count as f64).powi(2)) as f32;
+    (mean, var.max(0.0).sqrt())
+}
+
+/// Participation ratio of the centered feature covariance: an "effective
+/// rank" without needing an SVD. Equals tr(C)² / ‖C‖_F² where C is the
+/// D×D covariance. Range [1, D]: 1 ⇒ rank-1 collapse, D ⇒ uniform spread.
+fn effective_rank(feats: &[f32], n: usize, d: usize) -> f32 {
+    if n == 0 || d == 0 { return 0.0; }
+    // Mean per feature dim.
+    let mut mean = vec![0.0f32; d];
+    for i in 0..n {
+        let row = &feats[i * d..(i + 1) * d];
+        for j in 0..d { mean[j] += row[j]; }
+    }
+    let inv_n = 1.0 / n as f32;
+    for v in &mut mean { *v *= inv_n; }
+    // C[i,j] = (1/n) Σ_k (x[k,i]-mean[i]) (x[k,j]-mean[j])
+    // Compute tr(C) and ‖C‖_F² without materialising full C if d is large;
+    // here d=128 so just build it.
+    let mut c = vec![0.0f32; d * d];
+    for k in 0..n {
+        let row = &feats[k * d..(k + 1) * d];
+        for i in 0..d {
+            let xi = row[i] - mean[i];
+            for j in 0..d {
+                let xj = row[j] - mean[j];
+                c[i * d + j] += xi * xj;
+            }
+        }
+    }
+    for v in &mut c { *v *= inv_n; }
+    let tr: f32 = (0..d).map(|i| c[i * d + i]).sum();
+    let frob_sq: f32 = c.iter().map(|x| x * x).sum();
+    if frob_sq <= 1e-20 { 0.0 } else { tr * tr / frob_sq }
+}
+
 fn run_one(mode: &str) -> (f32, f32, f32) {
     eprintln!("\n────────── mode = {mode} ──────────");
     let cortex = match mode {
         "cifar"  => { eprintln!("  cortex: VisualCortex::cifar() (standard priors)"); VisualCortex::cifar() }
         "random" => { eprintln!("  cortex: VisualCortex::random(32, 32) (no priors)"); VisualCortex::random(32, 32) }
-        other    => panic!("unknown mode '{other}', want cifar|random"),
+        "cifar_ortho"  => { eprintln!("  cortex: VisualCortex::cifar_orthogonal() (priors + orthogonal V2/V4)"); VisualCortex::cifar_orthogonal() }
+        "random_ortho" => { eprintln!("  cortex: VisualCortex::random_orthogonal(32, 32) (orthogonal everywhere)"); VisualCortex::random_orthogonal(32, 32) }
+        "cifar_v2"     => { eprintln!("  cortex: VisualCortex::cifar_priors_v2() (full prior stack: DoG + Gabor + contour)"); VisualCortex::cifar_priors_v2() }
+        "cifar_v2_strong" => { eprintln!("  cortex: VisualCortex::cifar_priors_v2_strong() (priors with V2 contour replace+strength=0.5)"); VisualCortex::cifar_priors_v2_strong() }
+        path if path.starts_with("pretrained:") => {
+            let p = &path["pretrained:".len()..];
+            eprintln!("  cortex: VisualCortex::load({p}) — natural-image pretrained, input rescaled to 32×32");
+            let mut c = VisualCortex::load(p).expect("load pretrained cortex");
+            c.input_h = 32;
+            c.input_w = 32;
+            c
+        }
+        other    => panic!("unknown mode '{other}', want cifar|random|pretrained:<path>"),
     };
 
     let train = load_feat(TRAIN_PATH).expect("load train .feat");
@@ -181,6 +278,24 @@ fn run_one(mode: &str) -> (f32, f32, f32) {
 
     let (train_feat, train_lab) = extract_features(&cortex, &train);
     let (eval_feat,  eval_lab)  = extract_features(&cortex, &eval);
+
+    // ── Test 0: subspace structure (priors-as-W_p alignment with data) ──
+    // The right level-of-abstraction question for "do priors help": does
+    // the priors-shaped V4 preserve the data's natural feature subspace,
+    // or does it collapse the spatial output onto a single direction?
+    // High mean cross-sample cosine + low effective rank ⇒ collapsed.
+    // Low cosine + high effective rank ⇒ subspace preserved.
+    let (cos_mean, cos_std) = mean_cross_sample_cosine(&train_feat, train_lab.len(), 200);
+    let eff_rank = effective_rank(&train_feat, train_lab.len(), FEAT_DIM);
+    let first_tok_feats = extract_features_first_token(&cortex, &train);
+    let (cos_ft, _) = mean_cross_sample_cosine(&first_tok_feats, train_lab.len(), 200);
+    let eff_rank_ft = effective_rank(&first_tok_feats, train_lab.len(), FEAT_DIM);
+    eprintln!(
+        "test 0 — V4 subspace (n={}):  pooled cosine={:.3}±{:.3} eff_rank={:.1}/{}  |  per-token cosine={:.3} eff_rank={:.1}/{}",
+        train_lab.len().min(200),
+        cos_mean, cos_std, eff_rank, FEAT_DIM,
+        cos_ft, eff_rank_ft, FEAT_DIM,
+    );
 
     // ── Test 1: linear probe over all 10 classes (in-distribution) ──
     eprintln!("test 1 — linear probe, all 10 classes:");
@@ -257,6 +372,32 @@ fn main() {
         eprintln!("  k-NN, UNSEEN [5..10)      {:5.1}%   {:5.1}%   {:+5.1} pp   ← generalization",
                   ku_c * 100.0, ku_r * 100.0, (ku_c - ku_r) * 100.0);
         eprintln!("══════════════════════════════════════════════════════════");
+    } else if mode_arg == "compare3" {
+        // 3-way: priors-only (cifar) vs no-priors (random) vs natural-image-pretrained.
+        // Pretrained path overridable via MODGRAD_PRETRAINED_PATH; defaults to
+        // /tmp/retina_imagenet.bin if present, else /tmp/retina_stl10_smoke.bin.
+        let pretrained_path = std::env::var("MODGRAD_PRETRAINED_PATH").unwrap_or_else(|_| {
+            if std::path::Path::new("/tmp/retina_imagenet.bin").exists() {
+                "/tmp/retina_imagenet.bin".to_string()
+            } else {
+                "/tmp/retina_stl10_smoke.bin".to_string()
+            }
+        });
+        let (l_c, ks_c, ku_c) = run_one("cifar");
+        let (l_r, ks_r, ku_r) = run_one("random");
+        let (l_p, ks_p, ku_p) = run_one(&format!("pretrained:{}", pretrained_path));
+
+        eprintln!("\n══════════════════════════════════════════════════════════");
+        eprintln!("                           cifar    random   pretrained");
+        eprintln!("──────────────────────────────────────────────────────────");
+        eprintln!("  linear probe, 10cls       {:5.1}%   {:5.1}%   {:5.1}%",
+                  l_c * 100.0, l_r * 100.0, l_p * 100.0);
+        eprintln!("  k-NN, seen [0..5)         {:5.1}%   {:5.1}%   {:5.1}%",
+                  ks_c * 100.0, ks_r * 100.0, ks_p * 100.0);
+        eprintln!("  k-NN, UNSEEN [5..10)      {:5.1}%   {:5.1}%   {:5.1}%   ← generalization",
+                  ku_c * 100.0, ku_r * 100.0, ku_p * 100.0);
+        eprintln!("══════════════════════════════════════════════════════════");
+        eprintln!("  pretrained source: {pretrained_path}");
     } else {
         run_one(&mode_arg);
     }

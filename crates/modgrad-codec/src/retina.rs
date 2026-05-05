@@ -882,6 +882,23 @@ pub fn init_v1_gabor_filters_with_strength(conv: &mut Conv2d, seed: u64, gabor_l
 /// to h / v / ±45° (axis-aligned tasks); otherwise full 8-orientation
 /// bank (better for natural images).
 pub fn init_v2_contour_filters(conv: &mut Conv2d, cardinal_only: bool) {
+    init_v2_contour_filters_with_strength(conv, cardinal_only, /*replace=*/false, /*strength=*/None)
+}
+
+/// Parametrised V2 contour init.
+/// - `replace=true` zeros random Kaiming first, so the contour prior
+///   actually dominates V2 outputs. With `replace=false` (the default)
+///   the contour signal is added as a tiny perturbation on top of
+///   random, which gets drowned (measured: identical V4 cosine to plain
+///   `cifar`).
+/// - `strength=Some(s)` overrides the default `0.33/√fan_in` magnitude
+///   per 3×3 stripe; pass `Some(0.5)` or higher to make priors visible.
+pub fn init_v2_contour_filters_with_strength(
+    conv: &mut Conv2d,
+    cardinal_only: bool,
+    replace: bool,
+    strength: Option<f32>,
+) {
     let k = conv.kernel_size;
     let in_ch = conv.in_channels;
     let out_ch = conv.out_channels;
@@ -889,8 +906,9 @@ pub fn init_v2_contour_filters(conv: &mut Conv2d, cardinal_only: bool) {
     assert_eq!(out_ch, 64, "V2 contour bank targets 64 output channels");
     assert_eq!(k, 3, "V2 contour init only implemented for 3×3 kernels");
 
+    if replace { conv.weight.fill(0.0); conv.bias.fill(0.0); }
     let fan_in = (in_ch * k * k) as f32;
-    let strength = 0.33 / fan_in.sqrt();
+    let strength = strength.unwrap_or_else(|| 0.33 / fan_in.sqrt());
 
     // Given a 3×3 kernel and an orientation θ, return a 3-stripe
     // activation pattern: bright at center (1,1) and at two positions
@@ -949,6 +967,70 @@ pub fn init_v2_contour_filters(conv: &mut Conv2d, cardinal_only: bool) {
             conv.weight[base_b + j] += strength * pat_b[j];
         }
     }
+}
+
+/// Orthogonal initialization for the linear part of a Conv2d layer.
+///
+/// Treats the weight tensor as a `[out_ch × patch_size]` matrix
+/// (`patch_size = in_ch · k · k`) and replaces it with one whose rows
+/// are pairwise orthonormal, then scales by `gain`. The standard ReLU
+/// gain is `√2` (Saxe/Pennington); use `1.0` for identity activations.
+///
+/// **Why this matters.** Default Kaiming init preserves *variance*
+/// through ReLU layers but not *rank*. With Conv2d → leaky-ReLU stacked
+/// 2-3 layers deep on natural images, the cumulative random projection
+/// converges to its top singular direction and feature outputs collapse
+/// to a near-1-D subspace (measured 0.99 cross-sample cosine, effective
+/// rank 1.2/128 on cifar10_probe — the visual hierarchy was producing
+/// essentially the same vector for every input).
+///
+/// Orthogonal init makes the *linear* part of each layer rank-preserving:
+/// `‖Wx − Wy‖ = ‖x − y‖` exactly. After leaky-ReLU it's no longer
+/// isometric but distances aren't crushed either, so cross-sample
+/// diversity survives the depth.
+///
+/// Implementation: sample N(0,1) of the right shape, modified
+/// Gram-Schmidt over the rows, scale by `gain`. Numerical accuracy is
+/// good for our sizes (max 128 × 1152). For `out_ch > patch_size` the
+/// rows can't all be orthogonal in the input space; we orthogonalise
+/// the columns instead so the matrix is at least row-orthogonal in the
+/// output space.
+pub fn init_orthogonal_filters(conv: &mut Conv2d, seed: u64, gain: f32) {
+    let k = conv.kernel_size;
+    let out_ch = conv.out_channels;
+    let patch = conv.in_channels * k * k;
+
+    let (rows, cols, transpose) = if out_ch <= patch {
+        (out_ch, patch, false)
+    } else {
+        (patch, out_ch, true)
+    };
+
+    let mut rng_state = seed | 1;
+    let mut m = vec![0.0f32; rows * cols];
+    for v in &mut m { *v = simple_rng_normal(&mut rng_state); }
+
+    // Modified Gram-Schmidt over the rows of `m`.
+    for i in 0..rows {
+        for j in 0..i {
+            let mut dot = 0.0f32;
+            for c in 0..cols { dot += m[i * cols + c] * m[j * cols + c]; }
+            for c in 0..cols { m[i * cols + c] -= dot * m[j * cols + c]; }
+        }
+        let mut norm_sq = 0.0f32;
+        for c in 0..cols { norm_sq += m[i * cols + c] * m[i * cols + c]; }
+        let inv = if norm_sq > 1e-20 { norm_sq.sqrt().recip() } else { 1.0 };
+        for c in 0..cols { m[i * cols + c] *= inv; }
+    }
+
+    // Write back into conv.weight, untransposing if needed, with gain.
+    for oc in 0..out_ch {
+        for p in 0..patch {
+            let v = if transpose { m[p * cols + oc] } else { m[oc * cols + p] };
+            conv.weight[oc * patch + p] = v * gain;
+        }
+    }
+    conv.bias.fill(0.0);
 }
 
 /// Initialize retinal layer with biologically-inspired FIXED filters.
@@ -1568,6 +1650,84 @@ impl VisualCortex {
         let v1 = Conv2d::new(12, 32, 3, 1, 1);
         let v2 = Conv2d::new(32, 64, 3, 1, 1);
         let v4 = Conv2d::new(64, 128, 3, 1, 1);
+        let v4_ctm = V4Ctm::new(128, 128, 4);
+        Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
+               input_h: h, input_w: w, receptors: ReceptorState::default() }
+    }
+
+    /// Like `cifar()` but V2 and V4 use orthogonal-initialised weights
+    /// instead of Kaiming. Intended to address the rank collapse
+    /// (cross-sample cosine 0.99, effective rank 1.2/128 — V4 features
+    /// sit on a single direction regardless of input).
+    ///
+    /// **Empirical note (2026-05-05):** measured eff_rank with this
+    /// init = 1.3/128 (cosine 0.988) — orthogonal init alone does NOT
+    /// fix the collapse. The bottleneck is downstream of init (likely
+    /// leaky-ReLU saturation × stride-2 chain × no normalization).
+    /// See `init_orthogonal_filters` for the original rationale.
+    pub fn cifar_orthogonal() -> Self {
+        let mut retina = Conv2d::new(3, 12, 3, 2, 1);
+        init_retinal_ganglion_filters(&mut retina);
+        let mut v1 = Conv2d::new(12, 32, 3, 1, 1);
+        init_v1_gabor_filters(&mut v1, 0xC0FFEE);
+        let mut v2 = Conv2d::new(32, 64, 3, 2, 1);
+        init_orthogonal_filters(&mut v2, 0xC0FFEE_0001, std::f32::consts::SQRT_2);
+        let mut v4 = Conv2d::new(64, 128, 3, 2, 1);
+        init_orthogonal_filters(&mut v4, 0xC0FFEE_0002, std::f32::consts::SQRT_2);
+        let v4_ctm = V4Ctm::new(128, 128, 4);
+        Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
+               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+    }
+
+    /// Full prior stack — DoG retina + Gabor V1 + contour V2, V4 random.
+    /// Tests whether stacking task-aligned priors (the way biology does)
+    /// reduces feature subspace collapse more than orthogonal init.
+    pub fn cifar_priors_v2() -> Self {
+        let mut retina = Conv2d::new(3, 12, 3, 2, 1);
+        init_retinal_ganglion_filters(&mut retina);
+        let mut v1 = Conv2d::new(12, 32, 3, 1, 1);
+        init_v1_gabor_filters(&mut v1, 0xC0FFEE);
+        let mut v2 = Conv2d::new(32, 64, 3, 2, 1);
+        init_v2_contour_filters(&mut v2, /*cardinal_only=*/false);
+        let v4 = Conv2d::new(64, 128, 3, 2, 1);
+        let v4_ctm = V4Ctm::new(128, 128, 4);
+        Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
+               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+    }
+
+    /// Same as `cifar_priors_v2` but the V2 contour priors REPLACE
+    /// random Kaiming (instead of being a tiny additive perturbation).
+    /// This is the version where the prior actually dominates V2's
+    /// behaviour — needed to test whether stronger task-alignment in
+    /// V2 reduces V4 subspace collapse.
+    pub fn cifar_priors_v2_strong() -> Self {
+        let mut retina = Conv2d::new(3, 12, 3, 2, 1);
+        init_retinal_ganglion_filters(&mut retina);
+        let mut v1 = Conv2d::new(12, 32, 3, 1, 1);
+        init_v1_gabor_filters(&mut v1, 0xC0FFEE);
+        let mut v2 = Conv2d::new(32, 64, 3, 2, 1);
+        init_v2_contour_filters_with_strength(
+            &mut v2, /*cardinal_only=*/false,
+            /*replace=*/true, /*strength=*/Some(0.5),
+        );
+        let v4 = Conv2d::new(64, 128, 3, 2, 1);
+        let v4_ctm = V4Ctm::new(128, 128, 4);
+        Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
+               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+    }
+
+    /// Like `random()` but V2 and V4 use orthogonal init. Same rationale
+    /// as `cifar_orthogonal()`; `retina` and V1 are still random Kaiming
+    /// because that matches `random()`'s "no priors anywhere" intent.
+    pub fn random_orthogonal(h: usize, w: usize) -> Self {
+        let mut retina = Conv2d::new(3, 12, 3, 2, 1);
+        init_orthogonal_filters(&mut retina, 0xC0FFEE_1000, std::f32::consts::SQRT_2);
+        let mut v1 = Conv2d::new(12, 32, 3, 1, 1);
+        init_orthogonal_filters(&mut v1, 0xC0FFEE_1001, std::f32::consts::SQRT_2);
+        let mut v2 = Conv2d::new(32, 64, 3, 1, 1);
+        init_orthogonal_filters(&mut v2, 0xC0FFEE_1002, std::f32::consts::SQRT_2);
+        let mut v4 = Conv2d::new(64, 128, 3, 1, 1);
+        init_orthogonal_filters(&mut v4, 0xC0FFEE_1003, std::f32::consts::SQRT_2);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
                input_h: h, input_w: w, receptors: ReceptorState::default() }
