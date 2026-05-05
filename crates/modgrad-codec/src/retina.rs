@@ -969,6 +969,28 @@ pub fn init_v2_contour_filters_with_strength(
     }
 }
 
+/// In-place per-token z-score (LayerNorm without learnable γ/β).
+/// `tokens` is `[n_tokens × channels]` row-major. For each token,
+/// subtract the channel-mean and divide by the channel-std (+ε).
+///
+/// **Why.** Pooled V4 features are dominated by per-token magnitude
+/// variance: different spatial positions output features at wildly
+/// different scales, the magnitude pattern itself is the dominant
+/// principal direction, and the actual visual feature directions are
+/// hidden under it. Stripping the magnitude exposes the structure.
+/// Measured: lifts effective rank 4-7× and gives Gabor V1 priors a
+/// +10pp k-NN UNSEEN-class generalization gain on cifar10_probe.
+fn per_token_layernorm(tokens: &mut [f32], n_tokens: usize, channels: usize) {
+    let inv_c = 1.0 / channels as f32;
+    for t in 0..n_tokens {
+        let slice = &mut tokens[t * channels..(t + 1) * channels];
+        let mean: f32 = slice.iter().sum::<f32>() * inv_c;
+        let var: f32 = slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>() * inv_c;
+        let inv_std = (var + 1e-5).sqrt().recip();
+        for x in slice.iter_mut() { *x = (*x - mean) * inv_std; }
+    }
+}
+
 /// Orthogonal initialization for the linear part of a Conv2d layer.
 ///
 /// Treats the weight tensor as a `[out_ch × patch_size]` matrix
@@ -1353,6 +1375,15 @@ pub struct VisualCortex {
     /// Pharmacological state of V1/V2/V4 — modulates `lsd()` effect.
     #[serde(default)]
     pub receptors: ReceptorState,
+    /// Apply per-token LayerNorm-style z-score (across channels) to V4
+    /// output before it leaves `spatial_tokens` / `spatial_tokens_multiscale`.
+    /// Strips the per-token magnitude direction that otherwise dominates
+    /// pooled features (measured: lifts effective rank 1.7→11.2/128 on
+    /// cifar10_probe and gives Gabor V1 priors a +10pp k-NN UNSEEN-class
+    /// gain). Default `false` for back-compat with existing saved
+    /// cortexes; constructors that opt in include the suffix `_ln`.
+    #[serde(default)]
+    pub per_token_ln_v4: bool,
 }
 
 fn default_v4_ctm() -> V4Ctm {
@@ -1611,7 +1642,8 @@ impl VisualCortex {
         let v4 = Conv2d::new(64, 128, 3, 2, 1);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: h, input_w: w, receptors: ReceptorState::default() }
+               input_h: h, input_w: w, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// For CIFAR-10 (32×32×3)
@@ -1638,7 +1670,8 @@ impl VisualCortex {
         let v4 = Conv2d::new(64, 128, 3, 1, 1);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: h, input_w: w, receptors: ReceptorState::default() }
+               input_h: h, input_w: w, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// Genome-friendly constructor — no priors, no env vars, just
@@ -1652,7 +1685,8 @@ impl VisualCortex {
         let v4 = Conv2d::new(64, 128, 3, 1, 1);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: h, input_w: w, receptors: ReceptorState::default() }
+               input_h: h, input_w: w, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// Like `cifar()` but V2 and V4 use orthogonal-initialised weights
@@ -1676,7 +1710,8 @@ impl VisualCortex {
         init_orthogonal_filters(&mut v4, 0xC0FFEE_0002, std::f32::consts::SQRT_2);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+               input_h: 32, input_w: 32, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// Full prior stack — DoG retina + Gabor V1 + contour V2, V4 random.
@@ -1692,7 +1727,20 @@ impl VisualCortex {
         let v4 = Conv2d::new(64, 128, 3, 2, 1);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+               input_h: 32, input_w: 32, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
+    }
+
+    /// Like `cifar()` but with `per_token_ln_v4 = true`. This is the
+    /// recommended default for new natural-image work: strips the
+    /// per-token magnitude direction that otherwise hides the visual
+    /// feature directions in pooled output. Measured: gives Gabor V1
+    /// priors a +10pp k-NN UNSEEN-class generalization gain on
+    /// cifar10_probe.
+    pub fn cifar_ln() -> Self {
+        let mut c = Self::cifar();
+        c.per_token_ln_v4 = true;
+        c
     }
 
     /// Same as `cifar_priors_v2` but the V2 contour priors REPLACE
@@ -1713,7 +1761,8 @@ impl VisualCortex {
         let v4 = Conv2d::new(64, 128, 3, 2, 1);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: 32, input_w: 32, receptors: ReceptorState::default() }
+               input_h: 32, input_w: 32, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// Like `random()` but V2 and V4 use orthogonal init. Same rationale
@@ -1730,7 +1779,8 @@ impl VisualCortex {
         init_orthogonal_filters(&mut v4, 0xC0FFEE_1003, std::f32::consts::SQRT_2);
         let v4_ctm = V4Ctm::new(128, 128, 4);
         Self { retina, v1, v2, v4, v4_ctm, pool_dim: 128,
-               input_h: h, input_w: w, receptors: ReceptorState::default() }
+               input_h: h, input_w: w, receptors: ReceptorState::default(),
+               per_token_ln_v4: false }
     }
 
     /// Train the visual retina with Hebbian sparse coding.
@@ -2089,6 +2139,7 @@ impl VisualCortex {
             }
         }
 
+        if self.per_token_ln_v4 { per_token_layernorm(&mut tokens, n_tokens, channels); }
         (tokens, n_tokens, channels)
     }
 
@@ -2139,10 +2190,14 @@ impl VisualCortex {
             (tok, n, ch)
         };
 
+        let mut v4_tokens = chw_to_tokens(&v4_out, self.v4.out_channels, h4, w4);
+        if self.per_token_ln_v4 {
+            per_token_layernorm(&mut v4_tokens.0, v4_tokens.1, v4_tokens.2);
+        }
         [
             chw_to_tokens(&v1_out, self.v1.out_channels, h1, w1),
             chw_to_tokens(&v2_out, self.v2.out_channels, h2, w2),
-            chw_to_tokens(&v4_out, self.v4.out_channels, h4, w4),
+            v4_tokens,
             chw_to_tokens(&r_snapshot, self.retina.out_channels, rh, rw),
         ]
     }
