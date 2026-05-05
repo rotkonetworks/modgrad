@@ -3607,4 +3607,49 @@ mod tests {
             "per-token LN should not increase cross-sample cosine; \
              got no_ln={cos_no:.3} ln={cos_ln:.3}");
     }
+
+    /// Structural test for `cifar_retina_only_ln`: the constructor must
+    /// (a) install the fixed DoG ganglion priors at the retina,
+    /// (b) leave V1 as random Kaiming (NO Gabor priors applied),
+    /// (c) set `per_token_ln_v4 = true` so V4 output goes through LN.
+    ///
+    /// We compare V1 weights against a freshly-constructed
+    /// `Conv2d::new(12, 32, 3, 1, 1)`: their distributions should match
+    /// (= no Gabor init was applied) up to RNG state. Both use the
+    /// deterministic seed `(in_ch * out_ch * k) + 31337`, so the weights
+    /// are bit-for-bit equal when no Gabor init is layered on top.
+    ///
+    /// This locks in the DoG-only contract: future refactors that
+    /// accidentally call `init_v1_gabor_filters` or remove the LN flag
+    /// will fire this test.
+    #[test]
+    fn cifar_retina_only_ln_skips_gabor_v1() {
+        let cortex = VisualCortex::cifar_retina_only_ln(32, 32);
+        let plain_v1 = Conv2d::new(12, 32, 3, 1, 1);
+
+        // V1 weights bit-for-bit match a fresh random Conv2d (no Gabor
+        // overlay). If `init_v1_gabor_filters` is accidentally applied,
+        // any of the Gabor-stamped channels diverge by O(0.5).
+        assert_eq!(cortex.v1.weight.len(), plain_v1.weight.len(),
+            "v1 weight length should match a plain Conv2d::new");
+        for (i, (&a, &b)) in cortex.v1.weight.iter().zip(&plain_v1.weight).enumerate() {
+            assert!((a - b).abs() < 1e-6,
+                "v1.weight[{i}] = {a} differs from plain Conv2d {b}; \
+                 cifar_retina_only_ln must NOT apply Gabor priors to V1");
+        }
+
+        // LN flag is on.
+        assert!(cortex.per_token_ln_v4,
+            "cifar_retina_only_ln must set per_token_ln_v4 = true");
+
+        // Retina has the fixed DoG ganglion init: at least one weight
+        // must equal the canonical center-cell magnitude (8/8 = 1.0)
+        // up to scale. Cheap, structural — the full DoG pattern lives
+        // in init_retinal_ganglion_filters and has its own coverage.
+        let max_abs = cortex.retina.weight.iter()
+            .fold(0.0f32, |m, &w| m.max(w.abs()));
+        assert!(max_abs > 0.5,
+            "retina ganglion init looks too random (max|w|={max_abs}); \
+             expected DoG center at ~1.0");
+    }
 }
