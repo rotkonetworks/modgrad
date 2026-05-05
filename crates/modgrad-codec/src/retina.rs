@@ -1196,6 +1196,45 @@ fn init_retinal_filters(conv: &mut Conv2d) {
     }
 }
 
+/// Spatial LayerNorm in CHW layout: at each (y, x) spatial position,
+/// normalize across the C channel dimension (zero-mean unit-std).
+///
+/// Fixes the rank-1 collapse where leaky_relu accumulates a per-token
+/// DC offset through the V1→V2→V4 chain. By V4 the per-position
+/// channel mean is image-invariant and dominates the signal —
+/// `mean_cross_sample_cosine` saturates near 1.0 and effective rank
+/// collapses to ~1 out of 128. Stripping the per-position mean
+/// exposes the residual structure where priors actually encode
+/// inductive bias (measured 4-7× eff_rank lift, +10pp k-NN UNSEEN
+/// generalization on cifar10_probe with priors).
+///
+/// `chw[c * H * W + y * W + x]` ← `(chw[...] - mean_c) / std_c`
+/// where mean_c, std_c are computed across c for each fixed (y, x).
+#[inline]
+fn spatial_layernorm_chw(chw: &mut [f32], channels: usize, h: usize, w: usize) {
+    debug_assert_eq!(chw.len(), channels * h * w);
+    let hw = h * w;
+    let inv_c = 1.0 / channels as f32;
+    for pos in 0..hw {
+        // Compute mean across channels at this position.
+        let mut sum = 0.0f32;
+        for c in 0..channels { sum += chw[c * hw + pos]; }
+        let mean = sum * inv_c;
+        // Compute variance.
+        let mut var_sum = 0.0f32;
+        for c in 0..channels {
+            let d = chw[c * hw + pos] - mean;
+            var_sum += d * d;
+        }
+        let inv_std = (var_sum * inv_c + 1e-5).sqrt().recip();
+        // Apply normalization in place.
+        for c in 0..channels {
+            let idx = c * hw + pos;
+            chw[idx] = (chw[idx] - mean) * inv_std;
+        }
+    }
+}
+
 /// Leaky ReLU: preserves weak negative signals (subthreshold activity).
 /// Real neurons don't fully zero below threshold — membrane potential
 /// still fluctuates. The leak (0.1) keeps information flowing through
@@ -2197,6 +2236,18 @@ impl VisualCortex {
 
         let (mut v4_out, h4, w4) = self.v4.forward(&v2_out, 1, h2, w2);
         leaky_relu(&mut v4_out);
+
+        // MODGRAD_RETINA_LAYERNORM=1: spatial LayerNorm on V4 output to
+        // strip the per-position DC offset that collapses V4 to rank-1.
+        // See `spatial_layernorm_chw` for the why. Optionally also at
+        // V2 (set MODGRAD_RETINA_LAYERNORM=v2v4).
+        if let Some(stage) = std::env::var_os("MODGRAD_RETINA_LAYERNORM") {
+            let stage = stage.to_string_lossy();
+            if stage == "v2v4" {
+                spatial_layernorm_chw(&mut v2_out, self.v2.out_channels, h2, w2);
+            }
+            spatial_layernorm_chw(&mut v4_out, self.v4.out_channels, h4, w4);
+        }
 
         let chw_to_tokens = |chw: &[f32], ch: usize, hh: usize, ww: usize| {
             let n = hh * ww;
