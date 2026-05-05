@@ -282,6 +282,7 @@ fn run_one(mode: &str) -> (f32, f32, f32) {
         "cifar_v2"     => { eprintln!("  cortex: VisualCortex::cifar_priors_v2() (full prior stack: DoG + Gabor + contour)"); VisualCortex::cifar_priors_v2() }
         "cifar_v2_strong" => { eprintln!("  cortex: VisualCortex::cifar_priors_v2_strong() (priors with V2 contour replace+strength=0.5)"); VisualCortex::cifar_priors_v2_strong() }
         "cifar_ln"     => { eprintln!("  cortex: VisualCortex::cifar_ln() (priors + in-chain per-token LN on V4)"); VisualCortex::cifar_ln() }
+        "dog_only_ln"  => { eprintln!("  cortex: VisualCortex::cifar_retina_only_ln(32, 32) (DoG retina + random V1/V2/V4 + LN — cross-domain check)"); VisualCortex::cifar_retina_only_ln(32, 32) }
         path if path.starts_with("pretrained:") => {
             let p = &path["pretrained:".len()..];
             eprintln!("  cortex: VisualCortex::load({p}) — natural-image pretrained, input rescaled to 32×32");
