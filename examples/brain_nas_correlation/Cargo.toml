@@ -1,0 +1,12 @@
+[package]
+name = "brain_nas_correlation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+
+[[bin]]
+name = "brain_nas_correlation"
+path = "src/main.rs"

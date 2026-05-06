@@ -1,0 +1,13 @@
+[package]
+name = "brain_nas_train_smoke"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-compute = { path = "../../crates/modgrad-compute" }
+serde_json = "1"
+
+[[bin]]
+name = "brain_nas_train_smoke"
+path = "src/main.rs"
