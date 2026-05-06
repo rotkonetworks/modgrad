@@ -1,0 +1,87 @@
+[package]
+name = "penumbra_arena"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rocm = [
+    "modgrad-ctm/rocm",
+    "modgrad-device/rocm",
+]
+# `embedded` enables the in-process view+custody EmbeddedChain that
+# links penumbra-sdk-* crates directly. Adds path deps to the
+# user's local Penumbra workspace at ~/rotko/penumbra. First
+# integration slice: penumbra-sdk-keys for address derivation +
+# spend-key parse. Subsequent slices pull -view (Storage), -proto,
+# -custody, -transaction.
+embedded = [
+    "dep:penumbra-sdk-keys",
+    "dep:penumbra-sdk-view",
+    "dep:penumbra-sdk-proto",
+    "dep:penumbra-sdk-asset",
+    "dep:penumbra-sdk-custody",
+    "dep:penumbra-sdk-fee",
+    "dep:penumbra-sdk-dex",
+    "dep:penumbra-sdk-num",
+    "dep:penumbra-sdk-transaction",
+    "dep:penumbra-sdk-txhash",
+    "dep:penumbra-sdk-wallet",
+    "dep:tonic",
+    "dep:tokio",
+    "dep:url",
+    "dep:camino",
+    "dep:toml",
+    "dep:futures",
+    "dep:rand",
+    "dep:tracing",
+]
+
+[dependencies]
+modgrad-ctm     = { path = "../../crates/modgrad-ctm" }
+modgrad-device  = { path = "../../crates/modgrad-device" }
+modgrad-persist = { path = "../../crates/modgrad-persist" }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+anyhow          = "1"
+
+# Embedded-only deps. Path-deps to the user's local Penumbra workspace.
+penumbra-sdk-keys        = { path = "/home/alice/rotko/penumbra/crates/core/keys",                    optional = true }
+penumbra-sdk-view        = { path = "/home/alice/rotko/penumbra/crates/view",                         optional = true }
+penumbra-sdk-proto       = { path = "/home/alice/rotko/penumbra/crates/proto",                        optional = true, features = ["rpc"] }
+penumbra-sdk-asset       = { path = "/home/alice/rotko/penumbra/crates/core/asset",                   optional = true }
+penumbra-sdk-custody     = { path = "/home/alice/rotko/penumbra/crates/custody",                      optional = true }
+penumbra-sdk-fee         = { path = "/home/alice/rotko/penumbra/crates/core/component/fee",           optional = true }
+penumbra-sdk-dex         = { path = "/home/alice/rotko/penumbra/crates/core/component/dex",           optional = true }
+penumbra-sdk-num         = { path = "/home/alice/rotko/penumbra/crates/core/num",                     optional = true }
+penumbra-sdk-transaction = { path = "/home/alice/rotko/penumbra/crates/core/transaction",             optional = true }
+penumbra-sdk-txhash      = { path = "/home/alice/rotko/penumbra/crates/core/txhash",                  optional = true }
+penumbra-sdk-wallet      = { path = "/home/alice/rotko/penumbra/crates/wallet",                       optional = true }
+tonic                    = { version = "0.12.3", optional = true }
+tokio                    = { version = "1.39",   optional = true, features = ["rt-multi-thread", "macros"] }
+url                      = { version = "2",      optional = true }
+camino                   = { version = "1",      optional = true }
+toml                     = { version = "0.8",    optional = true }
+futures                  = { version = "0.3",    optional = true }
+rand                     = { version = "0.8",    optional = true }
+tracing                  = { version = "0.1",    optional = true }
+
+[[bin]]
+name = "penumbra_mm"
+path = "src/bin/penumbra_mm.rs"
+
+[[bin]]
+name = "penumbra_train"
+path = "src/bin/penumbra_train.rs"
+
+[[bin]]
+name = "penumbra_arena"
+path = "src/bin/penumbra_arena.rs"
+
+[[bin]]
+name = "arena_setup"
+path = "src/bin/arena_setup.rs"
+
+[[bin]]
+name = "penumbra_live_arena"
+path = "src/bin/penumbra_live_arena.rs"
