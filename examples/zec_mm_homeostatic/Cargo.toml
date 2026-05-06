@@ -1,0 +1,15 @@
+[package]
+name = "zec_mm_homeostatic"
+version = "0.1.0"
+edition = "2024"
+description = "Homeostatic market-making brain: ZECBTC quoter with PnL-driven pain/satisfaction interoception, trained online via REINFORCE on a regional CTM."
+license = "MIT"
+
+[[bin]]
+name = "zec_mm_homeostatic"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-traits = { path = "../../crates/modgrad-traits" }
