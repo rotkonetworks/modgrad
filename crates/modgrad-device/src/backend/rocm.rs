@@ -84,6 +84,19 @@ pub mod ffi {
             y: *mut f32,
             incy: c_int,
         ) -> hipblasStatus_t;
+        /// AXPY: `y = alpha * x + y` over `n` f32 elements. Used by
+        /// the resident SGD step (`w -= lr * g` is `saxpy(alpha=-lr,
+        /// x=g, y=w)`).
+        pub fn hipblasSaxpy(
+            handle: hipblasHandle_t,
+            n: c_int,
+            alpha: *const f32,
+            x: *const f32,
+            incx: c_int,
+            y: *mut f32,
+            incy: c_int,
+        ) -> hipblasStatus_t;
+
         pub fn hipblasSgemm(
             handle: hipblasHandle_t,
             transa: c_int,
@@ -556,6 +569,62 @@ impl HipBuffer {
     /// Public alias for `download_f32`.
     pub fn copy_to_host(&self, dst: &mut [f32]) -> Result<(), BackendError> {
         self.download_f32(dst)
+    }
+
+    /// Device-to-device range copy. Copies `len_f32` f32 elements
+    /// from `src` starting at `src_offset_f32`, into `self` starting
+    /// at `dst_offset_f32`. Both buffers must already be allocated.
+    ///
+    /// Used by `Tensor<Rocm>` gather/embedding operations to keep
+    /// data device-resident — no PCIe round-trip. The hipMemcpy
+    /// here is a device-to-device DMA (constant 3 in HIP enum),
+    /// the same path matvec_resident uses internally.
+    pub fn copy_range_from(
+        &self,
+        src: &HipBuffer,
+        src_offset_f32: usize,
+        dst_offset_f32: usize,
+        len_f32: usize,
+    ) -> Result<(), BackendError> {
+        // Use checked arithmetic for byte-size + bounds — same pattern
+        // as `glu_resident_f32`. Pathological len/offset values can wrap
+        // a raw multiply; the resulting bounds check would spuriously
+        // pass and the hipMemcpy would corrupt memory.
+        let overflow = || BackendError::Runtime(
+            "copy_range_from: usize overflow in size/offset arithmetic".into()
+        );
+        let bytes = len_f32.checked_mul(4).ok_or_else(overflow)?;
+        let src_off_bytes = src_offset_f32.checked_mul(4).ok_or_else(overflow)?;
+        let dst_off_bytes = dst_offset_f32.checked_mul(4).ok_or_else(overflow)?;
+        let src_end = src_off_bytes.checked_add(bytes).ok_or_else(overflow)?;
+        let dst_end = dst_off_bytes.checked_add(bytes).ok_or_else(overflow)?;
+        if src_end > src.bytes {
+            return Err(BackendError::Runtime(format!(
+                "copy_range_from: src range [{},{}) bytes exceeds src buffer ({} bytes)",
+                src_off_bytes, src_end, src.bytes,
+            )));
+        }
+        if dst_end > self.bytes {
+            return Err(BackendError::Runtime(format!(
+                "copy_range_from: dst range [{},{}) bytes exceeds dst buffer ({} bytes)",
+                dst_off_bytes, dst_end, self.bytes,
+            )));
+        }
+        const HIP_MEMCPY_DEVICE_TO_DEVICE: std::os::raw::c_int = 3;
+        let err = unsafe {
+            ffi::hipMemcpy(
+                (self.ptr as *mut u8).add(dst_off_bytes) as *mut std::os::raw::c_void,
+                (src.ptr as *const u8).add(src_off_bytes) as *const std::os::raw::c_void,
+                bytes,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipMemcpy D2D (range): {}", ffi::hip_err_str(err)
+            )));
+        }
+        Ok(())
     }
 
     /// Copy `src` (host) into this device buffer.
@@ -1071,6 +1140,10 @@ impl Backend for RocmBackend {
                 // gate is dropped — small ops are still profitable
                 // when weights and activations are already on device.
                 Op::MatvecResident { .. } => true,
+                Op::MatvecTResident { .. } => true,
+                Op::OuterProductAccResident { .. } => true,
+                Op::SgdUpdateResident { .. } => true,
+                Op::AxpyResident { .. } => true,
                 Op::SuperLinearFwdResident { .. } => true,
                 Op::SuperLinearBwdDwResident { .. } => true,
                 Op::SuperLinearBwdDxResident { .. } => true,
@@ -1167,6 +1240,35 @@ impl Backend for RocmBackend {
                     *out_dev as *mut std::os::raw::c_void,
                     *out_dim, *in_dim,
                 ),
+                Op::MatvecTResident {
+                    d_out_dev, weight_dev, d_input_dev,
+                    out_dim, in_dim,
+                } => self.matvec_t_resident_f32(
+                    *d_out_dev as *const std::os::raw::c_void,
+                    *weight_dev as *const std::os::raw::c_void,
+                    *d_input_dev as *mut std::os::raw::c_void,
+                    *out_dim, *in_dim,
+                ),
+                Op::OuterProductAccResident {
+                    a_dev, b_dev, accum_dev, m, n,
+                } => self.outer_product_acc_resident_f32(
+                    *a_dev as *const std::os::raw::c_void,
+                    *b_dev as *const std::os::raw::c_void,
+                    *accum_dev as *mut std::os::raw::c_void,
+                    *m, *n,
+                ),
+                Op::SgdUpdateResident { w_dev, g_dev, n, lr } => self
+                    .sgd_update_resident_f32(
+                        *w_dev as *mut std::os::raw::c_void,
+                        *g_dev as *const std::os::raw::c_void,
+                        *n, *lr,
+                    ),
+                Op::AxpyResident { y_dev, x_dev, n, alpha } => self
+                    .axpy_resident_f32(
+                        *y_dev as *mut std::os::raw::c_void,
+                        *x_dev as *const std::os::raw::c_void,
+                        *n, *alpha,
+                    ),
                 Op::SuperLinearFwdResident {
                     x_dev, weight_dev, bias_dev, out_dev,
                     n_neurons, in_per, out_per,
@@ -1562,6 +1664,151 @@ impl RocmBackend {
         if status != 0 {
             return Err(BackendError::Runtime(format!(
                 "hipblasSgemv (resident): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident transposed matvec: `d_input = W^T · d_out`.
+    /// Mirror of `matvec_resident_f32` with `TRANS=N` instead of
+    /// `TRANS=T` — same column-major-via-row-major-view trick.
+    ///
+    /// W is row-major `[out_dim × in_dim]` (column-major view is
+    /// `[in_dim × out_dim]`, which IS W^T). With `TRANS=N`, the
+    /// hipblasSgemv computes `A·d_out = W^T · d_out = d_input`,
+    /// where `m = in_dim`, `n = out_dim`, `lda = in_dim`. Output
+    /// `d_input_dev` is `[in_dim]`. `beta = 0` overwrites; the
+    /// caller decides about gradient accumulation upstream.
+    fn matvec_t_resident_f32(
+        &self,
+        d_out_dev: *const std::os::raw::c_void,
+        weight_dev: *const std::os::raw::c_void,
+        d_input_dev: *mut std::os::raw::c_void,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<(), BackendError> {
+        let in_dim_i32 = as_i32(in_dim, "in_dim")?;
+        let out_dim_i32 = as_i32(out_dim, "out_dim")?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSgemv(
+                *handle,
+                ffi::HIPBLAS_OP_N,
+                in_dim_i32,
+                out_dim_i32,
+                &alpha,
+                weight_dev as *const f32,
+                in_dim_i32,
+                d_out_dev as *const f32,
+                1,
+                &beta,
+                d_input_dev as *mut f32,
+                1,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemv (matvec_t resident): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident accumulating outer product: `accum += a ⊗ b`.
+    /// `a` is `[m]`, `b` is `[n]`, `accum` is row-major `[m × n]`.
+    /// Implemented via `hipblasSgemm` with `k = 1` and `beta = 1.0`,
+    /// so the result accumulates rather than overwrites — exactly
+    /// what `Linear<D>::backward` wants for `d_W += d_y ⊗ x`.
+    ///
+    /// Column-major / row-major mapping: row-major `[m × n]` accum
+    /// reads as column-major `[n × m]`, so we issue
+    /// `C_col[n × m] = α · B_col[n × 1] · A_col[1 × m] + β · C_col`
+    /// where `B_col = b` (length n, used as col), `A_col = a^T` (length
+    /// m, used as row). With `transa = N`, `transb = N`, this becomes
+    /// `C[n × m] += b · a` in column-major, which is `accum[m × n] += a · b`
+    /// when read row-major. Matches the host `outer_product_acc` semantics.
+    fn outer_product_acc_resident_f32(
+        &self,
+        a_dev: *const std::os::raw::c_void,
+        b_dev: *const std::os::raw::c_void,
+        accum_dev: *mut std::os::raw::c_void,
+        m: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let m_i = as_i32(m, "m")?;
+        let n_i = as_i32(n, "n")?;
+        let one_i: std::os::raw::c_int = 1;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 1.0;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        // Column-major: C[n×m] += b[n×1] · a[1×m]. ldb=n, lda=1, ldc=n.
+        let status = unsafe {
+            ffi::hipblasSgemm(
+                *handle,
+                ffi::HIPBLAS_OP_N,
+                ffi::HIPBLAS_OP_N,
+                n_i, m_i, one_i,
+                &alpha,
+                b_dev as *const f32, n_i,
+                a_dev as *const f32, one_i,
+                &beta,
+                accum_dev as *mut f32, n_i,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemm (outer_product_acc resident): status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fully-resident SGD step: `w -= lr · g` over `n` f32 elements.
+    /// Now a thin alias over `axpy_resident_f32` — `alpha = -lr`.
+    fn sgd_update_resident_f32(
+        &self,
+        w_dev: *mut std::os::raw::c_void,
+        g_dev: *const std::os::raw::c_void,
+        n: usize,
+        lr: f32,
+    ) -> Result<(), BackendError> {
+        self.axpy_resident_f32(w_dev, g_dev, n, -lr)
+    }
+
+    /// Fully-resident SAXPY: `y = alpha * x + y` over `n` f32s.
+    /// The general primitive — used by `SgdUpdate` (`alpha = -lr`),
+    /// `add_assign` (`alpha = 1`), and any future linear-combination
+    /// op. Single `hipblasSaxpy` call.
+    fn axpy_resident_f32(
+        &self,
+        y_dev: *mut std::os::raw::c_void,
+        x_dev: *const std::os::raw::c_void,
+        n: usize,
+        alpha: f32,
+    ) -> Result<(), BackendError> {
+        let n_i = as_i32(n, "n")?;
+        let handle = self.handle.lock()
+            .map_err(|_| BackendError::Runtime("rocm: hipblas handle poisoned".into()))?;
+        let status = unsafe {
+            ffi::hipblasSaxpy(
+                *handle,
+                n_i,
+                &alpha,
+                x_dev as *const f32, 1,
+                y_dev as *mut f32, 1,
+            )
+        };
+        drop(handle);
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSaxpy (axpy resident): status {status}"
             )));
         }
         Ok(())

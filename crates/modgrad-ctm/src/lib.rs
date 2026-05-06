@@ -20,12 +20,16 @@ pub mod dispatch_profile;
 // FFN architecture moved to the `modgrad-ffn` crate — parallel to
 // `modgrad-transformer`. Depend on it directly for SwiGLU language models.
 pub mod graph;
+/// Non-hand-designed brain search space. Encodes per-region shape,
+/// connectivity mask and globals as a sampleable architecture point;
+/// the `eight_region_*` presets are reproducible as encoded points.
+pub mod search_space;
+/// Zero-cost trainability proxies (NAS Survey §4.4): forward-entropy
+/// scores at init, no backward, no training. Used by random search
+/// to rank architectures without running a single optimiser step.
+pub mod proxies;
 pub mod schedule;
 pub mod modulator;
-#[cfg(feature = "rocm")]
-pub mod resident;
-#[cfg(feature = "rocm")]
-pub mod ctm_resident;
 /// Re-export of `modgrad_memory` for backward compatibility.
 /// New code should import from `modgrad_memory` directly.
 pub use modgrad_memory as memory;

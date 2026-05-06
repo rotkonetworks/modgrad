@@ -849,3 +849,655 @@ mod tests {
         }
     }
 }
+
+// ─── SynapseBlock<D> + SynapseUNet<D> — typed JAX-style ──────
+//
+// Path C ports of the U-Net synapse. Replaces the bifurcated host
+// (`SynapseBlock`/`SynapseUNet`) + resident (`SynapseUNetResident`)
+// pair with a single device-generic struct. `D = Cpu` runs on the
+// host path, `D = Rocm` runs entirely device-resident, with the
+// SAME forward code calling typed primitives that route to native
+// kernels per device.
+//
+// v0 scope: forward only. Backward is a separate slice — needs
+// matvec_t + outer_product_acc + layer_norm_bwd + silu_bwd composed
+// in reverse-tick order with skip-connection adjoint. See review
+// notes for the full backward composition.
+
+use modgrad_device::backend::tensor as tensor_api;
+use modgrad_device::backend::tensor::{Device, Tensor};
+use modgrad_device::backend::BackendError;
+
+/// One typed synapse block: `Linear → LayerNorm(γ,β) → SiLU`.
+/// Same struct works on every `D: Device`.
+pub struct SynapseBlockTyped<D: Device> {
+    pub linear: tensor_api::Linear<D>,
+    pub ln_gamma: Tensor<D>,
+    pub ln_beta: Tensor<D>,
+    pub out_dim: usize,
+}
+
+impl<D: Device> SynapseBlockTyped<D> {
+    /// Construct from host-side weight/bias/gamma/beta buffers.
+    /// Uploads to device on construction; subsequent `forward` calls
+    /// have zero PCIe round-trips when `D = Rocm`.
+    pub fn from_host(
+        weight: &[f32],
+        bias: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self, BackendError> {
+        if gamma.len() != out_dim {
+            return Err(BackendError::Runtime(format!(
+                "SynapseBlockTyped::from_host: gamma len {} != out_dim {}",
+                gamma.len(), out_dim,
+            )));
+        }
+        if beta.len() != out_dim {
+            return Err(BackendError::Runtime(format!(
+                "SynapseBlockTyped::from_host: beta len {} != out_dim {}",
+                beta.len(), out_dim,
+            )));
+        }
+        Ok(Self {
+            linear: tensor_api::Linear::<D>::from_host(weight, bias, in_dim, out_dim)?,
+            ln_gamma: Tensor::<D>::from_slice(gamma)?,
+            ln_beta: Tensor::<D>::from_slice(beta)?,
+            out_dim,
+        })
+    }
+
+    /// Convert from an existing untyped `SynapseBlock` (uploads to D).
+    /// Useful for migrating a checkpoint loaded via the old serde path.
+    pub fn from_untyped(block: &SynapseBlock) -> Result<Self, BackendError> {
+        let in_dim = block.linear.weight.len() / block.linear.bias.len();
+        let out_dim = block.linear.bias.len();
+        Self::from_host(
+            &block.linear.weight, &block.linear.bias,
+            &block.ln_gamma, &block.ln_beta,
+            in_dim, out_dim,
+        )
+    }
+
+    /// Forward: `y = SiLU(LayerNorm_{γ,β}(W·x + b))`. All ops route
+    /// through the typed cascade — same path on Cpu and Rocm.
+    pub fn forward(&self, x: &Tensor<D>) -> Result<Tensor<D>, BackendError> {
+        // Step 1: linear (matvec).
+        let pre_ln = self.linear.forward(x)?;
+        // Step 2: LayerNorm. Single-row apply (n_rows=1, n_cols=out_dim).
+        let mut post_ln = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::layer_norm(&pre_ln, &self.ln_gamma, &self.ln_beta,
+            &mut post_ln, 1, self.out_dim)?;
+        // Step 3: SiLU.
+        let mut out = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::silu(&post_ln, &mut out)?;
+        Ok(out)
+    }
+
+    /// Forward with cache — returns `(output, cache)` where cache
+    /// holds every intermediate the matched `backward` consumes.
+    /// Used by `SynapseUNetTyped<D>::backward` to walk reverse.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor<D>,
+    ) -> Result<(Tensor<D>, SynapseBlockCacheTyped<D>), BackendError> {
+        // Stash the Linear input by reading back its host content
+        // (small: in_dim per block, dwarfed by matmul cost).
+        let lin_in_host: Vec<f32> = x.to_vec()?;
+        let pre_ln = self.linear.forward(x)?;
+        let pre_ln_host: Vec<f32> = pre_ln.to_vec()?;
+
+        // LayerNorm with cache (mean + rstd, length 2*n_rows = 2).
+        let mut post_ln = Tensor::<D>::zeros(self.out_dim)?;
+        let mut ln_cache = Tensor::<D>::zeros(2)?;
+        tensor_api::layer_norm_train(&pre_ln, &self.ln_gamma, &self.ln_beta,
+            &mut post_ln, &mut ln_cache, 1, self.out_dim)?;
+        let post_ln_host: Vec<f32> = post_ln.to_vec()?;
+
+        // SiLU.
+        let mut out = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::silu(&post_ln, &mut out)?;
+
+        let cache = SynapseBlockCacheTyped {
+            linear_in: Tensor::<D>::from_slice(&lin_in_host)?,
+            ln_in: Tensor::<D>::from_slice(&pre_ln_host)?,
+            ln_cache,
+            silu_in: Tensor::<D>::from_slice(&post_ln_host)?,
+        };
+        Ok((out, cache))
+    }
+
+    /// Backward through one block: SiLU → LayerNorm → Linear (in
+    /// reverse). Given upstream `d_out` (gradient w.r.t. block
+    /// output), accumulate weight gradients (`d_W`, `d_b`,
+    /// `d_gamma`, `d_beta`) and overwrite `d_input`.
+    ///
+    /// **Output convention:**
+    ///   - `d_W`, `d_b`, `d_gamma`, `d_beta` ACCUMULATE
+    ///   - `d_input` OVERWRITTEN
+    pub fn backward(
+        &self,
+        d_out: &Tensor<D>,
+        cache: &SynapseBlockCacheTyped<D>,
+        d_w: &mut Tensor<D>,
+        d_b: &mut Tensor<D>,
+        d_gamma: &mut Tensor<D>,
+        d_beta: &mut Tensor<D>,
+        d_input: &mut Tensor<D>,
+    ) -> Result<(), BackendError> {
+        // Step 1: silu_bwd → d_post_ln.
+        let mut d_post_ln = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::silu_bwd(d_out, &cache.silu_in, &mut d_post_ln)?;
+
+        // Step 2: layer_norm_bwd → d_pre_ln. Accumulates into d_gamma/d_beta.
+        let mut d_pre_ln = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::layer_norm_bwd(
+            &d_post_ln, &cache.ln_in, &self.ln_gamma, &cache.ln_cache,
+            &mut d_pre_ln, d_gamma, d_beta,
+            1, self.out_dim,
+        )?;
+
+        // Step 3: Linear backward → d_input. Accumulates into d_W, d_b.
+        self.linear.backward(&d_pre_ln, &cache.linear_in, d_w, d_b, d_input)?;
+
+        Ok(())
+    }
+}
+
+/// Cache produced by `SynapseBlockTyped::forward_with_cache`.
+/// Holds every input that `backward` reads. The `ln_cache` is the
+/// mean/rstd buffer in the same layout `Tensor::layer_norm_train` writes.
+pub struct SynapseBlockCacheTyped<D: Device> {
+    pub linear_in: Tensor<D>,
+    pub ln_in: Tensor<D>,
+    pub ln_cache: Tensor<D>,
+    pub silu_in: Tensor<D>,
+}
+
+/// Typed U-Net synapse — generic over device. Mirrors the untyped
+/// `SynapseUNet` structure: first projection → down path → up path
+/// with skip connections + per-level LayerNorm.
+pub struct SynapseUNetTyped<D: Device> {
+    pub widths: Vec<usize>,
+    pub first_projection: SynapseBlockTyped<D>,
+    pub down_blocks: Vec<SynapseBlockTyped<D>>,
+    pub up_blocks: Vec<SynapseBlockTyped<D>>,
+    pub skip_ln_gamma: Vec<Tensor<D>>,
+    pub skip_ln_beta: Vec<Tensor<D>>,
+}
+
+impl<D: Device> SynapseUNetTyped<D> {
+    /// Convert from an existing untyped `SynapseUNet`. The host
+    /// weights/biases are uploaded to D; subsequent forward calls
+    /// stay on-device for `D = Rocm`.
+    pub fn from_untyped(unet: &SynapseUNet) -> Result<Self, BackendError> {
+        let first_projection = SynapseBlockTyped::<D>::from_untyped(&unet.first_projection)?;
+        let down_blocks = unet.down_blocks.iter()
+            .map(SynapseBlockTyped::<D>::from_untyped)
+            .collect::<Result<Vec<_>, _>>()?;
+        let up_blocks = unet.up_blocks.iter()
+            .map(SynapseBlockTyped::<D>::from_untyped)
+            .collect::<Result<Vec<_>, _>>()?;
+        let skip_ln_gamma = unet.skip_ln_gamma.iter()
+            .map(|g| Tensor::<D>::from_slice(g))
+            .collect::<Result<Vec<_>, _>>()?;
+        let skip_ln_beta = unet.skip_ln_beta.iter()
+            .map(|b| Tensor::<D>::from_slice(b))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            widths: unet.widths.clone(),
+            first_projection, down_blocks, up_blocks,
+            skip_ln_gamma, skip_ln_beta,
+        })
+    }
+
+    /// Forward pass — matches `SynapseUNet::forward` semantically.
+    /// Algorithm:
+    ///   1. first_projection(x) → outs_down[0]
+    ///   2. down: outs_down[i+1] = down_blocks[i](outs_down[i])
+    ///   3. up (in reverse): current = up_blocks[up_idx](current)
+    ///                       current += outs_down[up_idx]   (skip add)
+    ///                       current = LayerNorm_skip[up_idx](current)
+    pub fn forward(&self, x: &Tensor<D>) -> Result<Tensor<D>, BackendError> {
+        let n_blocks = self.down_blocks.len();
+        let mut outs_down: Vec<Tensor<D>> = Vec::with_capacity(n_blocks + 1);
+        outs_down.push(self.first_projection.forward(x)?);
+        for i in 0..n_blocks {
+            let next = self.down_blocks[i].forward(outs_down.last().unwrap())?;
+            outs_down.push(next);
+        }
+        // Take the bottleneck out of outs_down (we won't need it as a skip).
+        let mut current = outs_down.pop().expect("bottleneck present");
+        for i in 0..n_blocks {
+            let up_idx = n_blocks - 1 - i;
+            // Up projection.
+            let up_out = self.up_blocks[up_idx].forward(&current)?;
+            // Skip add: up_out += outs_down[up_idx].
+            // We swap into a fresh `accumulated` tensor so we can call
+            // `add_assign` (which takes &mut + &). Simpler: copy up_out
+            // into accumulated via reshape-to-self trick? Just allocate.
+            let n = self.widths[up_idx];
+            let mut accumulated = up_out;
+            tensor_api::add_assign(&mut accumulated, &outs_down[up_idx], n)?;
+            // LayerNorm on the sum.
+            let mut normed = Tensor::<D>::zeros(n)?;
+            tensor_api::layer_norm(&accumulated, &self.skip_ln_gamma[up_idx],
+                &self.skip_ln_beta[up_idx], &mut normed, 1, n)?;
+            current = normed;
+        }
+        Ok(current)
+    }
+
+    /// Output dimension (= widths[0]).
+    pub fn out_dim(&self) -> usize { self.widths[0] }
+
+    /// Forward with full cache — every intermediate the matched
+    /// backward consumes (per-block caches, every level's down output
+    /// for skip connections, every skip-LN cache).
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor<D>,
+    ) -> Result<(Tensor<D>, SynapseUNetCacheTyped<D>), BackendError> {
+        let n_blocks = self.down_blocks.len();
+
+        // First projection.
+        let (first_out, first_cache) = self.first_projection.forward_with_cache(x)?;
+
+        // Down path. Save each level's output (host shadow) for skip-conn replay.
+        let mut down_caches: Vec<SynapseBlockCacheTyped<D>> = Vec::with_capacity(n_blocks);
+        let mut down_outs_host: Vec<Vec<f32>> = Vec::with_capacity(n_blocks + 1);
+        let first_out_host: Vec<f32> = first_out.to_vec()?;
+        down_outs_host.push(first_out_host);
+        let mut current = first_out;
+        for i in 0..n_blocks {
+            let (next, cache) = self.down_blocks[i].forward_with_cache(&current)?;
+            let next_host: Vec<f32> = next.to_vec()?;
+            down_outs_host.push(next_host);
+            down_caches.push(cache);
+            current = next;
+        }
+
+        // Up path. For each level (reverse): up_block(current) + skip → ln_skip.
+        let mut up_caches: Vec<SynapseBlockCacheTyped<D>> = Vec::with_capacity(n_blocks);
+        let mut skip_pre_ln_host: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
+        let mut skip_ln_caches: Vec<Tensor<D>> = Vec::with_capacity(n_blocks);
+        // up_caches and skip_*_caches are filled in REVERSE-loop order
+        // (up_idx = n_blocks-1 first, then n_blocks-2, ...). We store in
+        // that order for direct backward consumption.
+        for i in 0..n_blocks {
+            let up_idx = n_blocks - 1 - i;
+            let (up_out, up_cache) = self.up_blocks[up_idx].forward_with_cache(&current)?;
+            up_caches.push(up_cache);
+
+            // Skip add: pre_skip_ln = up_out + down_outs[up_idx].
+            let mut pre_skip = up_out;
+            tensor_api::add_assign(
+                &mut pre_skip,
+                &Tensor::<D>::from_slice(&down_outs_host[up_idx])?,
+                self.widths[up_idx],
+            )?;
+            let pre_skip_h: Vec<f32> = pre_skip.to_vec()?;
+            skip_pre_ln_host.push(pre_skip_h);
+
+            // Skip-LN: forward + cache.
+            let mut post_ln = Tensor::<D>::zeros(self.widths[up_idx])?;
+            let mut ln_cache = Tensor::<D>::zeros(2)?;   // 2*n_rows = 2
+            tensor_api::layer_norm_train(
+                &pre_skip,
+                &self.skip_ln_gamma[up_idx], &self.skip_ln_beta[up_idx],
+                &mut post_ln, &mut ln_cache, 1, self.widths[up_idx],
+            )?;
+            skip_ln_caches.push(ln_cache);
+            current = post_ln;
+        }
+
+        let cache = SynapseUNetCacheTyped {
+            first: first_cache,
+            downs: down_caches,
+            ups: up_caches,
+            down_outs_host,
+            skip_pre_ln_host,
+            skip_ln_caches,
+        };
+        Ok((current, cache))
+    }
+
+    /// Backward through the full U-Net. Walk reverse:
+    ///   1. For each up level (forward order = reverse of up loop):
+    ///        layer_norm_bwd → d_pre_skip_ln (split into d_up_out + d_skip)
+    ///        d_skip accumulates into the matching down level's gradient
+    ///        up_block.backward → d_current_in
+    ///   2. After up loop, add d_current_in to bottleneck slot.
+    ///   3. Walk down path in reverse: down_block.backward propagates upstream.
+    ///   4. first_projection.backward → d_x.
+    ///
+    /// **Output convention:**
+    ///   - All weight grads (per-block + skip LN) ACCUMULATE.
+    ///   - `d_x` OVERWRITTEN.
+    pub fn backward(
+        &self,
+        d_out: &Tensor<D>,
+        cache: &SynapseUNetCacheTyped<D>,
+        grads: &mut UNetGradsTyped<D>,
+        d_x: &mut Tensor<D>,
+    ) -> Result<(), BackendError> {
+        let n_blocks = self.down_blocks.len();
+
+        // d_outs_down accumulates gradient flowing back into each
+        // down level (skip connections + main path). Initialised to
+        // zero per level; we accumulate via add_assign.
+        let mut d_outs_down: Vec<Tensor<D>> = (0..=n_blocks)
+            .map(|i| {
+                let w = if i < self.widths.len() { self.widths[i] } else { *self.widths.last().unwrap() };
+                Tensor::<D>::zeros(w)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // ── Reverse up loop ─────────────────────────────────
+        // Forward up loop pushed caches at step k (k=0..N-1) for
+        // up_idx = N-1-k. Cache[0] = deepest up_idx (=N-1, reached
+        // FIRST in forward). The output of forward is from forward
+        // step k=N-1 (up_idx=0), so d_out's flow goes BACKWARD into
+        // up_idx=0 first → must consume cache[N-1] first.
+        //
+        // We walk cache_idx_storage from N-1 down to 0; the
+        // corresponding up_idx (= down_level) walks 0 up to N-1.
+        let mut current_grad = Tensor::<D>::from_slice(&d_out.to_vec()?)?;
+        for step in 0..n_blocks {
+            let cache_idx = n_blocks - 1 - step;
+            let down_level = step;
+
+            // 1. layer_norm_bwd through skip-LN.
+            // Split-borrow trick: lift the two mutable refs into local vars first.
+            let pre_skip_ln = Tensor::<D>::from_slice(&cache.skip_pre_ln_host[cache_idx])?;
+            let mut d_pre_skip = Tensor::<D>::zeros(self.widths[down_level])?;
+            {
+                let skip_grads = (
+                    &mut grads.skip_d_gamma[down_level],
+                    &mut grads.skip_d_beta[down_level],
+                );
+                tensor_api::layer_norm_bwd(
+                    &current_grad, &pre_skip_ln,
+                    &self.skip_ln_gamma[down_level],
+                    &cache.skip_ln_caches[cache_idx],
+                    &mut d_pre_skip,
+                    skip_grads.0, skip_grads.1,
+                    1, self.widths[down_level],
+                )?;
+            }
+
+            // 2. Split d_pre_skip into d_up_out and d_skip (sum's adjoint).
+            //    Both EQUAL d_pre_skip; we send d_skip into down level
+            //    via add_assign and pass d_up_out into the up block.
+            let d_skip = Tensor::<D>::from_slice(&d_pre_skip.to_vec()?)?;
+            tensor_api::add_assign(
+                &mut d_outs_down[down_level], &d_skip,
+                self.widths[down_level],
+            )?;
+
+            // 3. Up block backward — split-borrow the per-block grads.
+            let mut d_up_in = Tensor::<D>::zeros(
+                self.up_blocks[down_level].linear.in_dim
+            )?;
+            {
+                let ug = &mut grads.ups[down_level];
+                self.up_blocks[down_level].backward(
+                    &d_pre_skip, &cache.ups[cache_idx],
+                    &mut ug.d_w, &mut ug.d_b, &mut ug.d_gamma, &mut ug.d_beta,
+                    &mut d_up_in,
+                )?;
+            }
+            current_grad = d_up_in;
+        }
+
+        // After up loop, current_grad is the gradient flowing into
+        // the bottleneck (= outs_down[n_blocks]). Add it.
+        tensor_api::add_assign(
+            &mut d_outs_down[n_blocks], &current_grad,
+            *self.widths.last().unwrap(),
+        )?;
+
+        // ── Reverse down loop ───────────────────────────────
+        for i in (0..n_blocks).rev() {
+            let upstream_host: Vec<f32> = d_outs_down[i + 1].to_vec()?;
+            let upstream = Tensor::<D>::from_slice(&upstream_host)?;
+            let mut d_block_in = Tensor::<D>::zeros(self.down_blocks[i].linear.in_dim)?;
+            {
+                let dg = &mut grads.downs[i];
+                self.down_blocks[i].backward(
+                    &upstream, &cache.downs[i],
+                    &mut dg.d_w, &mut dg.d_b, &mut dg.d_gamma, &mut dg.d_beta,
+                    &mut d_block_in,
+                )?;
+            }
+            tensor_api::add_assign(
+                &mut d_outs_down[i], &d_block_in,
+                self.widths[i],
+            )?;
+        }
+
+        // ── First projection backward ───────────────────────
+        let first_upstream_host: Vec<f32> = d_outs_down[0].to_vec()?;
+        let first_upstream = Tensor::<D>::from_slice(&first_upstream_host)?;
+        {
+            let fg = &mut grads.first;
+            self.first_projection.backward(
+                &first_upstream, &cache.first,
+                &mut fg.d_w, &mut fg.d_b, &mut fg.d_gamma, &mut fg.d_beta,
+                d_x,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Cache produced by `SynapseUNetTyped::forward_with_cache`.
+pub struct SynapseUNetCacheTyped<D: Device> {
+    pub first: SynapseBlockCacheTyped<D>,
+    pub downs: Vec<SynapseBlockCacheTyped<D>>,
+    pub ups: Vec<SynapseBlockCacheTyped<D>>,
+    /// Each down-level output, host shadow. Used by backward to
+    /// compute skip-conn adjoint without re-uploading.
+    pub down_outs_host: Vec<Vec<f32>>,
+    /// Pre-skip-LN values per up level (host shadow), for layer_norm_bwd.
+    pub skip_pre_ln_host: Vec<Vec<f32>>,
+    /// Per-up-level skip-LN cache (mean+rstd). Stored in reverse-of-up-idx
+    /// order matching forward push order (cache_idx 0 came first).
+    pub skip_ln_caches: Vec<Tensor<D>>,
+}
+
+/// Per-block typed gradients — d_w (Linear), d_b (Linear), d_gamma (LN), d_beta (LN).
+pub struct SynapseBlockGradsTyped<D: Device> {
+    pub d_w: Tensor<D>,
+    pub d_b: Tensor<D>,
+    pub d_gamma: Tensor<D>,
+    pub d_beta: Tensor<D>,
+}
+
+impl<D: Device> SynapseBlockGradsTyped<D> {
+    pub fn zeros(block: &SynapseBlockTyped<D>) -> Result<Self, BackendError> {
+        Ok(Self {
+            d_w: Tensor::<D>::zeros(block.linear.weight.len())?,
+            d_b: Tensor::<D>::zeros(block.linear.bias.len())?,
+            d_gamma: Tensor::<D>::zeros(block.ln_gamma.len())?,
+            d_beta: Tensor::<D>::zeros(block.ln_beta.len())?,
+        })
+    }
+}
+
+/// Full U-Net typed gradients — first projection + down + up + skip LN.
+pub struct UNetGradsTyped<D: Device> {
+    pub first: SynapseBlockGradsTyped<D>,
+    pub downs: Vec<SynapseBlockGradsTyped<D>>,
+    pub ups: Vec<SynapseBlockGradsTyped<D>>,
+    pub skip_d_gamma: Vec<Tensor<D>>,
+    pub skip_d_beta: Vec<Tensor<D>>,
+}
+
+impl<D: Device> UNetGradsTyped<D> {
+    pub fn zeros(unet: &SynapseUNetTyped<D>) -> Result<Self, BackendError> {
+        Ok(Self {
+            first: SynapseBlockGradsTyped::zeros(&unet.first_projection)?,
+            downs: unet.down_blocks.iter()
+                .map(SynapseBlockGradsTyped::zeros)
+                .collect::<Result<Vec<_>, _>>()?,
+            ups: unet.up_blocks.iter()
+                .map(SynapseBlockGradsTyped::zeros)
+                .collect::<Result<Vec<_>, _>>()?,
+            skip_d_gamma: unet.skip_ln_gamma.iter()
+                .map(|g| Tensor::<D>::zeros(g.len()))
+                .collect::<Result<Vec<_>, _>>()?,
+            skip_d_beta: unet.skip_ln_beta.iter()
+                .map(|b| Tensor::<D>::zeros(b.len()))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod typed_synapse_tests {
+    use super::*;
+    use modgrad_device::backend::tensor::Cpu;
+    #[cfg(feature = "rocm")]
+    use modgrad_device::backend::tensor::Rocm;
+
+    /// Build a small untyped SynapseUNet, run untyped forward + typed
+    /// forward through it, assert outputs match within float tolerance.
+    /// This is the parity proof: typed cascade reproduces the existing
+    /// brain forward semantics exactly.
+    #[test]
+    fn cpu_typed_synapse_unet_matches_untyped() {
+        let unet = SynapseUNet::new(8, 4, 3, 2);
+        let x_data: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) * 0.2).collect();
+
+        // Untyped reference.
+        let ref_out = unet.forward(&x_data);
+
+        // Typed.
+        let typed = SynapseUNetTyped::<Cpu>::from_untyped(&unet)
+            .expect("from_untyped");
+        let xt = Tensor::<Cpu>::from_slice(&x_data).unwrap();
+        let typed_out = typed.forward(&xt).expect("typed forward")
+            .to_vec().unwrap();
+
+        assert_eq!(ref_out.len(), typed_out.len());
+        for (i, (a, b)) in ref_out.iter().zip(&typed_out).enumerate() {
+            assert!((a - b).abs() < 1e-4,
+                "synapse_unet typed/untyped disagree at {}: ref={} typed={}", i, a, b);
+        }
+    }
+
+    /// Smoke-test SynapseUNetTyped<D>::backward — full U-Net reverse
+    /// composes: skip-LN backward, up block backwards (in reverse
+    /// forward order), down block backwards, first projection
+    /// backward, with skip-conn adjoint adding into matching down
+    /// levels' gradient. Verifies wiring; confirms d_x and a sample
+    /// of weight grads become non-zero.
+    #[test]
+    fn cpu_synapse_unet_backward_smoke() {
+        // Small: in=8 out=4 depth=3 min=2 → widths = [4,3,2].
+        let unet = SynapseUNet::new(8, 4, 3, 2);
+        let typed = SynapseUNetTyped::<Cpu>::from_untyped(&unet).unwrap();
+
+        let x_data: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) * 0.2).collect();
+        let x = Tensor::<Cpu>::from_slice(&x_data).unwrap();
+        let (out, cache) = typed.forward_with_cache(&x).unwrap();
+        assert_eq!(out.shape(), &[4]);
+
+        let d_out = Tensor::<Cpu>::from_slice(&[1.0, 0.0, -1.0, 0.5]).unwrap();
+        let mut grads = UNetGradsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut d_x = Tensor::<Cpu>::zeros(8).unwrap();
+        typed.backward(&d_out, &cache, &mut grads, &mut d_x).expect("U-Net backward");
+
+        // d_x should be non-zero (gradient flowed all the way through).
+        let dx = d_x.to_vec().unwrap();
+        assert!(dx.iter().any(|&v| v.abs() > 1e-6),
+            "d_x all zero — backward did not flow through first_projection");
+
+        // First projection weight grad must be non-zero.
+        let dw = grads.first.d_w.to_vec().unwrap();
+        assert!(dw.iter().any(|&v| v.abs() > 1e-6),
+            "first.d_w all zero");
+
+        // Skip-LN gamma grad on the deepest skip level — should be non-zero.
+        let dg = grads.skip_d_gamma[0].to_vec().unwrap();
+        assert!(dg.iter().any(|&v| v.abs() > 1e-6),
+            "skip_d_gamma[0] all zero");
+    }
+
+    /// Smoke-test SynapseBlockTyped<D>::backward — verify gradient
+    /// flow without exact numerical parity (full parity vs untyped
+    /// block_backward needs careful cache-format alignment, deferred).
+    /// Confirms d_W, d_b, d_gamma, d_beta all become non-zero and
+    /// d_input has matching shape.
+    #[test]
+    fn cpu_synapse_block_backward_smoke() {
+        // Build a small block: in_dim=4, out_dim=3.
+        // Random-ish weights, bias zero, gamma=1, beta=0.
+        let weights: Vec<f32> = (0..3 * 4).map(|i| (i as f32 - 5.5) * 0.1).collect();
+        let bias = vec![0.0f32; 3];
+        let gamma = vec![1.0f32; 3];
+        let beta = vec![0.0f32; 3];
+        let block = SynapseBlockTyped::<Cpu>::from_host(
+            &weights, &bias, &gamma, &beta, 4, 3,
+        ).unwrap();
+
+        let x = Tensor::<Cpu>::from_slice(&[0.5, -0.5, 0.25, 0.75]).unwrap();
+        let (out, cache) = block.forward_with_cache(&x).unwrap();
+        assert_eq!(out.shape(), &[3]);
+
+        // Hand-cooked d_out.
+        let d_out = Tensor::<Cpu>::from_slice(&[1.0, 0.0, -1.0]).unwrap();
+        let mut d_w = Tensor::<Cpu>::zeros(3 * 4).unwrap();
+        let mut d_b = Tensor::<Cpu>::zeros(3).unwrap();
+        let mut d_gamma = Tensor::<Cpu>::zeros(3).unwrap();
+        let mut d_beta = Tensor::<Cpu>::zeros(3).unwrap();
+        let mut d_input = Tensor::<Cpu>::zeros(4).unwrap();
+        block.backward(&d_out, &cache, &mut d_w, &mut d_b,
+            &mut d_gamma, &mut d_beta, &mut d_input).unwrap();
+
+        // d_input non-zero (gradient flowed all the way).
+        let di = d_input.to_vec().unwrap();
+        assert!(di.iter().any(|&v| v.abs() > 1e-6),
+            "d_input all zero — backward did not flow through Linear");
+        // d_beta = sum of d_post_ln across rows — should equal d_post_ln
+        // at this single-row config since silu_bwd preserves sign of d_out.
+        let db = d_beta.to_vec().unwrap();
+        assert!(db.iter().any(|&v| v.abs() > 1e-6),
+            "d_beta all zero");
+    }
+
+    /// Same code on Rocm produces matching output (within float tol).
+    /// The pay-off: the entire SynapseUNet now runs on AMD GPU using
+    /// the same Rust source as Cpu.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn cpu_and_rocm_typed_synapse_unet_match() {
+        let unet = SynapseUNet::new(8, 4, 3, 2);
+        let x_data: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) * 0.2).collect();
+
+        let cpu_typed = SynapseUNetTyped::<Cpu>::from_untyped(&unet).unwrap();
+        let xc = Tensor::<Cpu>::from_slice(&x_data).unwrap();
+        let cpu_out = cpu_typed.forward(&xc).unwrap().to_vec().unwrap();
+
+        let rocm_typed = match SynapseUNetTyped::<Rocm>::from_untyped(&unet) {
+            Ok(t) => t,
+            Err(BackendError::Runtime(msg)) if msg.contains("hipMalloc") => return,
+            Err(e) => panic!("rocm SynapseUNet build failed: {:?}", e),
+        };
+        let xr = Tensor::<Rocm>::from_slice(&x_data).unwrap();
+        let rocm_out = match rocm_typed.forward(&xr) {
+            Ok(t) => t.to_vec().unwrap(),
+            Err(BackendError::Runtime(msg)) if msg.contains("hipMalloc") => return,
+            Err(BackendError::Unsupported { .. }) => return,
+            Err(e) => panic!("rocm forward failed: {:?}", e),
+        };
+
+        for (a, b) in cpu_out.iter().zip(&rocm_out) {
+            assert!((a - b).abs() < 1e-3,
+                "Cpu and Rocm SynapseUNet disagree: cpu={} rocm={}", a, b);
+        }
+    }
+}

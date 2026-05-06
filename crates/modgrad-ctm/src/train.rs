@@ -193,10 +193,8 @@ impl BlockGrads {
     }
 
     /// Element-wise accumulate `other`'s gradients into `self`.
-    /// Used by the resident `RegionalBrain::backward_cached_resident`
-    /// path to merge per-tick `BlockGrads` from a region's
-    /// `ctm_backward_resident` into the outer `RegionalGradients`
-    /// accumulator.
+    /// Used to merge per-tick `BlockGrads` into the outer
+    /// `RegionalGradients` accumulator.
     fn add_from(&mut self, other: &BlockGrads) {
         for (d, s) in self.d_weight.iter_mut().zip(&other.d_weight) { *d += *s; }
         for (d, s) in self.d_bias.iter_mut().zip(&other.d_bias) { *d += *s; }
@@ -306,12 +304,8 @@ impl UNetGrads {
     }
 
     /// Element-wise accumulate `other`'s per-block gradients into
-    /// `self`. Used by `RegionalBrain::backward_cached_resident` to
-    /// merge per-tick per-region `UNetGrads` from
-    /// `ctm_backward_resident` into the outer `RegionalGradients`
-    /// accumulator. Path B for the resident U-Net backward depends
-    /// on this — without it, U-Net weight grads would still be
-    /// dropped at the outer-merge step.
+    /// `self`. Used to merge per-tick per-region `UNetGrads` into
+    /// the outer `RegionalGradients` accumulator.
     pub fn add_from(&mut self, other: &UNetGrads) {
         debug_assert_eq!(self.downs.len(), other.downs.len());
         debug_assert_eq!(self.ups.len(), other.ups.len());
@@ -328,10 +322,10 @@ impl UNetGrads {
     }
 
     /// Diagnostic: L2 norm across every weight/bias/gamma/beta
-    /// gradient buffer in this U-Net accumulator. Used by the
-    /// resident-backward regression tests to catch the
-    /// "U-Net grads regress to zero" bug — a passing forward
-    /// followed by `unet_backward` must drive this above zero.
+    /// gradient buffer in this U-Net accumulator. A passing forward
+    /// followed by `unet_backward` must drive this above zero —
+    /// regression test guard against the "U-Net grads regress to
+    /// zero" bug.
     pub fn l2_norm(&self) -> f32 {
         let mut sumsq: f64 = 0.0;
         let mut acc = |s: &[f32]| {
@@ -355,9 +349,8 @@ impl UNetGrads {
     /// Diagnostic: per-block weight gradient slices, in the order
     /// `first.d_weight, first.d_bias, first.d_gamma, first.d_beta,
     /// down[0].d_weight, ..., up[n-1].d_beta, skip_d_gamma[0], ...,
-    /// skip_d_beta[n-1]`. Used by the resident vs host backward
-    /// parity tests to compare per-block gradient magnitudes within
-    /// FP tolerance.
+    /// skip_d_beta[n-1]`. Used by parity tests to compare per-block
+    /// gradient magnitudes within FP tolerance.
     pub fn flat_weight_grads(&self) -> Vec<f32> {
         let mut v = Vec::new();
         v.extend_from_slice(&self.first.d_weight);

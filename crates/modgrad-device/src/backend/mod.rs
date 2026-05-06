@@ -24,6 +24,12 @@ pub mod kfd;
 pub mod cuda_be;
 pub mod vulkan;
 pub mod rocm;
+/// Path C — JAX-style location-aware tensor (`Tensor<Cpu>`,
+/// `Tensor<Rocm>`). Type system enforces same-device ops, no
+/// hidden PCIe round-trips. v0 implements matvec only; cascade
+/// to other ops + the `Linear` / `RegionalWeights` containers
+/// follows in subsequent commits.
+pub mod tensor;
 
 pub use buffer::{DeviceBuffer, HostBuffer};
 // Batched optimisers — CPU fallback always available, KFD variant

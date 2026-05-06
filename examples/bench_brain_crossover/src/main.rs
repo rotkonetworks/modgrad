@@ -1,24 +1,24 @@
 //! Find the GPU/CPU crossover for the regional brain forward.
 //!
-//! `bench_maze_resident_medium` showed GPU is 3× slower than CPU at
-//! d_model=512 — per-dispatch MIOpen overhead dominates. Small brains
-//! aren't where GPU wins. This bench pushes to LARGER models where
-//! compute >> dispatch overhead and resident should start winning.
+//! Path C version: measures `regional_forward_typed::<Cpu>` vs
+//! `regional_forward_typed::<Rocm>` across multiple cortex sizes.
+//! Same architectural question as the original *_resident bench
+//! ("at what model size does the GPU win") but on the typed cascade.
 //!
-//! Three preset sizes:
-//!   - `billion`     — cortex d_model=1024 (~2× compute over medium)
-//!   - `mega-2048`   — cortex d_model=2048 (~8× compute, custom inline)
-//!   - `mega-4096`   — cortex d_model=4096 (~32× compute)
-//!
-//! Larger d_model means each per-dispatch matvec amortizes more compute
-//! against the same ~5µs MIOpen overhead. Crossover hardware-dependent;
-//! on gfx1102 we expect somewhere between 1024 and 4096.
+//! Five preset sizes (single-scale only — typed forward doesn't yet
+//! route observation through `obs_scale_slice`, so multi-scale brains
+//! are skipped):
+//!   - `small`       — cortex d_model=128 (replaces bench_maze_resident)
+//!   - `medium`      — cortex d_model=512 (replaces bench_maze_resident_medium, single-scale variant)
+//!   - `billion`     — cortex d_model=1024
+//!   - `mega-2048`   — cortex d_model=2048
+//!   - `mega-2560`   — cortex d_model=2560 (largest fitting on 8 GB)
 //!
 //! Run with:
 //!   cargo run -p bench_brain_crossover --release --features rocm
 //!
-//! On no-HIP hosts: cleanly returns "skipping". The host-only baseline
-//! still runs but the comparison line is omitted.
+//! On no-HIP hosts: cleanly returns "skipping". The Cpu baseline still
+//! runs but the Cpu/Rocm comparison line is omitted.
 
 #[cfg(not(feature = "rocm"))]
 fn main() {
@@ -28,10 +28,8 @@ fn main() {
 #[cfg(feature = "rocm")]
 fn main() {
     use std::time::Instant;
-    use modgrad_ctm::graph::{RegionalBrain, RegionalConfig, RegionalWeights};
-    use modgrad_ctm::resident::RegionalResidentCache;
-    use modgrad_traits::{Brain, TokenInput};
-    use modgrad_device::backend::HipBatch;
+    use modgrad_ctm::graph::{RegionalConfig, RegionalWeights, RegionalWeightsTyped};
+    use modgrad_device::backend::tensor::{Cpu, Rocm};
 
     const N_ITERS: usize = 300;
     const N_WARMUP: usize = 4;
@@ -39,40 +37,32 @@ fn main() {
     const OBS_DIM: usize = 224;
     const OUT_DIMS: usize = 64;
 
-    eprintln!("bench_brain_crossover: n_iters={N_ITERS}\n");
+    eprintln!("bench_brain_crossover [typed]: n_iters={N_ITERS}\n");
 
-    // ── medium (d_model=512) — known to lose, included as reference ──
-    bench_preset("medium", "d_model=512", |obs_dim| {
-        let scales: Vec<usize> = vec![128, 64, 32];
-        assert_eq!(scales.iter().sum::<usize>(), obs_dim);
-        let mut cfg = RegionalConfig::eight_region_medium_multiscale(
-            &scales, OUT_DIMS, TICKS);
+    bench_preset("small", "d_model=128", |obs_dim| {
+        let mut cfg = RegionalConfig::eight_region_small(obs_dim, OUT_DIMS, TICKS);
         cfg.router = None;
         cfg
     }, OBS_DIM, N_ITERS, N_WARMUP);
 
-    // ── billion (d_model=1024) — 4× compute over medium ────────
+    bench_preset("medium", "d_model=512", |obs_dim| {
+        let mut cfg = RegionalConfig::eight_region_medium(obs_dim, OUT_DIMS, TICKS);
+        cfg.router = None;
+        cfg
+    }, OBS_DIM, N_ITERS, N_WARMUP);
+
     bench_preset("billion", "d_model=1024", |obs_dim| {
         let mut cfg = RegionalConfig::eight_region_billion(obs_dim, OUT_DIMS, TICKS);
         cfg.router = None;
         cfg
     }, OBS_DIM, N_ITERS, N_WARMUP);
 
-    // ── mega-2048 — 16× compute over medium ────────
-    // Each cortex region matvec is ~16 MB f32; per-dispatch MIOpen
-    // overhead (~5µs) is amortised against ~µs-scale GPU work. Fewer
-    // iters because per-iter wall climbs.
     bench_preset("mega-2048", "d_model=2048", |obs_dim| {
         let mut cfg = RegionalConfig::eight_region_mega(obs_dim, OUT_DIMS, TICKS, 2048);
         cfg.router = None;
         cfg
     }, OBS_DIM, 100, 2);
 
-    // ── mega-2560 — 25× compute over medium ────────
-    // Largest size that fits on 8 GB VRAM at f32 (mega-4096 = 4.58B
-    // params = 18 GB OOMs hipMalloc). bf16 would unlock 4096 but
-    // requires the resident path to take a non-f32 weight type — tracked
-    // separately. mega-2560 is the rightmost data point on this card.
     bench_preset("mega-2560", "d_model=2560", |obs_dim| {
         let mut cfg = RegionalConfig::eight_region_mega(obs_dim, OUT_DIMS, TICKS, 2560);
         cfg.router = None;
@@ -80,13 +70,11 @@ fn main() {
     }, OBS_DIM, 50, 2);
 
     eprintln!("\n────────────────────────────────────────────");
-    eprintln!("Read each preset's verdict line. Per-region matvec compute");
-    eprintln!("scales as cortex_d_model²; per-dispatch MIOpen overhead is");
-    eprintln!("constant ~5µs. The crossover (resident ≥ host) is whichever");
-    eprintln!("preset is the first to flip from HOST WINS to RESIDENT WINS.");
-    eprintln!("Sequential single-stream HipBatch caps the resident path —");
-    eprintln!("if even mega-4096 loses, true parallelism (per-stream HIP");
-    eprintln!("contexts + multi-thread dispatch) is the next intervention.");
+    eprintln!("Path C cascade comparison: Cpu vs Rocm Tensor<D>");
+    eprintln!("backends, same code, same allocations. Per-region matvec");
+    eprintln!("compute scales as cortex_d_model²; per-dispatch overhead");
+    eprintln!("is constant. Crossover (Rocm ≥ Cpu) is whichever preset");
+    eprintln!("first flips from CPU WINS to ROCM WINS.");
     eprintln!("────────────────────────────────────────────");
 
     fn bench_preset(
@@ -105,62 +93,73 @@ fn main() {
         eprintln!("  regions = {}, conns = {}",
             weights.regions.len(), weights.connection_synapses.len());
 
-        let input = TokenInput {
-            tokens: (0..obs_dim)
-                .map(|i| (i as f32 * 0.013 - 0.21).sin())
-                .collect(),
-            n_tokens: 1,
-            token_dim: obs_dim,
-        };
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| (i as f32 * 0.013 - 0.21).sin())
+            .collect();
 
-        // Host
-        let mut host_state = <RegionalBrain as Brain>::init_state(&weights);
+        // ── Cpu typed path ────────────────────────────────────
+        let typed_cpu = RegionalWeightsTyped::<Cpu>::from_untyped(&weights)
+            .expect("typed Cpu lift");
+        let n_sync = typed_cpu.config.n_global_sync;
+        let mut act_cpu: Vec<Vec<f32>> = weights.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut trc_cpu: Vec<Vec<f32>> = weights.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let mut alpha_cpu = vec![0.0f32; n_sync];
+        let mut beta_cpu = vec![1.0f32; n_sync];
         for _ in 0..n_warmup {
-            let (_, s) = <RegionalBrain as Brain>::forward(&weights, host_state, &input);
-            host_state = s;
+            let _ = typed_cpu.regional_forward_typed(
+                &observation, &mut act_cpu, &mut trc_cpu,
+                &mut alpha_cpu, &mut beta_cpu,
+            ).expect("Cpu warmup");
         }
         let t = Instant::now();
         for _ in 0..n_iters {
-            let (_, s) = <RegionalBrain as Brain>::forward(&weights, host_state, &input);
-            host_state = s;
+            let _ = typed_cpu.regional_forward_typed(
+                &observation, &mut act_cpu, &mut trc_cpu,
+                &mut alpha_cpu, &mut beta_cpu,
+            ).expect("Cpu forward");
         }
-        let dt_host = t.elapsed();
-        let per_iter_host = dt_host.as_nanos() as f64 / n_iters as f64 / 1000.0;
-        eprintln!("  host     wall = {dt_host:?}  per-iter = {per_iter_host:.2} µs");
+        let dt_cpu = t.elapsed();
+        let per_iter_cpu = dt_cpu.as_nanos() as f64 / n_iters as f64 / 1000.0;
+        eprintln!("  Cpu  wall = {dt_cpu:?}  per-iter = {per_iter_cpu:.2} µs");
 
-        // Resident
-        let cache = match RegionalResidentCache::from_weights(&weights) {
-            Ok(c) => c,
+        // ── Rocm typed path ───────────────────────────────────
+        let typed_rocm = match RegionalWeightsTyped::<Rocm>::from_untyped(&weights) {
+            Ok(t) => t,
             Err(e) => {
-                eprintln!("  resident: cache build failed ({e}) — skipping resident phase");
+                eprintln!("  Rocm: lift failed ({e}) — skipping Rocm phase");
                 return;
             }
         };
-        let batch = HipBatch::new();
-
+        let mut act_r: Vec<Vec<f32>> = weights.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut trc_r: Vec<Vec<f32>> = weights.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let mut alpha_r = vec![0.0f32; n_sync];
+        let mut beta_r = vec![1.0f32; n_sync];
         for _ in 0..n_warmup {
-            let fresh = cache.fresh(&weights).expect("fresh");
-            let _ = RegionalBrain::forward_cached_resident(&weights, fresh, &batch, &input)
-                .expect("warmup");
+            let _ = typed_rocm.regional_forward_typed(
+                &observation, &mut act_r, &mut trc_r,
+                &mut alpha_r, &mut beta_r,
+            ).expect("Rocm warmup");
         }
-        batch.flush().expect("warmup flush");
-
         let t = Instant::now();
         for _ in 0..n_iters {
-            let fresh = cache.fresh(&weights).expect("fresh");
-            let _ = RegionalBrain::forward_cached_resident(&weights, fresh, &batch, &input)
-                .expect("resident forward");
+            let _ = typed_rocm.regional_forward_typed(
+                &observation, &mut act_r, &mut trc_r,
+                &mut alpha_r, &mut beta_r,
+            ).expect("Rocm forward");
         }
-        batch.flush().expect("flush");
-        let dt_res = t.elapsed();
-        let per_iter_res = dt_res.as_nanos() as f64 / n_iters as f64 / 1000.0;
-        eprintln!("  resident wall = {dt_res:?}  per-iter = {per_iter_res:.2} µs");
+        let dt_rocm = t.elapsed();
+        let per_iter_rocm = dt_rocm.as_nanos() as f64 / n_iters as f64 / 1000.0;
+        eprintln!("  Rocm wall = {dt_rocm:?}  per-iter = {per_iter_rocm:.2} µs");
 
-        let speedup = per_iter_host / per_iter_res;
+        let speedup = per_iter_cpu / per_iter_rocm;
         let verdict = if speedup > 1.0 {
-            format!("RESIDENT WINS by {speedup:.2}×")
+            format!("ROCM WINS by {speedup:.2}×")
         } else {
-            format!("HOST WINS — resident is {:.2}× slower", 1.0 / speedup)
+            format!("CPU WINS — Rocm is {:.2}× slower", 1.0 / speedup)
         };
         eprintln!("  → {verdict}\n");
     }

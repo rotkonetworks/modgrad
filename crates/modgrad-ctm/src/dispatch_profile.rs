@@ -43,14 +43,14 @@ pub enum DispatchKind {
     OutProjRegion = 12,
     ExitGateRegion = 13,
 
-    // Backward-pass buckets — sub-sections of backward_cached_resident.
+    // Backward-pass buckets — sub-sections of the regional backward.
     BwdOutputProj   = 14, // output_proj backward (host registry: outer_product_acc + matvec_t)
     BwdGlobalSync   = 15, // global_sync_backward (host scalar)
-    BwdInnerCtm     = 16, // ctm_backward_resident per region (incl. U-Net Path B)
+    BwdInnerCtm     = 16, // per-region inner CTM backward (incl. U-Net)
     BwdConnSynapse  = 17, // connection synapse backward (host scalar triple loop)
-    BwdAccumGrads   = 18, // copying ctm_backward_resident result into RegionalGradients
+    BwdAccumGrads   = 18, // copying per-region backward result into RegionalGradients
 
-    // Inner backward sub-buckets — what's hot inside ctm_backward_resident.
+    // Inner backward sub-buckets — what's hot inside per-region CTM backward.
     BwdInnerSyncOut    = 19,
     BwdInnerNlm        = 20,
     BwdInnerUnet       = 21, // Path B host re-cache + unet_backward

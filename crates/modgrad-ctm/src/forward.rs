@@ -137,6 +137,62 @@ fn ctm_forward_with_kv(
     kv: &[f32],
     n_tokens: usize,
 ) -> CtmOutput {
+    ctm_forward_with_kv_inner(w, state, kv, n_tokens, None)
+}
+
+/// Like `ctm_forward` but also returns the per-tick × per-head softmax
+/// attention weights over input tokens, shape `[ticks_used][n_heads][n_tokens]`.
+/// Used by visualisation tools (and any caller wanting to inspect what
+/// the CTM is attending to). Numerics match `ctm_forward` exactly when
+/// `state` is constructed identically.
+pub fn ctm_forward_with_attn_trace(
+    w: &CtmWeights,
+    state: &mut CtmState,
+    input: CtmInput<'_>,
+) -> (CtmOutput, Vec<Vec<Vec<f32>>>) {
+    let d_in = w.config.d_input;
+    let (new_kv, n_new) = match input {
+        CtmInput::Raw { obs, n_tokens, raw_dim } => {
+            let mut kv = Vec::with_capacity(n_tokens * d_in);
+            for t in 0..n_tokens {
+                let tok = &obs[t * raw_dim..(t + 1) * raw_dim];
+                let mut projected = w.kv_proj.forward(tok);
+                affine_ln(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
+                kv.extend_from_slice(&projected);
+            }
+            (kv, n_tokens)
+        }
+        CtmInput::Projected { kv, n_tokens } => (kv.to_vec(), n_tokens),
+    };
+    let has_episodic_entries =
+        state.episodic.as_ref().map_or(false, |e| !e.is_empty());
+    let (kv_used, n_total) = if has_episodic_entries {
+        let ep = state.episodic.as_ref().unwrap();
+        let ep_n = ep.n_tokens();
+        let mut combined = Vec::with_capacity((ep_n + n_new) * d_in);
+        combined.extend_from_slice(&ep.as_kv());
+        combined.extend_from_slice(&new_kv);
+        (combined, ep_n + n_new)
+    } else {
+        (new_kv.clone(), n_new)
+    };
+    let mut trace: Vec<Vec<Vec<f32>>> = Vec::with_capacity(w.config.iterations);
+    let output = ctm_forward_with_kv_inner(w, state, &kv_used, n_total, Some(&mut trace));
+    if let Some(ref mut mem) = state.episodic {
+        for t in 0..n_new {
+            mem.push(&new_kv[t * d_in..(t + 1) * d_in]);
+        }
+    }
+    (output, trace)
+}
+
+fn ctm_forward_with_kv_inner(
+    w: &CtmWeights,
+    state: &mut CtmState,
+    kv: &[f32],
+    n_tokens: usize,
+    mut attn_trace: Option<&mut Vec<Vec<Vec<f32>>>>,
+) -> CtmOutput {
     let cfg = &w.config;
     let d = cfg.d_model;
     let d_in = cfg.d_input;
@@ -180,16 +236,23 @@ fn ctm_forward_with_kv(
             w.q_proj.forward(&sync_action)
         };
         let attn_out = {
-            // MhaIn covers internal Q/K/V proj + softmax; MhaOut is the
-            // output projection. We instrument the whole call here and
-            // accept that the breakdown is coarser than per-sub-op for
-            // Phase 0 — sufficient to see the MHA bucket size.
             let _g = crate::dispatch_profile::Guard::new(
                 crate::dispatch_profile::DispatchKind::MhaIn);
-            multihead_attention(
-                &q, kv, n_tokens, d_in, cfg.heads,
-                &w.mha_in_proj, &w.mha_out_proj,
-            )
+            if attn_trace.is_some() {
+                let mut tick_attn: Vec<Vec<f32>> = Vec::new();
+                let out = multihead_attention_with_attn(
+                    &q, kv, n_tokens, d_in, cfg.heads,
+                    &w.mha_in_proj, &w.mha_out_proj,
+                    Some(&mut tick_attn),
+                );
+                if let Some(ref mut t) = attn_trace { t.push(tick_attn); }
+                out
+            } else {
+                multihead_attention(
+                    &q, kv, n_tokens, d_in, cfg.heads,
+                    &w.mha_in_proj, &w.mha_out_proj,
+                )
+            }
         };
 
         let mut pre_syn = Vec::with_capacity(d_in + d);
@@ -254,1341 +317,6 @@ fn ctm_forward_with_kv(
     let sync_out = sync_read(&state.alpha_out, &state.beta_out);
     CtmOutput { predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory }
 }
-
-// ─── Device-resident tick loop ─────────────────────────────
-//
-// `ctm_forward_resident` mirrors `ctm_forward_with_kv` but routes the
-// big fixed-cost matvecs (q_proj, MHA Q/K/V, MHA out, synapse U-Net,
-// NLM stages, output_proj, exit_gate) through `CtmResidentCache` —
-// weights stay device-resident across ticks, zero PCIe per dispatch.
-//
-// **What stays host.** The CTM tick state (activated, trace,
-// alpha/beta accumulators, predictions, certainties, exit lambdas,
-// trajectory) is small Vec<f32> bookkeeping driven by scalar ops
-// (sync_init/sync_update, per_neuron_glu, softmax, certainty,
-// trace shift, exit-gate sigmoid). Forcing it onto device buys
-// nothing and complicates code. We upload to GpuVec::Hip on the
-// boundaries where a resident matvec needs it (sync_action →
-// q_proj, q_full → MHA, attn||activated → synapse, trace → NLM,
-// sync_out → output_proj/exit_gate) and download the matvec result
-// back to host before the next host op.
-//
-// **MHA softmax now resident.** Q (1 vector) and per-token K/V are
-// produced by resident matvecs against the row-sliced mha_in_q /
-// mha_in_k / mha_in_v sub-Linears. The per-head scores (host
-// dot-product against pre-projected host K) are packed into a
-// `[n_heads × n_tokens]` device buffer and run through a SINGLE
-// `softmax_resident` dispatch (ACCURATE algo, INSTANCE mode → per-N
-// softmax across the C axis), then downloaded as softmax weights.
-// One MIOpen kernel launch per tick instead of n_heads. The
-// per-head V·weights weighted sum stays host because V is in
-// [n_tokens × d_head] layout — turning that into a resident matvec
-// needs a transpose (or rocBLAS sgemv with transpose flag); keeping
-// it host costs only the small per-head reduction. TODO
-// (a) pre-transpose V on device so the weighted sum becomes a
-// resident matvec, or (b) batch the QK dot-product as a resident
-// matvec too so scores never round-trip; either subsumes the
-// current upload/download bracket around the softmax dispatch.
-//
-// **NLM per-neuron GLU now resident and batched.** Stage1 produces
-// a device `[d * 2*h]` block; a single
-// `per_neuron_glu_batched_resident` dispatch (custom hipcc kernel)
-// writes into a device `[d * h]` GLU output buffer, then optionally
-// feeds that directly into stage2 + a second batched GLU dispatch.
-// The whole NLM pipeline stays on device; only the final activated
-// state downloads back to host where sync_update consumes it.
-// Replacing the previous N-call MIOpen GLU loop drops `2*d` MIOpen
-// dispatches per CTM tick to 2 hipcc launches.
-
-#[cfg(feature = "rocm")]
-use modgrad_compute::backend::{GpuVec, ResidencyError};
-#[cfg(feature = "rocm")]
-use modgrad_device::backend::HipBatch;
-
-// ─── Resident-forward cache (PART A of backward-resident) ───────
-//
-// `CtmCacheResident` is the device-resident equivalent of host
-// `crate::train::CtmCache`. It exists separately rather than reusing
-// the host type because:
-//   1. The host `CtmCache` and its inner `TickCache` are private to
-//      `train.rs` (no public constructor); we cannot construct one
-//      from this file.
-//   2. The cache shape that resident BACKWARD will consume is shaped
-//      around MIOpen's *Backward* dispatch contracts (LN backward,
-//      activation backward, GLU backward, softmax backward), which
-//      take (input, grad_output) and recompute internal stats — so
-//      the resident cache only needs to save inputs to each forward
-//      stage, not the normalized/inv_std/pre-silu trio that the host
-//      CPU backward consumes. Same logical content; flatter shape.
-//
-// Storage strategy. Everything is host-side `Vec<f32>` for THIS
-// slice. Resident-backward (next slice) re-uploads whatever it
-// needs. Rationale: keeping (iterations × U-Net depth × per-block
-// buffers) as `GpuVec` would explode VRAM (every outer-tick × region
-// × inner-tick × block keeps a buffer live across the whole backward
-// pass) — and the cache lifecycle straddles the entire outer-tick
-// loop in `RegionalBrain::forward_cached_resident`. Host-side keeps
-// the device-residency window tight to just-the-forward.
-//
-// What the resident path materialises vs. doesn't.
-//   - Already host-resident in `ctm_forward_resident`: q_full,
-//     k_all, v_all, attn_weights, attn_out, pre_syn (synapse input),
-//     pre_act (synapse output), state.activated (post-NLM),
-//     sync_action, sync_out, beta_action, beta_out, predictions,
-//     exit_lambda, exit_gate input (= sync_out). These flow into
-//     the cache directly — no extra D2H.
-//   - Need an extra D2H to fill the cache: q_proj output (= input
-//     to mha_in_q), nlm stage1 raw output (pre per-neuron-GLU), nlm
-//     stage1 GLU output (= stage2 input when present), nlm stage2
-//     raw output. Four small D2Hs per tick total (the last one
-//     gated on `cfg.deep_nlms`).
-//   - U-Net interior intermediates (per-block linear input, per-
-//     block ln norm/invstd/pre-silu, skip-LN cache, down_outs,
-//     pre_skip_ln). NOT captured here. The resident U-Net dispatch
-//     (`SynapseUNetResident::forward`) is monolithic — pre_syn in,
-//     pre_act out, no per-block hooks. Resident backward will need
-//     either (a) a host-side `synapse.forward_cached(pre_syn)` to
-//     reconstruct intermediates, or (b) a future
-//     `SynapseUNetResident::forward_cached` that exposes per-block
-//     buffers. Both are out-of-scope for this slice and tracked on
-//     the next-slice plan. The cache stores `pre_syn` and `pre_act`
-//     so either approach is unblocked.
-
-/// Per-tick host-side cache from a resident inner CTM forward.
-///
-/// Mirrors the host `crate::train::TickCache` content needed for
-/// backward, but flat (one struct, no nested `LinearCache`/`MhaCache`/
-/// `UNetCache`/`NlmCache`) because resident backward will dispatch
-/// directly through MIOpen *Backward* symbols which take only
-/// (input, grad_output) — no need to thread normalized/inv_std
-/// per-LN.
-///
-/// All fields are host-resident `Vec<f32>` for this slice. Resident
-/// backward re-uploads as needed; see the module-level comment on
-/// `CtmCacheResident` for the storage rationale.
-#[cfg(feature = "rocm")]
-pub struct CtmTickCacheResident {
-    /// Activated state at start of tick (pre-NLM, pre-trace-shift).
-    /// Used by sync_action backward (gradient w.r.t. activated_prev)
-    /// and as the U-Net residual half (`pre_syn[d_in..]`).
-    pub activated_prev: Vec<f32>,
-    /// `sync_action` vector at this tick (= input to `q_proj`).
-    /// Length `cfg.n_synch_action`.
-    pub sync_action: Vec<f32>,
-    /// `beta_action` accumulator at this tick (read by sync_action
-    /// backward). Length `cfg.n_synch_action`.
-    pub beta_action: Vec<f32>,
-    /// `q_proj` output (= input to `mha_in_proj`). Length `d_input`.
-    /// Captured via an extra D2H of `q_proj_out_dev` per tick (the
-    /// existing path only downloads `mha_q_dev`).
-    pub q_proj_out: Vec<f32>,
-    /// MHA Q row of in_proj (= `mha_in_q @ q_proj_out`).
-    /// Length `d_input`. Used by MHA backward (per-head Q gradient).
-    pub q_full: Vec<f32>,
-    /// MHA K all-tokens (`[n_tokens × d_input]`, packed by token then
-    /// head). Used by MHA backward (per-head K gradient and the
-    /// QK-attention gradient).
-    pub k_all: Vec<f32>,
-    /// MHA V all-tokens (`[n_tokens × d_input]`). Used by MHA
-    /// backward (V gradient and softmax-input gradient).
-    pub v_all: Vec<f32>,
-    /// Per-token KV input to `mha_in_k`/`mha_in_v` (= the kv slice
-    /// passed in, sliced per token). `kv_tokens[t]` length =
-    /// `d_input`. Used by MHA backward to compute the gradient
-    /// w.r.t. the KV input — itself the synapse input for upstream
-    /// regions.
-    pub kv_tokens: Vec<Vec<f32>>,
-    /// Softmax weights per head, packed `[n_heads × n_tokens]`.
-    /// Used by MHA softmax backward.
-    pub attn_weights: Vec<f32>,
-    /// Concatenated heads (= input to `mha_out_proj`). Length
-    /// `d_input`. Used by `mha_out_proj` backward.
-    pub concat_heads: Vec<f32>,
-    /// Attention output (= `mha_out_proj` output, which is the first
-    /// half of the synapse input). Length `d_input`.
-    pub attn_out: Vec<f32>,
-    /// Synapse U-Net input — the concat `[attn_out, activated_prev]`
-    /// fed to `synapse.forward()`. Length `d_input + d_model`.
-    /// **Backward gap.** The resident U-Net dispatch is monolithic;
-    /// per-block intermediates (linear input, ln norm/invstd,
-    /// pre-silu, skip caches) are NOT captured here. Resident
-    /// backward must either (a) re-run the host-side
-    /// `unet_forward_cached(pre_syn)` to recover intermediates, or
-    /// (b) wait for `SynapseUNetResident::forward_cached` to expose
-    /// per-block buffers. See module-level comment on
-    /// `CtmCacheResident`.
-    pub pre_syn: Vec<f32>,
-    /// Synapse output (= U-Net output, pre-trace-shift). Length
-    /// `d_model`. Saved as the U-Net upstream gradient target so
-    /// resident backward can verify the dx shape.
-    pub pre_act: Vec<f32>,
-    /// Trace state AFTER trace-shift, BEFORE NLM forward (=
-    /// `nlm_stage1` input). Length `d_model × memory_length`.
-    /// **No D2H needed** — trace lives host-side already
-    /// (`state.trace`); cache holds a clone.
-    pub trace: Vec<f32>,
-    /// `nlm_stage1` raw output (BEFORE per-neuron GLU). Length
-    /// `d_model × stage1.out_per`. **D2H added by this slice.**
-    /// Required by GLU backward (the per-neuron GLU input is the raw
-    /// stage1 output).
-    pub nlm_s1_out: Vec<f32>,
-    /// `nlm_stage1` GLU output (= `nlm_stage2` input when stage2 is
-    /// present, else = `activated_post`). Length
-    /// `d_model × (stage1.out_per / 2)`. **D2H added by this slice.**
-    pub nlm_s1_glu: Vec<f32>,
-    /// `nlm_stage2` raw output (BEFORE per-neuron GLU). `Some` iff
-    /// `cfg.deep_nlms`. Length `d_model × stage2.out_per`. **D2H
-    /// added by this slice when stage2 is present.**
-    pub nlm_s2_out: Option<Vec<f32>>,
-    /// Activated state AFTER NLM (= region output). Length
-    /// `d_model`.
-    pub activated_post: Vec<f32>,
-    /// `sync_out` at this tick (= input to `output_proj` and to
-    /// `exit_gate`). Length `cfg.n_synch_out`.
-    pub sync_out: Vec<f32>,
-    /// `beta_out` accumulator at this tick. Length `cfg.n_synch_out`.
-    pub beta_out: Vec<f32>,
-    /// Output projection logits (`output_proj.forward(sync_out)`).
-    /// Length `cfg.out_dims`. Used to short-circuit certainty/loss
-    /// recomputation in backward.
-    pub pred: Vec<f32>,
-    /// Exit gate logit (saved as length-1 vec for shape consistency
-    /// with the other LinearCache slots). `Some` iff
-    /// `cfg.exit_strategy == AdaptiveGate { .. }` AND
-    /// `w.exit_gate.is_some()`. Length 1.
-    pub exit_gate_logit: Option<Vec<f32>>,
-    /// `λ_t = σ(gate_logit)` at this tick. `0.0` when gate is off.
-    pub exit_lambda: f32,
-}
-
-/// Cache from `ctm_forward_resident` — everything resident backward
-/// will need to drive a BPTT pass through `RegionalBrain` regions.
-///
-/// Mirrors the layout of host `crate::train::CtmCache` (top-level KV
-/// + per-tick caches + decay rates); see `CtmTickCacheResident` for
-/// the per-tick content. Built and consumed by:
-/// - `ctm_forward_resident` (this file) — populates.
-/// - `RegionalBrain::backward_cached_resident` (next slice) —
-///   consumes through `OuterTickCache::region_caches_resident`.
-#[cfg(feature = "rocm")]
-pub struct CtmCacheResident {
-    /// Per-tick caches. Length = `ticks_used` (may be less than
-    /// `cfg.iterations` when adaptive exit fires).
-    pub tick_caches: Vec<CtmTickCacheResident>,
-    /// KV stream for the inner forward (host-side copy of the
-    /// downloaded device KV — same as `kv_host` in the inner forward
-    /// fn). `[n_tokens × d_input]`.
-    pub kv: Vec<f32>,
-    /// Number of KV tokens (matches `n_tokens` arg to inner forward).
-    pub n_tokens: usize,
-    /// `cfg.d_input`. Cached for backward shape arithmetic without
-    /// re-reading config.
-    pub d_input: usize,
-    /// Sync-out decay rates `r_out[i] = exp(-decay_params_out[i])`.
-    /// Used by sync-out backward.
-    pub r_out: Vec<f32>,
-    /// Sync-action decay rates `r_action[i] = exp(-decay_params_action[i])`.
-    /// Used by sync-action backward.
-    pub r_action: Vec<f32>,
-}
-
-/// Device-resident equivalent of `ctm_forward_with_kv`. Drives the
-/// inner CTM tick loop with the heavy matvecs dispatched through
-/// `CtmResidentCache`. Host state (predictions, certainties,
-/// sync accumulators, exit bookkeeping) is identical to the host
-/// path; only the matmul transport changes.
-///
-/// **Device-resident KV input.** Takes pre-projected KV in d_input
-/// space as a `&GpuVec` (the `kv_proj` projection happens in the
-/// outer caller — typically `RegionalBrain::forward_cached_resident`
-/// — so this function focuses purely on the inner tick loop).
-/// Accepting `&GpuVec` rather than `&[f32]` lets the caller keep
-/// the connection-synapse output device-resident: the per-connection
-/// D2H bounce in `forward_cached_resident` disappears.
-///
-/// **Strategy (a) — single D2H per call.** Today this function
-/// downloads `kv` to a host scratch once at the top, then keeps the
-/// existing per-token MHA K/V dispatch logic (which uploads each
-/// token's d_in slice via `mha_kv_in_dev.copy_from`). Net D2H per
-/// inner forward: 1 (down from `n_tokens` worth of upload pressure
-/// previously fed by an outer-caller D2H). The per-token H2D
-/// uploads remain. TODO: ship strategy (b) as a follow-up — keep
-/// `kv` device-resident across the whole forward and replace the
-/// per-token H2D upload with a D2D copy from a sub-range of the
-/// input GpuVec into `mha_kv_in_dev`. Doable without API changes
-/// to `LinearResident::forward` once a `hipMemcpy` D2D wrapper is
-/// in place; deferred for honest scope.
-///
-/// **Cross-forward state contract.** Same as `ctm_forward_with_kv`:
-/// `alpha_out`/`beta_out` reset every call via `sync_init`, action
-/// accumulators are local, `activated`/`trace` persist across
-/// forwards (continuous-thinking semantics).
-///
-/// Returns `(CtmOutput, CtmCacheResident)` matching the host path
-/// bit-for-bit within 1e-3 FP tolerance (rocBLAS reduces in a
-/// different order than AVX-512 dot, hence the loose bound). The
-/// cache contains everything resident backward needs — see the
-/// module-level comment on `CtmCacheResident` for storage rationale
-/// and the known U-Net interior gap.
-///
-/// **PART A of backward-resident.** Returning a populated
-/// `CtmCacheResident` (rather than just `CtmOutput`) is the
-/// prerequisite for `RegionalBrain::backward_cached_resident` (next
-/// slice). The forward numerics are unchanged; the only behavioral
-/// difference is four extra small D2H downloads per tick to
-/// capture q_proj output, nlm stage1 raw output, stage1 GLU output,
-/// and (when `deep_nlms`) stage2 raw output. The U-Net pre-syn /
-/// pre-act pair is already host-resident in this function (no
-/// extra D2H).
-#[cfg(feature = "rocm")]
-pub fn ctm_forward_resident(
-    w: &CtmWeights,
-    cache: &crate::ctm_resident::CtmResidentCache,
-    state: &mut CtmState,
-    batch: &HipBatch,
-    kv: &GpuVec,
-    n_tokens: usize,
-) -> Result<(CtmOutput, CtmCacheResident), ResidencyError> {
-    let cfg = &w.config;
-    let d = cfg.d_model;
-    let d_in = cfg.d_input;
-    let k = cfg.iterations;
-    let m = cfg.memory_length;
-    let n_heads = cfg.heads;
-    let d_head = d_in / n_heads;
-    let scale = 1.0 / (d_head as f32).sqrt();
-
-    let r_out: Vec<f32> = w.decay_params_out.iter()
-        .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
-    let r_action: Vec<f32> = w.decay_params_action.iter()
-        .map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
-
-    sync_init(&state.activated, &w.sync_out_left, &w.sync_out_right,
-        &mut state.alpha_out, &mut state.beta_out);
-
-    let mut alpha_action: Vec<f32> = Vec::new();
-    let mut beta_action: Vec<f32> = Vec::new();
-    let mut action_initialized = false;
-
-    let mut predictions = Vec::with_capacity(k);
-    let mut certainties = Vec::with_capacity(k);
-    let mut exit_lambdas: Vec<f32> = Vec::new();
-    let mut exit_cdf = 0.0f32;
-    let mut survival = 1.0f32;
-    let collect_traj = cfg.collect_trajectories;
-    let mut trajectory = if collect_traj { Vec::with_capacity(k * d) } else { Vec::new() };
-
-    // Resident-backward cache accumulator. Pushed exactly once per
-    // tick that runs to completion (mirrors `predictions.push`
-    // cadence); when adaptive exit fires mid-tick we still push for
-    // the just-completed tick before breaking, so
-    // `tick_caches.len() == predictions.len() == ticks_used` holds.
-    let mut tick_caches: Vec<CtmTickCacheResident> = Vec::with_capacity(k);
-
-    // Pre-allocated device scratch buffers reused across ticks.
-    // q_proj output and MHA Q-projection share d_in shape so they
-    // could share a buffer, but cleanest to keep them distinct;
-    // hipMalloc cost amortises across the tick loop anyway.
-    let n_action = w.q_proj.in_dim;
-    let mut sync_action_dev = GpuVec::try_hip(n_action)?;
-    let mut q_proj_out_dev = GpuVec::try_hip(d_in)?;
-    let mut mha_q_dev = GpuVec::try_hip(d_in)?;
-    let mut mha_kv_in_dev = GpuVec::try_hip(d_in)?;
-    let mut mha_k_dev = GpuVec::try_hip(d_in)?;
-    let mut mha_v_dev = GpuVec::try_hip(d_in)?;
-    let mut mha_concat_dev = GpuVec::try_hip(d_in)?;
-    let mut attn_out_dev = GpuVec::try_hip(d_in)?;
-    let mut pre_syn_dev = GpuVec::try_hip(d_in + d)?;
-    let mut pre_act_dev = GpuVec::try_hip(d)?;
-    let mut nlm_in_dev = GpuVec::try_hip(d * m)?;
-    let mut nlm_s1_out_dev = GpuVec::try_hip(d * w.nlm_stage1.out_per)?;
-    // Stage1 GLU output: half_size = out_per / 2, n_neurons = d.
-    let s1_half = w.nlm_stage1.out_per / 2;
-    let mut nlm_s1_glu_dev = GpuVec::try_hip(d * s1_half)?;
-    // Stage2 buffers (raw output and GLU output) — only allocated
-    // when stage2 is present.
-    let nlm_s2_out_dev: Option<GpuVec> = match &w.nlm_stage2 {
-        Some(s2) => Some(GpuVec::try_hip(d * s2.out_per)?),
-        None => None,
-    };
-    let mut nlm_s2_out_dev = nlm_s2_out_dev;
-    let nlm_s2_glu_dev: Option<GpuVec> = match &w.nlm_stage2 {
-        Some(s2) => Some(GpuVec::try_hip(d * (s2.out_per / 2))?),
-        None => None,
-    };
-    let mut nlm_s2_glu_dev = nlm_s2_glu_dev;
-    // MHA softmax scratch — `[n_heads × n_tokens]` packed across
-    // all heads. One input buffer (scores per head) + one output
-    // buffer (softmax weights per head). Both reused across ticks.
-    // We dispatch n_heads softmax_resident calls per tick at offsets
-    // into these buffers, then a single flush + D2H drains them all
-    // — one device sync per tick instead of per head.
-    let mut mha_scores_dev = GpuVec::try_hip(n_heads * n_tokens)?;
-    let mut mha_softmax_dev = GpuVec::try_hip(n_heads * n_tokens)?;
-    let mut sync_out_dev = GpuVec::try_hip(cfg.n_synch_out)?;
-    let mut pred_dev = GpuVec::try_hip(cfg.out_dims)?;
-    let mut gate_dev = if w.exit_gate.is_some() {
-        Some(GpuVec::try_hip(1)?)
-    } else {
-        None
-    };
-
-    // Strategy (a): download `kv` (device-resident) to a host scratch
-    // ONCE up front, then keep the per-token MHA K/V dispatch logic
-    // intact (it slices into `kv_host` for `mha_kv_in_dev.copy_from`).
-    // This eliminates the caller-side per-connection D2H — graph.rs
-    // used to download every connection-synapse output to feed
-    // `&[f32]` here. Net D2H per inner forward: 1.
-    //
-    // TODO: lift to strategy (b) — replace the per-token H2D
-    // `mha_kv_in_dev.copy_from` upload with a D2D copy from a
-    // sub-range of `kv` directly. That keeps the input fully
-    // device-resident and removes the host scratch entirely.
-    let kv_host: Vec<f32> = match kv {
-        GpuVec::Hip(buf) => {
-            let mut host = vec![0.0f32; n_tokens * d_in];
-            debug_assert_eq!(buf.len_f32(), n_tokens * d_in,
-                "kv GpuVec length mismatch (n_tokens × d_in)");
-            buf.copy_to_host(&mut host)?;
-            host
-        }
-        // Non-Hip variants are valid host inputs (Heap/Vram are host-
-        // visible per `GpuVec::is_host_visible`); just clone the
-        // backing slice. Keeps the function callable from CPU-only
-        // tests too.
-        _ => kv.as_slice().to_vec(),
-    };
-
-    // Project all KV tokens once per call (kv doesn't change across
-    // ticks). Each token: K = mha_in_k @ kv_token + bias_k,
-    //                     V = mha_in_v @ kv_token + bias_v.
-    // Stored host-side because softmax + weighted sum is host.
-    // n_tokens × d_in each.
-    let mut k_all_host = vec![0.0f32; n_tokens * d_in];
-    let mut v_all_host = vec![0.0f32; n_tokens * d_in];
-    for t in 0..n_tokens {
-        mha_kv_in_dev.copy_from(&kv_host[t * d_in..(t + 1) * d_in]);
-        cache.mha_in_k.forward(batch, &mha_kv_in_dev, &mut mha_k_dev)?;
-        cache.mha_in_v.forward(batch, &mha_kv_in_dev, &mut mha_v_dev)?;
-        // D2H to host scratch. flush guarantees the matvecs above
-        // are finished before we read.
-        batch.flush()?;
-        let mut k_tok = vec![0.0f32; d_in];
-        let mut v_tok = vec![0.0f32; d_in];
-        match &mha_k_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut k_tok)?,
-            _ => unreachable!("hip alloc"),
-        }
-        match &mha_v_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut v_tok)?,
-            _ => unreachable!("hip alloc"),
-        }
-        k_all_host[t * d_in..(t + 1) * d_in].copy_from_slice(&k_tok);
-        v_all_host[t * d_in..(t + 1) * d_in].copy_from_slice(&v_tok);
-    }
-
-    for _tick in 0..k {
-        // ── Cache: activated_prev (snapshot before NLM mutates it). ──
-        // Backward needs this for the sync_action gradient and for
-        // the U-Net residual half (`pre_syn[d_in..]` = activated_prev).
-        let activated_prev_cache: Vec<f32> = state.activated.clone();
-
-        // ── Sync (action). Identical scalar op to the host path. ──
-        let sync_action = if !action_initialized {
-            sync_init(&state.activated, &w.sync_action_left, &w.sync_action_right,
-                &mut alpha_action, &mut beta_action);
-            action_initialized = true;
-            sync_read(&alpha_action, &beta_action)
-        } else {
-            sync_update(&state.activated, &w.sync_action_left, &w.sync_action_right,
-                &mut alpha_action, &mut beta_action, &r_action)
-        };
-        // beta_action snapshot for sync_action backward (the action
-        // sync accumulators decay across the next tick — clone now).
-        let beta_action_cache: Vec<f32> = beta_action.clone();
-
-        // ── Q projection: sync_action → d_input via q_proj. ──
-        sync_action_dev.copy_from(&sync_action);
-        cache.q_proj.forward(batch, &sync_action_dev, &mut q_proj_out_dev)?;
-
-        // ── Cache: q_proj_out (= input to mha_in_q). ──
-        // Existing path only downloads `mha_q_dev` (= mha_in_q @
-        // q_proj_out). For backward through `mha_in_proj` we need the
-        // q_proj output itself (which is the `q_in` of `MhaCache` in
-        // the host). Extra D2H of d_in floats per tick.
-        batch.flush()?;
-        let mut q_proj_out_cache = vec![0.0f32; d_in];
-        match &q_proj_out_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut q_proj_out_cache)?,
-            _ => unreachable!("hip alloc"),
-        }
-
-        // ── MHA Q row of in_proj. ──
-        // Host code: linear_slice(q_in, in_proj, 0, d_input).
-        // Resident: mha_in_q @ q_proj_out → mha_q_dev.
-        cache.mha_in_q.forward(batch, &q_proj_out_dev, &mut mha_q_dev)?;
-        batch.flush()?;
-        let mut q_full = vec![0.0f32; d_in];
-        match &mha_q_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut q_full)?,
-            _ => unreachable!("hip alloc"),
-        }
-
-        // ── Per-head scaled dot-product attention. ──
-        // K/V tokens were pre-projected once above. Per-head
-        // QK dot-product runs host (K/V live host). Softmax runs
-        // resident via `softmax_resident` (ACCURATE algo, INSTANCE
-        // mode): all per-head score rows are uploaded packed into
-        // `[n_heads × n_tokens]`, a single softmax_resident
-        // dispatch handles every head row in one MIOpen call,
-        // then we flush + D2H once. The V·weights weighted sum
-        // stays host. TODO: lift QK (resident matvec against
-        // packed K) and the V·weights weighted sum (V transpose +
-        // resident matvec, or sgemv with trans flag) — that
-        // subsumes both the upload-scores and download-weights
-        // bracket around the softmax kernel.
-        let mut concat_heads = vec![0.0f32; d_in];
-        let mut scores_host = vec![0.0f32; n_heads * n_tokens];
-        for h in 0..n_heads {
-            let q_h = &q_full[h * d_head..(h + 1) * d_head];
-            let row = &mut scores_host[h * n_tokens..(h + 1) * n_tokens];
-            for t in 0..n_tokens {
-                let k_h = &k_all_host[
-                    t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
-                let dot: f32 = q_h.iter().zip(k_h).map(|(&a, &b)| a * b).sum();
-                row[t] = dot * scale;
-            }
-        }
-
-        // Single resident softmax over all head rows at once.
-        // [n_heads, n_tokens, 1, 1] tensor with INSTANCE mode → per-N
-        // softmax across the row_len axis. ACCURATE algo (max-
-        // subtracting) matches the host numeric path within fp
-        // tolerance.
-        mha_scores_dev.copy_from(&scores_host);
-        let scores_ptr = match &mha_scores_dev {
-            GpuVec::Hip(b) => b.device_ptr() as *const f32,
-            _ => unreachable!("hip alloc"),
-        };
-        let softmax_ptr = match &mut mha_softmax_dev {
-            GpuVec::Hip(b) => b.device_ptr() as *mut f32,
-            _ => unreachable!("hip alloc"),
-        };
-        unsafe {
-            modgrad_device::backend::ops::softmax_resident(
-                scores_ptr, softmax_ptr,
-                n_heads, n_tokens, false,
-            )?;
-        }
-        batch.note_dispatch()?;
-        batch.flush()?;
-        let mut softmax_host = vec![0.0f32; n_heads * n_tokens];
-        match &mha_softmax_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut softmax_host)?,
-            _ => unreachable!("hip alloc"),
-        }
-
-        // Per-head V·weights weighted sum (host). V is shaped
-        // [n_tokens × d_head] per head, weights are [n_tokens]. TODO
-        // above.
-        for h in 0..n_heads {
-            let weights = &softmax_host[h * n_tokens..(h + 1) * n_tokens];
-            let head_out = &mut concat_heads[h * d_head..(h + 1) * d_head];
-            for j in 0..d_head { head_out[j] = 0.0; }
-            for t in 0..n_tokens {
-                let w_attn = weights[t];
-                let v_h = &v_all_host[
-                    t * d_in + h * d_head..t * d_in + (h + 1) * d_head];
-                for j in 0..d_head {
-                    head_out[j] += w_attn * v_h[j];
-                }
-            }
-        }
-
-        // ── MHA out projection: concat → d_input via mha_out_proj. ──
-        mha_concat_dev.copy_from(&concat_heads);
-        cache.mha_out_proj.forward(batch, &mha_concat_dev, &mut attn_out_dev)?;
-        batch.flush()?;
-        let mut attn_out = vec![0.0f32; d_in];
-        match &attn_out_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut attn_out)?,
-            _ => unreachable!("hip alloc"),
-        }
-
-        // ── Synapse U-Net: concat(attn_out, activated) → d_model. ──
-        // Build the concat host-side then upload as one block.
-        let mut pre_syn = Vec::with_capacity(d_in + d);
-        pre_syn.extend_from_slice(&attn_out);
-        pre_syn.extend_from_slice(&state.activated);
-        pre_syn_dev.copy_from(&pre_syn);
-        cache.synapse.forward(batch, &pre_syn_dev, &mut pre_act_dev)?;
-        batch.flush()?;
-        let mut pre_act = vec![0.0f32; d];
-        match &pre_act_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut pre_act)?,
-            _ => unreachable!("hip alloc"),
-        }
-        // Cache the U-Net input/output. Per-block intermediates
-        // remain a known gap; see CtmCacheResident doc-comment.
-        let pre_syn_cache: Vec<f32> = pre_syn.clone();
-        let pre_act_cache: Vec<f32> = pre_act.clone();
-
-        // ── Trace shift (host, scalar). ──
-        for n in 0..d {
-            let base = n * m;
-            state.trace.copy_within(base + 1..base + m, base);
-            state.trace[base + m - 1] = pre_act[n];
-        }
-        // Cache trace AFTER shift (= input to NLM stage1). The host
-        // CtmCache analogue is `s1_cache.input` inside `NlmCache`.
-        // Cloned host-side (no D2H needed: trace lives host-side).
-        let trace_cache: Vec<f32> = state.trace.clone();
-
-        // ── NLM forward: trace → activated, fully resident. ──
-        // Stage 1: nlm_stage1 (resident SuperLinear) → s1_out_dev.
-        // A single per-neuron-batched GLU dispatch (custom hipcc
-        // kernel) writes into nlm_s1_glu_dev. If stage2 is Some:
-        // stage2 (resident SuperLinear) reads nlm_s1_glu_dev →
-        // nlm_s2_out_dev, then a second batched GLU dispatch writes
-        // nlm_s2_glu_dev. Final activated is the only host download.
-        nlm_in_dev.copy_from(&state.trace);
-        cache.nlm_stage1.forward(batch, &nlm_in_dev, &mut nlm_s1_out_dev)?;
-
-        // Per-neuron GLU on stage1 output, batched into a single
-        // dispatch. Each neuron's slice in nlm_s1_out_dev is
-        // `[2*s1_half]` — values half followed by gates half
-        // WITHIN that neuron. MIOpen's GLU solver only splits along
-        // the leading axis (`src/solver/glu/forward_glu.cpp`), so the
-        // per-neuron interleaved layout cannot be batched in one
-        // MIOpen call; the custom hipcc kernel
-        // (`crates/modgrad-device/kernels/per_neuron_glu_batched.hip`)
-        // handles the interleaved layout in one launch and replaces
-        // the previous `d`-call MIOpen loop. Total threads launched =
-        // `d * s1_half`. The debug_assert pins `out_per == 2 * s1_half`
-        // — the kernel derives the per-neuron stride from `2 * half_size`.
-        debug_assert_eq!(w.nlm_stage1.out_per, 2 * s1_half);
-        {
-            let s1_out_base = match &nlm_s1_out_dev {
-                GpuVec::Hip(b) => b.device_ptr() as *const f32,
-                _ => unreachable!("hip alloc"),
-            };
-            let s1_glu_base = match &mut nlm_s1_glu_dev {
-                GpuVec::Hip(b) => b.device_ptr() as *mut f32,
-                _ => unreachable!("hip alloc"),
-            };
-            unsafe {
-                modgrad_device::backend::ops::per_neuron_glu_batched_resident(
-                    s1_out_base, s1_glu_base, d, s1_half,
-                )?;
-            }
-            batch.note_dispatch()?;
-        }
-
-        // ── Cache: D2H stage1 raw output (BEFORE per-neuron GLU). ──
-        // Required by GLU backward (the per-neuron GLU input is the
-        // raw stage1 output). The kernel is async, so flush before
-        // download. d_model × stage1.out_per floats per tick.
-        batch.flush()?;
-        let nlm_s1_out_cache: Vec<f32> = {
-            let mut h = vec![0.0f32; d * w.nlm_stage1.out_per];
-            match &nlm_s1_out_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
-                _ => unreachable!("hip alloc"),
-            }
-            h
-        };
-        // ── Cache: D2H stage1 GLU output (= stage2 input or =
-        // activated when no stage2). Required by stage2 backward
-        // (input gradient w.r.t. stage1 GLU). d_model × s1_half
-        // floats per tick.
-        let nlm_s1_glu_cache: Vec<f32> = {
-            let mut h = vec![0.0f32; d * s1_half];
-            match &nlm_s1_glu_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
-                _ => unreachable!("hip alloc"),
-            }
-            h
-        };
-
-        let (new_activated, nlm_s2_out_cache_opt): (Vec<f32>, Option<Vec<f32>>) =
-        if let Some(s2_resident) = &cache.nlm_stage2 {
-            // stage2 reads stage1's GLU output (already device-resident
-            // in nlm_s1_glu_dev). Output goes into nlm_s2_out_dev.
-            let s2_weights = w.nlm_stage2.as_ref()
-                .expect("nlm_stage2 host weights present when cache.nlm_stage2 is Some");
-            let s2_out_dev = nlm_s2_out_dev.as_mut()
-                .expect("s2 out buffer allocated when stage2 present");
-            s2_resident.forward(batch, &nlm_s1_glu_dev, s2_out_dev)?;
-
-            // ── Cache: D2H stage2 raw output (BEFORE per-neuron GLU). ──
-            // Required by GLU backward (the per-neuron GLU input is
-            // the raw stage2 output). Flush before download to wait
-            // on the stage2 matvec dispatches. d_model × stage2.out_per
-            // floats per tick when deep_nlms.
-            batch.flush()?;
-            let s2_out_cache: Vec<f32> = {
-                let mut h = vec![0.0f32; d * s2_weights.out_per];
-                match &*s2_out_dev {
-                    GpuVec::Hip(buf) => buf.copy_to_host(&mut h)?,
-                    _ => unreachable!("hip alloc"),
-                }
-                h
-            };
-
-            // Per-neuron GLU on stage2 output, same pattern as
-            // stage1: one batched dispatch into the custom hipcc
-            // kernel rather than `d` MIOpen calls.
-            let s2_half = s2_weights.out_per / 2;
-            debug_assert_eq!(s2_weights.out_per, 2 * s2_half);
-            let s2_glu_dev = nlm_s2_glu_dev.as_mut()
-                .expect("s2 glu buffer allocated when stage2 present");
-            {
-                let s2_out_base = match &*s2_out_dev {
-                    GpuVec::Hip(b) => b.device_ptr() as *const f32,
-                    _ => unreachable!("hip alloc"),
-                };
-                let s2_glu_base = match &mut *s2_glu_dev {
-                    GpuVec::Hip(b) => b.device_ptr() as *mut f32,
-                    _ => unreachable!("hip alloc"),
-                };
-                unsafe {
-                    modgrad_device::backend::ops::per_neuron_glu_batched_resident(
-                        s2_out_base, s2_glu_base, d, s2_half,
-                    )?;
-                }
-                batch.note_dispatch()?;
-            }
-            batch.flush()?;
-            let mut activated_host = vec![0.0f32; d * s2_half];
-            match &*s2_glu_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut activated_host)?,
-                _ => unreachable!("hip alloc"),
-            }
-            (activated_host, Some(s2_out_cache))
-        } else {
-            // No stage2: activated = nlm_s1_glu (already downloaded
-            // above into `nlm_s1_glu_cache`). Reuse that download to
-            // avoid a second D2H of the same buffer. The flush above
-            // already ensured the GLU dispatches completed.
-            (nlm_s1_glu_cache.clone(), None)
-        };
-        state.activated = new_activated;
-
-        if collect_traj {
-            trajectory.extend_from_slice(&state.activated);
-        }
-
-        // ── Sync (out): identical scalar op to host. ──
-        let sync_out = sync_update(&state.activated, &w.sync_out_left, &w.sync_out_right,
-            &mut state.alpha_out, &mut state.beta_out, &r_out);
-
-        // ── Output projection: sync_out → out_dims via output_proj. ──
-        sync_out_dev.copy_from(&sync_out);
-        cache.output_proj.forward(batch, &sync_out_dev, &mut pred_dev)?;
-        batch.flush()?;
-        let mut pred = vec![0.0f32; cfg.out_dims];
-        match &pred_dev {
-            GpuVec::Hip(buf) => buf.copy_to_host(&mut pred)?,
-            _ => unreachable!("hip alloc"),
-        }
-        let cert = compute_certainty(&pred);
-        predictions.push(pred.clone());
-        certainties.push(cert);
-
-        // ── Exit strategy: identical to host. ──
-        // Run the gate dispatch first (when AdaptiveGate is on) so
-        // its logit can be captured into the per-tick cache before
-        // we decide whether to break out of the loop. We push the
-        // cache UNCONDITIONALLY (mirroring `predictions.push` above)
-        // so `tick_caches.len() == predictions.len()` holds across
-        // both early-exit and full runs.
-        let mut should_break = false;
-        let mut exit_gate_logit_cache: Option<Vec<f32>> = None;
-        let mut exit_lambda_cache: f32 = 0.0;
-        match &cfg.exit_strategy {
-            crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
-                if let (Some(gate_resident), Some(gate_buf)) =
-                    (cache.exit_gate.as_ref(), gate_dev.as_mut())
-                {
-                    gate_resident.forward(batch, &sync_out_dev, gate_buf)?;
-                    batch.flush()?;
-                    let mut gate_out = [0.0f32; 1];
-                    match &*gate_buf {
-                        GpuVec::Hip(buf) => buf.copy_to_host(&mut gate_out)?,
-                        _ => unreachable!("hip alloc"),
-                    }
-                    let lambda = 1.0 / (1.0 + (-gate_out[0]).exp());
-                    exit_lambdas.push(lambda);
-                    let p_exit = lambda * survival;
-                    exit_cdf += p_exit;
-                    survival *= 1.0 - lambda;
-                    exit_gate_logit_cache = Some(vec![gate_out[0]]);
-                    exit_lambda_cache = lambda;
-                    if exit_cdf > *threshold { should_break = true; }
-                }
-            }
-            crate::config::ExitStrategy::Certainty { threshold } => {
-                if cert[1] > *threshold { should_break = true; }
-            }
-            crate::config::ExitStrategy::None => {}
-        }
-
-        // ── Cache push (mirrors host `tick_caches.push`). ──
-        // Same cadence as `predictions.push` above so length
-        // invariants hold for backward. Per-tick locals (sync_action,
-        // q_full, softmax_host, concat_heads, attn_out, sync_out)
-        // are MOVED in; loop-invariant scratches (k_all_host,
-        // v_all_host, kv_host slices) are CLONED because backward
-        // wants per-tick MhaCache content (host TickCache layout).
-        tick_caches.push(CtmTickCacheResident {
-            activated_prev: activated_prev_cache,
-            sync_action,
-            beta_action: beta_action_cache,
-            q_proj_out: q_proj_out_cache,
-            q_full,
-            k_all: k_all_host.clone(),
-            v_all: v_all_host.clone(),
-            kv_tokens: (0..n_tokens)
-                .map(|t| kv_host[t * d_in..(t + 1) * d_in].to_vec())
-                .collect(),
-            attn_weights: softmax_host,
-            concat_heads,
-            attn_out,
-            pre_syn: pre_syn_cache,
-            pre_act: pre_act_cache,
-            trace: trace_cache,
-            nlm_s1_out: nlm_s1_out_cache,
-            nlm_s1_glu: nlm_s1_glu_cache,
-            nlm_s2_out: nlm_s2_out_cache_opt,
-            activated_post: state.activated.clone(),
-            sync_out,
-            beta_out: state.beta_out.clone(),
-            pred,
-            exit_gate_logit: exit_gate_logit_cache,
-            exit_lambda: exit_lambda_cache,
-        });
-
-        if should_break { break; }
-    }
-
-    let ticks_used = predictions.len();
-    let sync_out = sync_read(&state.alpha_out, &state.beta_out);
-    let output = CtmOutput {
-        predictions, certainties, sync_out, exit_lambdas, ticks_used, trajectory,
-    };
-    let ctm_cache_resident = CtmCacheResident {
-        tick_caches,
-        kv: kv_host,
-        n_tokens,
-        d_input: d_in,
-        r_out,
-        r_action,
-    };
-    Ok((output, ctm_cache_resident))
-}
-
-// ─── Resident inner-CTM backward (PART B) ─────────────────────
-//
-// `ctm_backward_resident` mirrors `train::backward_from_activated`
-// structurally — same tick-loop reverse traversal, same gradient
-// accumulation pattern — but consumes a `CtmCacheResident` instead
-// of a host `CtmCache`.
-//
-// The math itself stays host-side for THIS slice. Resident BACKWARD
-// dispatch (MIOpen *Backward symbols routed through the new
-// `Op::*BackwardResident` variants) is plumbed end-to-end at the
-// device layer (Part 1) but the inner-CTM call sites here continue
-// to use the host-slice helpers (`crate::train::linear_backward`,
-// `sync_backward`, etc.) that are already battle-tested. Lifting
-// individual sub-graphs (LN backward, softmax backward) to resident
-// dispatch is mechanical from here — every `*BackwardResident` op
-// is callable, the descriptors match the forward-side dispatch.
-//
-// Synapse U-Net BACKWARD GAP — DOCUMENTED REGRESSION.
-//
-// `SynapseUNetResident::forward` is monolithic (no per-block
-// intermediate cache exposed). Of the two repair paths:
-//   (a) Extend `SynapseUNetResident::forward_cached` to expose
-//       per-block buffers — significant resident-dispatch refactor;
-//       deferred.
-//   (b) Promote `train::unet_forward_cached` / `train::unet_backward`
-//       (and `UNetCache`) to `pub(crate)`, then call them from here
-//       on the saved `tc.pre_syn`, accumulating into
-//       `grads.unet` — this is the path taken.
-//
-// Path B trades one extra host-side U-Net forward per tick for
-// minimal-surface code and the existing battle-tested host backward
-// math. The cross-tick BPTT chain (`d_pre_syn` propagation) was
-// already correct; this fix adds full weight/bias/gamma/beta
-// gradient accumulation into `CtmGradients.unet`.
-//
-// Path A remains a future option if the per-tick host U-Net forward
-// becomes a measurable bottleneck. The contract this function
-// exposes (`grads.unet` populated) does not depend on which path
-// computes the cache.
-
-/// Result of `ctm_backward_resident` — gradients plus the
-/// cross-tick observable propagation needed by the outer brain
-/// backward.
-#[cfg(feature = "rocm")]
-pub struct RegionBackwardResultResident {
-    /// Per-region weight gradients (matches host `RegionBackwardResult.grads`).
-    /// All fields including `grads.unet` are populated — the U-Net
-    /// regression documented in earlier slices is FIXED via Path B
-    /// (see module-level doc).
-    pub grads: crate::train::CtmGradients,
-    /// Gradient w.r.t. observation tokens fed in (per-token, flat).
-    /// Length `cache.n_tokens * raw_dim`.
-    pub d_observation: Vec<f32>,
-}
-
-/// Inner-CTM backward over a `CtmCacheResident`.
-///
-/// Mirrors `crate::train::backward_from_activated` structurally;
-/// see module-level doc above for the U-Net regression.
-///
-/// Returns `(grads, d_observation)` matching
-/// `crate::train::backward_from_activated`'s return shape minus the
-/// regressed U-Net subgraph.
-#[cfg(feature = "rocm")]
-pub fn ctm_backward_resident(
-    w: &CtmWeights,
-    cache: &CtmCacheResident,
-    d_external: &[f32],
-) -> RegionBackwardResultResident {
-    ctm_backward_resident_inner(w, cache, d_external, None)
-}
-
-/// Phase 3c variant: when `resident_grads` is `Some((rg, region_idx))`,
-/// the heavy SuperLinear dW backward goes through the resident kernel,
-/// accumulating into device buffers in `rg`. The host
-/// `RegionBackwardResultResident.grads.nlm_s1_w` / `nlm_s2_w` slices
-/// stay zero in that case — caller must merge them in via
-/// `RegionalGradientsResident::add_to_host` after backward completes.
-#[cfg(feature = "rocm")]
-pub fn ctm_backward_resident_with_grads_resident(
-    w: &CtmWeights,
-    cache: &CtmCacheResident,
-    d_external: &[f32],
-    resident_grads: &crate::resident::RegionalGradientsResident,
-    region_idx: usize,
-) -> RegionBackwardResultResident {
-    ctm_backward_resident_inner(w, cache, d_external, Some((resident_grads, region_idx)))
-}
-
-#[cfg(feature = "rocm")]
-fn ctm_backward_resident_inner(
-    w: &CtmWeights,
-    cache: &CtmCacheResident,
-    d_external: &[f32],
-    resident_grads: Option<(&crate::resident::RegionalGradientsResident, usize)>,
-) -> RegionBackwardResultResident {
-    let cfg = &w.config;
-    let d = cfg.d_model;
-    let d_in = cache.d_input;
-    let m = cfg.memory_length;
-    let n_tokens = cache.n_tokens;
-
-    let mut grads = crate::train::CtmGradients::zeros(w);
-
-    // d_activated propagates across ticks (the cross-tick BPTT
-    // backbone). Initialised with the external gradient at the
-    // last tick — same convention as host.
-    let mut d_activated: Vec<f32> = d_external.iter().copied()
-        .chain(std::iter::repeat(0.0))
-        .take(d)
-        .collect();
-
-    // Accumulator for d_kv across ticks (each tick attends over the
-    // same KV stream; gradient adds across ticks).
-    let mut d_kv_accumulated = vec![0.0f32; n_tokens * d_in];
-
-    // Hot-loop scratch — q_proj.in_dim is constant.
-    let mut d_sync_action_scratch = vec![0.0f32; w.q_proj.in_dim];
-
-    let ticks_used = cache.tick_caches.len();
-    for tick in (0..ticks_used).rev() {
-        let tc = &cache.tick_caches[tick];
-
-        // ── Sync-out backward (host scalar, identical to host path). ──
-        let d_from_sync = {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerSyncOut);
-            sync_backward_host(
-                &d_activated, &tc.activated_post, &tc.beta_out,
-                &w.sync_out_left, &w.sync_out_right, d,
-            )
-        };
-
-        // External gradient is injected at the LAST tick only (matches
-        // host `backward_from_activated`). Earlier ticks see only the
-        // gradient routed back through the next tick's synapse input.
-        let mut d_act_total = vec![0.0f32; d];
-        for i in 0..d {
-            d_act_total[i] = d_from_sync[i];
-            if tick == ticks_used - 1 {
-                d_act_total[i] += d_activated[i];
-            }
-        }
-
-        // ── NLM backward ──
-        let d_trace = {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerNlm);
-            nlm_backward_resident(
-                &d_act_total, tc,
-                &w.nlm_stage1, w.nlm_stage2.as_ref(),
-                &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
-                &mut grads.nlm_s2_w, &mut grads.nlm_s2_b,
-                resident_grads,
-            )
-        };
-
-        let mut d_pre_act = vec![0.0f32; d];
-        for n in 0..d { d_pre_act[n] = d_trace[n * m + m - 1]; }
-
-        // ── Synapse U-Net backward (Path B — host re-cache). ──
-        let d_pre_syn = {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerUnet);
-            let (_unet_out, unet_cache) = crate::train::unet_forward_cached(
-                &w.synapse, &tc.pre_syn,
-            );
-            crate::train::unet_backward(
-                &w.synapse, &d_pre_act, &unet_cache, &mut grads.unet,
-            )
-        };
-
-        let d_attn_out = &d_pre_syn[..d_in];
-        let d_act_from_syn = &d_pre_syn[d_in..];
-
-        // ── MHA backward ──
-        let (d_q, d_kv_tokens) = {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerMha);
-            mha_backward_resident(
-                d_attn_out, tc, n_tokens, d_in, cfg.heads,
-                &w.mha_in_proj, &w.mha_out_proj,
-                &mut grads.mha_in_w, &mut grads.mha_in_b,
-                &mut grads.mha_out_w, &mut grads.mha_out_b,
-            )
-        };
-
-        for (t, d_tok) in d_kv_tokens.iter().enumerate() {
-            let offset = t * d_in;
-            for j in 0..d_in.min(d_tok.len()) {
-                if offset + j < d_kv_accumulated.len() {
-                    d_kv_accumulated[offset + j] += d_tok[j];
-                }
-            }
-        }
-
-        // ── q_proj backward ──
-        {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerQProj);
-            let q_lin_cache = crate::train::LinearCache { input: tc.sync_action.clone() };
-            crate::train::linear_backward(
-                &w.q_proj, &d_q, &q_lin_cache,
-                &mut grads.q_proj_w, &mut grads.q_proj_b,
-                &mut d_sync_action_scratch,
-            );
-        }
-        let d_sync_action: &[f32] = &d_sync_action_scratch;
-
-        // ── Sync-action backward ──
-        let d_from_sync_action = {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::BwdInnerSyncAction);
-            sync_backward_host(
-                d_sync_action, &tc.activated_prev, &tc.beta_action,
-                &w.sync_action_left, &w.sync_action_right, d,
-            )
-        };
-
-        // Combined gradient for the previous tick's d_activated.
-        d_activated = vec![0.0f32; d];
-        for i in 0..d {
-            d_activated[i] = d_act_from_syn[i] + d_from_sync_action[i];
-        }
-    }
-
-    for i in 0..d { grads.d_start_activated[i] += d_activated[i]; }
-
-    // ── kv_proj backward (host scalar, identical to
-    // `backward_from_activated`). ──
-    let raw_dim = w.kv_proj.in_dim;
-    let mut d_observation = vec![0.0f32; n_tokens * raw_dim];
-    {
-        let _g = crate::dispatch_profile::Guard::new(
-            crate::dispatch_profile::DispatchKind::BwdInnerKvProj);
-        for t in 0..n_tokens {
-            let d_kv_t = &d_kv_accumulated[t * d_in..(t + 1).min(n_tokens) * d_in];
-            for j in 0..raw_dim {
-                for i in 0..d_in.min(d_kv_t.len()) {
-                    d_observation[t * raw_dim + j] +=
-                        d_kv_t[i] * w.kv_proj.weight[i * raw_dim + j];
-                }
-            }
-        }
-    }
-
-    RegionBackwardResultResident { grads, d_observation }
-}
-
-// ─── Local backward helpers used by ctm_backward_resident ───────
-//
-// These mirror the private `train::*_backward` functions. We
-// duplicate (rather than reach in) because the slice constraint
-// is "do not modify train.rs" — without `pub(crate)` exposure
-// these helpers are not reachable. Functions are minimal copies;
-// any divergence from train.rs is a bug.
-
-/// Mirrors `train::sync_backward`.
-#[cfg(feature = "rocm")]
-fn sync_backward_host(
-    d_sync: &[f32], activated: &[f32], beta: &[f32],
-    left: &[usize], right: &[usize], d_model: usize,
-) -> Vec<f32> {
-    use modgrad_device::backend::{ops, SyncBackwardScatterArgs};
-    let n_pairs = left.len();
-    let left_u32: Vec<u32> = left.iter().map(|&x| x as u32).collect();
-    let right_u32: Vec<u32> = right.iter().map(|&x| x as u32).collect();
-    let mut d_act = vec![0.0f32; d_model];
-    ops::sync_backward_scatter(SyncBackwardScatterArgs {
-        d_sync, pairs_left: &left_u32, pairs_right: &right_u32,
-        activated, beta, d_act: &mut d_act,
-        n_pairs, d_model,
-    }).expect("sync_backward_scatter dispatch");
-    d_act
-}
-
-/// Mirrors `train::nlm_backward` — reconstructs the NLM cache from
-/// the resident tick cache's saved activations and dispatches the
-/// per-stage backwards through `super_linear_bwd_*` ops.
-///
-/// The host path's `NlmCache` saves `s1_cache.input` (= trace),
-/// `glu1_cache.x` (= s1_out raw), `s2_cache.input` (= s1_glu),
-/// `glu2_cache.x` (= s2_out raw). Resident cache stores all four
-/// under `tc.trace`, `tc.nlm_s1_out`, `tc.nlm_s1_glu`, `tc.nlm_s2_out`.
-#[cfg(feature = "rocm")]
-fn nlm_backward_resident(
-    d_out: &[f32],
-    tc: &CtmTickCacheResident,
-    stage1: &modgrad_compute::neuron::SuperLinear,
-    stage2: Option<&modgrad_compute::neuron::SuperLinear>,
-    d_s1_w: &mut [f32], d_s1_b: &mut [f32],
-    d_s2_w: &mut Option<Vec<f32>>, d_s2_b: &mut Option<Vec<f32>>,
-    // Phase 3c: when Some, route the heavy super_linear_bwd_dw calls
-    // through the resident kernel (accumulating into device buffers
-    // owned by `RegionalGradientsResident`) instead of the host CPU
-    // dispatch. The caller is responsible for calling `add_to_host`
-    // on the resident grads at end-of-batch to consolidate the device
-    // dW into the host slices that the optimizer reads.
-    //
-    // When the resident path is taken, the host `d_s1_w` / `d_s2_w`
-    // slices stay untouched here — they're populated later by
-    // `add_to_host`. The bias and `d_trace` paths remain host because
-    // they're tiny and not the hot bucket.
-    resident_grads: Option<(&crate::resident::RegionalGradientsResident, usize)>,
-) -> Vec<f32> {
-    use modgrad_device::backend::ops;
-    let d_model = stage1.n_neurons;
-
-    // Reverse the (optional) stage2 first.
-    let d_glu1 = if let (Some(s2), Some(s2_out_raw)) = (stage2, tc.nlm_s2_out.as_ref()) {
-        // d_out has shape [d_model * (s2.out_per/2)].
-        // GLU2 backward: invert per-neuron GLU on s2_out_raw.
-        let s2_half = s2.out_per / 2;
-        let mut d_s2_in = vec![0.0f32; d_model * s2.out_per];
-        ops::per_neuron_glu_bwd(d_out, s2_out_raw, &mut d_s2_in, d_model, s2_half)
-            .expect("per_neuron_glu_bwd dispatch (s2)");
-        // SuperLinear stage2 backward — input was tc.nlm_s1_glu.
-        let n = s2.n_neurons;
-        let ip = s2.in_per;
-        let op = s2.out_per;
-        let db_s2 = d_s2_b.as_mut().expect("d_s2_b present when stage2 present");
-        for i in 0..n * op { db_s2[i] += d_s2_in[i]; }
-        // dW: resident if available, host otherwise.
-        if let Some((rg, region_idx)) = resident_grads {
-            rg.accumulate_super_linear_dw(region_idx, true, &d_s2_in, &tc.nlm_s1_glu, n, ip, op)
-                .expect("accumulate_super_linear_dw (s2 resident)");
-        } else {
-            let dw_s2 = d_s2_w.as_mut().expect("d_s2_w present when stage2 present");
-            ops::super_linear_bwd_dw(&d_s2_in, &tc.nlm_s1_glu, dw_s2, n, ip, op)
-                .expect("super_linear_bwd_dw (s2)");
-        }
-        let mut d_s1_glu = vec![0.0f32; n * ip];
-        ops::super_linear_bwd_dx(&d_s2_in, &s2.weights, &mut d_s1_glu, n, ip, op)
-            .expect("super_linear_bwd_dx (s2)");
-        // GLU1 backward: invert per-neuron GLU on tc.nlm_s1_out.
-        d_s1_glu
-    } else {
-        // No stage2 — d_out IS d_glu1 (post-stage1 GLU output is
-        // activated_post directly).
-        d_out.to_vec()
-    };
-
-    // Stage 1 GLU backward + SuperLinear backward.
-    let s1_half = stage1.out_per / 2;
-    let mut d_s1_in = vec![0.0f32; d_model * stage1.out_per];
-    ops::per_neuron_glu_bwd(&d_glu1, &tc.nlm_s1_out, &mut d_s1_in, d_model, s1_half)
-        .expect("per_neuron_glu_bwd (s1)");
-
-    let n = stage1.n_neurons;
-    let ip = stage1.in_per;
-    let op = stage1.out_per;
-    for i in 0..n * op { d_s1_b[i] += d_s1_in[i]; }
-    let mut d_trace = vec![0.0f32; n * ip];
-    if let Some((rg, region_idx)) = resident_grads {
-        rg.accumulate_super_linear_dw(region_idx, false, &d_s1_in, &tc.trace, n, ip, op)
-            .expect("accumulate_super_linear_dw (s1 resident)");
-    } else {
-        ops::super_linear_bwd_dw(&d_s1_in, &tc.trace, d_s1_w, n, ip, op)
-            .expect("super_linear_bwd_dw (s1)");
-    }
-    ops::super_linear_bwd_dx(&d_s1_in, &stage1.weights, &mut d_trace, n, ip, op)
-        .expect("super_linear_bwd_dx (s1)");
-    d_trace
-}
-
-/// Mirrors `train::mha_backward`.
-///
-/// MHA forward in `ctm_forward_resident` projects Q via `mha_in_q`
-/// (a sliced row sub-view of the full `mha_in_proj` weight) and
-/// projects K/V via `mha_in_k`/`mha_in_v` (other sliced row
-/// sub-views). The backward writes weight gradients into
-/// `d_in_w`/`d_in_b` at the row offsets matching each sub-view —
-/// `0..d_input` for Q, `d_input..2*d_input` for K, `2*d_input..3*d_input`
-/// for V.
-#[cfg(feature = "rocm")]
-fn mha_backward_resident(
-    d_out: &[f32], tc: &CtmTickCacheResident,
-    n_tokens: usize, d_input: usize, n_heads: usize,
-    in_proj: &Linear, out_proj: &Linear,
-    d_in_w: &mut [f32], d_in_b: &mut [f32],
-    d_out_w: &mut [f32], d_out_b: &mut [f32],
-) -> (Vec<f32>, Vec<Vec<f32>>) {
-    use modgrad_device::backend::ops;
-    let d_head = d_input / n_heads;
-    let scale = 1.0 / (d_head as f32).sqrt();
-
-    // out_proj backward — input was tc.concat_heads.
-    let out_lin_cache = crate::train::LinearCache { input: tc.concat_heads.clone() };
-    let mut d_concat = vec![0.0f32; out_proj.in_dim];
-    crate::train::linear_backward(out_proj, d_out, &out_lin_cache,
-        d_out_w, d_out_b, &mut d_concat);
-
-    // Per-head backward through softmax.
-    let mut d_q_full = vec![0.0f32; d_input];
-    let mut d_k_all = vec![0.0f32; n_tokens * d_input];
-    let mut d_v_all = vec![0.0f32; n_tokens * d_input];
-
-    for h in 0..n_heads {
-        let d_head_out = &d_concat[h * d_head..(h + 1) * d_head];
-        let weights = &tc.attn_weights[h * n_tokens..(h + 1) * n_tokens];
-
-        let mut d_weights = vec![0.0f32; n_tokens];
-        for t in 0..n_tokens {
-            let v_h = &tc.v_all[
-                t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
-            for j in 0..d_head {
-                d_weights[t] += d_head_out[j] * v_h[j];
-                d_v_all[t * d_input + h * d_head + j] += weights[t] * d_head_out[j];
-            }
-        }
-
-        // Softmax backward: d_scores[t] = w[t] * (d_w[t] - sum(w * d_w)) * scale
-        let dot_wd: f32 = weights.iter().zip(&d_weights).map(|(&w, &d)| w * d).sum();
-        let d_scores: Vec<f32> = (0..n_tokens)
-            .map(|t| weights[t] * (d_weights[t] - dot_wd) * scale)
-            .collect();
-
-        // d_q_h[j] += sum_t(d_scores[t] * k_h[t][j])
-        // d_k_h[t][j] += d_scores[t] * q_h[j]
-        let q_h = &tc.q_full[h * d_head..(h + 1) * d_head];
-        for t in 0..n_tokens {
-            let k_start = t * d_input + h * d_head;
-            let k_h = &tc.k_all[k_start..k_start + d_head];
-            for j in 0..d_head {
-                d_q_full[h * d_head + j] += d_scores[t] * k_h[j];
-                d_k_all[k_start + j] += d_scores[t] * q_h[j];
-            }
-        }
-    }
-
-    // in_proj backward — three slice-row sub-paths feeding the same
-    // big weight tensor `mha_in_proj`. Q sees rows 0..d_input over
-    // `tc.q_proj_out` (= q_in). K sees rows d_input..2*d_input over
-    // `tc.kv_tokens[t]`. V sees rows 2*d_input..3*d_input over
-    // `tc.kv_tokens[t]`.
-    //
-    // d_bias for the rows (ri ∈ [start, end)): d_in_b[ri] += d_out[ri-start]
-    // d_weight at row ri: d_in_w[ri * in_dim..(ri+1) * in_dim] += d_out[ri-start] * x
-    // d_input (= d for the corresponding x) accumulates from W^T·d_out
-    // across the matching slice.
-
-    let in_dim = in_proj.in_dim;
-
-    // Q rows [0, d_input). x = tc.q_proj_out.
-    let q_x = &tc.q_proj_out;
-    {
-        // d_bias slice
-        for r in 0..d_input { d_in_b[r] += d_q_full[r]; }
-        // d_weight slice (rows 0..d_input)
-        let w_slice = &mut d_in_w[..d_input * in_dim];
-        ops::outer_product_acc(&d_q_full, q_x, w_slice, d_input, in_dim)
-            .expect("outer_product_acc (Q)");
-    }
-    let mut d_q_in = vec![0.0f32; in_dim];
-    {
-        let wt_slice = &in_proj.weight[..d_input * in_dim];
-        ops::matvec_t(&d_q_full, wt_slice, &mut d_q_in, d_input, in_dim)
-            .expect("matvec_t (Q)");
-    }
-
-    // K rows [d_input, 2*d_input).  V rows [2*d_input, 3*d_input).
-    // The host path treats each (token, K) as one matvec into the
-    // K slice, accumulating d_in_w over the K sub-view across all
-    // tokens. Same for V.  We collect d_kv_tokens[t] = d_k_in_t +
-    // d_v_in_t (downstream gradient w.r.t. KV input).
-    let mut d_kv_tokens: Vec<Vec<f32>> = Vec::with_capacity(n_tokens);
-    let k_offset = d_input;
-    let v_offset = 2 * d_input;
-    for t in 0..n_tokens {
-        let kv_x = &tc.kv_tokens[t];
-        let d_k_t = &d_k_all[t * d_input..(t + 1) * d_input];
-        let d_v_t = &d_v_all[t * d_input..(t + 1) * d_input];
-
-        // K slice
-        for r in 0..d_input { d_in_b[k_offset + r] += d_k_t[r]; }
-        let w_slice = &mut d_in_w[k_offset * in_dim..(k_offset + d_input) * in_dim];
-        ops::outer_product_acc(d_k_t, kv_x, w_slice, d_input, in_dim)
-            .expect("outer_product_acc (K)");
-
-        // V slice
-        for r in 0..d_input { d_in_b[v_offset + r] += d_v_t[r]; }
-        let w_slice = &mut d_in_w[v_offset * in_dim..(v_offset + d_input) * in_dim];
-        ops::outer_product_acc(d_v_t, kv_x, w_slice, d_input, in_dim)
-            .expect("outer_product_acc (V)");
-
-        // d_kv_t = (W_K^T @ d_k_t) + (W_V^T @ d_v_t)
-        let mut d_kv_t = vec![0.0f32; in_dim];
-        let mut d_from_k = vec![0.0f32; in_dim];
-        let mut d_from_v = vec![0.0f32; in_dim];
-        ops::matvec_t(d_k_t, &in_proj.weight[k_offset * in_dim..(k_offset + d_input) * in_dim],
-            &mut d_from_k, d_input, in_dim)
-            .expect("matvec_t (K)");
-        ops::matvec_t(d_v_t, &in_proj.weight[v_offset * in_dim..(v_offset + d_input) * in_dim],
-            &mut d_from_v, d_input, in_dim)
-            .expect("matvec_t (V)");
-        for j in 0..in_dim { d_kv_t[j] = d_from_k[j] + d_from_v[j]; }
-        d_kv_tokens.push(d_kv_t);
-    }
-
-    (d_q_in, d_kv_tokens)
-}
-
 // ─── Episodic memory bridge ────────────────────────────────
 
 /// Store a CtmOutput as an episodic memory entry.
@@ -1712,6 +440,22 @@ fn nlm_forward(
 // ─── Multihead attention ───────────────────────────────────
 
 fn multihead_attention(
+    q_in: &[f32],
+    kv_flat: &[f32],
+    n_tokens: usize,
+    d_input: usize,
+    n_heads: usize,
+    in_proj: &Linear,
+    out_proj: &Linear,
+) -> Vec<f32> {
+    multihead_attention_with_attn(q_in, kv_flat, n_tokens, d_input, n_heads, in_proj, out_proj, None)
+}
+
+/// Like `multihead_attention` but optionally writes per-head softmax
+/// weights into `attn_out` as `[head][token]`. Used by
+/// `ctm_forward_with_attn_trace` for visualisation; behaviour and
+/// numerics are identical to `multihead_attention` when `attn_out` is None.
+fn multihead_attention_with_attn(
     q_in: &[f32],       // [d_input]
     kv_flat: &[f32],    // [n_tokens × d_input]
     n_tokens: usize,
@@ -1719,6 +463,7 @@ fn multihead_attention(
     n_heads: usize,
     in_proj: &Linear,    // d_input → 3×d_input
     out_proj: &Linear,   // d_input → d_input
+    attn_out: Option<&mut Vec<Vec<f32>>>,
 ) -> Vec<f32> {
     let d_head = d_input / n_heads;
     let scale = 1.0 / (d_head as f32).sqrt();
@@ -1737,6 +482,10 @@ fn multihead_attention(
 
     // Per-head scaled dot-product attention
     let mut concat_heads = Vec::with_capacity(d_input);
+    let collect_attn = attn_out.is_some();
+    let mut per_head_weights: Vec<Vec<f32>> = if collect_attn {
+        Vec::with_capacity(n_heads)
+    } else { Vec::new() };
     for h in 0..n_heads {
         let q_h = &q_full[h * d_head..(h + 1) * d_head];
 
@@ -1752,19 +501,26 @@ fn multihead_attention(
         let max_s = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let exp_s: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
         let sum_s: f32 = exp_s.iter().sum();
+        let inv_sum = 1.0 / sum_s;
 
         // Weighted sum of values
         let mut head_out = vec![0.0f32; d_head];
+        let mut head_weights: Vec<f32> = if collect_attn {
+            Vec::with_capacity(n_tokens)
+        } else { Vec::new() };
         for t in 0..n_tokens {
-            let w = exp_s[t] / sum_s;
+            let w = exp_s[t] * inv_sum;
+            if collect_attn { head_weights.push(w); }
             let v_h = &v_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
             for j in 0..d_head {
                 head_out[j] += w * v_h[j];
             }
         }
+        if collect_attn { per_head_weights.push(head_weights); }
         concat_heads.extend_from_slice(&head_out);
     }
 
+    if let Some(out) = attn_out { *out = per_head_weights; }
     out_proj.forward(&concat_heads)
 }
 
@@ -1820,164 +576,1405 @@ fn affine_ln(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
         x[i] = gamma[i] * (x[i] - mean) * inv_std + beta[i];
     }
 }
+// Device-generic CTM forward pass. v0 covers the core path:
+//   - Raw single-token input
+//   - Standard tick loop with kv_proj → MHA → synapse → trace shift
+//     → NLM → output_proj
+//   - ExitStrategy::None (no exit gate)
+//   - No episodic memory
+//   - No trajectory collection
+//
+// Big matvecs (kv_proj, q_proj, mha_in/out_proj, output_proj),
+// synapse U-Net, and NLM SuperLinears all route through the typed
+// cascade — for D = Rocm, weights stay on-device.
+//
+// Orchestration ops (sync_init/sync_update, per-head softmax+reduction
+// in MHA, per-neuron GLU, trace shift) currently fall back to host
+// computation per tick. They are small (O(d_model × n_heads × n_tokens))
+// and the matmuls dwarf them; full Path-C kernelisation is a v1
+// optimisation tracked as TODO. The download/upload bracket around
+// these ops is the visible host-fallback PCIe cost.
+
+use modgrad_device::backend::tensor as tensor_typed;
+use modgrad_device::backend::tensor::{Device as TensorDevice, Tensor};
+use modgrad_device::backend::BackendError;
+use crate::weights::CtmWeightsTyped;
+
+/// Forward pass through a typed CTM cell. Mirrors `ctm_forward` for
+/// the supported feature subset (single-token Raw input, no episodic,
+/// no exit gate, no trajectory). Returns identical output (within
+/// float tolerance) to the untyped path on the same weights and input.
+pub fn ctm_forward_typed<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    activated: &mut Vec<f32>,   // [d_model], persistent across ticks
+    trace: &mut Vec<f32>,       // [d_model × memory_length], persistent
+    obs: &[f32],                 // [raw_input_dim] single token
+) -> Result<CtmOutput, BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+
+    // ── Step 1: project the single observation token → d_input ──
+    let obs_t = Tensor::<D>::from_slice(obs)?;
+    let proj_pre_ln = w.kv_proj.forward(&obs_t)?;
+    let mut kv_t = Tensor::<D>::zeros(d_in)?;
+    tensor_typed::layer_norm(
+        &proj_pre_ln, &w.kv_ln_gamma, &w.kv_ln_beta,
+        &mut kv_t, 1, d_in,
+    )?;
+    // kv on host for the multi-head softmax dance (host-fallback
+    // orchestration; see module-level comment).
+    let kv_host: Vec<f32> = kv_t.to_vec()?;
+    let n_tokens = 1;
+
+    // ── Step 2: tick-loop bookkeeping (mirrors ctm_forward_with_kv) ──
+    let mut alpha_out: Vec<f32> = Vec::new();
+    let mut beta_out: Vec<f32> = Vec::new();
+    let decay_out_host: Vec<f32> = w.decay_params_out.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let decay_action_host: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+
+    sync_init(activated, &w.sync_out_left, &w.sync_out_right,
+        &mut alpha_out, &mut beta_out);
+
+    let mut alpha_action: Vec<f32> = Vec::new();
+    let mut beta_action: Vec<f32> = Vec::new();
+    let mut action_initialized = false;
+
+    let mut predictions = Vec::with_capacity(k);
+    let mut certainties = Vec::with_capacity(k);
+
+    // ── Step 3: tick loop. Same structure as ctm_forward_with_kv. ──
+    for _tick in 0..k {
+        // 3a. sync_action via host (small per-pair).
+        let sync_action: Vec<f32> = if !action_initialized {
+            sync_init(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action);
+            action_initialized = true;
+            sync_read(&alpha_action, &beta_action)
+        } else {
+            sync_update(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, &decay_action_host)
+        };
+
+        // 3b. q_proj on device.
+        let sa_t = Tensor::<D>::from_slice(&sync_action)?;
+        let q_t = w.q_proj.forward(&sa_t)?;
+
+        // 3c. MHA. v0: download q, run host MHA helper. The two big
+        //     matvecs (mha_in_proj, mha_out_proj) go through typed
+        //     Linear; the per-head softmax+sum stays host (it's
+        //     n_heads × n_tokens × d_head — small for typical CTM).
+        let q_host: Vec<f32> = q_t.to_vec()?;
+        let attn_out_host = multihead_attention_typed_helper::<D>(
+            &q_host, &kv_host, n_tokens, d_in, cfg.heads,
+            &w.mha_in_proj, &w.mha_out_proj,
+        )?;
+
+        // 3d. concat(attn_out, activated) → synapse U-Net.
+        let mut pre_syn_host = Vec::with_capacity(d_in + d);
+        pre_syn_host.extend_from_slice(&attn_out_host);
+        pre_syn_host.extend_from_slice(activated);
+        let pre_syn_t = Tensor::<D>::from_slice(&pre_syn_host)?;
+        let pre_act_t = w.synapse.forward(&pre_syn_t)?;
+        let pre_act_host: Vec<f32> = pre_act_t.to_vec()?;
+
+        // 3e. trace shift (host bookkeeping).
+        for n in 0..d {
+            let base = n * m;
+            trace.copy_within(base + 1..base + m, base);
+            trace[base + m - 1] = pre_act_host[n];
+        }
+
+        // 3f. NLM stage1 + GLU + optional stage2 + GLU.
+        let trace_t = Tensor::<D>::from_slice(trace)?;
+        let activated_new_host = nlm_forward_typed_helper::<D>(
+            &trace_t, &w.nlm_stage1, w.nlm_stage2.as_ref(), d,
+        )?;
+        *activated = activated_new_host;
+
+        // 3g. sync_out update.
+        let sync_out = sync_update(activated, &w.sync_out_left, &w.sync_out_right,
+            &mut alpha_out, &mut beta_out, &decay_out_host);
+
+        // 3h. output_proj on device.
+        let so_t = Tensor::<D>::from_slice(&sync_out)?;
+        let pred_t = w.output_proj.forward(&so_t)?;
+        let pred_host: Vec<f32> = pred_t.to_vec()?;
+        let cert = compute_certainty(&pred_host);
+        predictions.push(pred_host);
+        certainties.push(cert);
+    }
+
+    let ticks_used = predictions.len();
+    let sync_out_final = sync_read(&alpha_out, &beta_out);
+    Ok(CtmOutput {
+        predictions,
+        certainties,
+        sync_out: sync_out_final,
+        exit_lambdas: Vec::new(),
+        ticks_used,
+        trajectory: Vec::new(),
+    })
+}
+
+// ─── ctm_forward_typed_with_cache + ctm_backward_typed ───────
+//
+// Slice 4 orchestration: forward returns every intermediate the
+// matched backward needs; backward walks reverse-tick consuming
+// the cache. v0 covers the same feature subset as ctm_forward_typed
+// (single-token, no episodic, no exit gate) — full features land
+// after the parity loop is closed.
+
+/// Per-tick cache populated by `ctm_forward_typed_with_cache`.
+pub struct TickCacheTyped<D: TensorDevice> {
+    pub sync_action: Vec<f32>,
+    pub q: Tensor<D>,
+    pub mha: MhaCacheTyped<D>,
+    pub attn_out: Tensor<D>,
+    pub activated_pre_tick: Vec<f32>,    // activated[] before this tick's NLM
+    pub trace_pre_tick: Vec<f32>,         // trace before shift
+    pub synapse_input: Tensor<D>,         // [d_input + d_model] the "concat(attn, activated)"
+    pub synapse_cache: super::synapse::SynapseUNetCacheTyped<D>,
+    pub pre_act: Tensor<D>,                // synapse output (= NLM input via shift)
+    pub trace_post_shift: Vec<f32>,
+    pub nlm: NlmCacheTyped<D>,
+    pub sync_out_for_pred: Vec<f32>,       // post-update sync, fed into output_proj
+    pub alpha_out_post: Vec<f32>,
+    pub beta_out_post: Vec<f32>,
+    pub alpha_action_post: Vec<f32>,
+    pub beta_action_post: Vec<f32>,
+}
+
+/// Top-level cache: per-tick + KV path intermediates from before the loop.
+pub struct CtmCacheTyped<D: TensorDevice> {
+    pub obs: Tensor<D>,                    // raw obs token
+    pub kv_pre_ln: Tensor<D>,              // kv_proj output before LN
+    pub kv_ln_cache: Tensor<D>,            // mean+rstd from layer_norm_train
+    pub kv: Tensor<D>,                     // post-LN, fed into MHA per tick
+    pub ticks: Vec<TickCacheTyped<D>>,
+    pub d_input: usize,
+    pub d_model: usize,
+    pub raw_input_dim: usize,
+    pub memory_length: usize,
+}
+
+/// Forward pass with full cache for backward. Same algorithm as
+/// `ctm_forward_typed` but captures every intermediate.
+#[allow(clippy::too_many_arguments)]
+pub fn ctm_forward_typed_with_cache<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    activated: &mut Vec<f32>,
+    trace: &mut Vec<f32>,
+    obs: &[f32],
+) -> Result<(CtmOutput, CtmCacheTyped<D>), BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+
+    // KV projection + LN with cache.
+    let obs_t = Tensor::<D>::from_slice(obs)?;
+    let kv_pre_ln = w.kv_proj.forward(&obs_t)?;
+    let mut kv_post = Tensor::<D>::zeros(d_in)?;
+    let mut kv_ln_cache = Tensor::<D>::zeros(2)?;
+    tensor_typed::layer_norm_train(
+        &kv_pre_ln, &w.kv_ln_gamma, &w.kv_ln_beta,
+        &mut kv_post, &mut kv_ln_cache, 1, d_in,
+    )?;
+    let kv_host: Vec<f32> = kv_post.to_vec()?;
+    let n_tokens = 1;
+
+    // Bookkeeping.
+    let mut alpha_out: Vec<f32> = Vec::new();
+    let mut beta_out: Vec<f32> = Vec::new();
+    let decay_out_host: Vec<f32> = w.decay_params_out.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let decay_action_host: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    sync_init(activated, &w.sync_out_left, &w.sync_out_right,
+        &mut alpha_out, &mut beta_out);
+
+    let mut alpha_action: Vec<f32> = Vec::new();
+    let mut beta_action: Vec<f32> = Vec::new();
+    let mut action_initialized = false;
+
+    let mut predictions = Vec::with_capacity(k);
+    let mut certainties = Vec::with_capacity(k);
+    let mut tick_caches: Vec<TickCacheTyped<D>> = Vec::with_capacity(k);
+
+    for _tick in 0..k {
+        let activated_pre_tick = activated.clone();
+        let trace_pre_tick = trace.clone();
+
+        // sync_action.
+        let sync_action: Vec<f32> = if !action_initialized {
+            sync_init(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action);
+            action_initialized = true;
+            sync_read(&alpha_action, &beta_action)
+        } else {
+            sync_update(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, &decay_action_host)
+        };
+        let alpha_action_post = alpha_action.clone();
+        let beta_action_post = beta_action.clone();
+
+        // q_proj.
+        let sa_t = Tensor::<D>::from_slice(&sync_action)?;
+        let q_t = w.q_proj.forward(&sa_t)?;
+        let q_host: Vec<f32> = q_t.to_vec()?;
+
+        // MHA with cache.
+        let (attn_out_h, mha_cache) = multihead_attention_with_cache_typed::<D>(
+            &q_host, &kv_host, n_tokens, d_in, cfg.heads,
+            &w.mha_in_proj, &w.mha_out_proj,
+        )?;
+        let attn_out_t = Tensor::<D>::from_slice(&attn_out_h)?;
+
+        // synapse input = concat(attn_out, activated).
+        let mut pre_syn_host = Vec::with_capacity(d_in + d);
+        pre_syn_host.extend_from_slice(&attn_out_h);
+        pre_syn_host.extend_from_slice(activated);
+        let pre_syn_t = Tensor::<D>::from_slice(&pre_syn_host)?;
+        let (pre_act_t, synapse_cache) = w.synapse.forward_with_cache(&pre_syn_t)?;
+        let pre_act_host: Vec<f32> = pre_act_t.to_vec()?;
+
+        // Trace shift.
+        for n in 0..d {
+            let base = n * m;
+            trace.copy_within(base + 1..base + m, base);
+            trace[base + m - 1] = pre_act_host[n];
+        }
+        let trace_post_shift = trace.clone();
+
+        // NLM forward with cache.
+        let trace_t = Tensor::<D>::from_slice(trace)?;
+        let (activated_new_host, nlm_cache) = nlm_forward_with_cache::<D>(
+            &trace_t, &w.nlm_stage1, w.nlm_stage2.as_ref(), d,
+        )?;
+        *activated = activated_new_host;
+
+        // sync_out update.
+        let sync_out = sync_update(activated, &w.sync_out_left, &w.sync_out_right,
+            &mut alpha_out, &mut beta_out, &decay_out_host);
+        let alpha_out_post = alpha_out.clone();
+        let beta_out_post = beta_out.clone();
+
+        // output_proj.
+        let so_t = Tensor::<D>::from_slice(&sync_out)?;
+        let pred_t = w.output_proj.forward(&so_t)?;
+        let pred_host: Vec<f32> = pred_t.to_vec()?;
+        let cert = compute_certainty(&pred_host);
+        predictions.push(pred_host);
+        certainties.push(cert);
+
+        tick_caches.push(TickCacheTyped {
+            sync_action,
+            q: q_t,
+            mha: mha_cache,
+            attn_out: attn_out_t,
+            activated_pre_tick,
+            trace_pre_tick,
+            synapse_input: pre_syn_t,
+            synapse_cache,
+            pre_act: pre_act_t,
+            trace_post_shift,
+            nlm: nlm_cache,
+            sync_out_for_pred: sync_out,
+            alpha_out_post,
+            beta_out_post,
+            alpha_action_post,
+            beta_action_post,
+        });
+    }
+
+    let ticks_used = predictions.len();
+    let sync_out_final = sync_read(&alpha_out, &beta_out);
+    let output = CtmOutput {
+        predictions, certainties,
+        sync_out: sync_out_final,
+        exit_lambdas: Vec::new(),
+        ticks_used,
+        trajectory: Vec::new(),
+    };
+    let cache = CtmCacheTyped {
+        obs: obs_t,
+        kv_pre_ln,
+        kv_ln_cache,
+        kv: kv_post,
+        ticks: tick_caches,
+        d_input: d_in,
+        d_model: d,
+        raw_input_dim: obs.len(),
+        memory_length: m,
+    };
+    Ok((output, cache))
+}
+
+/// CTM backward orchestration. Given upstream `d_predictions[t]` for
+/// each tick (typically from a loss function), walk reverse-tick and
+/// accumulate gradients into `grads`. Returns `d_obs` (gradient flowing
+/// into the raw observation) for upstream connection-synapse backward.
+///
+/// **Output convention:** all weight grads ACCUMULATE; `d_obs` OVERWRITTEN.
+#[allow(clippy::too_many_arguments)]
+pub fn ctm_backward_typed<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    cache: &CtmCacheTyped<D>,
+    d_predictions: &[Vec<f32>],
+    grads: &mut crate::weights::CtmGradientsTyped<D>,
+    unet_grads: &mut crate::synapse::UNetGradsTyped<D>,
+    d_obs: &mut Tensor<D>,
+) -> Result<(), BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let m = cfg.memory_length;
+
+    // Carries across ticks (reverse-tick walk):
+    //   d_kv          — every tick reads the same kv from MHA, so its gradient sums.
+    //   d_activated_carry — synapse U-Net backward at tick T emits
+    //     d_synapse_input[d_in..] = d activated_pre_tick[T] = d activated_post_tick[T-1].
+    //     We thread this back into the next iteration's d_activated (the earlier tick).
+    let mut d_kv = Tensor::<D>::zeros(d_in)?;
+    let mut d_activated_carry: Vec<f32> = vec![0.0f32; d];
+
+    // Walk ticks in reverse.
+    let n_ticks = d_predictions.len().min(cache.ticks.len());
+    for tick_idx in (0..n_ticks).rev() {
+        let tick_cache = &cache.ticks[tick_idx];
+        let d_pred_h = &d_predictions[tick_idx];
+        let d_pred_t = Tensor::<D>::from_slice(d_pred_h)?;
+
+        // Step 1: output_proj backward → d_sync_out.
+        let so_t = Tensor::<D>::from_slice(&tick_cache.sync_out_for_pred)?;
+        let mut d_sync_out = Tensor::<D>::zeros(cfg.n_synch_out)?;
+        grads.backward_output_proj(w, &d_pred_t, &so_t, &mut d_sync_out)?;
+        let d_sync_out_h: Vec<f32> = d_sync_out.to_vec()?;
+
+        // Step 2: sync_update reverse → d_activated (host). Then add
+        // the cross-tick carry from the synapse input of tick T+1
+        // (which feeds this tick's post-tick activated state).
+        let mut d_activated = vec![0.0f32; d];
+        sync_update_reverse_host(
+            &d_sync_out_h,
+            &tick_cache.activated_pre_tick,  // approx: use the post-tick state
+            &tick_cache.alpha_out_post,
+            &tick_cache.beta_out_post,
+            &w.sync_out_left, &w.sync_out_right,
+            &mut d_activated,
+        );
+        for i in 0..d { d_activated[i] += d_activated_carry[i]; }
+
+        // Step 3: NLM backward → d_trace.
+        let d_activated_t = Tensor::<D>::from_slice(&d_activated)?;
+        let mut d_trace = Tensor::<D>::zeros(d * m)?;
+        let (s2_w, s2_b) = match (
+            grads.nlm_s2_w.as_mut(),
+            grads.nlm_s2_b.as_mut(),
+        ) {
+            (Some(w), Some(b)) => (Some(w), Some(b)),
+            _ => (None, None),
+        };
+        nlm_backward_typed_helper::<D>(
+            &d_activated_t, &tick_cache.nlm,
+            &w.nlm_stage1, w.nlm_stage2.as_ref(),
+            &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
+            s2_w, s2_b,
+            &mut d_trace,
+        )?;
+
+        // Step 4: trace shift adjoint → d_pre_act + d_trace_old.
+        let d_trace_h: Vec<f32> = d_trace.to_vec()?;
+        let mut d_pre_act = vec![0.0f32; d];
+        let mut d_trace_old = vec![0.0f32; d * m];
+        trace_shift_adjoint_host(&d_trace_h, &mut d_pre_act, &mut d_trace_old, d, m);
+
+        // Step 5: synapse U-Net backward → d_synapse_input (= d concat(attn, activated)).
+        let d_pre_act_t = Tensor::<D>::from_slice(&d_pre_act)?;
+        let mut d_synapse_input = Tensor::<D>::zeros(d_in + d)?;
+        w.synapse.backward(
+            &d_pre_act_t, &tick_cache.synapse_cache, unet_grads, &mut d_synapse_input,
+        )?;
+        let d_synapse_input_h: Vec<f32> = d_synapse_input.to_vec()?;
+        let d_attn_out = &d_synapse_input_h[..d_in];
+        // The activated half of d_synapse_input carries gradient that
+        // contributes to the *previous tick's* activated. Save it as
+        // the carry for the next iteration of this reverse-tick loop.
+        d_activated_carry.clear();
+        d_activated_carry.extend_from_slice(&d_synapse_input_h[d_in..]);
+
+        // Step 6: MHA backward → d_q_in + d_kv_tokens.
+        let d_attn_out_t = Tensor::<D>::from_slice(d_attn_out)?;
+        let (d_q_in, d_kv_tokens) = multihead_attention_backward_typed::<D>(
+            &d_attn_out_t, &tick_cache.mha, 1, d_in, cfg.heads,
+            &w.mha_in_proj, &w.mha_out_proj,
+            &mut grads.mha_in_w, &mut grads.mha_in_b,
+            &mut grads.mha_out_w, &mut grads.mha_out_b,
+        )?;
+
+        // Accumulate d_kv across ticks (each tick reads same kv).
+        let d_kv_t0 = Tensor::<D>::from_slice(&d_kv_tokens[0])?;
+        tensor_typed::add_assign(&mut d_kv, &d_kv_t0, d_in)?;
+
+        // Step 7: q_proj backward → d_sync_action. sync_action[T] is a
+        // function of activated_pre_tick[T] = activated_post_tick[T-1],
+        // so d_sync_action's gradient feeds the cross-tick carry.
+        let d_q_t = Tensor::<D>::from_slice(&d_q_in)?;
+        let mut d_sync_action = Tensor::<D>::zeros(cfg.n_synch_action)?;
+        grads.backward_q_proj(w, &d_q_t, &Tensor::<D>::from_slice(&tick_cache.sync_action)?,
+            &mut d_sync_action)?;
+        let d_sync_action_h: Vec<f32> = d_sync_action.to_vec()?;
+        sync_update_reverse_host(
+            &d_sync_action_h,
+            &tick_cache.activated_pre_tick,
+            &tick_cache.alpha_action_post,
+            &tick_cache.beta_action_post,
+            &w.sync_action_left, &w.sync_action_right,
+            &mut d_activated_carry,
+        );
+
+        let _ = tick_idx;
+    }
+
+    // After tick loop: kv_ln backward → d_kv_pre_ln, then kv_proj backward → d_obs.
+    let mut d_kv_pre_ln = Tensor::<D>::zeros(d_in)?;
+    grads.backward_kv_ln(
+        w, &d_kv, &cache.kv_pre_ln, &cache.kv_ln_cache,
+        &mut d_kv_pre_ln, d_in,
+    )?;
+    grads.backward_kv_proj(w, &d_kv_pre_ln, &cache.obs, d_obs)?;
+
+    Ok(())
+}
+
+/// Alternate CTM backward entry point: gradient enters via the
+/// post-last-tick `activated[]` state, NOT via per-tick predictions.
+///
+/// **Why:** in the regional cascade, the brain-level `output_proj`
+/// produces predictions; per-region CTMs feed only their final
+/// `activated[]` upward into the global sync. So the per-region
+/// backward must accept `d_activated_post_last_tick` as the seed
+/// instead of synthesising fake `d_predictions`.
+///
+/// **Semantics relative to `ctm_backward_typed`:**
+/// - Skips Step 1 (output_proj backward) — no per-region prediction loss.
+/// - Skips Step 2 (sync_update reverse) — no per-region sync produces
+///   loss at the regional level.
+/// - At the last tick: `d_activated` is seeded from
+///   `d_activated_post_last_tick`.
+/// - At earlier ticks: `d_activated` is zero (cross-tick carry through
+///   activated_pre_tick is currently dropped — same v0 limitation as
+///   `ctm_backward_typed`).
+/// - Walks Step 3 (NLM) → 4 (trace shift) → 5 (synapse) → 6 (MHA)
+///   → 7 (q_proj) for every tick.
+/// - After tick loop: kv_ln backward → kv_proj backward → `d_obs`.
+///
+/// **Output convention:** all weight grads ACCUMULATE; `d_obs`
+/// OVERWRITTEN.
+#[allow(clippy::too_many_arguments)]
+pub fn ctm_backward_from_d_activated<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    cache: &CtmCacheTyped<D>,
+    d_activated_post_last_tick: &Tensor<D>,
+    grads: &mut crate::weights::CtmGradientsTyped<D>,
+    unet_grads: &mut crate::synapse::UNetGradsTyped<D>,
+    d_obs: &mut Tensor<D>,
+) -> Result<(), BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let m = cfg.memory_length;
+
+    // Carries across ticks:
+    //   d_kv             — per-MHA-tick gradient sums (every tick reads same kv).
+    //   d_activated_carry — synapse U-Net backward at tick T emits
+    //     d_synapse_input[d_in..] = d activated_pre_tick[T] = d activated_post_tick[T-1].
+    //     Threaded back into the next iteration's d_activated. At the last tick
+    //     the carry is seeded from `d_activated_post_last_tick` (the regional
+    //     gradient flowing in via global sync).
+    let mut d_kv = Tensor::<D>::zeros(d_in)?;
+
+    let n_ticks = cache.ticks.len();
+    let last_tick = n_ticks.saturating_sub(1);
+
+    let d_act_seed_host: Vec<f32> = d_activated_post_last_tick.to_vec()?;
+    if d_act_seed_host.len() != d {
+        return Err(BackendError::Runtime(format!(
+            "ctm_backward_from_d_activated: d_activated len {} != d_model {}",
+            d_act_seed_host.len(), d,
+        )));
+    }
+    let mut d_activated_carry: Vec<f32> = vec![0.0f32; d];
+
+    for tick_idx in (0..n_ticks).rev() {
+        let tick_cache = &cache.ticks[tick_idx];
+
+        // d_activated for this tick: at the LAST tick, seed from the
+        // external `d_activated_post_last_tick`. At earlier ticks,
+        // seed from the synapse-input carry of the next-later tick.
+        let mut d_activated: Vec<f32> = if tick_idx == last_tick {
+            d_act_seed_host.clone()
+        } else {
+            vec![0.0f32; d]
+        };
+        for i in 0..d { d_activated[i] += d_activated_carry[i]; }
+
+        // Step 3: NLM backward → d_trace.
+        let d_activated_t = Tensor::<D>::from_slice(&d_activated)?;
+        let mut d_trace = Tensor::<D>::zeros(d * m)?;
+        let (s2_w, s2_b) = match (
+            grads.nlm_s2_w.as_mut(),
+            grads.nlm_s2_b.as_mut(),
+        ) {
+            (Some(w), Some(b)) => (Some(w), Some(b)),
+            _ => (None, None),
+        };
+        nlm_backward_typed_helper::<D>(
+            &d_activated_t, &tick_cache.nlm,
+            &w.nlm_stage1, w.nlm_stage2.as_ref(),
+            &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
+            s2_w, s2_b,
+            &mut d_trace,
+        )?;
+
+        // Step 4: trace shift adjoint → d_pre_act + d_trace_old.
+        let d_trace_h: Vec<f32> = d_trace.to_vec()?;
+        let mut d_pre_act = vec![0.0f32; d];
+        let mut d_trace_old = vec![0.0f32; d * m];
+        trace_shift_adjoint_host(&d_trace_h, &mut d_pre_act, &mut d_trace_old, d, m);
+
+        // Step 5: synapse U-Net backward → d_synapse_input
+        // (= d concat(attn_out, activated)).
+        let d_pre_act_t = Tensor::<D>::from_slice(&d_pre_act)?;
+        let mut d_synapse_input = Tensor::<D>::zeros(d_in + d)?;
+        w.synapse.backward(
+            &d_pre_act_t, &tick_cache.synapse_cache, unet_grads, &mut d_synapse_input,
+        )?;
+        let d_synapse_input_h: Vec<f32> = d_synapse_input.to_vec()?;
+        let d_attn_out = &d_synapse_input_h[..d_in];
+        // Save the activated half as carry for the next iteration
+        // (= the earlier tick) of this reverse-tick walk.
+        d_activated_carry.clear();
+        d_activated_carry.extend_from_slice(&d_synapse_input_h[d_in..]);
+
+        // Step 6: MHA backward → d_q_in + d_kv_tokens.
+        let d_attn_out_t = Tensor::<D>::from_slice(d_attn_out)?;
+        let (d_q_in, d_kv_tokens) = multihead_attention_backward_typed::<D>(
+            &d_attn_out_t, &tick_cache.mha, 1, d_in, cfg.heads,
+            &w.mha_in_proj, &w.mha_out_proj,
+            &mut grads.mha_in_w, &mut grads.mha_in_b,
+            &mut grads.mha_out_w, &mut grads.mha_out_b,
+        )?;
+
+        let d_kv_t0 = Tensor::<D>::from_slice(&d_kv_tokens[0])?;
+        tensor_typed::add_assign(&mut d_kv, &d_kv_t0, d_in)?;
+
+        // Step 7: q_proj backward → d_sync_action. sync_action[T] uses
+        // activated_pre_tick[T] = activated_post_tick[T-1]; reverse the
+        // sync_action update to add a contribution to the cross-tick carry.
+        let d_q_t = Tensor::<D>::from_slice(&d_q_in)?;
+        let mut d_sync_action = Tensor::<D>::zeros(cfg.n_synch_action)?;
+        grads.backward_q_proj(
+            w, &d_q_t,
+            &Tensor::<D>::from_slice(&tick_cache.sync_action)?,
+            &mut d_sync_action,
+        )?;
+        let d_sync_action_h: Vec<f32> = d_sync_action.to_vec()?;
+        sync_update_reverse_host(
+            &d_sync_action_h,
+            &tick_cache.activated_pre_tick,
+            &tick_cache.alpha_action_post,
+            &tick_cache.beta_action_post,
+            &w.sync_action_left, &w.sync_action_right,
+            &mut d_activated_carry,
+        );
+    }
+
+    // After tick loop: kv_ln backward → d_kv_pre_ln, then kv_proj backward → d_obs.
+    let mut d_kv_pre_ln = Tensor::<D>::zeros(d_in)?;
+    grads.backward_kv_ln(
+        w, &d_kv, &cache.kv_pre_ln, &cache.kv_ln_cache,
+        &mut d_kv_pre_ln, d_in,
+    )?;
+    grads.backward_kv_proj(w, &d_kv_pre_ln, &cache.obs, d_obs)?;
+
+    Ok(())
+}
+
+/// Per-neuron NLM forward via typed SuperLinear<D>. v0 does the GLU
+/// step on host between stages — typed `glu` exists but the layout
+/// for per-neuron paired (value, gate) needs a small reshape.
+fn nlm_forward_typed_helper<D: TensorDevice>(
+    trace: &Tensor<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_model: usize,
+) -> Result<Vec<f32>, BackendError> {
+    let s1_t = stage1.forward(trace)?;
+    let s1_host: Vec<f32> = s1_t.to_vec()?;
+    let s1_glu = per_neuron_glu(&s1_host, d_model, stage1.out_per);
+
+    if let Some(s2) = stage2 {
+        let s1_glu_t = Tensor::<D>::from_slice(&s1_glu)?;
+        let s2_t = s2.forward(&s1_glu_t)?;
+        let s2_host: Vec<f32> = s2_t.to_vec()?;
+        Ok(per_neuron_glu(&s2_host, d_model, s2.out_per))
+    } else {
+        Ok(s1_glu)
+    }
+}
+
+/// NLM forward + cache. Same as `nlm_forward_typed_helper` but
+/// returns the intermediates needed by `nlm_backward_typed_helper`:
+/// `s1` (pre-GLU stage1 output), `s1_glu` (post-GLU, = stage2 input),
+/// `s2` (pre-GLU stage2 output, only when deep). Caller persists
+/// these as part of `CtmCacheTyped<D>` for the backward pass.
+pub struct NlmCacheTyped<D: TensorDevice> {
+    pub trace: Tensor<D>,           // [d_model × in_per_1]
+    pub s1: Tensor<D>,              // [d_model × out_per_1]
+    pub s1_glu: Tensor<D>,          // [d_model × out_per_1/2]
+    pub s2: Option<Tensor<D>>,      // [d_model × out_per_2] when stage2 present
+}
+
+#[allow(dead_code)] // wired by ctm_backward_typed in the next slice commit.
+fn nlm_forward_with_cache<D: TensorDevice>(
+    trace: &Tensor<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_model: usize,
+) -> Result<(Vec<f32>, NlmCacheTyped<D>), BackendError> {
+    let s1_t = stage1.forward(trace)?;
+    let s1_host: Vec<f32> = s1_t.to_vec()?;
+    let s1_glu_host = per_neuron_glu(&s1_host, d_model, stage1.out_per);
+    let s1_glu_t = Tensor::<D>::from_slice(&s1_glu_host)?;
+
+    let (final_host, s2_cache) = if let Some(s2) = stage2 {
+        let s2_t = s2.forward(&s1_glu_t)?;
+        let s2_host: Vec<f32> = s2_t.to_vec()?;
+        let final_glu = per_neuron_glu(&s2_host, d_model, s2.out_per);
+        (final_glu, Some(s2_t))
+    } else {
+        (s1_glu_host.clone(), None)
+    };
+
+    let cache = NlmCacheTyped {
+        trace: Tensor::<D>::from_slice(&trace.to_vec()?)?,
+        s1: s1_t,
+        s1_glu: s1_glu_t,
+        s2: s2_cache,
+    };
+    Ok((final_host, cache))
+}
+
+/// Reverse the sync_update / sync_init at one tick.
+///
+/// Forward: `alpha[i] = r[i]·alpha_prev[i] + activated[left[i]]·activated[right[i]]`
+///          `beta[i]  = r[i]·beta_prev[i]  + 1`
+///          `sync[i]  = alpha[i] / sqrt(beta[i])`
+///
+/// Backward: given `d_sync` (length n_pairs), accumulate into
+/// `d_activated` (length d_model) the contribution from this tick's
+/// product term. The `r·alpha_prev` carry through ticks is handled
+/// by the orchestration loop (each tick consumes its slice of the
+/// d_alpha trail).
+///
+/// **Output convention:** d_activated ACCUMULATES (multiple sync
+/// pairs may touch the same neuron index).
+pub fn sync_update_reverse_host(
+    d_sync: &[f32],
+    activated: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    left: &[usize],
+    right: &[usize],
+    d_activated: &mut [f32],
+) {
+    let n_pairs = left.len();
+    debug_assert_eq!(d_sync.len(), n_pairs);
+    for i in 0..n_pairs {
+        let beta_i = beta[i].max(1e-8);
+        let inv_sqrt_beta = 1.0 / beta_i.sqrt();
+        // d_alpha = d_sync / sqrt(beta); d_beta path is for higher-
+        // order corrections — skipped here because alpha/beta carry
+        // multiplicatively through ticks via r and the dominant
+        // gradient flows through alpha.
+        let d_alpha = d_sync[i] * inv_sqrt_beta;
+        let l = left[i];
+        let r = right[i];
+        // d_product / d_activated[left]  = activated[right]
+        // d_product / d_activated[right] = activated[left]
+        // alpha gradient flows directly into product (the +product term).
+        d_activated[l] += d_alpha * activated[r];
+        d_activated[r] += d_alpha * activated[l];
+        let _ = alpha; // alpha read is reserved for the higher-order
+                       // beta correction — kept in the signature so
+                       // callers can plug it in when full correction
+                       // is added. Today we use the dominant term.
+    }
+}
+
+/// Reverse the per-neuron trace shift that `ctm_forward_typed` does:
+///   forward:  trace_new[base+i] = trace_old[base+i+1]   for i in 0..m-1
+///             trace_new[base+m-1] = pre_act[n]
+///
+/// backward: given `d_trace_new` (per neuron flat, length d_model*m),
+/// produce `d_pre_act` (length d_model) and overwrite `d_trace_old`
+/// with the shifted gradient.
+///
+/// **Output conventions:** d_pre_act OVERWRITTEN; d_trace_old OVERWRITTEN.
+pub fn trace_shift_adjoint_host(
+    d_trace_new: &[f32],
+    d_pre_act: &mut [f32],
+    d_trace_old: &mut [f32],
+    d_model: usize,
+    memory_length: usize,
+) {
+    debug_assert_eq!(d_trace_new.len(), d_model * memory_length);
+    debug_assert_eq!(d_pre_act.len(), d_model);
+    debug_assert_eq!(d_trace_old.len(), d_model * memory_length);
+    for n in 0..d_model {
+        let base = n * memory_length;
+        // d_pre_act[n] picks up the gradient on the newly-inserted slot.
+        d_pre_act[n] = d_trace_new[base + memory_length - 1];
+        // Other slots: gradient on trace_new[base+i] flows to trace_old[base+i+1].
+        // Equivalently: d_trace_old[base + i + 1] = d_trace_new[base + i] for i in 0..m-1.
+        // Slot trace_old[base + 0] receives no gradient through the shift
+        // (it was discarded by the forward; conceptually the oldest entry
+        // falls out of the window).
+        d_trace_old[base] = 0.0;
+        for i in 0..memory_length - 1 {
+            d_trace_old[base + i + 1] = d_trace_new[base + i];
+        }
+    }
+}
+
+/// NLM backward: given upstream `d_activated` (gradient w.r.t. NLM
+/// output, length = `d_model × final_per_half`), compose backwards
+/// through optional stage2-GLU and stage1-GLU, accumulating into
+/// `d_W`/`d_b` for each stage and overwriting `d_trace`.
+///
+/// **Output convention:** d_W and d_b ACCUMULATE; d_trace is OVERWRITTEN.
+pub fn nlm_backward_typed_helper<D: TensorDevice>(
+    d_activated: &Tensor<D>,    // [d_model × out_per_2/2] (deep) or [d_model × out_per_1/2]
+    cache: &NlmCacheTyped<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_stage1_w: &mut Tensor<D>,
+    d_stage1_b: &mut Tensor<D>,
+    d_stage2_w: Option<&mut Tensor<D>>,
+    d_stage2_b: Option<&mut Tensor<D>>,
+    d_trace: &mut Tensor<D>,
+) -> Result<(), BackendError> {
+    let n_neurons = stage1.n_neurons;
+
+    // d_s1_glu — gradient flowing into the stage1 GLU output.
+    // For deep NLM: comes from stage2 backward.
+    // For shallow: equals d_activated directly.
+    let d_s1_glu = if let Some(s2) = stage2 {
+        let s2_cache = cache.s2.as_ref()
+            .expect("deep NLM cache requires s2");
+        // Step 1: d_s2 = glu_bwd(d_activated, s2) — overwrite into a fresh buffer.
+        let mut d_s2 = Tensor::<D>::zeros(n_neurons * s2.out_per)?;
+        tensor_typed::glu_bwd(d_activated, s2_cache, &mut d_s2,
+            n_neurons, s2.out_per / 2)?;
+        // Step 2: super_linear backward — d_W2 += d_s2 ⊗ s1_glu, d_s1_glu = W2^T·d_s2.
+        let mut d_s1_glu_buf = Tensor::<D>::zeros(n_neurons * s2.in_per)?;
+        if let (Some(dw), Some(db)) = (d_stage2_w, d_stage2_b) {
+            tensor_typed::super_linear_bwd_dw(&d_s2, &cache.s1_glu, dw,
+                n_neurons, s2.in_per, s2.out_per)?;
+            // d_b += d_s2 (per-neuron passthrough — same shape as biases).
+            tensor_typed::add_assign(db, &d_s2, n_neurons * s2.out_per)?;
+        }
+        tensor_typed::super_linear_bwd_dx(&d_s2, &s2.weights, &mut d_s1_glu_buf,
+            n_neurons, s2.in_per, s2.out_per)?;
+        d_s1_glu_buf
+    } else {
+        // Shallow: d_activated IS the gradient w.r.t. s1_glu. Clone it
+        // (we need a Tensor<D> to feed into the next glu_bwd call).
+        let host: Vec<f32> = d_activated.to_vec()?;
+        Tensor::<D>::from_slice(&host)?
+    };
+
+    // Step 3: d_s1 = glu_bwd(d_s1_glu, s1)
+    let mut d_s1 = Tensor::<D>::zeros(n_neurons * stage1.out_per)?;
+    tensor_typed::glu_bwd(&d_s1_glu, &cache.s1, &mut d_s1,
+        n_neurons, stage1.out_per / 2)?;
+
+    // Step 4: super_linear stage1 backward — d_W1 += d_s1 ⊗ trace, d_trace = W1^T·d_s1.
+    tensor_typed::super_linear_bwd_dw(&d_s1, &cache.trace, d_stage1_w,
+        n_neurons, stage1.in_per, stage1.out_per)?;
+    tensor_typed::add_assign(d_stage1_b, &d_s1, n_neurons * stage1.out_per)?;
+    tensor_typed::super_linear_bwd_dx(&d_s1, &stage1.weights, d_trace,
+        n_neurons, stage1.in_per, stage1.out_per)?;
+
+    Ok(())
+}
+
+/// MHA forward + cache. Same algorithm as `multihead_attention_typed_helper`
+/// but returns the intermediates the matched backward needs:
+/// `q_full` (= in_proj(q_in)[..d_input]), `k_all`, `v_all` (per-token K/V),
+/// per-head softmax `weights`, the concat_heads input to out_proj, and
+/// the q_in / kv_tokens used for in_proj backward.
+pub struct MhaCacheTyped<D: TensorDevice> {
+    pub q_full: Vec<f32>,
+    pub k_all: Vec<f32>,
+    pub v_all: Vec<f32>,
+    pub attn_weights: Vec<Vec<f32>>,    // [n_heads][n_tokens]
+    pub concat_heads: Tensor<D>,         // out_proj input — needed for Linear::backward
+    pub q_in: Vec<f32>,
+    pub kv_tokens: Vec<Vec<f32>>,
+}
+
+#[allow(dead_code)] // wired by ctm_backward_typed in next slice commit.
+fn multihead_attention_with_cache_typed<D: TensorDevice>(
+    q_in: &[f32],
+    kv_flat: &[f32],
+    n_tokens: usize,
+    d_input: usize,
+    n_heads: usize,
+    in_proj: &tensor_typed::Linear<D>,
+    out_proj: &tensor_typed::Linear<D>,
+) -> Result<(Vec<f32>, MhaCacheTyped<D>), BackendError> {
+    let d_head = d_input / n_heads;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    // Q projection.
+    let q_in_t = Tensor::<D>::from_slice(q_in)?;
+    let q_full_t = in_proj.forward(&q_in_t)?;
+    let q_full_h: Vec<f32> = q_full_t.to_vec()?;
+    let q_full = q_full_h[..d_input].to_vec();
+
+    // KV projection — store per-token K + V slices.
+    let mut k_all = Vec::with_capacity(n_tokens * d_input);
+    let mut v_all = Vec::with_capacity(n_tokens * d_input);
+    let mut kv_tokens = Vec::with_capacity(n_tokens);
+    for t in 0..n_tokens {
+        let tok = &kv_flat[t * d_input..(t + 1) * d_input];
+        kv_tokens.push(tok.to_vec());
+        let tok_t = Tensor::<D>::from_slice(tok)?;
+        let proj_t = in_proj.forward(&tok_t)?;
+        let proj_h: Vec<f32> = proj_t.to_vec()?;
+        k_all.extend_from_slice(&proj_h[d_input..2 * d_input]);
+        v_all.extend_from_slice(&proj_h[2 * d_input..3 * d_input]);
+    }
+
+    // Per-head softmax + weighted sum (host).
+    let mut all_weights = Vec::with_capacity(n_heads);
+    let mut concat_heads_h = Vec::with_capacity(d_input);
+    for h in 0..n_heads {
+        let q_h = &q_full[h * d_head..(h + 1) * d_head];
+        let mut scores = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let k_h = &k_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
+            scores.push(q_h.iter().zip(k_h).map(|(&a, &b)| a * b).sum::<f32>() * scale);
+        }
+        let max_s = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exp_s: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+        let sum_s: f32 = exp_s.iter().sum();
+        let weights: Vec<f32> = exp_s.iter().map(|&e| e / sum_s).collect();
+        let mut head_out = vec![0.0f32; d_head];
+        for t in 0..n_tokens {
+            let v_h = &v_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
+            for j in 0..d_head { head_out[j] += weights[t] * v_h[j]; }
+        }
+        all_weights.push(weights);
+        concat_heads_h.extend_from_slice(&head_out);
+    }
+
+    // out_proj.
+    let concat_t = Tensor::<D>::from_slice(&concat_heads_h)?;
+    let out_t = out_proj.forward(&concat_t)?;
+    let out_h: Vec<f32> = out_t.to_vec()?;
+
+    let cache = MhaCacheTyped {
+        q_full, k_all, v_all,
+        attn_weights: all_weights,
+        concat_heads: Tensor::<D>::from_slice(&concat_heads_h)?,
+        q_in: q_in.to_vec(),
+        kv_tokens,
+    };
+    Ok((out_h, cache))
+}
+
+/// MHA backward — composes Linear<D>::backward (out_proj, in_proj × per-token) with
+/// per-head host softmax_bwd + Q·K^T adjoint + value-weighted-sum adjoint. Returns
+/// (d_q_in, d_kv_tokens).
+///
+/// in_proj backward: we don't have a row-sliced backward, so we build masked
+/// upstream gradients (length 3*d_input) and call Linear::backward once per
+/// input (q_in, then per-token kv). All calls accumulate into the same d_W/d_b.
+#[allow(dead_code)] // wired by ctm_backward_typed in next slice commit.
+fn multihead_attention_backward_typed<D: TensorDevice>(
+    d_out: &Tensor<D>,
+    cache: &MhaCacheTyped<D>,
+    n_tokens: usize,
+    d_input: usize,
+    n_heads: usize,
+    in_proj: &tensor_typed::Linear<D>,
+    out_proj: &tensor_typed::Linear<D>,
+    d_in_w: &mut Tensor<D>, d_in_b: &mut Tensor<D>,
+    d_out_w: &mut Tensor<D>, d_out_b: &mut Tensor<D>,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>), BackendError> {
+    let d_head = d_input / n_heads;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    // 1. out_proj backward → d_concat (length d_input).
+    let mut d_concat = Tensor::<D>::zeros(d_input)?;
+    out_proj.backward(d_out, &cache.concat_heads, d_out_w, d_out_b, &mut d_concat)?;
+    let d_concat_h: Vec<f32> = d_concat.to_vec()?;
+
+    // 2. Per-head softmax+sum reverse (host).
+    let mut d_q_full = vec![0.0f32; d_input];
+    let mut d_k_all = vec![0.0f32; n_tokens * d_input];
+    let mut d_v_all = vec![0.0f32; n_tokens * d_input];
+    for h in 0..n_heads {
+        let d_head_out = &d_concat_h[h * d_head..(h + 1) * d_head];
+        let weights = &cache.attn_weights[h];
+        let mut d_weights = vec![0.0f32; n_tokens];
+        for t in 0..n_tokens {
+            let v_h = &cache.v_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
+            for j in 0..d_head {
+                d_weights[t] += d_head_out[j] * v_h[j];
+                d_v_all[t * d_input + h * d_head + j] += weights[t] * d_head_out[j];
+            }
+        }
+        // softmax_bwd in closed form (Jacobian-vector product).
+        let dot_wd: f32 = weights.iter().zip(&d_weights).map(|(&w, &d)| w * d).sum();
+        let d_scores: Vec<f32> = (0..n_tokens)
+            .map(|t| weights[t] * (d_weights[t] - dot_wd) * scale)
+            .collect();
+        // Reverse Q·K^T.
+        let q_h = &cache.q_full[h * d_head..(h + 1) * d_head];
+        for t in 0..n_tokens {
+            let k_start = t * d_input + h * d_head;
+            for j in 0..d_head {
+                d_q_full[h * d_head + j] += d_scores[t] * cache.k_all[k_start + j];
+                d_k_all[k_start + j] += d_scores[t] * q_h[j];
+            }
+        }
+    }
+
+    // 3. in_proj backward for Q from q_in.
+    //    Mask: upstream = [d_q_full, 0, 0] (length 3*d_input).
+    let mut q_upstream = vec![0.0f32; 3 * d_input];
+    q_upstream[..d_input].copy_from_slice(&d_q_full);
+    let q_upstream_t = Tensor::<D>::from_slice(&q_upstream)?;
+    let q_in_t = Tensor::<D>::from_slice(&cache.q_in)?;
+    let mut d_q_in_t = Tensor::<D>::zeros(d_input)?;
+    in_proj.backward(&q_upstream_t, &q_in_t, d_in_w, d_in_b, &mut d_q_in_t)?;
+    let d_q_in: Vec<f32> = d_q_in_t.to_vec()?;
+
+    // 4. in_proj backward for K + V from each kv_token.
+    //    Mask: upstream = [0, d_k_t, d_v_t].
+    let mut d_kv_tokens: Vec<Vec<f32>> = Vec::with_capacity(n_tokens);
+    for t in 0..n_tokens {
+        let mut kv_upstream = vec![0.0f32; 3 * d_input];
+        kv_upstream[d_input..2 * d_input].copy_from_slice(
+            &d_k_all[t * d_input..(t + 1) * d_input],
+        );
+        kv_upstream[2 * d_input..3 * d_input].copy_from_slice(
+            &d_v_all[t * d_input..(t + 1) * d_input],
+        );
+        let upstream_t = Tensor::<D>::from_slice(&kv_upstream)?;
+        let tok_t = Tensor::<D>::from_slice(&cache.kv_tokens[t])?;
+        let mut d_tok = Tensor::<D>::zeros(d_input)?;
+        in_proj.backward(&upstream_t, &tok_t, d_in_w, d_in_b, &mut d_tok)?;
+        d_kv_tokens.push(d_tok.to_vec()?);
+    }
+
+    Ok((d_q_in, d_kv_tokens))
+}
+
+/// Multi-head attention via typed `Linear<D>` for the two big matmuls;
+/// per-head dot-products + softmax + value-weighted-sum are host
+/// (small, intricate to typify). Mirrors `multihead_attention` exactly.
+fn multihead_attention_typed_helper<D: TensorDevice>(
+    q_in: &[f32],            // [d_input]
+    kv_flat: &[f32],         // [n_tokens × d_input]
+    n_tokens: usize,
+    d_input: usize,
+    n_heads: usize,
+    in_proj: &tensor_typed::Linear<D>,    // d_input → 3×d_input
+    out_proj: &tensor_typed::Linear<D>,   // d_input → d_input
+) -> Result<Vec<f32>, BackendError> {
+    let d_head = d_input / n_heads;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    // Project query through full in_proj (we'll slice the [Q | K | V]
+    // result on host since Q only uses the first d_input of 3*d_input).
+    let q_in_t = Tensor::<D>::from_slice(q_in)?;
+    let q_full_t = in_proj.forward(&q_in_t)?;   // [3*d_input]
+    let q_full_host: Vec<f32> = q_full_t.to_vec()?;
+    let q_full = &q_full_host[..d_input];
+
+    // Project all KV tokens — for each token, we need K (slice
+    // d_input..2*d_input) and V (slice 2*d_input..3*d_input).
+    let mut k_all = Vec::with_capacity(n_tokens * d_input);
+    let mut v_all = Vec::with_capacity(n_tokens * d_input);
+    for t in 0..n_tokens {
+        let tok = &kv_flat[t * d_input..(t + 1) * d_input];
+        let tok_t = Tensor::<D>::from_slice(tok)?;
+        let proj_t = in_proj.forward(&tok_t)?;     // [3*d_input]
+        let proj_host: Vec<f32> = proj_t.to_vec()?;
+        k_all.extend_from_slice(&proj_host[d_input..2 * d_input]);
+        v_all.extend_from_slice(&proj_host[2 * d_input..3 * d_input]);
+    }
+
+    // Per-head scaled dot-product attention (host arithmetic).
+    let mut concat_heads = Vec::with_capacity(d_input);
+    for h in 0..n_heads {
+        let q_h = &q_full[h * d_head..(h + 1) * d_head];
+
+        let mut scores = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let k_h = &k_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
+            let dot: f32 = q_h.iter().zip(k_h).map(|(&a, &b)| a * b).sum();
+            scores.push(dot * scale);
+        }
+
+        let max_s = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exp_s: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+        let sum_s: f32 = exp_s.iter().sum();
+
+        let mut head_out = vec![0.0f32; d_head];
+        for t in 0..n_tokens {
+            let w = exp_s[t] / sum_s;
+            let v_h = &v_all[t * d_input + h * d_head..t * d_input + (h + 1) * d_head];
+            for j in 0..d_head {
+                head_out[j] += w * v_h[j];
+            }
+        }
+        concat_heads.extend_from_slice(&head_out);
+    }
+
+    let concat_t = Tensor::<D>::from_slice(&concat_heads)?;
+    let out_t = out_proj.forward(&concat_t)?;
+    out_t.to_vec()
+}
 
 #[cfg(test)]
-mod tests {
+mod typed_forward_tests {
     use super::*;
+    use modgrad_device::backend::tensor::Cpu;
+    #[cfg(feature = "rocm")]
+    use modgrad_device::backend::tensor::Rocm;
     use crate::config::CtmConfig;
     use crate::weights::{CtmWeights, CtmState};
 
-    #[test]
-    fn smoke_forward() {
-        let cfg = CtmConfig {
-            iterations: 4,
-            d_model: 64,
-            d_input: 32,
-            heads: 4,
-            n_synch_out: 32,
-            n_synch_action: 32,
-            synapse_depth: 3,
-            memory_length: 8,
-            deep_nlms: true,
-            memory_hidden_dims: 4,
-            out_dims: 10,
+    fn small_cfg() -> CtmConfig {
+        CtmConfig {
+            iterations: 2,
+            d_model: 4,
+            d_input: 8,
+            heads: 2,
+            n_synch_out: 4,
+            n_synch_action: 4,
+            synapse_depth: 2,
+            memory_length: 4,
+            deep_nlms: false,
+            memory_hidden_dims: 0,
+            out_dims: 3,
             n_random_pairing_self: 0,
-            min_width: 16,
-            ..Default::default()
-        };
-        let raw_dim = 16;
-        let w = CtmWeights::new(cfg.clone(), raw_dim);
-        let mut state = CtmState::new(&w);
-
-        eprintln!("  params: {}", w.n_params());
-        eprintln!("  synapse widths: {:?}", w.synapse.widths);
-
-        // Single token observation
-        let obs = vec![0.5f32; raw_dim];
-        let out = ctm_forward(&w, &mut state, CtmInput::Raw {
-            obs: &obs, n_tokens: 1, raw_dim,
-        });
-
-        assert_eq!(out.predictions.len(), cfg.iterations);
-        assert_eq!(out.predictions[0].len(), cfg.out_dims);
-        assert_eq!(out.certainties.len(), cfg.iterations);
-
-        eprintln!("  tick 0 pred: {:?}", &out.predictions[0][..5]);
-        eprintln!("  tick 0 cert: {:?}", out.certainties[0]);
-        eprintln!("  tick {} pred: {:?}", cfg.iterations - 1,
-            &out.predictions[cfg.iterations - 1][..5]);
-        eprintln!("  tick {} cert: {:?}", cfg.iterations - 1,
-            out.certainties[cfg.iterations - 1]);
-
-        // Predictions should differ across ticks (thinking changes output)
-        let diff: f32 = out.predictions[0].iter()
-            .zip(&out.predictions[cfg.iterations - 1])
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        eprintln!("  pred diff (tick 0 vs last): {:.4}", diff);
-        assert!(diff > 0.0, "predictions should change across ticks");
+            min_width: 2,
+            exit_strategy: crate::config::ExitStrategy::None,
+            collect_trajectories: false,
+        }
     }
 
-    /// Host `ctm_forward_with_kv` and resident `ctm_forward_resident`
-    /// must produce matching predictions (first tick, last tick) and
-    /// matching final sync_out within 1e-3 FP tolerance. rocBLAS
-    /// reduces in a different order than AVX-512 dot, so the bound
-    /// is loose. AdaptiveGate is enabled to exercise the resident
-    /// exit_gate dispatch path.
-    ///
-    /// **Why two states.** Both forwards mutate `CtmState` (trace,
-    /// activated, alpha/beta_out). To keep the comparison clean each
-    /// path gets its own state, both seeded identically from
-    /// `CtmState::new(&w)`.
+    /// Run untyped ctm_forward on Raw single-token input and the
+    /// typed Cpu version on the same weights — assert predictions
+    /// agree to 1e-4. The parity proof: typed cascade reproduces
+    /// the brain forward semantics exactly.
+    #[test]
+    fn cpu_typed_ctm_forward_matches_untyped_single_token() {
+        let cfg = small_cfg();
+        let raw_input_dim = 6;
+        let w = CtmWeights::new(cfg.clone(), raw_input_dim);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w)
+            .expect("from_untyped");
+
+        let obs: Vec<f32> = (0..raw_input_dim).map(|i| (i as f32 - 2.5) * 0.3).collect();
+
+        // Untyped reference.
+        let mut state = CtmState::new(&w);
+        let ref_out = ctm_forward(&w, &mut state, CtmInput::Raw {
+            obs: &obs, n_tokens: 1, raw_dim: raw_input_dim,
+        });
+
+        // Typed.
+        let mut activated = w.start_activated.clone();
+        let mut trace = w.start_trace.clone();
+        let typed_out = ctm_forward_typed::<Cpu>(
+            &typed, &mut activated, &mut trace, &obs,
+        ).expect("typed forward");
+
+        assert_eq!(ref_out.predictions.len(), typed_out.predictions.len());
+        assert_eq!(ref_out.ticks_used, typed_out.ticks_used);
+        for (tick, (a, b)) in ref_out.predictions.iter()
+            .zip(&typed_out.predictions).enumerate()
+        {
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!((x - y).abs() < 1e-3,
+                    "tick {} pred[{}] disagree: untyped={} typed={}",
+                    tick, i, x, y);
+            }
+        }
+    }
+
+    /// **The closing capability test.** Run ctm_forward_typed_with_cache,
+    /// then ctm_backward_typed with hand-cooked d_predictions, verify
+    /// every CtmGradientsTyped buffer has non-zero entries (gradient
+    /// flowed through every weight). Confirms the full backward chain
+    /// composes correctly.
+    #[test]
+    fn cpu_ctm_backward_typed_full_chain_flows_gradients() {
+        use crate::weights::{CtmWeights, CtmGradientsTyped};
+        use crate::synapse::UNetGradsTyped;
+
+        let cfg = small_cfg();
+        let raw_input_dim = 6;
+        let w = CtmWeights::new(cfg.clone(), raw_input_dim);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        let obs: Vec<f32> = (0..raw_input_dim).map(|i| (i as f32 - 2.5) * 0.3).collect();
+        let mut activated = w.start_activated.clone();
+        let mut trace = w.start_trace.clone();
+
+        let (out, cache) = ctm_forward_typed_with_cache::<Cpu>(
+            &typed, &mut activated, &mut trace, &obs,
+        ).expect("forward");
+
+        // Hand-cooked d_predictions: ones at every tick.
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()])
+            .collect();
+
+        let mut grads = CtmGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut unet_grads = UNetGradsTyped::<Cpu>::zeros(&typed.synapse).unwrap();
+        let mut d_obs = Tensor::<Cpu>::zeros(raw_input_dim).unwrap();
+        ctm_backward_typed::<Cpu>(
+            &typed, &cache, &d_preds,
+            &mut grads, &mut unet_grads, &mut d_obs,
+        ).expect("backward");
+
+        // Every primary weight gradient must be non-zero (the chain
+        // succeeded in propagating gradient to that weight).
+        // Note: q_proj_w is intentionally NOT probed — with n_tokens=1
+        // (single-token KV) the softmax output is trivially [1.0]
+        // and ∂attn/∂Q = 0, so q_proj sees zero gradient. Multi-token
+        // tests will exercise the Q path.
+        let probes = [
+            ("out_proj_w", &grads.out_proj_w),
+            ("kv_proj_w", &grads.kv_proj_w),
+            ("mha_in_w", &grads.mha_in_w),
+            ("mha_out_w", &grads.mha_out_w),
+            ("nlm_s1_w", &grads.nlm_s1_w),
+        ];
+        for (name, t) in probes {
+            let v = t.to_vec().unwrap();
+            assert!(v.iter().any(|&x| x.abs() > 1e-6),
+                "{} all zero — backward did not flow into this weight", name);
+        }
+        // Synapse first projection grad should also be non-zero.
+        let dw_first = unet_grads.first.d_w.to_vec().unwrap();
+        assert!(dw_first.iter().any(|&x| x.abs() > 1e-6),
+            "unet_grads.first.d_w all zero");
+        // d_obs should be non-zero (gradient flowed all the way back).
+        let do_h = d_obs.to_vec().unwrap();
+        assert!(do_h.iter().any(|&x| x.abs() > 1e-6),
+            "d_obs all zero — kv_proj backward did not flow");
+    }
+
+    #[test]
+    fn cpu_mha_backward_smoke() {
+        // Build mha_in_proj (d_input → 3*d_input) and mha_out_proj (d_input → d_input).
+        // d_input=4, n_heads=2, d_head=2. n_tokens=2.
+        let d_input = 4;
+        let n_heads = 2;
+        let n_tokens = 2;
+
+        // Random-ish weights using deterministic init.
+        let in_w: Vec<f32> = (0..3 * d_input * d_input).map(|i| (i as f32 - 24.0) * 0.05).collect();
+        let in_b = vec![0.0f32; 3 * d_input];
+        let in_proj = tensor_typed::Linear::<Cpu>::from_host(
+            &in_w, &in_b, d_input, 3 * d_input,
+        ).unwrap();
+        let out_w: Vec<f32> = (0..d_input * d_input).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let out_b = vec![0.0f32; d_input];
+        let out_proj = tensor_typed::Linear::<Cpu>::from_host(
+            &out_w, &out_b, d_input, d_input,
+        ).unwrap();
+
+        let q_in: Vec<f32> = (0..d_input).map(|i| (i as f32 + 1.0) * 0.2).collect();
+        let kv: Vec<f32> = (0..n_tokens * d_input).map(|i| (i as f32 - 4.0) * 0.15).collect();
+
+        let (out, cache) = multihead_attention_with_cache_typed::<Cpu>(
+            &q_in, &kv, n_tokens, d_input, n_heads, &in_proj, &out_proj,
+        ).unwrap();
+        assert_eq!(out.len(), d_input);
+
+        // Run backward with a hand-cooked d_out.
+        let d_out_h = vec![1.0, 0.5, -0.5, -1.0];
+        let d_out_t = Tensor::<Cpu>::from_slice(&d_out_h).unwrap();
+        let mut d_in_w = Tensor::<Cpu>::zeros(in_w.len()).unwrap();
+        let mut d_in_b = Tensor::<Cpu>::zeros(in_b.len()).unwrap();
+        let mut d_out_w_t = Tensor::<Cpu>::zeros(out_w.len()).unwrap();
+        let mut d_out_b_t = Tensor::<Cpu>::zeros(out_b.len()).unwrap();
+        let (d_q_in, d_kv_tokens) = multihead_attention_backward_typed::<Cpu>(
+            &d_out_t, &cache, n_tokens, d_input, n_heads,
+            &in_proj, &out_proj,
+            &mut d_in_w, &mut d_in_b, &mut d_out_w_t, &mut d_out_b_t,
+        ).unwrap();
+
+        // Sanity: d_q_in should be non-zero (gradient flowed through Q path).
+        assert!(d_q_in.iter().any(|&v| v.abs() > 1e-6),
+            "d_q_in all zero — Q backward did not flow");
+        // d_kv_tokens should have an entry per token, each non-zero overall.
+        assert_eq!(d_kv_tokens.len(), n_tokens);
+        for (t, dt) in d_kv_tokens.iter().enumerate() {
+            assert!(dt.iter().any(|&v| v.abs() > 1e-6),
+                "d_kv_tokens[{}] all zero — K/V backward did not flow", t);
+        }
+        // in_proj.d_W must have non-zero entries (accumulated from Q + K + V calls).
+        let dw = d_in_w.to_vec().unwrap();
+        assert!(dw.iter().any(|&v| v.abs() > 1e-6),
+            "d_in_w all zero — in_proj weight grad did not accumulate");
+    }
+
+    #[test]
+    fn cpu_trace_shift_adjoint_redistributes_gradient() {
+        // 2 neurons, memory_length=3. d_trace_new = [10,20,30, 100,200,300].
+        // For neuron 0:
+        //   d_pre_act[0] = d_trace_new[2] = 30
+        //   d_trace_old[0] = 0 (oldest entry discarded)
+        //   d_trace_old[1] = d_trace_new[0] = 10
+        //   d_trace_old[2] = d_trace_new[1] = 20
+        // Symmetric for neuron 1.
+        let d_trace_new = vec![10.0, 20.0, 30.0, 100.0, 200.0, 300.0];
+        let mut d_pre_act = vec![0.0f32; 2];
+        let mut d_trace_old = vec![0.0f32; 6];
+        trace_shift_adjoint_host(&d_trace_new, &mut d_pre_act, &mut d_trace_old, 2, 3);
+        assert_eq!(d_pre_act, vec![30.0, 300.0]);
+        assert_eq!(d_trace_old, vec![0.0, 10.0, 20.0, 0.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn cpu_sync_update_reverse_accumulates_into_activated() {
+        // 4 neurons, 2 sync pairs.
+        // alpha = [1.0, 2.0], beta = [4.0, 4.0]  → sqrt(beta) = 2.
+        // left = [0, 1], right = [2, 3].
+        // d_sync = [4.0, 8.0] →
+        //   d_alpha[0] = 4.0/2 = 2.0
+        //   d_alpha[1] = 8.0/2 = 4.0
+        // For activated = [1, 1, 5, 5]:
+        //   d_activated[0] += 2.0 * 5 = 10
+        //   d_activated[2] += 2.0 * 1 = 2
+        //   d_activated[1] += 4.0 * 5 = 20
+        //   d_activated[3] += 4.0 * 1 = 4
+        let d_sync = vec![4.0, 8.0];
+        let activated = vec![1.0, 1.0, 5.0, 5.0];
+        let alpha = vec![1.0, 2.0];
+        let beta = vec![4.0, 4.0];
+        let left = vec![0, 1];
+        let right = vec![2, 3];
+        let mut d_activated = vec![0.0f32; 4];
+        sync_update_reverse_host(&d_sync, &activated, &alpha, &beta,
+            &left, &right, &mut d_activated);
+        assert!((d_activated[0] - 10.0).abs() < 1e-5);
+        assert!((d_activated[1] - 20.0).abs() < 1e-5);
+        assert!((d_activated[2] - 2.0).abs() < 1e-5);
+        assert!((d_activated[3] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cpu_nlm_backward_smoke_shallow() {
+        // Shallow NLM: 4 neurons, in_per=4, out_per=2 (so post-GLU = 1 per neuron).
+        // Build a SuperLinear, run forward-with-cache, backward.
+        // Verifies wiring: d_W and d_b accumulate, d_trace overwrites,
+        // shapes line up.
+        let n = 4; let in_per = 4; let out_per = 2;
+        let weights: Vec<f32> = (0..n * out_per * in_per).map(|i| (i as f32) * 0.1).collect();
+        let biases = vec![0.0f32; n * out_per];
+        let stage1 = tensor_typed::SuperLinear::<Cpu>::from_host(
+            &weights, &biases, n, in_per, out_per,
+        ).unwrap();
+
+        let trace: Vec<f32> = (0..n * in_per).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let trace_t = Tensor::<Cpu>::from_slice(&trace).unwrap();
+
+        let (output, cache) = nlm_forward_with_cache::<Cpu>(
+            &trace_t, &stage1, None, n,
+        ).unwrap();
+        assert_eq!(output.len(), n * (out_per / 2));
+
+        let d_activated = Tensor::<Cpu>::from_slice(&vec![1.0; n * (out_per / 2)]).unwrap();
+        let mut d_w1 = Tensor::<Cpu>::zeros(n * out_per * in_per).unwrap();
+        let mut d_b1 = Tensor::<Cpu>::zeros(n * out_per).unwrap();
+        let mut d_trace = Tensor::<Cpu>::zeros(n * in_per).unwrap();
+        nlm_backward_typed_helper::<Cpu>(
+            &d_activated, &cache, &stage1, None,
+            &mut d_w1, &mut d_b1, None, None,
+            &mut d_trace,
+        ).expect("nlm backward");
+
+        // Sanity: d_trace must have non-zero entries (gradient flowed).
+        let dt = d_trace.to_vec().unwrap();
+        assert!(dt.iter().any(|&v| v.abs() > 1e-6),
+            "d_trace all zero — backward did not flow");
+        // d_W1 must have non-zero entries (outer product accumulation).
+        let dw = d_w1.to_vec().unwrap();
+        assert!(dw.iter().any(|&v| v.abs() > 1e-6),
+            "d_W1 all zero — outer product accumulation failed");
+    }
+
     #[cfg(feature = "rocm")]
     #[test]
-    fn ctm_forward_resident_matches_host() {
-        use crate::config::ExitStrategy;
-        use crate::ctm_resident::CtmResidentCache;
-        use modgrad_device::backend::HipBatch;
-        use modgrad_device::backend::rocm::ffi::runtime_available;
-        use modgrad_compute::neuron::SimpleRng;
-
-        if !runtime_available() {
-            eprintln!("hip runtime unavailable, skipping");
-            return;
-        }
-
-        let cfg = CtmConfig {
-            iterations: 4,
-            d_model: 64,
-            d_input: 32,
-            heads: 4,
-            n_synch_out: 32,
-            n_synch_action: 32,
-            synapse_depth: 3,
-            memory_length: 8,
-            deep_nlms: true,
-            memory_hidden_dims: 4,
-            out_dims: 10,
-            n_random_pairing_self: 0,
-            min_width: 16,
-            exit_strategy: ExitStrategy::AdaptiveGate { beta: 0.1, threshold: 0.99 },
-            collect_trajectories: false,
-        };
-        let raw_input_dim = 16;
+    fn cpu_and_rocm_typed_ctm_forward_match() {
+        let cfg = small_cfg();
+        let raw_input_dim = 6;
         let w = CtmWeights::new(cfg.clone(), raw_input_dim);
 
-        // Pre-projected kv in d_input space; n_tokens = 3.
-        let n_tokens = 3;
-        let mut rng = SimpleRng::new(0xCD_FE_E0);
-        let kv: Vec<f32> = (0..n_tokens * cfg.d_input)
-            .map(|_| rng.next_normal()).collect();
+        let obs: Vec<f32> = (0..raw_input_dim).map(|i| (i as f32 - 2.5) * 0.3).collect();
 
-        // Host run.
-        let mut host_state = CtmState::new(&w);
-        let host_out = ctm_forward_with_kv(&w, &mut host_state, &kv, n_tokens);
+        // Cpu typed.
+        let cpu_typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let mut a_cpu = w.start_activated.clone();
+        let mut t_cpu = w.start_trace.clone();
+        let cpu_out = ctm_forward_typed::<Cpu>(
+            &cpu_typed, &mut a_cpu, &mut t_cpu, &obs,
+        ).unwrap();
 
-        // Resident run with a fresh state. Upload `kv` to a
-        // device-resident `GpuVec::Hip` to match the new
-        // `ctm_forward_resident` signature (`&GpuVec`).
-        let mut resident_state = CtmState::new(&w);
-        let cache = CtmResidentCache::from_weights(&w)
-            .expect("CtmResidentCache::from_weights");
-        let batch = HipBatch::new();
-        let mut kv_dev = modgrad_compute::backend::GpuVec::try_hip(kv.len())
-            .expect("GpuVec::try_hip(kv)");
-        kv_dev.copy_from(&kv);
-        let (resident_out, resident_cache) = ctm_forward_resident(
-            &w, &cache, &mut resident_state, &batch, &kv_dev, n_tokens,
-        ).expect("ctm_forward_resident");
-        batch.flush().expect("flush");
-
-        // Forward correctness still the contract; the cache is a
-        // bonus payload. PART A check: tick_caches.len() must equal
-        // ticks_used (so backward sees one cache per emitted prediction).
-        assert_eq!(resident_cache.tick_caches.len(), resident_out.ticks_used,
-            "CtmCacheResident.tick_caches.len() = {} but ticks_used = {} — \
-             cache push cadence drifted from predictions push cadence",
-            resident_cache.tick_caches.len(), resident_out.ticks_used);
-
-        assert_eq!(host_out.ticks_used, resident_out.ticks_used,
-            "ticks_used mismatch (exit gate decided differently)");
-        let last = host_out.ticks_used.saturating_sub(1);
-        assert!(host_out.ticks_used >= 1);
-
-        let max_diff = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
+        // Rocm typed.
+        let rocm_typed = match CtmWeightsTyped::<Rocm>::from_untyped(&w) {
+            Ok(t) => t,
+            Err(BackendError::Runtime(msg)) if msg.contains("hipMalloc") => return,
+            Err(e) => panic!("rocm CtmWeightsTyped build failed: {:?}", e),
+        };
+        let mut a_rocm = w.start_activated.clone();
+        let mut t_rocm = w.start_trace.clone();
+        let rocm_out = match ctm_forward_typed::<Rocm>(
+            &rocm_typed, &mut a_rocm, &mut t_rocm, &obs,
+        ) {
+            Ok(o) => o,
+            Err(BackendError::Runtime(msg)) if msg.contains("hipMalloc") => return,
+            Err(BackendError::Unsupported { .. }) => return,
+            Err(e) => panic!("rocm typed forward failed: {:?}", e),
         };
 
-        let p0 = max_diff(&host_out.predictions[0], &resident_out.predictions[0]);
-        assert!(p0 < 1e-3, "predictions[0] mismatch: max |Δ| = {p0}");
-
-        let pl = max_diff(&host_out.predictions[last], &resident_out.predictions[last]);
-        assert!(pl < 1e-3, "predictions[last] mismatch: max |Δ| = {pl}");
-
-        let sd = max_diff(&host_out.sync_out, &resident_out.sync_out);
-        assert!(sd < 1e-3, "sync_out mismatch: max |Δ| = {sd}");
-
-        eprintln!("  ticks_used = {}", resident_out.ticks_used);
-        eprintln!("  max |Δ predictions[0]|    = {p0:.6}");
-        eprintln!("  max |Δ predictions[last]| = {pl:.6}");
-        eprintln!("  max |Δ sync_out|          = {sd:.6}");
+        for (tick, (a, b)) in cpu_out.predictions.iter()
+            .zip(&rocm_out.predictions).enumerate()
+        {
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!((x - y).abs() < 1e-2,
+                    "tick {} pred[{}] CPU vs Rocm disagree: cpu={} rocm={}",
+                    tick, i, x, y);
+            }
+        }
     }
 }

@@ -30,8 +30,10 @@ use std::path::Path;
 use modgrad_codec::retina::VisualCortex;
 use modgrad_ctm::config::ExitStrategy;
 use modgrad_ctm::graph::{
-    RegionalAdamW, RegionalBrain, RegionalConfig, RegionalGradients, RegionalWeights,
+    RegionalAdamW, RegionalAdamWTyped, RegionalBrain, RegionalConfig,
+    RegionalGradients, RegionalGradientsTyped, RegionalWeights, RegionalWeightsTyped,
 };
+use modgrad_device::backend::tensor::{Cpu, Tensor};
 use modgrad_traits::{Brain, Encoder, LossFn, StepwiseCE, TokenInput};
 
 const N_ACTIONS: usize = 7;
@@ -113,13 +115,21 @@ fn shuffle_idx(idx: &mut [usize], seed: &mut u64) {
     }
 }
 
-/// Per-token observation dim for the brain's `obs_proj`. Falls back
-/// to the patchify layout (49 × 192) when the cortex is absent
-/// (Variant A — raw RGB).
+/// Brain-input dim. Equals the full encoder output `n_tokens × token_dim`
+/// (V4 grid 49×128 = 6272 with default cortex; raw 49×192 = 9408 in
+/// Variant A). The earlier per-single-token bottleneck (=token_dim only)
+/// dropped 98% of the spatial signal before the brain — see
+/// feedback_visual_priors.md.
 fn obs_dim_of(cortex: &Option<VisualCortex>) -> usize {
-    cortex.as_ref()
-        .map(|c| c.token_dim())
-        .unwrap_or(3 * RAW_PATCH * RAW_PATCH)
+    if let Some(c) = cortex {
+        // Probe once to get n_tokens (depends on cortex strides). One
+        // synthetic frame is fine; the brain only needs the dim, not
+        // any specific values.
+        let probe = c.encode(&vec![0.0f32; IMG_PIXELS]);
+        probe.tokens.len()
+    } else {
+        IMG_PIXELS
+    }
 }
 
 /// Encode a CHW RGB frame into a `TokenInput` for the brain.
@@ -303,28 +313,40 @@ fn main() {
             c.input_w = IMG_W;
             ("D — pretrained", Some(c))
         }
+        "dog_only" => {
+            eprintln!("\n[Variant E] DOG-ONLY  (VisualCortex::cifar_retina_only_ln({IMG_H}, {IMG_W}) — DoG retina + random V1/V2/V4 + LN). Tests the prediction that synthetic gridworld is hurt by Gabor V1, not by lack of priors.");
+            ("E — dog_only", Some(VisualCortex::cifar_retina_only_ln(IMG_H, IMG_W)))
+        }
         "gabor" | _ => {
             eprintln!("\n[Variant C] GABOR PRIORS  (VisualCortex::new({IMG_H}, {IMG_W}) — DoG + Gabor V1 + random V2/V4)");
             ("C — gabor", Some(VisualCortex::new(IMG_H, IMG_W)))
         }
     };
     let _ = variant_name;
+    // MODGRAD_RETINA_LAYERNORM=1: enable per-token LayerNorm at V4 output.
+    // Strips the per-position DC offset that collapses V4 to rank-1 — see
+    // `feedback_visual_priors.md` and `crates/modgrad-codec/src/retina.rs:
+    // per_token_layernorm`. Off by default for back-compat; opt-in for the
+    // re-test of the original "vision priors improve performance" claim.
+    let cortex = if std::env::var_os("MODGRAD_RETINA_LAYERNORM").is_some() {
+        cortex.map(|mut c| { c.per_token_ln_v4 = true; c })
+    } else {
+        cortex
+    };
     eprintln!("  train={}  eval={}", train.len(), eval.len());
 
-    // Phase 5 profile mode: run BOTH host and resident forwards
-    // back-to-back, report side-by-side speedup. Brain size selected
-    // via MODGRAD_BRAIN_SIZE (small / medium / large / billion).
-    // Activated by MODGRAD_PROFILE_ONLY=N.
+    // Forward-only timing on the host path. Selected via
+    // MODGRAD_BRAIN_SIZE (small / medium / large / billion);
+    // activated by MODGRAD_PROFILE_ONLY=N.
     if std::env::var_os("MODGRAD_PROFILE_ONLY").is_some() {
         let n = std::env::var("MODGRAD_PROFILE_ONLY")
             .ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0)
             .unwrap_or(4);
         let n = n.min(train.len()).max(1);
         let size = std::env::var("MODGRAD_BRAIN_SIZE").unwrap_or_else(|_| "billion".into());
-        eprintln!("\n[phase5-profile] brain size = {size}, {n} forward passes per path");
+        eprintln!("\n[profile] brain size = {size}, {n} host forwards");
         let w = build_brain(obs_dim_of(&cortex));
 
-        // ── Host path. ──
         let t_host = std::time::Instant::now();
         for i in 0..n {
             let input = encode_for_brain(&cortex, &train[i].rgb);
@@ -334,35 +356,9 @@ fn main() {
         let host_total = t_host.elapsed();
         let host_per = 1000.0 * host_total.as_secs_f32() / n as f32;
 
-        // ── Resident path (only with --features rocm). ──
-        #[cfg(feature = "rocm")]
-        let resident_per = {
-            use modgrad_ctm::resident::RegionalResidentCache;
-            use modgrad_device::backend::HipBatch;
-            let cache = RegionalResidentCache::from_weights(&w).expect("cache build");
-            let batch = HipBatch::new();
-            let t = std::time::Instant::now();
-            for i in 0..n {
-                let input = encode_for_brain(&cortex, &train[i].rgb);
-                let fresh = cache.fresh(&w).expect("cache fresh");
-                let _ = modgrad_ctm::RegionalBrain::forward_cached_resident(
-                    &w, fresh, &batch, &input,
-                ).expect("forward_cached_resident");
-            }
-            batch.flush().expect("flush");
-            let resident_total = t.elapsed();
-            1000.0 * resident_total.as_secs_f32() / n as f32
-        };
-        #[cfg(not(feature = "rocm"))]
-        let resident_per = f32::NAN;
-
         eprintln!();
-        eprintln!("[phase5-profile] forward-only timings, {n} samples each:");
+        eprintln!("[profile] forward-only timings, {n} samples:");
         eprintln!("  host      : {:>8.1} ms/forward", host_per);
-        eprintln!("  resident  : {:>8.1} ms/forward", resident_per);
-        if resident_per.is_finite() && resident_per > 0.0 {
-            eprintln!("  speedup   : {:>8.2}× (host / resident)", host_per / resident_per);
-        }
         modgrad_ctm::dispatch_profile::dump();
         return;
     }
@@ -392,6 +388,26 @@ fn main() {
     }
     // Dump cortex features for sklearn-side analysis (cheap, always do it).
     dump_cortex_features(&cortex, &train, &eval, "/tmp/babyai_cortex_feats.bin");
+
+    // Path C typed pipeline: env-gated for now. Runs the full
+    // typed cascade (RegionalWeightsTyped<Cpu>, regional_forward_typed_with_cache,
+    // regional_backward_typed, RegionalAdamWTyped) end-to-end. Skips
+    // diagnose since the diagnose helpers operate on untyped weights.
+    if std::env::var_os("MODGRAD_USE_TYPED").is_some() {
+        let epochs: usize = std::env::var("MODGRAD_TYPED_EPOCHS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+        let lr: f32 = std::env::var("MODGRAD_TYPED_LR")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-4);
+        let batch_size: usize = std::env::var("MODGRAD_TYPED_BS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        eprintln!(
+            "\n[typed] Path C cascade  Cpu  epochs={epochs}  bs={batch_size}  lr={lr:.0e}",
+        );
+        let _ = study_brain_typed_cpu(&cortex, &train, &eval, epochs, batch_size, lr);
+        eprintln!();
+        modgrad_ctm::dispatch_profile::dump();
+        return;
+    }
 
     // bs=16 + lr=1e-4 because (a) larger model → smaller LR, (b) batch=16
     // keeps activation memory comfortable on 8 GB VRAM with d_model=1024.
@@ -463,143 +479,9 @@ fn study_brain(
     let mut idx: Vec<usize> = (0..train.len()).collect();
     let mut rng: u64 = 0xBABE_FACE_BABE_FACE;
 
-    let use_resident = std::env::var_os("MODGRAD_USE_RESIDENT").is_some();
     eprintln!(
-        "  brain: 8-region  ticks={TICKS}  obs_dim={obs_dim}  bs={batch_size}  lr={lr:.0e}  path={}",
-        if use_resident { "resident" } else { "host" },
+        "  brain: 8-region  ticks={TICKS}  obs_dim={obs_dim}  bs={batch_size}  lr={lr:.0e}  path=host",
     );
-
-    #[cfg(feature = "rocm")]
-    if use_resident {
-        use modgrad_ctm::resident::{RegionalResidentCache, RegionalGradientsResident};
-        use modgrad_device::backend::HipBatch;
-        use std::time::{Duration, Instant};
-        let mut cache = RegionalResidentCache::from_weights(&w).expect("build cache");
-        // Phase 3c: device-resident NLM dW accumulator. Allocated
-        // once, zeroed per batch, downloaded into batch_grads via
-        // add_to_host before each opt.step. Lifts the 36.7% NLM
-        // backward bucket from CPU to GPU.
-        let resident_grads = RegionalGradientsResident::from_weights(&w)
-            .expect("build resident grads");
-        let batch = HipBatch::new();
-        // Phase 2 instrumentation — per-section accumulators for the
-        // training loop. Find which bucket dominates the 3 s/sample
-        // wall-clock (forward profile alone is 260 ms).
-        let mut t_encode = Duration::ZERO;
-        let mut t_fwd    = Duration::ZERO;
-        let mut t_loss   = Duration::ZERO;
-        let mut t_bwd    = Duration::ZERO;
-        let mut t_accum  = Duration::ZERO;
-        let mut t_flush  = Duration::ZERO;
-        let mut t_opt    = Duration::ZERO;
-        let mut t_sync   = Duration::ZERO;
-        let mut t_eval   = Duration::ZERO;
-        let mut n_train_samples = 0usize;
-
-        for ep in 0..epochs {
-            shuffle_idx(&mut idx, &mut rng);
-            let t_ep = std::time::Instant::now();
-            let mut total_loss = 0.0f32;
-            let mut n_seen = 0usize;
-            for chunk in idx.chunks(batch_size) {
-                let mut batch_grads = RegionalGradients::zeros(&w);
-                let mut batch_loss = 0.0f32;
-                // Zero the device-resident NLM dW accumulator before
-                // each batch — host batch_grads is already zero, the
-                // device buffers need their own reset.
-                resident_grads.zero().expect("zero resident grads");
-                for &i in chunk {
-                    let step = &train[i];
-
-                    let t = Instant::now();
-                    let input = encode_for_brain(&cortex, &step.rgb);
-                    t_encode += t.elapsed();
-
-                    let t = Instant::now();
-                    let fresh = cache.fresh(&w).expect("fresh cache");
-                    let (output, _state, fwd_cache) =
-                        modgrad_ctm::RegionalBrain::forward_cached_resident(
-                            &w, fresh, &batch, &input,
-                        ).expect("forward_cached_resident");
-                    t_fwd += t.elapsed();
-
-                    let t = Instant::now();
-                    let target = [step.action as usize];
-                    let (loss, d_preds) = loss_fn.compute(
-                        &output.predictions, &output.certainties, &target,
-                    );
-                    batch_loss += loss;
-                    t_loss += t.elapsed();
-
-                    let t = Instant::now();
-                    // Phase 3c: route NLM dW through the resident
-                    // kernel. The returned sample_grads has zero
-                    // nlm_s1_w / nlm_s2_w; resident_grads accumulates
-                    // them on device.
-                    let sample_grads = modgrad_ctm::RegionalBrain::backward_cached_resident_with_grads_resident(
-                        &w, fwd_cache, &d_preds, &resident_grads,
-                    );
-                    t_bwd += t.elapsed();
-
-                    let t = Instant::now();
-                    accumulate(&mut batch_grads, &sample_grads);
-                    t_accum += t.elapsed();
-
-                    n_train_samples += 1;
-                }
-                let t = Instant::now();
-                batch.flush().expect("hip flush per batch");
-                t_flush += t.elapsed();
-                total_loss += batch_loss;
-                n_seen += chunk.len();
-                // Consolidate device-resident NLM dW into the host
-                // batch_grads before opt.step consumes them.
-                resident_grads.add_to_host(&mut batch_grads)
-                    .expect("add_to_host resident grads");
-                let t = Instant::now();
-                opt.step(&mut w, &mut batch_grads);
-                t_opt += t.elapsed();
-                let t = Instant::now();
-                cache.sync_from_weights(&w).expect("re-sync cache after opt.step");
-                t_sync += t.elapsed();
-            }
-            let eval_sub: Vec<Step> = eval.iter().take(256).map(|s| Step {
-                mission_id: s.mission_id, rgb: s.rgb.clone(), action: s.action,
-            }).collect();
-            let t = Instant::now();
-            let acc = eval_accuracy_silent(&w, cortex, &eval_sub);
-            t_eval += t.elapsed();
-            eprintln!(
-                "  epoch {:>2}/{}  loss={:.3}  eval_acc(256)={:.1}%  {:.1}s",
-                ep + 1, epochs, total_loss / n_seen as f32, acc * 100.0,
-                t_ep.elapsed().as_secs_f32(),
-            );
-        }
-
-        // Phase 2 timing dump.
-        let bucket = |label: &str, d: Duration, total_ms: f64| {
-            let ms = d.as_secs_f64() * 1000.0;
-            let pct = if total_ms > 0.0 { 100.0 * ms / total_ms } else { 0.0 };
-            let avg = if n_train_samples > 0 { ms / n_train_samples as f64 } else { 0.0 };
-            eprintln!("    {:<12}  {:>9.1} ms total  {:>6.2} ms/sample  {:>5.1}%",
-                      label, ms, avg, pct);
-        };
-        let total = t_encode + t_fwd + t_loss + t_bwd + t_accum + t_flush + t_opt + t_sync + t_eval;
-        let total_ms = total.as_secs_f64() * 1000.0;
-        eprintln!("\n[phase2-profile] training-loop sections (n_train_samples={n_train_samples}):");
-        bucket("encode",   t_encode, total_ms);
-        bucket("forward",  t_fwd, total_ms);
-        bucket("loss",     t_loss, total_ms);
-        bucket("backward", t_bwd, total_ms);
-        bucket("accum",    t_accum, total_ms);
-        bucket("flush",    t_flush, total_ms);
-        bucket("opt.step", t_opt, total_ms);
-        bucket("cache_sync", t_sync, total_ms);
-        bucket("eval",     t_eval, total_ms);
-        eprintln!("    {:<12}  {:>9.1} ms total", "TOTAL", total_ms);
-
-        return w;
-    }
 
     // Host path
     for ep in 0..epochs {
@@ -651,6 +533,176 @@ fn eval_accuracy_silent(w: &RegionalWeights, cortex: &Option<VisualCortex>, step
         }
     }
     correct as f32 / steps.len() as f32
+}
+
+// ─── Path C typed pipeline ──────────────────────────────────────
+//
+// Mirrors the host path of `study_brain` but every weight, gradient,
+// and optimiser-state buffer lives in `Tensor<D>` (today: D = Cpu;
+// Rocm comes after the *_resident hierarchy collapses). Single
+// observation per outer brain step matches the existing untyped
+// behaviour where `obs_scale_slice(0)` selects `tokens[..raw_obs_dim]`.
+
+fn observation_for_typed(input: &TokenInput, raw_obs_dim: usize) -> Vec<f32> {
+    let n = input.tokens.len().min(raw_obs_dim);
+    let mut out = vec![0.0f32; raw_obs_dim];
+    out[..n].copy_from_slice(&input.tokens[..n]);
+    // MODGRAD_NORMALIZE_OBS=1: per-sample zero-mean unit-std of obs.
+    // obs_proj init assumes ~zero-mean inputs; gabor's mean=+0.11 was
+    // saturating the brain. Diagnostic: when normalized, does gabor learn?
+    if std::env::var_os("MODGRAD_NORMALIZE_OBS").is_some() && n > 0 {
+        let m: f32 = out[..n].iter().sum::<f32>() / n as f32;
+        let var: f32 = out[..n].iter().map(|x| (x - m).powi(2)).sum::<f32>() / n as f32;
+        let inv_std = (var + 1e-5).sqrt().recip();
+        for x in &mut out[..n] { *x = (*x - m) * inv_std; }
+    }
+    out
+}
+
+fn study_brain_typed_cpu(
+    cortex: &Option<VisualCortex>,
+    train: &[Step], eval: &[Step],
+    epochs: usize, batch_size: usize, lr: f32,
+) -> RegionalWeightsTyped<Cpu> {
+    let obs_dim = obs_dim_of(cortex);
+
+    // Build a fresh RegionalWeights, lift to typed.
+    let untyped = build_brain(obs_dim);
+    let mut typed = RegionalWeightsTyped::<Cpu>::from_untyped(&untyped)
+        .expect("from_untyped");
+    let mut opt = RegionalAdamWTyped::<Cpu>::new(&typed)
+        .expect("RegionalAdamWTyped::new")
+        .with_lr(lr).with_clip(5.0);
+    let loss_fn = StepwiseCE { n_classes: N_ACTIONS, lookahead: 1 };
+    let mut idx: Vec<usize> = (0..train.len()).collect();
+    let mut rng: u64 = 0xBABE_FACE_BABE_FACE;
+
+    let raw_obs_dim = typed.config.raw_obs_dim;
+    let n_sync = typed.config.n_global_sync;
+
+    let mut batch_grads = RegionalGradientsTyped::<Cpu>::zeros(&typed)
+        .expect("RegionalGradientsTyped::zeros");
+
+    // MODGRAD_DOBS_PROBE=1: capture d_observation on the first sample of
+    // every epoch and log its norm + percentile stats. Tells us whether
+    // the policy-loss gradient that reaches the raw observation is large
+    // enough to drive end-to-end retina training (the next step beyond
+    // the frozen-retina 4-variant comparison).
+    let dobs_probe = std::env::var_os("MODGRAD_DOBS_PROBE").is_some();
+    let mut d_obs_buf: Tensor<Cpu> = Tensor::<Cpu>::zeros(raw_obs_dim)
+        .expect("Tensor::<Cpu>::zeros for d_observation");
+
+    for ep in 0..epochs {
+        shuffle_idx(&mut idx, &mut rng);
+        let t_ep = std::time::Instant::now();
+        let mut total_loss = 0.0f32;
+        let mut n_seen = 0usize;
+        let mut probe_done_this_epoch = false;
+        for chunk in idx.chunks(batch_size) {
+            batch_grads.zero().expect("RegionalGradientsTyped::zero");
+            let mut batch_loss = 0.0f32;
+
+            for &i in chunk {
+                let step = &train[i];
+                let input = encode_for_brain(cortex, &step.rgb);
+                let observation = observation_for_typed(&input, raw_obs_dim);
+
+                // Per-sample state init from the brain's start states.
+                let mut region_activated: Vec<Vec<f32>> = untyped.regions.iter()
+                    .map(|r| r.start_activated.clone()).collect();
+                let mut region_trace: Vec<Vec<f32>> = untyped.regions.iter()
+                    .map(|r| r.start_trace.clone()).collect();
+                let mut global_alpha = vec![0.0f32; n_sync];
+                let mut global_beta = vec![1.0f32; n_sync];
+
+                let (out, cache) = typed.regional_forward_typed_with_cache(
+                    &observation,
+                    &mut region_activated, &mut region_trace,
+                    &mut global_alpha, &mut global_beta,
+                ).expect("regional_forward_typed_with_cache");
+
+                let target = [step.action as usize];
+                let (loss, d_preds) = loss_fn.compute(
+                    &out.predictions, &out.certainties, &target,
+                );
+                batch_loss += loss;
+
+                if dobs_probe && !probe_done_this_epoch {
+                    typed.regional_backward_typed_with_d_obs(
+                        &cache, &d_preds, &mut batch_grads, &mut d_obs_buf,
+                    ).expect("regional_backward_typed_with_d_obs");
+                    let d_obs_h = d_obs_buf.to_vec().expect("d_obs to_vec");
+                    let n = d_obs_h.len() as f32;
+                    let l2: f32 = d_obs_h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let mean_abs: f32 = d_obs_h.iter().map(|x| x.abs()).sum::<f32>() / n;
+                    let max_abs: f32 = d_obs_h.iter().map(|x| x.abs())
+                        .fold(0.0f32, f32::max);
+                    let nonzero: usize = d_obs_h.iter().filter(|x| x.abs() > 1e-8).count();
+                    // Pre-step gradient norm in batch_grads.output_proj.d_w for
+                    // a same-units sanity reference. Only this sample contributed,
+                    // so this is the per-sample brain-internal grad scale.
+                    let d_w_h = batch_grads.output_proj.d_w.to_vec()
+                        .expect("d_w to_vec");
+                    let d_w_l2: f32 = d_w_h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!(
+                        "  [dobs-probe ep{}] d_obs L2={:.4e}  mean|.|={:.4e}  max|.|={:.4e}  nonzero={}/{}  loss={:.3}  | output_proj.d_w L2={:.4e}",
+                        ep + 1, l2, mean_abs, max_abs, nonzero, d_obs_h.len(), loss, d_w_l2,
+                    );
+                    probe_done_this_epoch = true;
+                } else {
+                    typed.regional_backward_typed(&cache, &d_preds, &mut batch_grads)
+                        .expect("regional_backward_typed");
+                }
+                n_seen += 1;
+            }
+
+            total_loss += batch_loss;
+            opt.step(&mut typed, &mut batch_grads).expect("typed opt.step");
+        }
+
+        let eval_sub: Vec<&Step> = eval.iter().take(256).collect();
+        let acc = eval_accuracy_silent_typed(&typed, cortex, &eval_sub);
+        eprintln!(
+            "  [typed] epoch {:>2}/{}  loss={:.3}  eval_acc(256)={:.1}%  {:.1}s",
+            ep + 1, epochs, total_loss / n_seen.max(1) as f32, acc * 100.0,
+            t_ep.elapsed().as_secs_f32(),
+        );
+    }
+
+    typed
+}
+
+fn eval_accuracy_silent_typed(
+    w: &RegionalWeightsTyped<Cpu>,
+    cortex: &Option<VisualCortex>,
+    steps: &[&Step],
+) -> f32 {
+    let raw_obs_dim = w.config.raw_obs_dim;
+    let n_sync = w.config.n_global_sync;
+    let mut correct = 0usize;
+    for step in steps {
+        let input = encode_for_brain(cortex, &step.rgb);
+        let observation = observation_for_typed(&input, raw_obs_dim);
+        // Need start states from an untyped reference — typed weights
+        // hold post-step copies. Reading directly off typed is fine
+        // since we only use start_activated/start_trace as init.
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.to_vec().unwrap_or_default()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.to_vec().unwrap_or_default()).collect();
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let out = w.regional_forward_typed(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).expect("regional_forward_typed");
+        if let Some(last) = out.predictions.last() {
+            if argmax(last) == step.action as usize { correct += 1; }
+        }
+    }
+    correct as f32 / steps.len().max(1) as f32
 }
 
 /// Five focused diagnostics on the trained brain.

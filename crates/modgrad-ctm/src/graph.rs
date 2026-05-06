@@ -705,6 +705,94 @@ impl RegionalConfig {
         }
     }
 
+    /// 8-region preset tuned for market-making MLPs: small enough to
+    /// fit on Cpu (40k params), output dim sized for the barbell-LP
+    /// motor (`out_dims = 12 = 4 rungs × 3 params`). Used by
+    /// `examples/penumbra_arena` (penumbra_train, penumbra_live_arena,
+    /// the synthetic-replay arena binary). Single-scale obs.
+    ///
+    /// Cortical regions (INPUT/ATTENTION/OUTPUT/MOTOR) get
+    /// `d_model_cortical=32` so the brain has enough capacity to
+    /// represent the 24-dim observation (price + spread + inventory
+    /// + 4-block history + bid/ask depth at 4 offsets); subcortical
+    /// regions stay at `d_model_sub=16` for cost.
+    ///
+    /// `memory_length=8` for all regions (matches the historical
+    /// shape that existing checkpoints were trained against). A
+    /// future preset variant could expand HIPPOCAMPUS specifically
+    /// for fill-history memory once retraining lands.
+    pub fn eight_region_mm(obs_dim: usize, out_dims: usize, ticks: usize) -> Self {
+        const INPUT: usize = 0;
+        const ATTENTION: usize = 1;
+        const OUTPUT: usize = 2;
+        const MOTOR: usize = 3;
+        const CEREBELLUM: usize = 4;
+        const BASAL_GANGLIA: usize = 5;
+        const INSULA: usize = 6;
+        const HIPPOCAMPUS: usize = 7;
+
+        let d_model_cortical: usize = 32;
+        let d_model_sub: usize = 16;
+        let mk = |d_model: usize| CtmConfig {
+            iterations: 1,
+            d_model,
+            d_input: 16,
+            heads: 2,
+            n_synch_out: 8,
+            n_synch_action: 8,
+            synapse_depth: 1,
+            memory_length: 8,
+            deep_nlms: false,
+            memory_hidden_dims: 4,
+            out_dims,
+            n_random_pairing_self: 0,
+            min_width: 8,
+            ..Default::default()
+        };
+
+        let regions = vec![
+            mk(d_model_cortical),  // 0 INPUT
+            mk(d_model_cortical),  // 1 ATTENTION
+            mk(d_model_cortical),  // 2 OUTPUT
+            mk(d_model_cortical),  // 3 MOTOR
+            mk(d_model_sub),       // 4 CEREBELLUM
+            mk(d_model_sub),       // 5 BASAL_GANGLIA
+            mk(d_model_sub),       // 6 INSULA
+            mk(d_model_sub),       // 7 HIPPOCAMPUS
+        ];
+        let region_names: Vec<String> = [
+            "input","attention","output","motor",
+            "cerebellum","basal_ganglia","insula","hippocampus",
+        ].into_iter().map(String::from).collect();
+
+        let connections = vec![
+            Connection { from: vec![MOTOR], to: INPUT, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![INPUT, HIPPOCAMPUS], to: ATTENTION, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![ATTENTION], to: OUTPUT, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: MOTOR, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![MOTOR], to: CEREBELLUM, receives_observation: true, observation_scale: 0 },
+            Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
+        ];
+
+        let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
+        Self {
+            regions,
+            region_names,
+            connections,
+            outer_ticks: ticks,
+            exit_strategy: crate::config::ExitStrategy::None,
+            n_global_sync: total_neurons.min(64),
+            out_dims,
+            raw_obs_dim: obs_dim,
+            obs_scale_dims: vec![obs_dim],
+            aux_losses: AuxLossConfig::default(),
+            router: None,
+            cereb_mode: Default::default(),
+        }
+    }
+
     /// Multi-scale variant of `eight_region_small`. Mirrors the
     /// biological wiring where V1 projects directly to motor/parietal
     /// and V2 to attention areas, not only via V4 → IT → PFC.
@@ -2209,20 +2297,8 @@ pub struct OuterTickCache {
     region_activated: Vec<Vec<f32>>,
     /// Per-region: SDK CTM cache for inner-tick BPTT (HOST path).
     /// Populated by `<RegionalBrain as Brain>::forward_cached`,
-    /// `regional_train_step`, and `forward_cached_frozen`. The
-    /// resident path leaves this `None` because the host `CtmCache`
-    /// constructor lives in private module-scope of `train.rs` —
-    /// see `region_caches_resident` for the resident equivalent.
+    /// `regional_train_step`, and `forward_cached_frozen`.
     region_caches: Vec<Option<CtmCache>>,
-    /// Per-region: device-resident CTM cache for resident BPTT.
-    /// Populated by `RegionalBrain::forward_cached_resident` (PART A
-    /// of the backward-resident slice). All host-path forwards leave
-    /// this `None` because they don't run resident dispatch. Backward
-    /// resident (next slice) reads here; backward host reads from
-    /// `region_caches`. Mutually exclusive across the two paths.
-    #[cfg(feature = "rocm")]
-    #[allow(dead_code)] // consumed by the next-slice backward_cached_resident
-    region_caches_resident: Vec<Option<crate::forward::CtmCacheResident>>,
     /// All activations concatenated (for global sync backward).
     all_activations: Vec<f32>,
     /// Global sync values at this tick.
@@ -2909,8 +2985,6 @@ pub fn regional_train_step(
             region_obs,
             region_activated: state.region_outputs.clone(),
             region_caches,
-            #[cfg(feature = "rocm")]
-            region_caches_resident: (0..n_regions).map(|_| None).collect(),
             all_activations,
             global_sync: global_sync.clone(),
             global_beta: state.global_beta.clone(),
@@ -3503,8 +3577,6 @@ fn regional_train_step_inner(
             region_obs,
             region_activated: state.region_outputs.clone(),
             region_caches,
-            #[cfg(feature = "rocm")]
-            region_caches_resident: (0..n_regions).map(|_| None).collect(),
             all_activations: all_act_buf.clone(),
             global_sync: gs_buf.clone(),
             global_beta: state.global_beta.clone(),
@@ -4170,10 +4242,9 @@ impl RegionalAdamW {
             *logit = logit_slice[0];
         }
 
-        // Invalidate any device-resident snapshot of these weights. One
-        // bump covers every nested mutation above (per-region SGD,
-        // connection synapses, projections, aux heads). Resident caches
-        // detect this via `RegionalResidentCache::fresh(&w)`.
+        // Bump generation after every weight mutation. One bump covers
+        // every nested mutation above (per-region SGD, connection
+        // synapses, projections, aux heads).
         w.bump_generation();
     }
 
@@ -4186,6 +4257,361 @@ impl RegionalAdamW {
     pub fn load(path: &str) -> std::io::Result<Self> {
         modgrad_persist::persist::load(path)
     }
+}
+
+// ─── Typed optimiser (Path C) ────────────────────────────────
+//
+// Same scope as `RegionalAdamW` but operates on `RegionalWeightsTyped<D>`
+// and `RegionalGradientsTyped<D>`. Major weights (NLM, projections,
+// embedding, connection synapses) get AdamW; minor tensors (U-Net,
+// LN gamma/beta, start states, decay params, exit gate) get raw SGD.
+// Matches the untyped split so per-step semantics are familiar.
+
+use modgrad_device::backend::tensor::AdamW as AdamWTyped;
+
+/// Per-region typed inner optimiser — AdamW state for the major
+/// CTM tensors. Mirrors `RegionInnerAdamW` but generic over Device.
+pub struct RegionInnerAdamWTyped<D: TensorDeviceG> {
+    pub nlm_s1_w: AdamWTyped<D>,
+    pub nlm_s1_b: AdamWTyped<D>,
+    pub nlm_s2_w: Option<AdamWTyped<D>>,
+    pub nlm_s2_b: Option<AdamWTyped<D>>,
+    pub kv_proj_w: AdamWTyped<D>,
+    pub kv_proj_b: AdamWTyped<D>,
+    pub q_proj_w: AdamWTyped<D>,
+    pub q_proj_b: AdamWTyped<D>,
+    pub mha_in_w: AdamWTyped<D>,
+    pub mha_in_b: AdamWTyped<D>,
+    pub mha_out_w: AdamWTyped<D>,
+    pub mha_out_b: AdamWTyped<D>,
+    pub out_proj_w: AdamWTyped<D>,
+    pub out_proj_b: AdamWTyped<D>,
+}
+
+impl<D: TensorDeviceG> RegionInnerAdamWTyped<D> {
+    pub fn new(rw: &CtmWeightsTyped<D>) -> Result<Self, BackendErrorG> {
+        Ok(Self {
+            nlm_s1_w: AdamWTyped::<D>::new(rw.nlm_stage1.weights.len())?,
+            nlm_s1_b: AdamWTyped::<D>::new(rw.nlm_stage1.biases.len())?,
+            nlm_s2_w: match &rw.nlm_stage2 {
+                Some(s) => Some(AdamWTyped::<D>::new(s.weights.len())?),
+                None => None,
+            },
+            nlm_s2_b: match &rw.nlm_stage2 {
+                Some(s) => Some(AdamWTyped::<D>::new(s.biases.len())?),
+                None => None,
+            },
+            kv_proj_w: AdamWTyped::<D>::new(rw.kv_proj.weight.len())?,
+            kv_proj_b: AdamWTyped::<D>::new(rw.kv_proj.bias.len())?,
+            q_proj_w: AdamWTyped::<D>::new(rw.q_proj.weight.len())?,
+            q_proj_b: AdamWTyped::<D>::new(rw.q_proj.bias.len())?,
+            mha_in_w: AdamWTyped::<D>::new(rw.mha_in_proj.weight.len())?,
+            mha_in_b: AdamWTyped::<D>::new(rw.mha_in_proj.bias.len())?,
+            mha_out_w: AdamWTyped::<D>::new(rw.mha_out_proj.weight.len())?,
+            mha_out_b: AdamWTyped::<D>::new(rw.mha_out_proj.bias.len())?,
+            out_proj_w: AdamWTyped::<D>::new(rw.output_proj.weight.len())?,
+            out_proj_b: AdamWTyped::<D>::new(rw.output_proj.bias.len())?,
+        })
+    }
+
+    /// Apply AdamW to every major tensor; biases use weight_decay=0.
+    pub fn step(
+        &mut self,
+        rw: &mut CtmWeightsTyped<D>,
+        rg: &mut crate::weights::CtmGradientsTyped<D>,
+        lr: f32, wd: f32,
+    ) -> Result<(), BackendErrorG> {
+        macro_rules! step {
+            ($adam:expr, $w:expr, $g:expr, $wd:expr) => {{
+                $adam.lr = lr;
+                $adam.weight_decay = $wd;
+                $adam.step(&mut $w, &$g)?;
+            }};
+        }
+        step!(self.nlm_s1_w, rw.nlm_stage1.weights, rg.nlm_s1_w, wd);
+        step!(self.nlm_s1_b, rw.nlm_stage1.biases, rg.nlm_s1_b, 0.0);
+        if let (Some(s2), Some(adam_w), Some(g)) = (
+            rw.nlm_stage2.as_mut(), self.nlm_s2_w.as_mut(), rg.nlm_s2_w.as_ref(),
+        ) {
+            adam_w.lr = lr;
+            adam_w.weight_decay = wd;
+            adam_w.step(&mut s2.weights, g)?;
+        }
+        if let (Some(s2), Some(adam_b), Some(g)) = (
+            rw.nlm_stage2.as_mut(), self.nlm_s2_b.as_mut(), rg.nlm_s2_b.as_ref(),
+        ) {
+            adam_b.lr = lr;
+            adam_b.weight_decay = 0.0;
+            adam_b.step(&mut s2.biases, g)?;
+        }
+        step!(self.kv_proj_w, rw.kv_proj.weight, rg.kv_proj_w, wd);
+        step!(self.kv_proj_b, rw.kv_proj.bias, rg.kv_proj_b, 0.0);
+        step!(self.q_proj_w, rw.q_proj.weight, rg.q_proj_w, wd);
+        step!(self.q_proj_b, rw.q_proj.bias, rg.q_proj_b, 0.0);
+        step!(self.mha_in_w, rw.mha_in_proj.weight, rg.mha_in_w, wd);
+        step!(self.mha_in_b, rw.mha_in_proj.bias, rg.mha_in_b, 0.0);
+        step!(self.mha_out_w, rw.mha_out_proj.weight, rg.mha_out_w, wd);
+        step!(self.mha_out_b, rw.mha_out_proj.bias, rg.mha_out_b, 0.0);
+        step!(self.out_proj_w, rw.output_proj.weight, rg.out_proj_w, wd);
+        step!(self.out_proj_b, rw.output_proj.bias, rg.out_proj_b, 0.0);
+        Ok(())
+    }
+}
+
+/// Typed AdamW for the entire RegionalCtm. Same shape as
+/// `RegionalAdamW` but uses `Tensor<D>` everywhere.
+///
+/// Coverage matches the untyped optimiser:
+/// - AdamW on: embeddings, connection synapses, obs_proj, output_proj,
+///   global_decay, per-region inner majors (via RegionInnerAdamWTyped).
+/// - SGD (clip-scaled lr) on: U-Net synapse, kv_ln gamma/beta,
+///   start_activated, start_trace, decay_params_out/action, exit_gate.
+///
+/// Skipped subsystems (deferred — same as RegionalWeightsTyped):
+/// router, cereb_projection, cereb_blend_logit, generation counter.
+pub struct RegionalAdamWTyped<D: TensorDeviceG> {
+    pub step_count: u64,
+    pub lr: f32,
+    pub weight_decay: f32,
+    pub grad_clip: f32,
+    pub embeddings: AdamWTyped<D>,
+    pub conn_w: Vec<AdamWTyped<D>>,
+    pub conn_b: Vec<AdamWTyped<D>>,
+    pub obs_proj_w: AdamWTyped<D>,
+    pub obs_proj_b: AdamWTyped<D>,
+    pub global_decay: AdamWTyped<D>,
+    pub output_proj_w: AdamWTyped<D>,
+    pub output_proj_b: AdamWTyped<D>,
+    pub region_inner: Vec<RegionInnerAdamWTyped<D>>,
+    pub outer_exit_gate_w: Option<AdamWTyped<D>>,
+    pub outer_exit_gate_b: Option<AdamWTyped<D>>,
+}
+
+impl<D: TensorDeviceG> RegionalAdamWTyped<D> {
+    pub fn new(w: &RegionalWeightsTyped<D>) -> Result<Self, BackendErrorG> {
+        let conn_w = w.connection_synapses.iter()
+            .map(|s| AdamWTyped::<D>::new(s.weight.len()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let conn_b = w.connection_synapses.iter()
+            .map(|s| AdamWTyped::<D>::new(s.bias.len()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let region_inner = w.regions.iter()
+            .map(RegionInnerAdamWTyped::<D>::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let outer_exit_gate_w = match &w.outer_exit_gate {
+            Some(g) => Some(AdamWTyped::<D>::new(g.weight.len())?),
+            None => None,
+        };
+        let outer_exit_gate_b = match &w.outer_exit_gate {
+            Some(g) => Some(AdamWTyped::<D>::new(g.bias.len())?),
+            None => None,
+        };
+        Ok(Self {
+            step_count: 0,
+            lr: 3e-4,
+            weight_decay: 0.01,
+            grad_clip: 1.0,
+            embeddings: AdamWTyped::<D>::new(w.embeddings.len())?,
+            conn_w, conn_b,
+            obs_proj_w: AdamWTyped::<D>::new(w.obs_proj.weight.len())?,
+            obs_proj_b: AdamWTyped::<D>::new(w.obs_proj.bias.len())?,
+            global_decay: AdamWTyped::<D>::new(w.global_decay.len())?,
+            output_proj_w: AdamWTyped::<D>::new(w.output_proj.weight.len())?,
+            output_proj_b: AdamWTyped::<D>::new(w.output_proj.bias.len())?,
+            region_inner,
+            outer_exit_gate_w,
+            outer_exit_gate_b,
+        })
+    }
+
+    pub fn with_lr(mut self, lr: f32) -> Self { self.lr = lr; self }
+    pub fn with_wd(mut self, wd: f32) -> Self { self.weight_decay = wd; self }
+    pub fn with_clip(mut self, clip: f32) -> Self { self.grad_clip = clip; self }
+
+    /// Compute global L2 norm across every gradient tensor — host fallback
+    /// (one to_vec per tensor). Acceptable cost: gradient clipping fires
+    /// once per training step on small tensors.
+    fn grad_norm(&self, grads: &RegionalGradientsTyped<D>) -> Result<f32, BackendErrorG> {
+        let mut sumsq = 0.0f64;
+        let mut sum_sq_tensor = |t: &TensorG<D>| -> Result<(), BackendErrorG> {
+            let h: Vec<f32> = t.to_vec()?;
+            for &x in &h { sumsq += (x as f64) * (x as f64); }
+            Ok(())
+        };
+        sum_sq_tensor(&grads.output_proj.d_w)?;
+        sum_sq_tensor(&grads.output_proj.d_b)?;
+        sum_sq_tensor(&grads.obs_proj.d_w)?;
+        sum_sq_tensor(&grads.obs_proj.d_b)?;
+        for cg in &grads.connection_synapses {
+            sum_sq_tensor(&cg.d_w)?;
+            sum_sq_tensor(&cg.d_b)?;
+        }
+        for rg in &grads.regions {
+            sum_sq_tensor(&rg.nlm_s1_w)?;
+            sum_sq_tensor(&rg.out_proj_w)?;
+            sum_sq_tensor(&rg.q_proj_w)?;
+            sum_sq_tensor(&rg.kv_proj_w)?;
+        }
+        Ok((sumsq.sqrt()) as f32)
+    }
+
+    /// Apply one optimiser step. Mirrors `RegionalAdamW::step`:
+    /// 1. Compute global grad norm + clip scale.
+    /// 2. AdamW on majors with scaled lr.
+    /// 3. SGD on minors with scaled lr.
+    pub fn step(
+        &mut self,
+        w: &mut RegionalWeightsTyped<D>,
+        grads: &mut RegionalGradientsTyped<D>,
+    ) -> Result<(), BackendErrorG> {
+        self.step_count += 1;
+        let norm = self.grad_norm(grads)?;
+        let scale = if norm > self.grad_clip { self.grad_clip / norm } else { 1.0 };
+        let lr = self.lr * scale;
+        let wd = self.weight_decay;
+
+        // Per-region inner majors (AdamW) + minors (SGD).
+        for r in 0..w.regions.len() {
+            self.region_inner[r].step(&mut w.regions[r], &mut grads.regions[r], lr, wd)?;
+            // Minor tensors → SGD via clip-scaled lr.
+            apply_minor_typed::<D>(&mut w.regions[r], &mut grads.regions[r],
+                &mut grads.region_unets[r], lr)?;
+        }
+
+        // Outer connection synapses — AdamW.
+        for i in 0..w.connection_synapses.len() {
+            self.conn_w[i].lr = lr;
+            self.conn_w[i].weight_decay = wd;
+            self.conn_w[i].step(&mut w.connection_synapses[i].weight, &grads.connection_synapses[i].d_w)?;
+            self.conn_b[i].lr = lr;
+            self.conn_b[i].weight_decay = 0.0;
+            self.conn_b[i].step(&mut w.connection_synapses[i].bias, &grads.connection_synapses[i].d_b)?;
+        }
+
+        // obs_proj — AdamW.
+        self.obs_proj_w.lr = lr;
+        self.obs_proj_w.weight_decay = wd;
+        self.obs_proj_w.step(&mut w.obs_proj.weight, &grads.obs_proj.d_w)?;
+        self.obs_proj_b.lr = lr;
+        self.obs_proj_b.weight_decay = 0.0;
+        self.obs_proj_b.step(&mut w.obs_proj.bias, &grads.obs_proj.d_b)?;
+
+        // global_decay — AdamW (regional cascade currently doesn't flow
+        // gradient into it; the AdamW step just runs against zero grads).
+        self.global_decay.lr = lr;
+        self.global_decay.weight_decay = 0.0;
+        self.global_decay.step(&mut w.global_decay, &grads.global_decay)?;
+
+        // output_proj — AdamW.
+        self.output_proj_w.lr = lr;
+        self.output_proj_w.weight_decay = wd;
+        self.output_proj_w.step(&mut w.output_proj.weight, &grads.output_proj.d_w)?;
+        self.output_proj_b.lr = lr;
+        self.output_proj_b.weight_decay = 0.0;
+        self.output_proj_b.step(&mut w.output_proj.bias, &grads.output_proj.d_b)?;
+
+        // Outer exit gate — AdamW (optional).
+        if let (Some(gate), Some(opt_w), Some(opt_b), Some(g)) = (
+            w.outer_exit_gate.as_mut(),
+            self.outer_exit_gate_w.as_mut(),
+            self.outer_exit_gate_b.as_mut(),
+            grads.outer_exit_gate.as_ref(),
+        ) {
+            opt_w.lr = lr;
+            opt_w.weight_decay = wd;
+            opt_w.step(&mut gate.weight, &g.d_w)?;
+            opt_b.lr = lr;
+            opt_b.weight_decay = 0.0;
+            opt_b.step(&mut gate.bias, &g.d_b)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Apply SGD updates to per-region minor tensors: U-Net synapse weights,
+/// kv_ln gamma/beta, start states, decay params, and inner exit gate.
+/// Matches `CtmGradients::apply_minor` but typed.
+fn apply_minor_typed<D: TensorDeviceG>(
+    rw: &mut CtmWeightsTyped<D>,
+    rg: &mut crate::weights::CtmGradientsTyped<D>,
+    unet_grads: &mut crate::synapse::UNetGradsTyped<D>,
+    lr: f32,
+) -> Result<(), BackendErrorG> {
+    // U-Net synapse: per-block linear + LN, plus skip-LN gamma/beta.
+    apply_minor_block::<D>(&mut rw.synapse.first_projection, &mut unet_grads.first, lr)?;
+    let n_down = rw.synapse.down_blocks.len().min(unet_grads.downs.len());
+    for i in 0..n_down {
+        apply_minor_block::<D>(
+            &mut rw.synapse.down_blocks[i],
+            &mut unet_grads.downs[i],
+            lr,
+        )?;
+    }
+    let n_up = rw.synapse.up_blocks.len().min(unet_grads.ups.len());
+    for i in 0..n_up {
+        apply_minor_block::<D>(
+            &mut rw.synapse.up_blocks[i],
+            &mut unet_grads.ups[i],
+            lr,
+        )?;
+    }
+    let n_skip = rw.synapse.skip_ln_gamma.len()
+        .min(rw.synapse.skip_ln_beta.len())
+        .min(unet_grads.skip_d_gamma.len())
+        .min(unet_grads.skip_d_beta.len());
+    for i in 0..n_skip {
+        let n_g = rw.synapse.skip_ln_gamma[i].len();
+        let n_b = rw.synapse.skip_ln_beta[i].len();
+        tensor_typed_g::sgd_step::<D>(&mut rw.synapse.skip_ln_gamma[i], &unet_grads.skip_d_gamma[i], n_g, lr)?;
+        tensor_typed_g::sgd_step::<D>(&mut rw.synapse.skip_ln_beta[i], &unet_grads.skip_d_beta[i], n_b, lr)?;
+    }
+
+    // kv-LN gamma/beta.
+    let n_g = rw.kv_ln_gamma.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.kv_ln_gamma, &rg.kv_ln_d_gamma, n_g, lr)?;
+    let n_b = rw.kv_ln_beta.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.kv_ln_beta, &rg.kv_ln_d_beta, n_b, lr)?;
+
+    // Start states.
+    let n_a = rw.start_activated.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.start_activated, &rg.d_start_activated, n_a, lr)?;
+    let n_t = rw.start_trace.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.start_trace, &rg.d_start_trace, n_t, lr)?;
+
+    // Decay params.
+    let n_do = rw.decay_params_out.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.decay_params_out, &rg.d_decay_out, n_do, lr)?;
+    let n_da = rw.decay_params_action.len();
+    tensor_typed_g::sgd_step::<D>(&mut rw.decay_params_action, &rg.d_decay_action, n_da, lr)?;
+
+    // Inner exit gate (per-region — distinct from outer_exit_gate).
+    if let (Some(gate), Some(gw), Some(gb)) = (
+        rw.exit_gate.as_mut(), rg.exit_gate_w.as_ref(), rg.exit_gate_b.as_ref(),
+    ) {
+        let nw = gate.weight.len();
+        let nb = gate.bias.len();
+        tensor_typed_g::sgd_step::<D>(&mut gate.weight, gw, nw, lr)?;
+        tensor_typed_g::sgd_step::<D>(&mut gate.bias, gb, nb, lr)?;
+    }
+
+    Ok(())
+}
+
+fn apply_minor_block<D: TensorDeviceG>(
+    block: &mut crate::synapse::SynapseBlockTyped<D>,
+    grads: &mut crate::synapse::SynapseBlockGradsTyped<D>,
+    lr: f32,
+) -> Result<(), BackendErrorG> {
+    let nw = block.linear.weight.len();
+    tensor_typed_g::sgd_step::<D>(&mut block.linear.weight, &grads.d_w, nw, lr)?;
+    let nb = block.linear.bias.len();
+    tensor_typed_g::sgd_step::<D>(&mut block.linear.bias, &grads.d_b, nb, lr)?;
+    let ng = block.ln_gamma.len();
+    tensor_typed_g::sgd_step::<D>(&mut block.ln_gamma, &grads.d_gamma, ng, lr)?;
+    let nbg = block.ln_beta.len();
+    tensor_typed_g::sgd_step::<D>(&mut block.ln_beta, &grads.d_beta, nbg, lr)?;
+    Ok(())
 }
 
 /// Train one token: embed → forward → loss → backward → accumulate embed grads.
@@ -4425,6 +4851,1437 @@ impl RegionalWeights {
     }
 }
 
+/// Typed Linear weight + bias gradient pair, used for connection
+/// synapses and various single-Linear projections at the brain level.
+pub struct LinearGradsTyped<D: TensorDeviceG> {
+    pub d_w: TensorG<D>,
+    pub d_b: TensorG<D>,
+}
+
+impl<D: TensorDeviceG> LinearGradsTyped<D> {
+    pub fn zeros(lin: &modgrad_device::backend::tensor::Linear<D>)
+        -> Result<Self, BackendErrorG>
+    {
+        Ok(Self {
+            d_w: TensorG::<D>::zeros(lin.weight.len())?,
+            d_b: TensorG::<D>::zeros(lin.bias.len())?,
+        })
+    }
+}
+
+/// All gradients for a typed regional brain. Mirrors the untyped
+/// `RegionalGradients` shape in the subsystems we've ported. v0
+/// scope: per-region CTM + UNet + connection synapses + obs_proj +
+/// global_decay + output_proj + outer_exit_gate. Skipped:
+/// extra_heads, cereb_predict, bg_value, router (subsystems still
+/// untyped).
+pub struct RegionalGradientsTyped<D: TensorDeviceG> {
+    pub regions: Vec<crate::weights::CtmGradientsTyped<D>>,
+    pub region_unets: Vec<crate::synapse::UNetGradsTyped<D>>,
+    pub connection_synapses: Vec<LinearGradsTyped<D>>,
+    pub obs_proj: LinearGradsTyped<D>,
+    pub global_decay: TensorG<D>,
+    pub output_proj: LinearGradsTyped<D>,
+    pub outer_exit_gate: Option<LinearGradsTyped<D>>,
+}
+
+impl<D: TensorDeviceG> RegionalGradientsTyped<D> {
+    /// Allocate zeroed gradient tensors matching the weight shapes
+    /// in the supplied typed regional weights.
+    pub fn zeros(w: &RegionalWeightsTyped<D>) -> Result<Self, BackendErrorG> {
+        let regions = w.regions.iter()
+            .map(crate::weights::CtmGradientsTyped::<D>::zeros)
+            .collect::<Result<Vec<_>, _>>()?;
+        let region_unets = w.regions.iter()
+            .map(|r| crate::synapse::UNetGradsTyped::<D>::zeros(&r.synapse))
+            .collect::<Result<Vec<_>, _>>()?;
+        let connection_synapses = w.connection_synapses.iter()
+            .map(LinearGradsTyped::<D>::zeros)
+            .collect::<Result<Vec<_>, _>>()?;
+        let obs_proj = LinearGradsTyped::<D>::zeros(&w.obs_proj)?;
+        let global_decay = TensorG::<D>::zeros(w.global_decay.len())?;
+        let output_proj = LinearGradsTyped::<D>::zeros(&w.output_proj)?;
+        let outer_exit_gate = match &w.outer_exit_gate {
+            Some(g) => Some(LinearGradsTyped::<D>::zeros(g)?),
+            None => None,
+        };
+        Ok(Self {
+            regions, region_unets, connection_synapses,
+            obs_proj, global_decay, output_proj, outer_exit_gate,
+        })
+    }
+
+    /// Reset every gradient tensor to zero. Mirrors the untyped
+    /// `RegionalGradients::zero` pattern — call once per batch
+    /// before accumulating per-sample backward results.
+    ///
+    /// **v0 implementation cost.** Currently re-allocates each
+    /// tensor (`*t = TensorG::zeros(t.len())?`). For `D = Cpu` this
+    /// is cheap; for `D = Rocm` it issues a fresh `hipMalloc` per
+    /// tensor. A future op `Op::FillZeroResident` (single hipMemsetAsync
+    /// per buffer) will close the gap. Documented as a known
+    /// inefficiency — measure before optimising.
+    pub fn zero(&mut self) -> Result<(), BackendErrorG> {
+        for r in &mut self.regions {
+            zero_ctm_grads::<D>(r)?;
+        }
+        for u in &mut self.region_unets {
+            zero_unet_grads::<D>(u)?;
+        }
+        for cg in &mut self.connection_synapses {
+            zero_linear_grads::<D>(cg)?;
+        }
+        zero_linear_grads::<D>(&mut self.obs_proj)?;
+        let n = self.global_decay.len();
+        self.global_decay = TensorG::<D>::zeros(n)?;
+        zero_linear_grads::<D>(&mut self.output_proj)?;
+        if let Some(g) = self.outer_exit_gate.as_mut() {
+            zero_linear_grads::<D>(g)?;
+        }
+        Ok(())
+    }
+
+    /// Element-wise `dst += src` across every gradient tensor.
+    /// Matches the untyped `accumulate(...)` helper used in babyai_probe;
+    /// lets callers maintain a per-batch accumulator without
+    /// re-allocating between samples.
+    pub fn accumulate_from(&mut self, other: &Self) -> Result<(), BackendErrorG> {
+        for (r_dst, r_src) in self.regions.iter_mut().zip(other.regions.iter()) {
+            accumulate_ctm_grads::<D>(r_dst, r_src)?;
+        }
+        for (u_dst, u_src) in self.region_unets.iter_mut().zip(other.region_unets.iter()) {
+            accumulate_unet_grads::<D>(u_dst, u_src)?;
+        }
+        for (c_dst, c_src) in self.connection_synapses.iter_mut().zip(other.connection_synapses.iter()) {
+            accumulate_linear_grads::<D>(c_dst, c_src)?;
+        }
+        accumulate_linear_grads::<D>(&mut self.obs_proj, &other.obs_proj)?;
+        let n = self.global_decay.len().min(other.global_decay.len());
+        tensor_typed_g::add_assign::<D>(&mut self.global_decay, &other.global_decay, n)?;
+        accumulate_linear_grads::<D>(&mut self.output_proj, &other.output_proj)?;
+        if let (Some(g_dst), Some(g_src)) = (
+            self.outer_exit_gate.as_mut(), other.outer_exit_gate.as_ref(),
+        ) {
+            accumulate_linear_grads::<D>(g_dst, g_src)?;
+        }
+        Ok(())
+    }
+}
+
+fn zero_linear_grads<D: TensorDeviceG>(g: &mut LinearGradsTyped<D>) -> Result<(), BackendErrorG> {
+    g.d_w = TensorG::<D>::zeros(g.d_w.len())?;
+    g.d_b = TensorG::<D>::zeros(g.d_b.len())?;
+    Ok(())
+}
+
+fn accumulate_linear_grads<D: TensorDeviceG>(
+    dst: &mut LinearGradsTyped<D>, src: &LinearGradsTyped<D>,
+) -> Result<(), BackendErrorG> {
+    let nw = dst.d_w.len().min(src.d_w.len());
+    let nb = dst.d_b.len().min(src.d_b.len());
+    tensor_typed_g::add_assign::<D>(&mut dst.d_w, &src.d_w, nw)?;
+    tensor_typed_g::add_assign::<D>(&mut dst.d_b, &src.d_b, nb)?;
+    Ok(())
+}
+
+fn zero_ctm_grads<D: TensorDeviceG>(
+    g: &mut crate::weights::CtmGradientsTyped<D>,
+) -> Result<(), BackendErrorG> {
+    macro_rules! zt { ($t:expr) => { $t = TensorG::<D>::zeros($t.len())?; }; }
+    zt!(g.nlm_s1_w); zt!(g.nlm_s1_b);
+    if let Some(t) = g.nlm_s2_w.as_mut() { *t = TensorG::<D>::zeros(t.len())?; }
+    if let Some(t) = g.nlm_s2_b.as_mut() { *t = TensorG::<D>::zeros(t.len())?; }
+    zt!(g.d_start_activated); zt!(g.d_start_trace);
+    zt!(g.kv_proj_w); zt!(g.kv_proj_b);
+    zt!(g.kv_ln_d_gamma); zt!(g.kv_ln_d_beta);
+    zt!(g.q_proj_w); zt!(g.q_proj_b);
+    zt!(g.mha_in_w); zt!(g.mha_in_b);
+    zt!(g.mha_out_w); zt!(g.mha_out_b);
+    zt!(g.d_decay_out); zt!(g.d_decay_action);
+    zt!(g.out_proj_w); zt!(g.out_proj_b);
+    if let Some(t) = g.exit_gate_w.as_mut() { *t = TensorG::<D>::zeros(t.len())?; }
+    if let Some(t) = g.exit_gate_b.as_mut() { *t = TensorG::<D>::zeros(t.len())?; }
+    Ok(())
+}
+
+fn accumulate_ctm_grads<D: TensorDeviceG>(
+    dst: &mut crate::weights::CtmGradientsTyped<D>,
+    src: &crate::weights::CtmGradientsTyped<D>,
+) -> Result<(), BackendErrorG> {
+    macro_rules! aa {
+        ($d:expr, $s:expr) => {{
+            let n = $d.len().min($s.len());
+            tensor_typed_g::add_assign::<D>(&mut $d, &$s, n)?;
+        }};
+    }
+    aa!(dst.nlm_s1_w, src.nlm_s1_w);
+    aa!(dst.nlm_s1_b, src.nlm_s1_b);
+    if let (Some(d), Some(s)) = (dst.nlm_s2_w.as_mut(), src.nlm_s2_w.as_ref()) {
+        let n = d.len().min(s.len());
+        tensor_typed_g::add_assign::<D>(d, s, n)?;
+    }
+    if let (Some(d), Some(s)) = (dst.nlm_s2_b.as_mut(), src.nlm_s2_b.as_ref()) {
+        let n = d.len().min(s.len());
+        tensor_typed_g::add_assign::<D>(d, s, n)?;
+    }
+    aa!(dst.d_start_activated, src.d_start_activated);
+    aa!(dst.d_start_trace, src.d_start_trace);
+    aa!(dst.kv_proj_w, src.kv_proj_w);
+    aa!(dst.kv_proj_b, src.kv_proj_b);
+    aa!(dst.kv_ln_d_gamma, src.kv_ln_d_gamma);
+    aa!(dst.kv_ln_d_beta, src.kv_ln_d_beta);
+    aa!(dst.q_proj_w, src.q_proj_w);
+    aa!(dst.q_proj_b, src.q_proj_b);
+    aa!(dst.mha_in_w, src.mha_in_w);
+    aa!(dst.mha_in_b, src.mha_in_b);
+    aa!(dst.mha_out_w, src.mha_out_w);
+    aa!(dst.mha_out_b, src.mha_out_b);
+    aa!(dst.d_decay_out, src.d_decay_out);
+    aa!(dst.d_decay_action, src.d_decay_action);
+    aa!(dst.out_proj_w, src.out_proj_w);
+    aa!(dst.out_proj_b, src.out_proj_b);
+    if let (Some(d), Some(s)) = (dst.exit_gate_w.as_mut(), src.exit_gate_w.as_ref()) {
+        let n = d.len().min(s.len());
+        tensor_typed_g::add_assign::<D>(d, s, n)?;
+    }
+    if let (Some(d), Some(s)) = (dst.exit_gate_b.as_mut(), src.exit_gate_b.as_ref()) {
+        let n = d.len().min(s.len());
+        tensor_typed_g::add_assign::<D>(d, s, n)?;
+    }
+    Ok(())
+}
+
+fn zero_unet_grads<D: TensorDeviceG>(
+    g: &mut crate::synapse::UNetGradsTyped<D>,
+) -> Result<(), BackendErrorG> {
+    let zero_block = |b: &mut crate::synapse::SynapseBlockGradsTyped<D>| -> Result<(), BackendErrorG> {
+        b.d_w = TensorG::<D>::zeros(b.d_w.len())?;
+        b.d_b = TensorG::<D>::zeros(b.d_b.len())?;
+        b.d_gamma = TensorG::<D>::zeros(b.d_gamma.len())?;
+        b.d_beta = TensorG::<D>::zeros(b.d_beta.len())?;
+        Ok(())
+    };
+    zero_block(&mut g.first)?;
+    for d in &mut g.downs { zero_block(d)?; }
+    for u in &mut g.ups { zero_block(u)?; }
+    for t in &mut g.skip_d_gamma { *t = TensorG::<D>::zeros(t.len())?; }
+    for t in &mut g.skip_d_beta { *t = TensorG::<D>::zeros(t.len())?; }
+    Ok(())
+}
+
+fn accumulate_unet_grads<D: TensorDeviceG>(
+    dst: &mut crate::synapse::UNetGradsTyped<D>,
+    src: &crate::synapse::UNetGradsTyped<D>,
+) -> Result<(), BackendErrorG> {
+    let acc_block = |
+        d: &mut crate::synapse::SynapseBlockGradsTyped<D>,
+        s: &crate::synapse::SynapseBlockGradsTyped<D>,
+    | -> Result<(), BackendErrorG> {
+        let nw = d.d_w.len().min(s.d_w.len());
+        tensor_typed_g::add_assign::<D>(&mut d.d_w, &s.d_w, nw)?;
+        let nb = d.d_b.len().min(s.d_b.len());
+        tensor_typed_g::add_assign::<D>(&mut d.d_b, &s.d_b, nb)?;
+        let ng = d.d_gamma.len().min(s.d_gamma.len());
+        tensor_typed_g::add_assign::<D>(&mut d.d_gamma, &s.d_gamma, ng)?;
+        let nbg = d.d_beta.len().min(s.d_beta.len());
+        tensor_typed_g::add_assign::<D>(&mut d.d_beta, &s.d_beta, nbg)?;
+        Ok(())
+    };
+    acc_block(&mut dst.first, &src.first)?;
+    let n_down = dst.downs.len().min(src.downs.len());
+    for i in 0..n_down { acc_block(&mut dst.downs[i], &src.downs[i])?; }
+    let n_up = dst.ups.len().min(src.ups.len());
+    for i in 0..n_up { acc_block(&mut dst.ups[i], &src.ups[i])?; }
+    let n_g = dst.skip_d_gamma.len().min(src.skip_d_gamma.len());
+    for i in 0..n_g {
+        let n = dst.skip_d_gamma[i].len().min(src.skip_d_gamma[i].len());
+        tensor_typed_g::add_assign::<D>(&mut dst.skip_d_gamma[i], &src.skip_d_gamma[i], n)?;
+    }
+    let n_b = dst.skip_d_beta.len().min(src.skip_d_beta.len());
+    for i in 0..n_b {
+        let n = dst.skip_d_beta[i].len().min(src.skip_d_beta[i].len());
+        tensor_typed_g::add_assign::<D>(&mut dst.skip_d_beta[i], &src.skip_d_beta[i], n)?;
+    }
+    Ok(())
+}
+
+/// Per-tick cache from `regional_forward_typed_with_cache`. Holds
+/// every intermediate `regional_backward_typed` will need.
+pub struct RegionTickCacheTyped<D: TensorDeviceG> {
+    /// Region outputs at the START of this tick (the "prev_outputs"
+    /// that fed the connection synapses). Used by the multi-region
+    /// backward to flow gradient back through the matvec chain.
+    pub prev_outputs_pre_tick: Vec<Vec<f32>>,
+    /// One Vec per connection: the concat(source activations [+obs])
+    /// fed into `connection_synapses[ci].forward`. Backward needs
+    /// these to compute the synapse weight grads via Linear::backward.
+    pub conn_inputs: Vec<Vec<f32>>,
+    /// One CtmCacheTyped per region — drives ctm_backward_typed.
+    pub region_ctm_caches: Vec<crate::forward::CtmCacheTyped<D>>,
+    /// Concatenated post-tick region activations [total_neurons].
+    /// Used by global_sync_reverse to scatter d_sync into per-region grads.
+    pub all_act: Vec<f32>,
+    pub global_alpha_pre: Vec<f32>,
+    pub global_beta_pre: Vec<f32>,
+    /// Normalised global sync [n_sync] fed into output_proj.
+    pub gs_post_update: Vec<f32>,
+}
+
+/// Top-level cache from `regional_forward_typed_with_cache`.
+pub struct RegionCacheTyped<D: TensorDeviceG> {
+    pub obs: TensorG<D>,
+    pub obs_proj_host: Vec<f32>,
+    pub ticks: Vec<RegionTickCacheTyped<D>>,
+}
+
+// ─── RegionalWeightsTyped<D> — Path C JAX-style port ─────────
+//
+// Top-level brain data container. Mirrors `RegionalWeights`
+// field-by-field with `Tensor<D>` / `Linear<D>` / `CtmWeightsTyped<D>`
+// substitutions. Skipped subsystems (deferred, orthogonal):
+//   - RegionalRouter (own type; complex MoS-style routing)
+//   - cereb_projection (frozen cerebellum LLM bridge — its own crate piece)
+//   - cereb_blend_logit (single scalar, host)
+//   - generation counter (u64, host bookkeeping)
+
+use modgrad_device::backend::tensor as tensor_typed_g;
+use modgrad_device::backend::tensor::{Device as TensorDeviceG, Tensor as TensorG};
+use modgrad_device::backend::BackendError as BackendErrorG;
+use crate::weights::CtmWeightsTyped;
+
+/// Path C typed top-level brain weights. Each f32 buffer in
+/// `RegionalWeights` becomes a `Tensor<D>` here; each `Linear`
+/// becomes `tensor::Linear<D>`; each per-region `CtmWeights`
+/// becomes `CtmWeightsTyped<D>`.
+pub struct RegionalWeightsTyped<D: TensorDeviceG> {
+    pub config: RegionalConfig,
+    pub embeddings: TensorG<D>,
+    pub regions: Vec<CtmWeightsTyped<D>>,
+    pub connection_synapses: Vec<tensor_typed_g::Linear<D>>,
+    pub obs_proj: tensor_typed_g::Linear<D>,
+    /// Sync indices stay as host-side integer LUTs.
+    pub global_sync_left: Vec<usize>,
+    pub global_sync_right: Vec<usize>,
+    pub global_decay: TensorG<D>,
+    pub output_proj: tensor_typed_g::Linear<D>,
+    pub outer_exit_gate: Option<tensor_typed_g::Linear<D>>,
+    pub extra_heads: Vec<tensor_typed_g::Linear<D>>,
+    pub cereb_predict: Option<tensor_typed_g::Linear<D>>,
+    pub bg_value: Option<tensor_typed_g::Linear<D>>,
+}
+
+impl<D: TensorDeviceG> RegionalWeightsTyped<D> {
+    /// Migration constructor: transfer every buffer from the
+    /// untyped `RegionalWeights` into device-resident `Tensor<D>`s.
+    /// After this call, every weight read goes through the typed
+    /// cascade — for `D = Rocm`, weights stay on-device.
+    ///
+    /// Skips: `router`, `cereb_projection`, `cereb_blend_logit`,
+    /// `generation` (deferred subsystems).
+    pub fn from_untyped(w: &RegionalWeights) -> Result<Self, BackendErrorG> {
+        let regions = w.regions.iter()
+            .map(CtmWeightsTyped::<D>::from_untyped)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let connection_synapses = w.connection_synapses.iter()
+            .map(|l| tensor_typed_g::Linear::<D>::from_host(
+                &l.weight, &l.bias, l.in_dim, l.out_dim,
+            ))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let obs_proj = tensor_typed_g::Linear::<D>::from_host(
+            &w.obs_proj.weight, &w.obs_proj.bias,
+            w.obs_proj.in_dim, w.obs_proj.out_dim,
+        )?;
+        let output_proj = tensor_typed_g::Linear::<D>::from_host(
+            &w.output_proj.weight, &w.output_proj.bias,
+            w.output_proj.in_dim, w.output_proj.out_dim,
+        )?;
+        let outer_exit_gate = match &w.outer_exit_gate {
+            Some(g) => Some(tensor_typed_g::Linear::<D>::from_host(
+                &g.weight, &g.bias, g.in_dim, g.out_dim,
+            )?),
+            None => None,
+        };
+        let extra_heads = w.extra_heads.iter()
+            .map(|h| tensor_typed_g::Linear::<D>::from_host(
+                &h.weight, &h.bias, h.in_dim, h.out_dim,
+            ))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cereb_predict = match &w.cereb_predict {
+            Some(h) => Some(tensor_typed_g::Linear::<D>::from_host(
+                &h.weight, &h.bias, h.in_dim, h.out_dim,
+            )?),
+            None => None,
+        };
+        let bg_value = match &w.bg_value {
+            Some(h) => Some(tensor_typed_g::Linear::<D>::from_host(
+                &h.weight, &h.bias, h.in_dim, h.out_dim,
+            )?),
+            None => None,
+        };
+
+        Ok(Self {
+            config: w.config.clone(),
+            embeddings: TensorG::<D>::from_slice(&w.embeddings)?,
+            regions, connection_synapses,
+            obs_proj,
+            global_sync_left: w.global_sync_left.clone(),
+            global_sync_right: w.global_sync_right.clone(),
+            global_decay: TensorG::<D>::from_slice(&w.global_decay)?,
+            output_proj, outer_exit_gate, extra_heads,
+            cereb_predict, bg_value,
+        })
+    }
+
+    /// Multi-region forward pass through the typed cascade.
+    /// v0 covers:
+    ///   - Single observation token
+    ///   - Fixed connection topology (no router)
+    ///   - No episodic memory
+    ///   - No outer exit gate
+    ///   - ExitStrategy::None on the outer tick loop
+    ///
+    /// Each region's activated/trace persists in the caller-supplied
+    /// `region_activated` / `region_trace` vectors (one Vec<f32> per region).
+    /// Returns predictions per outer tick + final global_sync read.
+    pub fn regional_forward_typed(
+        &self,
+        observation: &[f32],
+        region_activated: &mut Vec<Vec<f32>>,
+        region_trace: &mut Vec<Vec<f32>>,
+        global_alpha: &mut Vec<f32>,
+        global_beta: &mut Vec<f32>,
+    ) -> Result<crate::forward::CtmOutput, BackendErrorG> {
+        let cfg = &self.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+        let n_outer = cfg.outer_ticks;
+
+        // Project observation once for fallback (regions with no incoming edges).
+        let obs_t = TensorG::<D>::from_slice(observation)?;
+        let obs_proj_t = self.obs_proj.forward(&obs_t)?;
+        let obs_proj_h: Vec<f32> = obs_proj_t.to_vec()?;
+
+        // Pre-projection of obs is shared; per-region observation
+        // buffers are built fresh each tick from the previous tick's
+        // region outputs + connection synapses.
+        let mut prev_outputs: Vec<Vec<f32>> = region_activated.clone();
+
+        let mut predictions = Vec::with_capacity(n_outer);
+        let mut certainties = Vec::with_capacity(n_outer);
+
+        for _outer_tick in 0..n_outer {
+            // Phase A: build region observations from connection synapses.
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                // src = concat(prev_outputs[from_idx]) + maybe observation slice
+                let mut src: Vec<f32> = Vec::new();
+                for &fi in &conn.from { src.extend_from_slice(&prev_outputs[fi]); }
+                if conn.receives_observation {
+                    let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                    let end = (s + len).min(observation.len());
+                    if s < end { src.extend_from_slice(&observation[s..end]); }
+                }
+                if src.is_empty() { continue; }
+                // Project through this connection's synapse.
+                let src_t = TensorG::<D>::from_slice(&src)?;
+                let proj_t = self.connection_synapses[ci].forward(&src_t)?;
+                let proj_h: Vec<f32> = proj_t.to_vec()?;
+                // Additive merge into target region's slot.
+                let slot = &mut region_obs[conn.to];
+                if slot.is_empty() {
+                    *slot = proj_h;
+                } else {
+                    let n = slot.len().min(proj_h.len());
+                    for i in 0..n { slot[i] += proj_h[i]; }
+                }
+            }
+            // Regions with no incoming edges fall back to obs_projected.
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() { region_obs[r] = obs_proj_h.clone(); }
+            }
+
+            // Phase B: per-region CTM forward. Drive each region with its
+            // observation. Collect outputs (= activated state).
+            let mut new_outputs: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                crate::forward::ctm_forward_typed(
+                    &self.regions[r],
+                    &mut region_activated[r],
+                    &mut region_trace[r],
+                    &region_obs[r],
+                )?;
+                new_outputs.push(region_activated[r].clone());
+            }
+            prev_outputs = new_outputs;
+
+            // Phase C: global sync update from concat of all region activations.
+            let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+            let mut all_act = vec![0.0f32; total_neurons];
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = prev_outputs[r].len();
+                all_act[offset..offset + d].copy_from_slice(&prev_outputs[r]);
+                offset += d;
+            }
+            let global_decay_h: Vec<f32> = self.global_decay.to_vec()?;
+            for i in 0..n_sync {
+                let l = self.global_sync_left[i];
+                let r = self.global_sync_right[i];
+                if l < all_act.len() && r < all_act.len() {
+                    let pw = all_act[l] * all_act[r];
+                    let decay = (-global_decay_h[i].clamp(0.0, 15.0)).exp();
+                    global_alpha[i] = decay * global_alpha[i] + pw;
+                    global_beta[i] = decay * global_beta[i] + 1.0;
+                }
+            }
+            let gs: Vec<f32> = (0..n_sync)
+                .map(|i| global_alpha[i] / global_beta[i].sqrt().max(1e-8))
+                .collect();
+
+            // Phase D: output projection.
+            let gs_t = TensorG::<D>::from_slice(&gs)?;
+            let pred_t = self.output_proj.forward(&gs_t)?;
+            let pred_h: Vec<f32> = pred_t.to_vec()?;
+            let cert = crate::forward::compute_certainty_pub(&pred_h);
+            predictions.push(pred_h);
+            certainties.push(cert);
+        }
+
+        let ticks_used = predictions.len();
+        let final_gs: Vec<f32> = (0..n_sync)
+            .map(|i| global_alpha[i] / global_beta[i].sqrt().max(1e-8))
+            .collect();
+        Ok(crate::forward::CtmOutput {
+            predictions,
+            certainties,
+            sync_out: final_gs,
+            exit_lambdas: Vec::new(),
+            ticks_used,
+            trajectory: Vec::new(),
+        })
+    }
+
+    /// Forward + cache per outer tick. Same algorithm as
+    /// `regional_forward_typed` but exposes every intermediate the
+    /// matched `regional_backward_typed` will need (per-tick connection
+    /// inputs, per-region CTM caches, global-sync state).
+    pub fn regional_forward_typed_with_cache(
+        &self,
+        observation: &[f32],
+        region_activated: &mut Vec<Vec<f32>>,
+        region_trace: &mut Vec<Vec<f32>>,
+        global_alpha: &mut Vec<f32>,
+        global_beta: &mut Vec<f32>,
+    ) -> Result<(crate::forward::CtmOutput, RegionCacheTyped<D>), BackendErrorG> {
+        let cfg = &self.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+        let n_outer = cfg.outer_ticks;
+
+        let obs_t = TensorG::<D>::from_slice(observation)?;
+        let obs_proj_t = self.obs_proj.forward(&obs_t)?;
+        let obs_proj_h: Vec<f32> = obs_proj_t.to_vec()?;
+
+        let mut prev_outputs: Vec<Vec<f32>> = region_activated.clone();
+
+        let mut predictions = Vec::with_capacity(n_outer);
+        let mut certainties = Vec::with_capacity(n_outer);
+        let mut tick_caches: Vec<RegionTickCacheTyped<D>> = Vec::with_capacity(n_outer);
+
+        for _outer_tick in 0..n_outer {
+            let prev_outputs_snapshot = prev_outputs.clone();
+            let global_alpha_pre = global_alpha.clone();
+            let global_beta_pre = global_beta.clone();
+
+            // Phase A: build region observations from connection synapses.
+            // Cache the per-connection inputs (= concat(prev_outputs[from]) + maybe obs slice).
+            let mut conn_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let mut src: Vec<f32> = Vec::new();
+                for &fi in &conn.from { src.extend_from_slice(&prev_outputs[fi]); }
+                if conn.receives_observation {
+                    let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                    let end = (s + len).min(observation.len());
+                    if s < end { src.extend_from_slice(&observation[s..end]); }
+                }
+                conn_inputs.push(src.clone());
+                if src.is_empty() { continue; }
+                let src_t = TensorG::<D>::from_slice(&src)?;
+                let proj_t = self.connection_synapses[ci].forward(&src_t)?;
+                let proj_h: Vec<f32> = proj_t.to_vec()?;
+                let slot = &mut region_obs[conn.to];
+                if slot.is_empty() {
+                    *slot = proj_h;
+                } else {
+                    let n = slot.len().min(proj_h.len());
+                    for i in 0..n { slot[i] += proj_h[i]; }
+                }
+            }
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() { region_obs[r] = obs_proj_h.clone(); }
+            }
+
+            // Phase B: per-region CTM forward with cache.
+            let mut region_ctm_caches: Vec<crate::forward::CtmCacheTyped<D>>
+                = Vec::with_capacity(n_regions);
+            let mut new_outputs: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let (_out, cache) = crate::forward::ctm_forward_typed_with_cache(
+                    &self.regions[r],
+                    &mut region_activated[r],
+                    &mut region_trace[r],
+                    &region_obs[r],
+                )?;
+                region_ctm_caches.push(cache);
+                new_outputs.push(region_activated[r].clone());
+            }
+            prev_outputs = new_outputs;
+
+            // Phase C: global sync update.
+            let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+            let mut all_act = vec![0.0f32; total_neurons];
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = prev_outputs[r].len();
+                all_act[offset..offset + d].copy_from_slice(&prev_outputs[r]);
+                offset += d;
+            }
+            let global_decay_h: Vec<f32> = self.global_decay.to_vec()?;
+            for i in 0..n_sync {
+                let l = self.global_sync_left[i];
+                let r = self.global_sync_right[i];
+                if l < all_act.len() && r < all_act.len() {
+                    let pw = all_act[l] * all_act[r];
+                    let decay = (-global_decay_h[i].clamp(0.0, 15.0)).exp();
+                    global_alpha[i] = decay * global_alpha[i] + pw;
+                    global_beta[i] = decay * global_beta[i] + 1.0;
+                }
+            }
+            let gs: Vec<f32> = (0..n_sync)
+                .map(|i| global_alpha[i] / global_beta[i].sqrt().max(1e-8))
+                .collect();
+
+            // Phase D: output projection.
+            let gs_t = TensorG::<D>::from_slice(&gs)?;
+            let pred_t = self.output_proj.forward(&gs_t)?;
+            let pred_h: Vec<f32> = pred_t.to_vec()?;
+            let cert = crate::forward::compute_certainty_pub(&pred_h);
+
+            tick_caches.push(RegionTickCacheTyped {
+                prev_outputs_pre_tick: prev_outputs_snapshot,
+                conn_inputs,
+                region_ctm_caches,
+                all_act,
+                global_alpha_pre,
+                global_beta_pre,
+                gs_post_update: gs,
+            });
+            predictions.push(pred_h);
+            certainties.push(cert);
+        }
+
+        let ticks_used = predictions.len();
+        let final_gs: Vec<f32> = (0..n_sync)
+            .map(|i| global_alpha[i] / global_beta[i].sqrt().max(1e-8))
+            .collect();
+        let output = crate::forward::CtmOutput {
+            predictions, certainties,
+            sync_out: final_gs.clone(),
+            exit_lambdas: Vec::new(),
+            ticks_used,
+            trajectory: Vec::new(),
+        };
+        let cache = RegionCacheTyped {
+            obs: obs_t,
+            obs_proj_host: obs_proj_h,
+            ticks: tick_caches,
+        };
+        Ok((output, cache))
+    }
+
+    /// Multi-region backward — composes everything in reverse-tick.
+    /// For each outer tick (reverse):
+    ///   1. output_proj backward → d_gs
+    ///   2. global_sync_reverse → d_all_act (per-region d_activated)
+    ///   3. For each region: ctm_backward_typed → d_region_obs
+    ///   4. For each connection: Linear<D>::backward → d_conn_input
+    ///      Aggregate d_conn_input back into d_prev_outputs[from_idx]
+    ///      and d_obs if the connection receives_observation
+    ///
+    /// **Output convention:** all weight grads ACCUMULATE. `d_observation`
+    /// is OVERWRITTEN with the gradient flowing back into the raw
+    /// observation tensor — useful for upstream encoder backprop.
+    ///
+    /// Existing callers that don't need `d_observation` should call
+    /// `regional_backward_typed` instead, which allocates and discards
+    /// the buffer internally.
+    pub fn regional_backward_typed_with_d_obs(
+        &self,
+        cache: &RegionCacheTyped<D>,
+        d_predictions: &[Vec<f32>],
+        grads: &mut RegionalGradientsTyped<D>,
+        d_observation: &mut TensorG<D>,
+    ) -> Result<(), BackendErrorG> {
+        let cfg = &self.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+        let n_outer = cfg.outer_ticks.min(d_predictions.len()).min(cache.ticks.len());
+
+        // Host-side d_observation accumulator. Two sources contribute:
+        //   1. Per-connection tail bytes after the from-segments of each
+        //      `conn` with `receives_observation = true` — sliced into
+        //      d_obs_host[s..s+len] per `cfg.obs_scale_slice(scale)`.
+        //   2. obs_proj backward when any region falls back to obs_proj
+        //      (no incoming connection at this tick) — adds the full
+        //      d_x_t of length raw_obs_dim.
+        let raw_obs_dim = cfg.raw_obs_dim;
+        let mut d_obs_host = vec![0.0f32; raw_obs_dim];
+
+        // Pre-build incoming-connection list per region.
+        let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); n_regions];
+        for (ci, conn) in cfg.connections.iter().enumerate() {
+            if conn.to < n_regions { incoming[conn.to].push(ci); }
+        }
+
+        // Cache global_decay host-side once (was being read every tick).
+        let global_decay_h: Vec<f32> = self.global_decay.to_vec()?;
+
+        // d_decay_host accumulates the brain-level decay-parameter
+        // gradient across every outer tick. Forward:
+        //   alpha_post[i] = decay * alpha_pre[i] + product
+        //   decay = exp(-clamp(decay_param, 0, 15))
+        // Dominant chain (alpha path; matches the alpha-only convention
+        // used by sync_update_reverse_host):
+        //   d alpha_post / d decay      = alpha_pre
+        //   d decay      / d decay_param = -decay  (within clamp range)
+        // ⇒ d_decay_param[i] += -d_alpha * decay * alpha_pre[i]
+        let mut d_decay_host: Vec<f32> = vec![0.0f32; n_sync];
+
+        // Cross-tick carry of d_activated_post for each region: written
+        // by the connection-synapse backward at tick T and consumed at
+        // tick T-1 (added on top of d_per_region from sync_update_reverse).
+        let mut carry_d_prev: Vec<Vec<f32>> = (0..n_regions)
+            .map(|r| vec![0.0f32; self.regions[r].config.d_model])
+            .collect();
+
+        // Accumulator for the obs_proj fallback path. d_obs_proj_h
+        // accumulates contributions from any region that fell back to
+        // obs_proj (had no incoming connection at this tick), summed
+        // over all ticks. We run obs_proj.backward once after the loop.
+        let obs_proj_out_dim = self.obs_proj.out_dim;
+        let mut d_obs_proj_h_acc = vec![0.0f32; obs_proj_out_dim];
+        let mut obs_proj_active = false;
+
+        for tick_idx in (0..n_outer).rev() {
+            let tick_cache = &cache.ticks[tick_idx];
+
+            // 1. output_proj backward.
+            let d_pred_t = TensorG::<D>::from_slice(&d_predictions[tick_idx])?;
+            let gs_t = TensorG::<D>::from_slice(&tick_cache.gs_post_update)?;
+            let mut d_gs = TensorG::<D>::zeros(n_sync)?;
+            self.output_proj.backward(
+                &d_pred_t, &gs_t,
+                &mut grads.output_proj.d_w, &mut grads.output_proj.d_b,
+                &mut d_gs,
+            )?;
+            let d_gs_h: Vec<f32> = d_gs.to_vec()?;
+
+            // 2. Global sync reverse — scatter d_gs into d_all_act and
+            // accumulate the per-pair decay-parameter gradient.
+            // Forward: gs[i] = alpha[i]/sqrt(beta[i]) where
+            //   alpha[i] = decay·alpha_prev + activated[left]·activated[right]
+            // Dominant gradient (matches sync_update_reverse_host):
+            //   d_alpha[i] = d_gs[i] / sqrt(beta[i])
+            //   d_act[left]  += d_alpha · activated[right]
+            //   d_act[right] += d_alpha · activated[left]
+            //   d_decay_param[i] += -d_alpha · decay · alpha_pre[i]
+            let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+            let mut d_all_act = vec![0.0f32; total_neurons];
+            for i in 0..n_sync {
+                let l = self.global_sync_left[i];
+                let r = self.global_sync_right[i];
+                if l >= total_neurons || r >= total_neurons { continue; }
+                let raw = global_decay_h[i];
+                let decay = (-raw.clamp(0.0, 15.0)).exp();
+                let beta_post = decay * tick_cache.global_beta_pre[i] + 1.0;
+                let inv_sqrt_beta = 1.0 / beta_post.max(1e-8).sqrt();
+                let d_alpha = d_gs_h[i] * inv_sqrt_beta;
+                d_all_act[l] += d_alpha * tick_cache.all_act[r];
+                d_all_act[r] += d_alpha * tick_cache.all_act[l];
+                // Decay grad — only flows in the unclamped interior.
+                if raw > 0.0 && raw < 15.0 {
+                    d_decay_host[i] += -d_alpha * decay * tick_cache.global_alpha_pre[i];
+                }
+            }
+
+            // Split d_all_act per-region; add cross-tick carry from
+            // tick T+1 (= what was the next iteration's connection-synapse
+            // backward output, indexed back into this tick's outputs).
+            let mut d_per_region: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            let mut offset = 0;
+            for r in 0..n_regions {
+                let d = self.regions[r].config.d_model;
+                let mut slice = d_all_act[offset..offset + d].to_vec();
+                for i in 0..d { slice[i] += carry_d_prev[r][i]; }
+                d_per_region.push(slice);
+                offset += d;
+            }
+
+            // Reset carry — we'll overwrite it below as the connection
+            // backward produces new d_prev_outputs splits for tick T-1.
+            for v in carry_d_prev.iter_mut() {
+                v.iter_mut().for_each(|x| *x = 0.0);
+            }
+
+            // 3. Per-region ctm_backward_from_d_activated → d_obs_per_region.
+            // Each region emits a d_obs vector of shape = the region's
+            // input dim (= region_obs[r].len() in forward = obs_proj_out_dim
+            // for fallback, or connection_synapses[ci].out_dim for connected).
+            let mut d_obs_per_region: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let region_cache = &tick_cache.region_ctm_caches[r];
+                let region_input_dim = region_cache.raw_input_dim;
+                let d_act_t = TensorG::<D>::from_slice(&d_per_region[r])?;
+                let mut d_obs_r = TensorG::<D>::zeros(region_input_dim)?;
+                crate::forward::ctm_backward_from_d_activated::<D>(
+                    &self.regions[r],
+                    region_cache,
+                    &d_act_t,
+                    &mut grads.regions[r],
+                    &mut grads.region_unets[r],
+                    &mut d_obs_r,
+                )?;
+                d_obs_per_region.push(d_obs_r.to_vec()?);
+            }
+
+            // 4. Per-connection Linear backward — accumulate d_w/d_b for
+            // every connection that contributed to its target region;
+            // split d_src into carry_d_prev[from_idx] for tick T-1.
+            // Regions without any incoming connection at this tick had
+            // their region_obs filled by obs_proj_h — route d_obs_per_region[r]
+            // into the obs_proj_h accumulator instead.
+            for r in 0..n_regions {
+                if incoming[r].is_empty() {
+                    let d_obs_r = &d_obs_per_region[r];
+                    let n = d_obs_r.len().min(d_obs_proj_h_acc.len());
+                    for i in 0..n { d_obs_proj_h_acc[i] += d_obs_r[i]; }
+                    obs_proj_active = true;
+                    continue;
+                }
+                let d_proj_r = &d_obs_per_region[r];
+                if d_proj_r.is_empty() { continue; }
+
+                for &ci in &incoming[r] {
+                    let conn = &cfg.connections[ci];
+                    let conn_input_h = &tick_cache.conn_inputs[ci];
+                    if conn_input_h.is_empty() { continue; }
+
+                    // d_y is shared across all incoming connections (forward
+                    // accumulated `slot += proj`), so each ci sees the same
+                    // d_proj for region r.
+                    let d_y_t = TensorG::<D>::from_slice(d_proj_r)?;
+                    let x_t = TensorG::<D>::from_slice(conn_input_h)?;
+                    let mut d_x_t = TensorG::<D>::zeros(conn_input_h.len())?;
+                    let cg = &mut grads.connection_synapses[ci];
+                    self.connection_synapses[ci].backward(
+                        &d_y_t, &x_t,
+                        &mut cg.d_w, &mut cg.d_b,
+                        &mut d_x_t,
+                    )?;
+                    let d_x_h: Vec<f32> = d_x_t.to_vec()?;
+
+                    // Split d_x_h into per-from segments + optional
+                    // observation tail. Layout matches forward's
+                    // `src.extend_from_slice(&prev_outputs[fi])` for each fi.
+                    let mut off = 0;
+                    for &fi in &conn.from {
+                        if fi >= n_regions { break; }
+                        let d_from = self.regions[fi].config.d_model;
+                        if off + d_from > d_x_h.len() { break; }
+                        for i in 0..d_from {
+                            carry_d_prev[fi][i] += d_x_h[off + i];
+                        }
+                        off += d_from;
+                    }
+                    // receives_observation tail: d_x_h[off..off+len]
+                    // feeds the raw-observation slice for this connection's
+                    // scale. Forward did `src.extend_from_slice(&observation[s..s+len])`,
+                    // so backward routes the same range back into d_obs_host.
+                    if conn.receives_observation {
+                        let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
+                        let avail = d_x_h.len().saturating_sub(off);
+                        let n = len.min(avail).min(d_obs_host.len().saturating_sub(s));
+                        for i in 0..n {
+                            d_obs_host[s + i] += d_x_h[off + i];
+                        }
+                    }
+                }
+            }
+        }
+
+        // After tick loop: obs_proj backward (one-shot) if any region
+        // fell back to obs_proj across any tick. Forward did
+        // `obs_proj_t = obs_proj.forward(obs)` once before the tick loop,
+        // so backward is a single Linear::backward against the cached
+        // raw obs.
+        if obs_proj_active {
+            let d_y_t = TensorG::<D>::from_slice(&d_obs_proj_h_acc)?;
+            let mut d_x_t = TensorG::<D>::zeros(cache.obs.len())?;
+            self.obs_proj.backward(
+                &d_y_t, &cache.obs,
+                &mut grads.obs_proj.d_w, &mut grads.obs_proj.d_b,
+                &mut d_x_t,
+            )?;
+            // d_x_t covers the full observation; add it to d_obs_host.
+            let d_x_h: Vec<f32> = d_x_t.to_vec()?;
+            let n = d_x_h.len().min(d_obs_host.len());
+            for i in 0..n { d_obs_host[i] += d_x_h[i]; }
+        }
+
+        // Flush accumulated decay-parameter gradient into grads.global_decay
+        // via add_assign. The optimiser will then step `w.global_decay`
+        // with this signal (RegionalAdamWTyped::step uses weight_decay=0
+        // for it). Per-region decay_params_out / decay_params_action stay
+        // on the same v0 alpha-only approximation as before.
+        let n_decay = grads.global_decay.len().min(d_decay_host.len());
+        if n_decay > 0 {
+            let d_decay_t = TensorG::<D>::from_slice(&d_decay_host)?;
+            tensor_typed_g::add_assign::<D>(&mut grads.global_decay, &d_decay_t, n_decay)?;
+        }
+
+        // Write the host-side d_observation accumulator into the caller's
+        // tensor. Overwrite semantics: replace the buffer with the
+        // accumulated gradient (caller can chain encoder backward on it).
+        *d_observation = TensorG::<D>::from_slice(&d_obs_host)?;
+
+        Ok(())
+    }
+
+    /// Convenience wrapper that calls `regional_backward_typed_with_d_obs`
+    /// with a discarded `d_observation` buffer. Existing callers that
+    /// don't need upstream encoder backprop should keep using this.
+    pub fn regional_backward_typed(
+        &self,
+        cache: &RegionCacheTyped<D>,
+        d_predictions: &[Vec<f32>],
+        grads: &mut RegionalGradientsTyped<D>,
+    ) -> Result<(), BackendErrorG> {
+        let mut throwaway = TensorG::<D>::zeros(self.config.raw_obs_dim)?;
+        self.regional_backward_typed_with_d_obs(cache, d_predictions, grads, &mut throwaway)
+    }
+
+    /// Total trainable parameters — matches `RegionalWeights::n_params`
+    /// for the ported subsystems. Excludes deferred ones (router,
+    /// cereb_projection) which would add their own counts.
+    pub fn n_params(&self) -> usize {
+        let mut n = self.embeddings.len();
+        for r in &self.regions { n += r.n_params(); }
+        for s in &self.connection_synapses {
+            n += s.weight.len() + s.bias.len();
+        }
+        n += self.obs_proj.weight.len() + self.obs_proj.bias.len();
+        n += self.global_decay.len();
+        n += self.output_proj.weight.len() + self.output_proj.bias.len();
+        if let Some(g) = &self.outer_exit_gate {
+            n += g.weight.len() + g.bias.len();
+        }
+        for h in &self.extra_heads {
+            n += h.weight.len() + h.bias.len();
+        }
+        if let Some(h) = &self.cereb_predict {
+            n += h.weight.len() + h.bias.len();
+        }
+        if let Some(h) = &self.bg_value {
+            n += h.weight.len() + h.bias.len();
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod regional_weights_typed_tests {
+    use super::*;
+    use modgrad_device::backend::tensor::Cpu;
+    #[cfg(feature = "rocm")]
+    use modgrad_device::backend::tensor::Rocm;
+
+    fn small_regional_cfg() -> RegionalConfig {
+        // Smallest sensible 8-region brain.
+        RegionalConfig::eight_region_small(16, 32, 2)
+    }
+
+    #[test]
+    fn cpu_regional_weights_typed_round_trip() {
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).expect("from_untyped");
+
+        // Sub-systems we ported should match in n_params.
+        // (Untyped n_params includes router params if router is Some;
+        // typed n_params excludes router. Compute the delta.)
+        let untyped_total = w.n_params();
+        let router_params: usize = w.router.as_ref().map_or(0, |r| r.n_params());
+        let cereb_params: usize = w.cereb_projection.as_ref().map_or(0, |p|
+            p.proj_out_w.len() + p.proj_out_b.len());
+        let cereb_blend: usize = w.cereb_blend_logit.is_some().then_some(1).unwrap_or(0);
+        let expected_typed = untyped_total - router_params - cereb_params - cereb_blend;
+        assert_eq!(typed.n_params(), expected_typed,
+            "typed n_params {} should match untyped {} minus router={} cereb={} blend={}",
+            typed.n_params(), untyped_total, router_params, cereb_params, cereb_blend);
+
+        // Region count + connection count preserved.
+        assert_eq!(typed.regions.len(), w.regions.len());
+        assert_eq!(typed.connection_synapses.len(), w.connection_synapses.len());
+
+        // Embedding round-trip.
+        let emb_h = typed.embeddings.to_vec().unwrap();
+        assert_eq!(emb_h, w.embeddings);
+    }
+
+    #[test]
+    fn cpu_regional_forward_typed_multiscale_smoke() {
+        // Use a multi-scale config (different obs_scale_dims per
+        // connection) and confirm regional_forward_typed slices the
+        // observation by `obs_scale_slice(conn.observation_scale)`
+        // rather than feeding the whole observation. The connection
+        // synapses are sized for `len(from) + obs_scale_dims[scale]`
+        // so a wrong-sized observation extension would surface as
+        // a shape mismatch in connection_synapses[*].forward.
+        use crate::graph::Connection;
+        let scales = vec![64, 32, 16];
+        let mut cfg = RegionalConfig::eight_region_small_multiscale(
+            &scales, 8, 1,
+        );
+        cfg.router = None;
+        // Spread connections across scales: ci % 3 picks scale 0/1/2.
+        for (ci, conn) in cfg.connections.iter_mut().enumerate() {
+            if conn.receives_observation {
+                conn.observation_scale = ci % scales.len();
+            }
+        }
+        let _ = Connection { from: vec![], to: 0, receives_observation: false, observation_scale: 0 };
+
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        // raw_obs_dim = sum of scales = 112
+        let obs_dim = typed.config.raw_obs_dim;
+        assert_eq!(obs_dim, scales.iter().sum::<usize>());
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.097).cos()).collect();
+
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let out = typed.regional_forward_typed(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).expect("multi-scale regional_forward_typed");
+        assert_eq!(out.predictions.len(), typed.config.outer_ticks);
+    }
+
+    #[test]
+    fn cpu_regional_forward_typed_smoke() {
+        // Build a small typed brain, run forward through every region,
+        // verify it produces predictions of the right shape and that
+        // every region's activated state changes (gradient... wait,
+        // not gradient — just that the typed multi-region forward
+        // composes through connection synapses without panicking).
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+
+        // Initialise per-region activated/trace from start states.
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let out = typed.regional_forward_typed(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).expect("regional_forward_typed");
+
+        assert_eq!(out.predictions.len(), typed.config.outer_ticks);
+        for p in &out.predictions {
+            assert_eq!(p.len(), typed.config.out_dims);
+            // Predictions should not all be zero (something flowed).
+            assert!(p.iter().any(|&x| x.abs() > 1e-6),
+                "prediction all zero — multi-region forward did not produce output");
+        }
+        assert_eq!(out.sync_out.len(), n_sync);
+    }
+
+    #[test]
+    fn cpu_regional_forward_typed_with_cache_smoke() {
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).expect("forward+cache");
+
+        // Cache structural sanity.
+        assert_eq!(cache.ticks.len(), typed.config.outer_ticks);
+        for (tick_idx, tick) in cache.ticks.iter().enumerate() {
+            assert_eq!(tick.region_ctm_caches.len(), typed.regions.len(),
+                "tick {} region cache count mismatch", tick_idx);
+            assert_eq!(tick.conn_inputs.len(), typed.config.connections.len(),
+                "tick {} conn input count mismatch", tick_idx);
+            assert_eq!(tick.gs_post_update.len(), n_sync,
+                "tick {} gs len mismatch", tick_idx);
+        }
+        // Predictions still produced normally.
+        assert_eq!(out.predictions.len(), typed.config.outer_ticks);
+    }
+
+    #[test]
+    fn cpu_regional_backward_typed_full_chain() {
+        // Full regional backward: output_proj + global_sync_reverse +
+        // per-region ctm_backward_from_d_activated + connection synapse
+        // backward, with cross-tick activated carry through connection
+        // d_src splits.
+        //
+        // Asserts that gradient reaches multiple subsystems:
+        //   - brain-level output_proj (top of the chain)
+        //   - per-region NLM / MHA / kv_proj (via ctm_backward_from_d_activated)
+        //   - connection_synapses (via Linear<D>::backward)
+        //
+        // The per-region `out_proj_w` (= each CTM's own output_proj
+        // for per-tick predictions) stays zero by design: the regional
+        // cascade only consumes a region's final activated[] state
+        // through global sync, never its per-tick predictions.
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).unwrap();
+
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()]).collect();
+
+        let mut grads = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        typed.regional_backward_typed(&cache, &d_preds, &mut grads)
+            .expect("regional_backward_typed");
+
+        // Brain-level output_proj must flow.
+        let dw = grads.output_proj.d_w.to_vec().unwrap();
+        assert!(dw.iter().any(|&x| x.abs() > 1e-6),
+            "brain output_proj.d_w all zero");
+        let db = grads.output_proj.d_b.to_vec().unwrap();
+        assert!(db.iter().any(|&x| x.abs() > 1e-6),
+            "brain output_proj.d_b all zero");
+
+        // Per-region NLM stage 1 weight — driven by d_activated
+        // through nlm_backward inside ctm_backward_from_d_activated.
+        let any_region_nlm_flowed = (0..typed.regions.len()).any(|r| {
+            let dw = grads.regions[r].nlm_s1_w.to_vec().unwrap();
+            dw.iter().any(|&x| x.abs() > 1e-6)
+        });
+        assert!(any_region_nlm_flowed,
+            "no region's nlm_s1_w flowed gradient — ctm_backward_from_d_activated path broken");
+
+        // Per-region kv_proj weight — driven by d_obs feeding back
+        // through kv_ln + kv_proj at the end of the inner-tick walk.
+        let any_region_kv_flowed = (0..typed.regions.len()).any(|r| {
+            let dw = grads.regions[r].kv_proj_w.to_vec().unwrap();
+            dw.iter().any(|&x| x.abs() > 1e-6)
+        });
+        assert!(any_region_kv_flowed,
+            "no region's kv_proj_w flowed gradient");
+
+        // At least one connection_synapse must flow gradient (every
+        // connection feeds gradient via Linear<D>::backward when its
+        // target region's d_obs is non-zero).
+        let any_conn_flowed = (0..typed.connection_synapses.len()).any(|ci| {
+            let dw = grads.connection_synapses[ci].d_w.to_vec().unwrap();
+            dw.iter().any(|&x| x.abs() > 1e-6)
+        });
+        assert!(any_conn_flowed,
+            "no connection_synapse weight flowed gradient");
+
+        // Per-region output_proj (per-tick prediction head inside CTM)
+        // is intentionally dead in the regional cascade — confirm.
+        let region0_out_proj = grads.regions[0].out_proj_w.to_vec().unwrap();
+        assert!(region0_out_proj.iter().all(|&x| x == 0.0),
+            "regions[0].out_proj_w should be zero — regional cascade bypasses per-region prediction head");
+    }
+
+    #[test]
+    fn cpu_regional_backward_typed_flows_d_observation() {
+        // When at least one connection has receives_observation=true,
+        // regional_backward_typed_with_d_obs should populate d_observation
+        // with non-zero gradient for the bytes that connection consumed.
+        // small_regional_cfg's eight_region_small has connection 0
+        // (MOTOR→INPUT) with receives_observation=true.
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let n_sync = typed.config.n_global_sync;
+        let raw_obs_dim = typed.config.raw_obs_dim;
+
+        let observation: Vec<f32> = (0..raw_obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).unwrap();
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()]).collect();
+
+        let mut grads = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut d_obs = TensorG::<Cpu>::zeros(raw_obs_dim).unwrap();
+        typed.regional_backward_typed_with_d_obs(
+            &cache, &d_preds, &mut grads, &mut d_obs,
+        ).expect("regional_backward_typed_with_d_obs");
+
+        let dh = d_obs.to_vec().unwrap();
+        assert_eq!(dh.len(), raw_obs_dim);
+        assert!(dh.iter().any(|&x| x.abs() > 1e-9),
+            "d_observation all zero — connection-tail backward did not populate it");
+    }
+
+    #[test]
+    fn cpu_regional_backward_typed_flows_global_decay_grad() {
+        // Brain-level decay-parameter gradient must flow during
+        // regional_backward_typed. With weights initialised to a
+        // mid-range (decay_param > 0), the unclamped interior gives
+        // a non-zero grad through `-d_alpha · decay · alpha_pre`.
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let mut typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        // Bump global_decay to a known non-zero, non-clamped value so
+        // the d_decay branch is active.
+        let n_sync = typed.config.n_global_sync;
+        let raw: Vec<f32> = (0..n_sync).map(|_| 0.5_f32).collect();
+        typed.global_decay = TensorG::<Cpu>::from_slice(&raw).unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        // Two-step forward so the second tick has alpha_pre != 0
+        // (decay grad is multiplied by alpha_pre, so a fresh first tick
+        // alone sees alpha_pre = 0 and contributes nothing).
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).unwrap();
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()]).collect();
+
+        let mut grads = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        typed.regional_backward_typed(&cache, &d_preds, &mut grads)
+            .expect("regional_backward_typed");
+
+        let dd = grads.global_decay.to_vec().unwrap();
+        assert!(dd.iter().any(|&x| x.abs() > 1e-9),
+            "global_decay grad all zero — backward did not propagate decay-parameter signal");
+    }
+
+    #[test]
+    fn cpu_regional_gradients_typed_zero_and_accumulate() {
+        // Build typed brain + grads, run a real backward to populate
+        // grads, snapshot a probe value, then:
+        //   1. zero() resets every tracked tensor to zeros.
+        //   2. accumulate_from(other) adds another set of grads in.
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).unwrap();
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()]).collect();
+
+        let mut g_a = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        typed.regional_backward_typed(&cache, &d_preds, &mut g_a).unwrap();
+
+        // Probe: at least one connection synapse should have non-zero
+        // d_w after a real backward.
+        let probe_before_zero = g_a.connection_synapses[0].d_w.to_vec().unwrap();
+        assert!(probe_before_zero.iter().any(|&x| x.abs() > 1e-6),
+            "test setup: expected non-zero connection grad after backward");
+
+        // Step 1: zero().
+        g_a.zero().unwrap();
+        let probe_after_zero = g_a.connection_synapses[0].d_w.to_vec().unwrap();
+        assert!(probe_after_zero.iter().all(|&x| x == 0.0),
+            "zero() did not reset connection_synapses[0].d_w");
+        let region_probe = g_a.regions[0].nlm_s1_w.to_vec().unwrap();
+        assert!(region_probe.iter().all(|&x| x == 0.0),
+            "zero() did not reset regions[0].nlm_s1_w");
+        let unet_probe = g_a.region_unets[0].first.d_w.to_vec().unwrap();
+        assert!(unet_probe.iter().all(|&x| x == 0.0),
+            "zero() did not reset region_unets[0].first.d_w");
+
+        // Step 2: accumulate_from with a second backward pass.
+        let mut g_b = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        typed.regional_backward_typed(&cache, &d_preds, &mut g_b).unwrap();
+        g_a.accumulate_from(&g_b).unwrap();
+        let probe_after_acc = g_a.connection_synapses[0].d_w.to_vec().unwrap();
+        let probe_b = g_b.connection_synapses[0].d_w.to_vec().unwrap();
+        // After accumulate, g_a should match g_b (since g_a was zero'd then accumulated once).
+        for (a, b) in probe_after_acc.iter().zip(&probe_b) {
+            assert!((a - b).abs() < 1e-9,
+                "accumulate_from after zero produced wrong sum: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn cpu_regional_adamw_typed_step_changes_weights() {
+        // End-to-end: typed forward+cache → typed backward → typed AdamW
+        // step. Asserts the optimiser actually mutates weight tensors
+        // and bumps step_count.
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let mut typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let mut opt = RegionalAdamWTyped::<Cpu>::new(&typed).unwrap()
+            .with_lr(1e-2).with_clip(10.0);
+
+        // Snapshot a few weight tensors.
+        let output_proj_w_before = typed.output_proj.weight.to_vec().unwrap();
+        let region0_nlm_s1_w_before = typed.regions[0].nlm_stage1.weights.to_vec().unwrap();
+        let conn0_w_before = typed.connection_synapses[0].weight.to_vec().unwrap();
+
+        let obs_dim = typed.config.raw_obs_dim;
+        let observation: Vec<f32> = (0..obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin()).collect();
+        let mut region_activated: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_activated.clone()).collect();
+        let mut region_trace: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| r.start_trace.clone()).collect();
+        let n_sync = typed.config.n_global_sync;
+        let mut global_alpha = vec![0.0f32; n_sync];
+        let mut global_beta = vec![1.0f32; n_sync];
+
+        let (out, cache) = typed.regional_forward_typed_with_cache(
+            &observation,
+            &mut region_activated, &mut region_trace,
+            &mut global_alpha, &mut global_beta,
+        ).unwrap();
+        let d_preds: Vec<Vec<f32>> = out.predictions.iter()
+            .map(|p| vec![1.0; p.len()]).collect();
+
+        let mut grads = RegionalGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        typed.regional_backward_typed(&cache, &d_preds, &mut grads).unwrap();
+        opt.step(&mut typed, &mut grads).unwrap();
+        assert_eq!(opt.step_count, 1, "step_count must bump");
+
+        // Each previously-flowing weight must now differ from snapshot.
+        let output_proj_w_after = typed.output_proj.weight.to_vec().unwrap();
+        let any_changed = output_proj_w_before.iter().zip(&output_proj_w_after)
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(any_changed, "output_proj.weight unchanged after AdamW step");
+
+        let nlm_after = typed.regions[0].nlm_stage1.weights.to_vec().unwrap();
+        let any_nlm_changed = region0_nlm_s1_w_before.iter().zip(&nlm_after)
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(any_nlm_changed,
+            "regions[0].nlm_stage1.weights unchanged — RegionInnerAdamWTyped did not step");
+
+        let conn_after = typed.connection_synapses[0].weight.to_vec().unwrap();
+        let any_conn_changed = conn0_w_before.iter().zip(&conn_after)
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(any_conn_changed,
+            "connection_synapses[0].weight unchanged — connection AdamW did not step");
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_regional_weights_typed_constructible() {
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = match RegionalWeightsTyped::<Rocm>::from_untyped(&w) {
+            Ok(t) => t,
+            Err(BackendErrorG::Runtime(msg)) if msg.contains("hipMalloc") => return,
+            Err(e) => panic!("rocm RegionalWeightsTyped build failed: {:?}", e),
+        };
+        assert_eq!(typed.regions.len(), w.regions.len());
+        // Embedding round-trip on Rocm.
+        let emb = typed.embeddings.to_vec().unwrap();
+        for (a, b) in emb.iter().zip(&w.embeddings) {
+            assert!((a - b).abs() < 1e-6,
+                "embedding diverged on Rocm: {} vs {}", a, b);
+        }
+    }
+}
+
 // ─── Multimodal tokenization helpers ──────────────────────
 
 // ── Tokenization helpers ──────────────────────────────────
@@ -4579,11 +6436,13 @@ impl RegionalBrain {
     /// the host path is faster — sometimes dramatically (5× regression
     /// at maze-scale d_model=32).
     ///
-    /// Callers that opt into the resident path (`forward_cached_resident`,
-    /// `backward_cached_resident_with_grads_resident`) should consult
-    /// this first to avoid silently slowing down small-brain training.
-    /// See memory `feedback_residency_dispatch_overhead.md` for the
-    /// measured speedup table at small/medium/large/billion configs
+    /// Heuristic preserved from the now-removed device-resident path.
+    /// `bench_brain_crossover` (typed Cpu vs Rocm) is the current
+    /// authoritative comparison; this helper still answers "is the
+    /// brain large enough that ROCm would beat host CPU" using the
+    /// same d_model threshold the resident path used. See memory
+    /// `feedback_residency_dispatch_overhead.md` for the measured
+    /// speedup table at small/medium/large/billion configs
     /// (0.18×, 0.50×, 0.85×, 1.83× respectively).
     pub fn is_resident_likely_faster(weights: &RegionalWeights) -> bool {
         // Take the maximum cortical d_model across regions. The big
@@ -4732,8 +6591,6 @@ impl RegionalBrain {
                 region_obs,
                 region_activated: state.region_outputs.clone(),
                 region_caches,
-                #[cfg(feature = "rocm")]
-                region_caches_resident: (0..n_regions).map(|_| None).collect(),
                 all_activations,
                 global_sync: global_sync.clone(),
                 global_beta: state.global_beta.clone(),
@@ -4769,550 +6626,6 @@ impl RegionalBrain {
         (brain_output, state, cache)
     }
 
-    /// Device-resident equivalent of `<RegionalBrain as Brain>::forward_cached`.
-    ///
-    /// Mirrors the host outer-tick loop but routes every heavy matvec
-    /// (connection synapses, per-region inner CTM tick loop via
-    /// `ctm_forward_resident`, output projection, optional outer exit
-    /// gate) through `RegionalResidentCache`. Weights stay resident on
-    /// device across ticks; numerics match the host path within
-    /// `~1e-3` FP tolerance (rocBLAS reduces in a different order than
-    /// AVX-512 dot, hence the loose bound).
-    ///
-    /// **Cache freshness.** The caller is responsible for going through
-    /// `RegionalResidentCache::fresh(&weights)?` and handing the
-    /// resulting `FreshCache` to this function. The freshness witness
-    /// covers the entire dispatch chain (top-level Linears + every
-    /// `CtmResidentCache` for `weights.regions[r]`); we do not re-check
-    /// inside this function.
-    ///
-    /// **Cache shape.** The returned `RegionalCache` has
-    /// `tick_caches[t].region_caches[r] = None` for every region —
-    /// the host `CtmCache` constructor is private to `train.rs`, so
-    /// we cannot synthesise one from outside the module. The
-    /// resident BPTT-bound payload lives in
-    /// `tick_caches[t].region_caches_resident[r]`, populated as
-    /// `Some(CtmCacheResident)` per region (PART A of the
-    /// backward-resident slice). Calling
-    /// `<RegionalBrain as Brain>::backward` on this cache will still
-    /// dereference `None` from `region_caches[r]` and panic — that
-    /// path stays host-only. The next slice adds an inherent
-    /// `RegionalBrain::backward_cached_resident` that consumes
-    /// `region_caches_resident` instead. Until that lands, use
-    /// `forward_cached` for training paths and `forward_cached_resident`
-    /// only for inference (or as the forward half of a future
-    /// resident BPTT).
-    ///
-    /// **KV travels through device.** `ctm_forward_resident` now
-    /// takes a `&GpuVec` KV input (Part A of this slice), so the
-    /// per-region forward call passes a device-resident KV scratch
-    /// rather than a host slice. We still run `kv_proj + LayerNorm`
-    /// host-side between the connection synapse output and the
-    /// resident inner forward — `kv_proj` is a per-region matvec
-    /// that is in the resident inventory (`CtmResidentCache::kv_proj`)
-    /// but the affine LayerNorm has no resident op yet, so the
-    /// roundtrip stays for now. The shape change matters: it
-    /// unblocks strategy (b) where `kv` rides device-resident from
-    /// synapse → kv_proj_resident → LN_resident → MHA without any
-    /// host bounce. Today: synapse(GpuVec) → D2H → kv_proj host →
-    /// LN host → H2D upload to scratch → `ctm_forward_resident(
-    /// &GpuVec)`. The per-token H2D upload inside
-    /// `ctm_forward_resident` is sourced from a one-shot D2H of the
-    /// scratch (strategy a).
-    /// TODO: lift `kv_proj + LN` to resident dispatch and drop the
-    /// host roundtrip entirely.
-    ///
-    /// **Router fallback.** When `weights.router.is_some()` this
-    /// function falls back to `<RegionalBrain as Brain>::forward_cached`
-    /// on host. Routing the learned MoS-style router through resident
-    /// dispatch is a separate iteration.
-    #[cfg(feature = "rocm")]
-    pub fn forward_cached_resident(
-        weights: &RegionalWeights,
-        cache_fresh: crate::resident::FreshCache<'_>,
-        batch: &modgrad_device::backend::HipBatch,
-        input: &modgrad_traits::TokenInput,
-    ) -> Result<
-        (modgrad_traits::BrainOutput, RegionalState, RegionalCache),
-        modgrad_compute::backend::ResidencyError,
-    > {
-        use modgrad_compute::backend::GpuVec;
-
-        // Router path is not yet resident — fall through to host. The
-        // dynamic routing logic owns its own forward/backward chain,
-        // and its matvecs are not in the connection_synapses inventory.
-        if weights.router.is_some() {
-            let state = RegionalState::new(weights);
-            return Ok(<Self as modgrad_traits::Brain>::forward_cached(
-                weights, state, input,
-            ));
-        }
-
-        let cfg = &weights.config;
-        let n_regions = cfg.regions.len();
-        let n_sync = cfg.n_global_sync;
-
-        // Same structure as the host forward_cached: fresh state per
-        // call (the trait's `_state` parameter is also ignored on the
-        // host path — see KNOWN REGRESSION at line 4078). Resident
-        // path drives `ctm_forward_resident` which takes `&mut CtmState`,
-        // so we use `RegionalState::new`'s per-region `CtmState`s
-        // directly rather than the `CtmStateExplicit` parallel-vec the
-        // host path builds for `Ctm::forward_cached`.
-        let obs_projected = weights.obs_proj.forward(&input.tokens);
-        let mut state = RegionalState::new(weights);
-        let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
-
-        // Resident scratch buffers reused across ticks. global_sync_dev
-        // and pred_dev hold the output_proj input/output; gate_dev is
-        // allocated only if the outer exit gate exists.
-        let mut global_sync_dev = GpuVec::try_hip(weights.output_proj.in_dim)?;
-        let mut pred_dev = GpuVec::try_hip(weights.output_proj.out_dim)?;
-        let mut gate_dev = if weights.outer_exit_gate.is_some() {
-            Some(GpuVec::try_hip(1)?)
-        } else {
-            None
-        };
-
-        // Per-region KV upload scratch — `ctm_forward_resident` now
-        // takes `&GpuVec`. Allocate once outside the outer-tick loop
-        // and reuse across ticks. Size matches each region's d_input
-        // (= kv_proj.out_dim) for the n_tokens=1 case driven below.
-        let mut region_kv_dev: Vec<GpuVec> = weights.regions.iter()
-            .map(|rw| GpuVec::try_hip(rw.kv_proj.out_dim))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for _outer_tick in 0..cfg.outer_ticks {
-            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
-            let mut connection_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
-
-            // ── Connection synapses (resident with host bounce). ──
-            // Mirrors the no-router branch of forward_cached. Each
-            // synapse: build src on host, upload, matvec_resident,
-            // download to feed the host-side `kv_proj + LayerNorm`.
-            // The post-LN `kv` is then re-uploaded to a per-region
-            // device scratch for the resident inner forward (which
-            // now takes `&GpuVec`). TODO: keep the synapse output on
-            // device by lifting `kv_proj + LayerNorm` to resident
-            // dispatch — drops the per-connection D2H here.
-            for (ci, conn) in cfg.connections.iter().enumerate() {
-                let mut src = Vec::new();
-                for &from_idx in &conn.from {
-                    src.extend_from_slice(&state.region_outputs[from_idx]);
-                }
-                if conn.receives_observation {
-                    let (s, len) = cfg.obs_scale_slice(conn.observation_scale);
-                    src.extend_from_slice(&input.tokens[s..s + len]);
-                }
-                connection_inputs.push(src.clone());
-
-                let synapse = &cache_fresh.connection_synapses()[ci];
-                debug_assert_eq!(synapse.in_dim, src.len(),
-                    "connection synapse in_dim mismatch (ci={ci})");
-                let mut x_dev = GpuVec::try_hip(synapse.in_dim)?;
-                x_dev.copy_from(&src);
-                let mut y_dev = GpuVec::try_hip(synapse.out_dim)?;
-                synapse.forward(batch, &x_dev, &mut y_dev)?;
-                batch.flush()?;
-                let mut projected = vec![0.0f32; synapse.out_dim];
-                match &y_dev {
-                    GpuVec::Hip(buf) => buf.copy_to_host(&mut projected)?,
-                    _ => unreachable!("hip alloc"),
-                }
-                merge_into_region_obs(&mut region_obs[conn.to], projected);
-            }
-            for r in 0..n_regions {
-                if region_obs[r].is_empty() {
-                    region_obs[r] = obs_projected.clone();
-                }
-            }
-
-            // ── Per-region inner CTM forward (resident). ──
-            // Sequential, not parallel: the host path uses rayon for
-            // disjoint mut, but resident dispatch shares a single
-            // HipBatch / command queue, so per-region work is naturally
-            // serialised on the GPU side. Driving it sequentially on
-            // the host keeps the dispatch order deterministic.
-            //
-            // Note: `ctm_forward_resident` takes a `&GpuVec` KV in
-            // `d_input` space; the host's `Ctm::forward_cached` runs
-            // its own `kv_proj + LayerNorm` first. We mirror that
-            // host-side projection block below, then upload to the
-            // per-region device scratch (`region_kv_dev[r]`) for the
-            // resident inner call.
-            let mut region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
-            // The host-shape `region_caches` slot stays empty on the
-            // resident path — `CtmCache` constructor lives in
-            // `train.rs` private scope and we cannot synthesise one
-            // from outside the module. Resident BPTT consumes
-            // `region_caches_resident` instead. See the host-vs-
-            // resident comment on `OuterTickCache::region_caches`.
-            let region_caches: Vec<Option<CtmCache>> =
-                (0..n_regions).map(|_| None).collect();
-            let mut region_caches_resident:
-                Vec<Option<crate::forward::CtmCacheResident>> =
-                Vec::with_capacity(n_regions);
-            for r in 0..n_regions {
-                let rw = &weights.regions[r];
-                // Project region_obs[r] through kv_proj + affine LN per
-                // token (n_tokens = 1) to match the host's
-                // Ctm::forward_cached pre-tick projection. Done host-
-                // side because kv_proj is not in CtmResidentCache for
-                // this slice (would be a small additional matvec; not
-                // load-bearing).
-                let kv = {
-                    let tok = &region_obs[r];
-                    debug_assert_eq!(tok.len(), rw.kv_proj.in_dim);
-                    let mut projected = rw.kv_proj.forward(tok);
-                    let n = projected.len() as f32;
-                    let mean: f32 = projected.iter().sum::<f32>() / n;
-                    let var: f32 = projected.iter()
-                        .map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-                    let inv_std = 1.0 / (var + 1e-5).sqrt();
-                    for i in 0..projected.len() {
-                        projected[i] = rw.kv_ln_gamma[i] * (projected[i] - mean) * inv_std
-                            + rw.kv_ln_beta[i];
-                    }
-                    projected
-                };
-                // Upload post-kv_proj+LN `kv` to the per-region
-                // device scratch and pass `&GpuVec` to the resident
-                // inner forward. The scratch is reused across outer
-                // ticks (allocated once outside the loop). Inside
-                // `ctm_forward_resident` the GpuVec is downloaded
-                // once at the top (strategy a) — there is no per-
-                // connection D2H bounce here anymore.
-                let kv_dev = &mut region_kv_dev[r];
-                debug_assert_eq!(kv_dev.len(), kv.len(),
-                    "per-region kv scratch dim mismatch (r={r})");
-                kv_dev.copy_from(&kv);
-                let rstate = &mut state.region_states[r];
-                let ctm_cache = &cache_fresh.ctm_caches()[r];
-                // PART A: ctm_forward_resident now returns a
-                // populated `CtmCacheResident`; stash it for the next
-                // slice's `backward_cached_resident`.
-                let (_output, ctm_cache_resident) =
-                    crate::forward::ctm_forward_resident(
-                        rw, ctm_cache, rstate, batch, kv_dev, 1,
-                    )?;
-                region_activated.push(rstate.activated.clone());
-                region_caches_resident.push(Some(ctm_cache_resident));
-            }
-            state.region_outputs = region_activated;
-
-            let mut all_activations = Vec::new();
-            for r in 0..n_regions {
-                all_activations.extend_from_slice(&state.region_outputs[r]);
-            }
-
-            // ── Global sync (host scalar op, identical to host path). ──
-            for i in 0..n_sync {
-                let l = weights.global_sync_left[i];
-                let ri = weights.global_sync_right[i];
-                if l < all_activations.len() && ri < all_activations.len() {
-                    let pw = all_activations[l] * all_activations[ri];
-                    let decay = (-weights.global_decay[i].clamp(0.0, 15.0)).exp();
-                    state.global_alpha[i] = decay * state.global_alpha[i] + pw;
-                    state.global_beta[i] = decay * state.global_beta[i] + 1.0;
-                }
-            }
-
-            let global_sync: Vec<f32> = (0..n_sync)
-                .map(|i| state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8))
-                .collect();
-
-            // ── Outer exit gate (resident). ──
-            // No LinearCache produced here — the host forward_cached
-            // builds one for backward, but this is the forward-only
-            // resident path. exit_gate_cache stays None.
-            let exit_lambda = if let (Some(gate_resident), Some(gate_buf)) =
-                (cache_fresh.outer_exit_gate(), gate_dev.as_mut())
-            {
-                global_sync_dev.copy_from(&global_sync);
-                gate_resident.forward(batch, &global_sync_dev, gate_buf)?;
-                batch.flush()?;
-                let mut gate_out = [0.0f32; 1];
-                match &*gate_buf {
-                    GpuVec::Hip(buf) => buf.copy_to_host(&mut gate_out)?,
-                    _ => unreachable!("hip alloc"),
-                }
-                1.0 / (1.0 + (-gate_out[0]).exp())
-            } else {
-                0.0
-            };
-
-            tick_caches.push(OuterTickCache {
-                region_obs,
-                region_activated: state.region_outputs.clone(),
-                region_caches,
-                #[cfg(feature = "rocm")]
-                region_caches_resident,
-                all_activations,
-                global_sync: global_sync.clone(),
-                global_beta: state.global_beta.clone(),
-                connection_inputs,
-                // Forward-only path: no LinearCache for backward. See
-                // doc comment above ("Forward-only RegionalCache").
-                exit_gate_cache: None,
-                exit_lambda,
-                router_cache: None,
-            });
-        }
-
-        // ── Output projection (resident, one dispatch per tick). ──
-        let out_dim = weights.output_proj.out_dim;
-        let mut predictions: Vec<Vec<f32>> = Vec::with_capacity(tick_caches.len());
-        for tc in &tick_caches {
-            global_sync_dev.copy_from(&tc.global_sync);
-            cache_fresh.output_proj().forward(batch, &global_sync_dev, &mut pred_dev)?;
-            batch.flush()?;
-            let mut pred = vec![0.0f32; out_dim];
-            match &pred_dev {
-                GpuVec::Hip(buf) => buf.copy_to_host(&mut pred)?,
-                _ => unreachable!("hip alloc"),
-            }
-            predictions.push(pred);
-        }
-        let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
-            let c = compute_certainty(p);
-            [1.0 - c, c]
-        }).collect();
-
-        let brain_output = modgrad_traits::BrainOutput {
-            predictions,
-            certainties,
-            sync: tick_caches.last()
-                .map(|tc| tc.global_sync.clone())
-                .unwrap_or_default(),
-        };
-
-        let cache = RegionalCache {
-            tick_caches,
-            observation: input.tokens.clone(),
-            last_region_activations: state.region_outputs.clone(),
-        };
-
-        Ok((brain_output, state, cache))
-    }
-
-    /// Resident backward pass — counterpart to
-    /// [`forward_cached_resident`]. Mirrors
-    /// `<RegionalBrain as Brain>::backward` but consumes the
-    /// `region_caches_resident` slot of each `OuterTickCache` (populated
-    /// by `forward_cached_resident`) and dispatches per-region inner
-    /// BPTT through `crate::forward::ctm_backward_resident`.
-    ///
-    /// **Output projection / global sync / connection synapses.** All
-    /// dispatched through host helpers today (`outer_product_acc`,
-    /// `matvec_t`, scalar global-sync scatter). The resident
-    /// `Op::MatmulResidentTN` / `Op::MatmulResidentNT` variants
-    /// shipped with PART A are perfectly applicable here — the
-    /// shapes are right — but lifting them is mechanical and a
-    /// follow-up. The host paths already dispatch through the
-    /// device registry (which, on rocm-feature builds, routes
-    /// `outer_product_acc` and `matvec_t` to ROCm at qualifying
-    /// shapes).
-    ///
-    /// **U-Net subgraph (Path B).** See
-    /// `crate::forward::ctm_backward_resident` module-level doc.
-    /// `region_grads[r].unet` is now populated — the prior
-    /// "regress to zero" regression is closed by promoting
-    /// `train::unet_forward_cached`/`train::unet_backward` to
-    /// `pub(crate)` and calling them on the saved `pre_syn` from
-    /// each tick's resident cache.
-    ///
-    /// **Router fallback.** Mirrors `forward_cached_resident`: when
-    /// `weights.router.is_some()` we don't run the resident inner
-    /// backward (no resident router today); the caller's training
-    /// path stays on `<Self as Brain>::backward` for that case.
-    /// Returns `None` to signal the caller should fall back.
-    ///
-    /// **Adaptive exit gate.** Same shape as host backward — uses
-    /// the per-tick `exit_gate_cache` in `OuterTickCache`. The
-    /// resident forward currently leaves `exit_gate_cache = None`,
-    /// so the gate gradient is skipped here; fixing that needs the
-    /// resident forward to plumb a `LinearCache`-shaped artefact
-    /// for the gate matvec, which is a tiny follow-up. Tests run
-    /// with `ExitStrategy::None` to side-step it for this slice.
-    #[cfg(feature = "rocm")]
-    pub fn backward_cached_resident(
-        weights: &RegionalWeights,
-        cache: RegionalCache,
-        d_predictions: &[Vec<f32>],
-    ) -> RegionalGradients {
-        Self::backward_cached_resident_inner(weights, cache, d_predictions, None)
-    }
-
-    /// Phase 3c variant: when `resident_grads` is `Some(rg)`, the
-    /// per-region NLM `super_linear_bwd_dw` calls dispatch through
-    /// the resident kernel, accumulating into `rg`'s device buffers.
-    /// The returned host `RegionalGradients` will have zero
-    /// `region_grads[r].nlm_s1_w` / `nlm_s2_w` — caller must merge
-    /// device-accumulated values via `rg.add_to_host(&mut grads)`
-    /// before opt.step.
-    #[cfg(feature = "rocm")]
-    pub fn backward_cached_resident_with_grads_resident(
-        weights: &RegionalWeights,
-        cache: RegionalCache,
-        d_predictions: &[Vec<f32>],
-        resident_grads: &crate::resident::RegionalGradientsResident,
-    ) -> RegionalGradients {
-        Self::backward_cached_resident_inner(weights, cache, d_predictions, Some(resident_grads))
-    }
-
-    #[cfg(feature = "rocm")]
-    fn backward_cached_resident_inner(
-        weights: &RegionalWeights,
-        cache: RegionalCache,
-        d_predictions: &[Vec<f32>],
-        resident_grads: Option<&crate::resident::RegionalGradientsResident>,
-    ) -> RegionalGradients {
-        use crate::dispatch_profile::{Guard, DispatchKind};
-        let cfg = &weights.config;
-        let n_regions = cfg.regions.len();
-        let mut grads = RegionalGradients::zeros(weights);
-
-        let add = |d: &mut [f32], s: &[f32]| {
-            for (d, s) in d.iter_mut().zip(s) { *d += s; }
-        };
-
-        // Exit gate gradients — same shape as host backward but
-        // gated on `exit_gate_cache` being populated. The resident
-        // forward leaves it None today (see GAP doc above); tests
-        // exercise `ExitStrategy::None` so this branch is dead in
-        // the smoke test.
-        if let Some(ref gate) = weights.outer_exit_gate {
-            let predictions: Vec<Vec<f32>> = cache.tick_caches.iter()
-                .map(|tc| weights.output_proj.forward(&tc.global_sync))
-                .collect();
-            let lambdas: Vec<f32> = cache.tick_caches.iter().map(|tc| tc.exit_lambda).collect();
-            let beta = cfg.exit_strategy.beta();
-            let (_exit_loss, _exit_d_preds, d_lambdas) = crate::train::adaptive_exit_loss(
-                &predictions, &lambdas, 0, beta);
-            let mut d_gate_in_scratch = vec![0.0f32; gate.in_dim];
-            for (t, d_lambda) in d_lambdas.iter().enumerate() {
-                if let Some(ref ec) = cache.tick_caches[t].exit_gate_cache {
-                    let gw = grads.outer_exit_gate_dw.as_mut().unwrap();
-                    let gb = grads.outer_exit_gate_db.as_mut().unwrap();
-                    crate::train::linear_backward(
-                        gate, &[*d_lambda], ec, gw, gb,
-                        &mut d_gate_in_scratch);
-                }
-            }
-        }
-
-        for (t, tc) in cache.tick_caches.into_iter().enumerate().rev() {
-            let d_logits = &d_predictions[t];
-
-            // ── output_proj backward (host registry dispatch). ──
-            let out_dim = weights.output_proj.out_dim;
-            let in_dim = weights.output_proj.in_dim;
-            let mut d_global_sync = vec![0.0f32; in_dim];
-            {
-                let _g = Guard::new(DispatchKind::BwdOutputProj);
-                for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
-                modgrad_device::backend::ops::outer_product_acc(
-                    d_logits, &tc.global_sync, &mut grads.output_proj_dw,
-                    out_dim, in_dim,
-                ).expect("output_proj backward: outer_product_acc dispatch");
-                modgrad_device::backend::ops::matvec_t(
-                    d_logits, &weights.output_proj.weight, &mut d_global_sync,
-                    out_dim, in_dim,
-                ).expect("output_proj backward: matvec_t dispatch");
-            }
-
-            // ── Global sync backward (host scalar). ──
-            let total_act_dim = tc.all_activations.len();
-            let d_all_activations = {
-                let _g = Guard::new(DispatchKind::BwdGlobalSync);
-                global_sync_backward(
-                    &d_global_sync, &tc.all_activations, &tc.global_beta,
-                    &weights.global_sync_left, &weights.global_sync_right, total_act_dim,
-                )
-            };
-
-            // Split per region.
-            let mut offset = 0;
-            let mut d_region_activated: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
-            for r in 0..n_regions {
-                let dim = weights.regions[r].config.d_model;
-                d_region_activated.push(d_all_activations[offset..offset + dim].to_vec());
-                offset += dim;
-            }
-
-            // ── Per-region inner BPTT via `ctm_backward_resident`. ──
-            // The resident path stores its inner caches in
-            // `region_caches_resident`; this is what PART A populates.
-            let mut d_region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
-            #[allow(unused_mut)]
-            let mut region_caches_resident = tc.region_caches_resident;
-            for r in 0..n_regions {
-                if let Some(rcache_resident) = region_caches_resident[r].take() {
-                    let result = {
-                        let _g = Guard::new(DispatchKind::BwdInnerCtm);
-                        match resident_grads {
-                            Some(rg) => crate::forward::ctm_backward_resident_with_grads_resident(
-                                &weights.regions[r], &rcache_resident,
-                                &d_region_activated[r],
-                                rg, r,
-                            ),
-                            None => crate::forward::ctm_backward_resident(
-                                &weights.regions[r], &rcache_resident,
-                                &d_region_activated[r],
-                            ),
-                        }
-                    };
-                    let _g = Guard::new(DispatchKind::BwdAccumGrads);
-                    let dst = &mut grads.region_grads[r];
-                    add(&mut dst.nlm_s1_w, &result.grads.nlm_s1_w);
-                    add(&mut dst.nlm_s1_b, &result.grads.nlm_s1_b);
-                    if let (Some(dw), Some(sw)) = (&mut dst.nlm_s2_w, &result.grads.nlm_s2_w) {
-                        add(dw, sw);
-                    }
-                    if let (Some(db), Some(sb)) = (&mut dst.nlm_s2_b, &result.grads.nlm_s2_b) {
-                        add(db, sb);
-                    }
-                    add(&mut dst.d_start_activated, &result.grads.d_start_activated);
-                    add(&mut dst.d_start_trace, &result.grads.d_start_trace);
-                    add(&mut dst.kv_proj_w, &result.grads.kv_proj_w);
-                    add(&mut dst.kv_proj_b, &result.grads.kv_proj_b);
-                    add(&mut dst.q_proj_w, &result.grads.q_proj_w);
-                    add(&mut dst.q_proj_b, &result.grads.q_proj_b);
-                    add(&mut dst.mha_in_w, &result.grads.mha_in_w);
-                    add(&mut dst.mha_in_b, &result.grads.mha_in_b);
-                    add(&mut dst.mha_out_w, &result.grads.mha_out_w);
-                    add(&mut dst.mha_out_b, &result.grads.mha_out_b);
-                    add(&mut dst.out_proj_w, &result.grads.out_proj_w);
-                    add(&mut dst.out_proj_b, &result.grads.out_proj_b);
-                    dst.unet.add_from(&result.grads.unet);
-                    d_region_obs[r] = result.d_observation;
-                }
-            }
-
-            // ── Connection synapse backward (host scalar) ──
-            {
-                let _g = Guard::new(DispatchKind::BwdConnSynapse);
-                for (ci, conn) in cfg.connections.iter().enumerate() {
-                    let r = conn.to;
-                    if d_region_obs[r].is_empty() { continue; }
-                    let d_proj_out = &d_region_obs[r];
-                    let syn = &weights.connection_synapses[ci];
-                    let syn_input = &tc.connection_inputs.get(ci);
-                    if let Some(input) = syn_input {
-                        for i in 0..syn.out_dim.min(d_proj_out.len()) {
-                            grads.connection_db[ci][i] += d_proj_out[i];
-                            for j in 0..syn.in_dim.min(input.len()) {
-                                grads.connection_dw[ci][i * syn.in_dim + j] +=
-                                    d_proj_out[i] * input[j];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        grads
-    }
 }
 
 impl modgrad_traits::Brain for RegionalBrain {
@@ -5475,8 +6788,6 @@ impl modgrad_traits::Brain for RegionalBrain {
                 region_obs,
                 region_activated: state.region_outputs.clone(),
                 region_caches,
-                #[cfg(feature = "rocm")]
-                region_caches_resident: (0..n_regions).map(|_| None).collect(),
                 all_activations,
                 global_sync: global_sync.clone(),
                 global_beta: state.global_beta.clone(),
@@ -6423,18 +7734,13 @@ mod tests {
             |preds, _certainties| {
                 let last_tick = preds.len() - 1;
                 let brain_output = &preds[last_tick];
-                debug_assert_eq!(brain_output.len(), VOCAB,
-                    "brain emits at out_dims=VOCAB; check config");
+                debug_assert_eq!(brain_output.len(), BRAIN_OUT,
+                    "brain emits at out_dims=BRAIN_OUT; modulator's brain_dim must match");
 
-                // Brain's out_dims is VOCAB (=BRAIN_OUT in this test
-                // because we set cfg's out_dims = BRAIN_OUT). For a
-                // real-world Qwen experiment with vocab≠brain_dim,
-                // there's an additional projection. Here both equal
-                // BRAIN_OUT so the modulator's brain_dim matches.
-
-                // Synthetic mod_brain_dim must match brain's out_dim.
-                // BRAIN_OUT was used for both: brain.out_dims=BRAIN_OUT
-                // (configured) and modulator.brain_dim=BRAIN_OUT.
+                // Brain's out_dims is BRAIN_OUT and modulator's brain_dim
+                // is also BRAIN_OUT, so the projection is a square map
+                // BRAIN_OUT → BRAIN_OUT. For a real-world Qwen experiment
+                // with vocab≠brain_dim, there's an additional projection.
                 let mut modulated = vec![0.0f32; VOCAB];
                 let mut z = vec![0.0f32; modulator_ref.rank];
                 modulator_ref.modulate_into_with_scratch(
@@ -6453,7 +7759,9 @@ mod tests {
                 // Modulator backward with d_brain_output: feeds the
                 // gradient back through the projection and produces
                 // `d_brain_output` we hand to the brain backward.
-                let mut d_brain_output = vec![0.0f32; VOCAB];
+                // Sized to brain_dim (= BRAIN_OUT) — the modulator
+                // asserts d_brain_output.len() == self.brain_dim.
+                let mut d_brain_output = vec![0.0f32; BRAIN_OUT];
                 modulator_ref.backward_with_d_brain(
                     brain_output, &d_modulated,
                     d_dw_r, d_db_r, d_uw_r, d_ub_r,
@@ -6461,10 +7769,11 @@ mod tests {
                 );
 
                 // Per-tick d_preds: zero for non-last ticks, gradient
-                // at the last tick.
+                // at the last tick. Brain's predictions are out_dims
+                // (= BRAIN_OUT) so d_preds entries match BRAIN_OUT.
                 let n_ticks = preds.len();
                 let mut d_preds: Vec<Vec<f32>> = (0..n_ticks)
-                    .map(|_| vec![0.0f32; VOCAB]).collect();
+                    .map(|_| vec![0.0f32; BRAIN_OUT]).collect();
                 d_preds[last_tick] = d_brain_output;
 
                 (nll, d_preds)
@@ -6594,295 +7903,7 @@ mod tests {
         let _ = std::fs::remove_file(NeuralComputer::sidecar_path(&path));
     }
 
-    /// Host `<RegionalBrain as Brain>::forward_cached` and the resident
-    /// `RegionalBrain::forward_cached_resident` must produce matching
-    /// per-tick predictions and a matching final sync vector within
-    /// 1e-3 FP tolerance. rocBLAS reduces in a different order than
-    /// the host AVX-512 dot, plus each connection synapse takes a host
-    /// bounce in this slice (see the doc comment on
-    /// `forward_cached_resident`), so the bound is loose. AdaptiveGate
-    /// is enabled at both inner and outer levels via
-    /// `eight_region_small`'s default config — exercises the resident
-    /// outer exit gate dispatch path.
-    ///
-    /// **No router.** `eight_region_small` sets `router = None`; the
-    /// resident path falls back to host when a router is configured,
-    /// so the matching test covers only the no-router path
-    /// (the fallback is by definition bit-identical).
-    #[cfg(feature = "rocm")]
-    #[test]
-    fn forward_cached_resident_matches_host() {
-        use modgrad_device::backend::rocm::ffi::runtime_available;
-        use modgrad_device::backend::HipBatch;
-        use crate::resident::RegionalResidentCache;
 
-        if !runtime_available() {
-            eprintln!("hip runtime unavailable, skipping");
-            return;
-        }
-
-        // Match the resident.rs/ctm_resident.rs test fixtures: small
-        // 8-region brain with adaptive exit, single token observation.
-        let token_dim = 16usize;
-        let n_tokens = 4usize;
-        let out_dims = 64usize;
-        let ticks = 2usize;
-        let cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
-        let weights = RegionalWeights::new(cfg);
-        assert!(weights.router.is_none(), "this test exercises the no-router resident path");
-
-        let tokens = modgrad_traits::TokenInput {
-            tokens: (0..n_tokens * token_dim)
-                .map(|i| (i as f32 * 0.013 - 0.21).sin())
-                .collect(),
-            n_tokens,
-            token_dim,
-        };
-
-        // Host run.
-        let host_state = <RegionalBrain as modgrad_traits::Brain>::init_state(&weights);
-        let (host_out, _host_state, _host_cache) =
-            <RegionalBrain as modgrad_traits::Brain>::forward_cached(
-                &weights, host_state, &tokens);
-
-        // Resident run.
-        let cache = RegionalResidentCache::from_weights(&weights)
-            .expect("RegionalResidentCache::from_weights");
-        let fresh = cache.fresh(&weights).expect("fresh on first build");
-        let batch = HipBatch::new();
-        let (resident_out, _resident_state, _resident_cache) =
-            RegionalBrain::forward_cached_resident(
-                &weights, fresh, &batch, &tokens,
-            ).expect("forward_cached_resident");
-        batch.flush().expect("flush");
-
-        assert_eq!(host_out.predictions.len(), resident_out.predictions.len(),
-            "tick count mismatch: host={} resident={}",
-            host_out.predictions.len(), resident_out.predictions.len());
-        assert!(!host_out.predictions.is_empty(),
-            "expected at least one tick");
-
-        let max_diff = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
-        };
-
-        // Compare predictions at last tick (most error accumulation).
-        let last = host_out.predictions.len() - 1;
-        let pl = max_diff(&host_out.predictions[last], &resident_out.predictions[last]);
-        assert!(pl < 1e-3,
-            "predictions[last] mismatch: max |Δ| = {pl}");
-
-        // Final global sync vector.
-        let sd = max_diff(&host_out.sync, &resident_out.sync);
-        assert!(sd < 1e-3, "sync mismatch: max |Δ| = {sd}");
-
-        eprintln!("  ticks = {}", host_out.predictions.len());
-        eprintln!("  max |Δ predictions[last]| = {pl:.6}");
-        eprintln!("  max |Δ sync|              = {sd:.6}");
-    }
-
-    /// PART B smoke: `backward_cached_resident` matches host
-    /// `Brain::backward` on every gradient field including the
-    /// U-Net subgraph (regression FIXED via Path B — see
-    /// `crate::forward::ctm_backward_resident` module-level doc).
-    ///
-    /// Strategy: run the host CTM forward path (`forward_cached`) +
-    /// host backward to get a full reference. Run the resident
-    /// forward (`forward_cached_resident`) + resident backward
-    /// (`backward_cached_resident`) to get the resident path. Compare
-    /// every gradient field within tolerance — connection synapse
-    /// dW/db, output_proj dW/db, region NLM/MHA/q_proj/output_proj
-    /// gradients, U-Net weight/bias/gamma/beta grads, sync starts.
-    ///
-    /// Uses `ExitStrategy::None` everywhere to side-step the
-    /// adaptive-gate cache that the resident forward currently
-    /// leaves None — see backward_cached_resident's exit-gate
-    /// branch comment.
-    #[cfg(feature = "rocm")]
-    #[test]
-    fn backward_cached_resident_matches_host() {
-        use modgrad_device::backend::rocm::ffi::runtime_available;
-        use modgrad_device::backend::HipBatch;
-        use crate::resident::RegionalResidentCache;
-
-        if !runtime_available() {
-            eprintln!("hip runtime unavailable, skipping");
-            return;
-        }
-
-        let token_dim = 16usize;
-        let n_tokens = 4usize;
-        let out_dims = 64usize;
-        let ticks = 2usize;
-        let mut cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
-        // Force ExitStrategy::None at every level (outer + per-region).
-        // The resident forward leaves the gate cache None today; the
-        // resident backward's gate branch is dead in this slice, so
-        // a fair comparison needs both paths to skip gate gradients.
-        cfg.exit_strategy = crate::config::ExitStrategy::None;
-        for r in cfg.regions.iter_mut() {
-            r.exit_strategy = crate::config::ExitStrategy::None;
-        }
-        let weights = RegionalWeights::new(cfg);
-        assert!(weights.router.is_none(), "this test exercises the no-router resident path");
-        assert!(weights.outer_exit_gate.is_none(),
-            "test must run with ExitStrategy::None — outer_exit_gate must be None");
-
-        let tokens = modgrad_traits::TokenInput {
-            tokens: (0..n_tokens * token_dim)
-                .map(|i| (i as f32 * 0.013 - 0.21).sin())
-                .collect(),
-            n_tokens,
-            token_dim,
-        };
-
-        // ── Host run. ──
-        let host_state = <RegionalBrain as modgrad_traits::Brain>::init_state(&weights);
-        let (host_out, _host_state, host_cache) =
-            <RegionalBrain as modgrad_traits::Brain>::forward_cached(
-                &weights, host_state, &tokens);
-        let n_host_ticks = host_out.predictions.len();
-        // Synthetic d_predictions: deterministic sinusoid, one per tick.
-        let d_predictions_host: Vec<Vec<f32>> = (0..n_host_ticks).map(|t| {
-            (0..out_dims).map(|i| ((t * out_dims + i) as f32 * 0.011).sin() * 0.3)
-                .collect()
-        }).collect();
-        let host_grads = <RegionalBrain as modgrad_traits::Brain>::backward(
-            &weights, host_cache, &d_predictions_host,
-        );
-
-        // ── Resident run. ──
-        let cache = RegionalResidentCache::from_weights(&weights)
-            .expect("RegionalResidentCache::from_weights");
-        let fresh = cache.fresh(&weights).expect("fresh on first build");
-        let batch = HipBatch::new();
-        let (resident_out, _resident_state, resident_cache) =
-            RegionalBrain::forward_cached_resident(
-                &weights, fresh, &batch, &tokens,
-            ).expect("forward_cached_resident");
-        batch.flush().expect("flush");
-        let n_resident_ticks = resident_out.predictions.len();
-        assert_eq!(n_host_ticks, n_resident_ticks,
-            "host vs resident tick count mismatch ({n_host_ticks} vs {n_resident_ticks})");
-        let resident_grads = RegionalBrain::backward_cached_resident(
-            &weights, resident_cache, &d_predictions_host,
-        );
-
-        // ── Compare. ──
-        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
-            assert_eq!(a.len(), b.len(), "shape mismatch");
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
-        };
-
-        // Tolerance budget. The resident forward is independently
-        // allowed to drift up to 1e-3 from the host forward (per the
-        // existing forward_cached_resident_matches_host test). That
-        // forward drift compounds through:
-        //  - per-tick activations feeding the next tick's gradient
-        //  - gradient accumulation across ticks
-        // so backward gradients can drift by a multiple of the
-        // forward bound. 5e-2 is empirically below "real backward
-        // bug" territory while above the FP-reorder noise floor
-        // for an 8-region 2-tick configuration.
-        let outer_tol = 5e-2f32;
-
-        // output_proj gradients — host registry + resident registry both
-        // route through the same op variants, so should match closely.
-        let dw_diff = max_diff(&host_grads.output_proj_dw, &resident_grads.output_proj_dw);
-        let db_diff = max_diff(&host_grads.output_proj_db, &resident_grads.output_proj_db);
-        assert!(dw_diff < outer_tol, "output_proj_dw mismatch: max |Δ| = {dw_diff}");
-        assert!(db_diff < outer_tol, "output_proj_db mismatch: max |Δ| = {db_diff}");
-
-        // Connection synapse gradients.
-        for ci in 0..host_grads.connection_dw.len() {
-            let dw_d = max_diff(&host_grads.connection_dw[ci], &resident_grads.connection_dw[ci]);
-            let db_d = max_diff(&host_grads.connection_db[ci], &resident_grads.connection_db[ci]);
-            assert!(dw_d < outer_tol, "connection_dw[{ci}] mismatch: max |Δ| = {dw_d}");
-            assert!(db_d < outer_tol, "connection_db[{ci}] mismatch: max |Δ| = {db_d}");
-        }
-
-        // Per-region inner gradients (excluding U-Net, see GAP doc).
-        // Same tolerance budget as outer (and for the same reason —
-        // per-tick activation drift compounds through BPTT). The
-        // resident forward's softmax/MHA path is the dominant
-        // drift source; it gates a 5e-2 ceiling here.
-        let region_tol = 5e-2f32;
-        for r in 0..host_grads.region_grads.len() {
-            let h = &host_grads.region_grads[r];
-            let res = &resident_grads.region_grads[r];
-
-            let nlm1_w_d = max_diff(&h.nlm_s1_w, &res.nlm_s1_w);
-            assert!(nlm1_w_d < region_tol,
-                "region_grads[{r}].nlm_s1_w mismatch: max |Δ| = {nlm1_w_d}");
-            let nlm1_b_d = max_diff(&h.nlm_s1_b, &res.nlm_s1_b);
-            assert!(nlm1_b_d < region_tol,
-                "region_grads[{r}].nlm_s1_b mismatch: max |Δ| = {nlm1_b_d}");
-
-            let qw = max_diff(&h.q_proj_w, &res.q_proj_w);
-            assert!(qw < region_tol, "region_grads[{r}].q_proj_w max |Δ| = {qw}");
-            let qb = max_diff(&h.q_proj_b, &res.q_proj_b);
-            assert!(qb < region_tol, "region_grads[{r}].q_proj_b max |Δ| = {qb}");
-
-            let mhainw = max_diff(&h.mha_in_w, &res.mha_in_w);
-            assert!(mhainw < region_tol, "region_grads[{r}].mha_in_w max |Δ| = {mhainw}");
-            let mhaoutw = max_diff(&h.mha_out_w, &res.mha_out_w);
-            assert!(mhaoutw < region_tol, "region_grads[{r}].mha_out_w max |Δ| = {mhaoutw}");
-
-            let opw = max_diff(&h.out_proj_w, &res.out_proj_w);
-            assert!(opw < region_tol, "region_grads[{r}].out_proj_w max |Δ| = {opw}");
-
-            let dsa = max_diff(&h.d_start_activated, &res.d_start_activated);
-            assert!(dsa < region_tol, "region_grads[{r}].d_start_activated max |Δ| = {dsa}");
-
-            // U-Net grads — Path B (host re-cache) FIXED the prior
-            // "U-Net grads regress to zero" regression. Both host and
-            // resident paths now drive `grads.unet` from the same host
-            // `unet_backward` math; the only divergence comes from
-            // `tc.pre_syn` (the U-Net input on the resident path is
-            // a D2H of the resident MHA output, while the host path
-            // computes it from the host MHA).
-            let unet_h = h.unet.flat_weight_grads();
-            let unet_r = res.unet.flat_weight_grads();
-            // Sanity: host U-Net actually trained.
-            let h_l2 = h.unet.l2_norm();
-            assert!(h_l2 > 0.0,
-                "region_grads[{r}].unet host l2_norm = {h_l2} — \
-                 host backward did not populate U-Net grads (test bug?)");
-            // Primary regression check: resident U-Net grads NOT zero
-            // — this is the bug Path B eliminates.
-            let r_l2 = res.unet.l2_norm();
-            assert!(r_l2 > 0.0,
-                "region_grads[{r}].unet resident l2_norm = 0.0 — \
-                 resident U-Net weight gradients regressed to zero (Path B fix broken?)");
-            // Magnitude parity — host vs resident l2 within an order
-            // of magnitude. Tighter element-wise parity is gated by
-            // FP-reorder drift in the resident MHA path, which feeds
-            // `tc.pre_syn` and compounds through the U-Net's deep
-            // composition (3 down + 3 up + 3 skip-LN blocks). 0.5×
-            // to 2× covers the observed drift envelope on this
-            // hardware while still catching real backward bugs (a
-            // dropped gradient term would shift l2 by an order of
-            // magnitude or more).
-            let l2_ratio = r_l2 / h_l2;
-            assert!(l2_ratio > 0.5 && l2_ratio < 2.0,
-                "region_grads[{r}].unet l2 ratio = {l2_ratio:.4} \
-                 (host = {h_l2:.4}, resident = {r_l2:.4})");
-            // Element-wise drift — looser than `region_tol` because
-            // U-Net gradients accumulate the FP-reorder drift of
-            // every preceding op in the BPTT chain. Empirically
-            // ≤0.15 on this 8-region 2-tick configuration.
-            let unet_tol = 0.20f32;
-            let unet_diff = max_diff(&unet_h, &unet_r);
-            assert!(unet_diff < unet_tol,
-                "region_grads[{r}].unet flat_weight_grads max |Δ| = {unet_diff} \
-                 (host l2 = {h_l2:.4}, resident l2 = {r_l2:.4}, tol = {unet_tol})");
-        }
-
-        eprintln!("  ticks = {n_host_ticks}");
-        eprintln!("  output_proj_dw |Δ|max = {dw_diff:.6}");
-        eprintln!("  output_proj_db |Δ|max = {db_diff:.6}");
-    }
 
     /// Phase 5 calibration: `is_resident_likely_faster` returns `true`
     /// only at d_model ≥ 1024 (billion config). All smaller standard
@@ -6916,265 +7937,7 @@ mod tests {
             "billion (d_model=1024): resident measured 1.83× — heuristic must say true");
     }
 
-    /// Phase 3c parity: `backward_cached_resident_with_grads_resident`
-    /// (which routes the per-region NLM dW through the new resident
-    /// kernel and the long-lived `RegionalGradientsResident` device
-    /// buffers) must produce the same per-region `nlm_s1_w` /
-    /// `nlm_s2_w` host gradients as the WITHOUT-resident-grads path,
-    /// once `add_to_host` consolidates the device-accumulated values.
-    /// All other gradient fields (q_proj, mha, output_proj, etc.) go
-    /// through the same code path, so their parity continues to hold.
-    #[cfg(feature = "rocm")]
-    #[test]
-    fn backward_cached_resident_with_resident_grads_matches() {
-        use modgrad_device::backend::rocm::ffi::runtime_available;
-        use modgrad_device::backend::HipBatch;
-        use crate::resident::{RegionalResidentCache, RegionalGradientsResident};
 
-        if !runtime_available() {
-            eprintln!("hip runtime unavailable, skipping");
-            return;
-        }
-
-        let token_dim = 16usize;
-        let n_tokens = 4usize;
-        let out_dims = 64usize;
-        let ticks = 2usize;
-        let mut cfg = RegionalConfig::eight_region_small(token_dim, out_dims, ticks);
-        cfg.exit_strategy = crate::config::ExitStrategy::None;
-        for r in cfg.regions.iter_mut() {
-            r.exit_strategy = crate::config::ExitStrategy::None;
-        }
-        let weights = RegionalWeights::new(cfg);
-        let tokens = modgrad_traits::TokenInput {
-            tokens: (0..n_tokens * token_dim)
-                .map(|i| (i as f32 * 0.013 - 0.21).sin())
-                .collect(),
-            n_tokens, token_dim,
-        };
-
-        let cache = RegionalResidentCache::from_weights(&weights)
-            .expect("RegionalResidentCache::from_weights");
-        let batch = HipBatch::new();
-
-        // ── Path A: backward_cached_resident (host nlm dW). ──
-        let fresh_a = cache.fresh(&weights).expect("fresh A");
-        let (out_a, _state_a, cache_a) = RegionalBrain::forward_cached_resident(
-            &weights, fresh_a, &batch, &tokens,
-        ).expect("forward_cached_resident A");
-        batch.flush().expect("flush A");
-        let n_ticks = out_a.predictions.len();
-        let d_predictions: Vec<Vec<f32>> = (0..n_ticks).map(|t| {
-            (0..out_dims).map(|i| ((t * out_dims + i) as f32 * 0.011).sin() * 0.3)
-                .collect()
-        }).collect();
-        let grads_a = RegionalBrain::backward_cached_resident(
-            &weights, cache_a, &d_predictions,
-        );
-
-        // ── Path B: backward_cached_resident_with_grads_resident
-        //    (resident nlm dW). ──
-        let resident_grads = RegionalGradientsResident::from_weights(&weights)
-            .expect("RegionalGradientsResident");
-        resident_grads.zero().expect("zero resident grads");
-        let fresh_b = cache.fresh(&weights).expect("fresh B");
-        let (_out_b, _state_b, cache_b) = RegionalBrain::forward_cached_resident(
-            &weights, fresh_b, &batch, &tokens,
-        ).expect("forward_cached_resident B");
-        batch.flush().expect("flush B");
-        let mut grads_b = RegionalBrain::backward_cached_resident_with_grads_resident(
-            &weights, cache_b, &d_predictions, &resident_grads,
-        );
-        // Path B's grads_b has zero nlm_s1_w / nlm_s2_w until we
-        // download from the device buffers.
-        for r in 0..weights.regions.len() {
-            for &v in &grads_b.region_grads[r].nlm_s1_w {
-                assert_eq!(v, 0.0, "resident path should leave host nlm_s1_w zero pre-merge");
-            }
-        }
-        resident_grads.add_to_host(&mut grads_b).expect("add_to_host");
-
-        // ── Compare nlm_s1_w / nlm_s2_w per region. ──
-        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
-            assert_eq!(a.len(), b.len(), "shape");
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
-        };
-        let tol = 5e-2f32; // matches existing parity test budget
-        let mut max_overall = 0.0f32;
-        for r in 0..weights.regions.len() {
-            let d1 = max_diff(&grads_a.region_grads[r].nlm_s1_w,
-                              &grads_b.region_grads[r].nlm_s1_w);
-            assert!(d1 < tol,
-                "region {r} nlm_s1_w mismatch: |Δ|max = {d1}");
-            if d1 > max_overall { max_overall = d1; }
-            if let (Some(a), Some(b)) = (
-                grads_a.region_grads[r].nlm_s2_w.as_ref(),
-                grads_b.region_grads[r].nlm_s2_w.as_ref(),
-            ) {
-                let d2 = max_diff(a, b);
-                assert!(d2 < tol,
-                    "region {r} nlm_s2_w mismatch: |Δ|max = {d2}");
-                if d2 > max_overall { max_overall = d2; }
-            }
-        }
-        eprintln!("  nlm_s*_w resident-vs-host max |Δ| = {max_overall:.6}");
-    }
-
-    /// Resident inner-CTM backward populates `grads.unet` (Path B fix).
-    ///
-    /// Smaller-scope regression test that exercises just
-    /// `ctm_forward_resident` + `ctm_backward_resident` against the
-    /// host `Ctm::forward_cached` + `train::backward_from_activated`,
-    /// without the surrounding `RegionalBrain` wrapping. Asserts:
-    ///   - `grads.unet.l2_norm() > 0` after the resident backward
-    ///   - per-block flat grad slice matches host within 1e-2
-    ///
-    /// This is the minimum viable test for the U-Net regression fix.
-    /// `backward_cached_resident_matches_host` covers the full
-    /// regional-brain wiring; this one isolates the inner CTM.
-    #[cfg(feature = "rocm")]
-    #[test]
-    fn ctm_backward_resident_unet_grads_nonzero() {
-        use modgrad_device::backend::rocm::ffi::runtime_available;
-        use modgrad_device::backend::HipBatch;
-        use crate::ctm_resident::CtmResidentCache;
-        use crate::config::ExitStrategy;
-        use crate::weights::CtmState;
-        use crate::config::CtmConfig;
-        use crate::forward::{ctm_forward_resident, ctm_backward_resident};
-        use modgrad_compute::neuron::SimpleRng;
-
-        if !runtime_available() {
-            eprintln!("hip runtime unavailable, skipping");
-            return;
-        }
-
-        let cfg = CtmConfig {
-            iterations: 4,
-            d_model: 64,
-            d_input: 32,
-            heads: 4,
-            n_synch_out: 32,
-            n_synch_action: 32,
-            synapse_depth: 3,
-            memory_length: 8,
-            deep_nlms: true,
-            memory_hidden_dims: 4,
-            out_dims: 10,
-            n_random_pairing_self: 0,
-            min_width: 16,
-            exit_strategy: ExitStrategy::None,
-            collect_trajectories: false,
-        };
-        let raw_input_dim = 16;
-        let w = crate::weights::CtmWeights::new(cfg.clone(), raw_input_dim);
-
-        // Pre-projected kv in d_input space.
-        let n_tokens = 3;
-        let mut rng = SimpleRng::new(0xBA_5E_BA_11);
-        let kv: Vec<f32> = (0..n_tokens * cfg.d_input)
-            .map(|_| rng.next_normal()).collect();
-
-        // External gradient with deterministic non-zero values so
-        // the U-Net backward sees a real signal at every layer.
-        let d_external: Vec<f32> = (0..cfg.d_model)
-            .map(|i| ((i as f32) * 0.07 - 1.1).sin() * 0.5)
-            .collect();
-
-        // ── Host path (reference). ──
-        // We need the host CtmCache; build it via the Brain trait
-        // which calls `forward_cached`. The trait's TokenInput
-        // expects raw observation tokens, but our `kv` is already
-        // pre-projected. So we use the inner `ctm_forward_with_kv`
-        // path and a manually-driven cache via TokenInput with
-        // n_tokens projected through kv_proj. To match resident
-        // (`ctm_forward_resident` takes pre-projected KV directly),
-        // we instead drive both paths from the same kv.
-        //
-        // Simpler: synthesise a TokenInput by projecting kv backwards
-        // through kv_proj^-1 is wrong; instead, run host
-        // `Ctm::forward_cached` from raw input that produces the same
-        // semantic kv. For the regression test the absolute parity
-        // isn't required — only that the resident U-Net grads are
-        // non-zero AND comparable in magnitude to the host U-Net
-        // grads on the SAME (kv, d_external) input.
-        //
-        // We do this by feeding identical raw observations to both
-        // paths (let the host's kv_proj produce the kv internally).
-        let raw_obs: Vec<f32> = (0..n_tokens * raw_input_dim)
-            .map(|_| rng.next_normal()).collect();
-        let token_input = modgrad_traits::TokenInput {
-            tokens: raw_obs.clone(),
-            n_tokens,
-            token_dim: raw_input_dim,
-        };
-        let host_state = <crate::train::Ctm as modgrad_traits::Brain>::init_state(&w);
-        let (_host_out, _host_state, host_cache) =
-            <crate::train::Ctm as modgrad_traits::Brain>::forward_cached(
-                &w, host_state, &token_input);
-        let host_result = crate::train::backward_from_activated(
-            &w, &host_cache, &d_external);
-        let host_unet_l2 = host_result.grads.unet.l2_norm();
-        assert!(host_unet_l2 > 0.0,
-            "host U-Net l2_norm = {host_unet_l2} — host path didn't train U-Net (test bug)");
-
-        // ── Resident path. ──
-        // Project the same raw_obs through kv_proj host-side to get
-        // the kv that the resident inner forward expects.
-        let mut kv_host: Vec<f32> = Vec::with_capacity(n_tokens * cfg.d_input);
-        for t in 0..n_tokens {
-            let tok = &raw_obs[t * raw_input_dim..(t + 1) * raw_input_dim];
-            let mut projected = w.kv_proj.forward(tok);
-            // Apply LN consistent with host path.
-            let n = projected.len() as f32;
-            let mean: f32 = projected.iter().sum::<f32>() / n;
-            let var: f32 = projected.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-            let inv_std = 1.0 / (var + 1e-5).sqrt();
-            for i in 0..projected.len() {
-                projected[i] = w.kv_ln_gamma[i] * (projected[i] - mean) * inv_std + w.kv_ln_beta[i];
-            }
-            kv_host.extend_from_slice(&projected);
-        }
-        let _ = kv; // kv built earlier was a different distribution
-        let mut kv_dev = modgrad_compute::backend::GpuVec::try_hip(kv_host.len())
-            .expect("GpuVec::try_hip(kv)");
-        kv_dev.copy_from(&kv_host);
-
-        let mut resident_state = CtmState::new(&w);
-        let cache = CtmResidentCache::from_weights(&w)
-            .expect("CtmResidentCache::from_weights");
-        let batch = HipBatch::new();
-        let (_resident_out, resident_cache) = ctm_forward_resident(
-            &w, &cache, &mut resident_state, &batch, &kv_dev, n_tokens,
-        ).expect("ctm_forward_resident");
-        batch.flush().expect("flush");
-
-        let resident_result = ctm_backward_resident(
-            &w, &resident_cache, &d_external);
-        let res_unet_l2 = resident_result.grads.unet.l2_norm();
-
-        // Primary regression assertion — the bug being fixed.
-        assert!(res_unet_l2 > 0.0,
-            "resident U-Net l2_norm = 0.0 — Path B fix broken; \
-             U-Net weight gradients dropped on the resident backward path");
-
-        // Magnitude sanity — within an order of magnitude. Tighter
-        // parity is checked by `backward_cached_resident_matches_host`
-        // which uses the full RegionalBrain wrapping; here we keep
-        // the bound loose because the host path runs `Ctm` with
-        // independent state evolution while the resident one ran
-        // `ctm_forward_resident` (different forward shape on the
-        // pre-MHA kv path), so per-element parity is NOT contracted.
-        let ratio = res_unet_l2 / host_unet_l2;
-        assert!(ratio > 0.1 && ratio < 10.0,
-            "resident vs host U-Net l2 ratio = {ratio:.4} — \
-             magnitudes diverged by >10× (host = {host_unet_l2:.4}, \
-             resident = {res_unet_l2:.4}); Path B math may be wrong");
-
-        eprintln!("  host U-Net l2     = {host_unet_l2:.6}");
-        eprintln!("  resident U-Net l2 = {res_unet_l2:.6}");
-        eprintln!("  ratio             = {ratio:.4}");
-    }
 
     /// Data-attribution support: flattening RegionalGradients must
     /// produce a stable-length, non-empty Vec<f32> for a fixed brain

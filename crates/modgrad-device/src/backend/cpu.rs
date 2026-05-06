@@ -52,6 +52,10 @@ impl Backend for CpuBackend {
         match op {
             Op::Matvec { quant: QuantKind::Q4K, .. } => false,
             Op::MatvecResident { .. } => false,
+            Op::MatvecTResident { .. } => false,
+            Op::OuterProductAccResident { .. } => false,
+            Op::SgdUpdateResident { .. } => false,
+            Op::AxpyResident { .. } => false,
             Op::SuperLinearFwdResident { .. } => false,
             Op::SuperLinearBwdDwResident { .. } => false,
             Op::SuperLinearBwdDxResident { .. } => false,
@@ -108,6 +112,22 @@ impl Backend for CpuBackend {
             }),
             Op::MatvecResident { .. } => Err(BackendError::Unsupported {
                 op: "matvec_resident",
+                backend: "cpu",
+            }),
+            Op::MatvecTResident { .. } => Err(BackendError::Unsupported {
+                op: "matvec_t_resident",
+                backend: "cpu",
+            }),
+            Op::OuterProductAccResident { .. } => Err(BackendError::Unsupported {
+                op: "outer_product_acc_resident",
+                backend: "cpu",
+            }),
+            Op::SgdUpdateResident { .. } => Err(BackendError::Unsupported {
+                op: "sgd_update_resident",
+                backend: "cpu",
+            }),
+            Op::AxpyResident { .. } => Err(BackendError::Unsupported {
+                op: "axpy_resident",
                 backend: "cpu",
             }),
             Op::SuperLinearFwdResident { .. } => Err(BackendError::Unsupported {

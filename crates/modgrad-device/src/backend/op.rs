@@ -207,6 +207,59 @@ pub enum Op<'a> {
         in_dim: usize,
     },
 
+    /// **Device-resident** transposed matvec — `d_input = W^T · d_out`.
+    /// First backward primitive on the typed cascade: lets `Linear<D>::backward`
+    /// flow gradient through input without leaving the device. Implemented
+    /// via `hipblasSgemv` with `TRANS=N` (mirror image of `MatvecResident`'s
+    /// `TRANS=T`, which is also the only difference).
+    ///
+    /// Layout matches `MatvecResident`: weight is row-major
+    /// `[out_dim × in_dim]` (so column-major view is `[in_dim × out_dim]`,
+    /// which IS W^T). With `TRANS=N` and the column-major view, the result
+    /// `A·d_out = W^T·d_out = d_input`. Output `d_input_dev` is `[in_dim]`.
+    MatvecTResident {
+        d_out_dev: *const f32,
+        weight_dev: *const f32,
+        d_input_dev: *mut f32,
+        out_dim: usize,
+        in_dim: usize,
+    },
+
+    /// **Device-resident** accumulating outer product:
+    /// `accum += a ⊗ b`, where `a` is `[m]`, `b` is `[n]`, `accum`
+    /// is `[m × n]` row-major. Used by `Linear<D>::backward` for
+    /// the weight gradient `d_W += d_y ⊗ x`. Implemented as a
+    /// `hipblasSgemm` of `[m × 1] @ [1 × n]` with `beta = 1.0`.
+    OuterProductAccResident {
+        a_dev: *const f32,
+        b_dev: *const f32,
+        accum_dev: *mut f32,
+        m: usize,
+        n: usize,
+    },
+
+    /// **Device-resident** SGD step: `w -= lr · g`. The simplest
+    /// optimiser, used as the integration smoke for the end-to-end
+    /// trainable capability before `AdamW<D>` lands.
+    SgdUpdateResident {
+        w_dev: *mut f32,
+        g_dev: *const f32,
+        n: usize,
+        lr: f32,
+    },
+
+    /// **Device-resident** SAXPY: `y = alpha * x + y` over `n` f32s.
+    /// The general primitive that subsumes `SgdUpdateResident` (which
+    /// is `axpy` with `alpha = -lr`) and `add_assign` (`alpha = 1`).
+    /// Backends should prefer routing to this and treating
+    /// `SgdUpdateResident` as a thin alias.
+    AxpyResident {
+        y_dev: *mut f32,
+        x_dev: *const f32,
+        n: usize,
+        alpha: f32,
+    },
+
     /// **Device-resident** batched per-neuron matvec — fused dispatch
     /// for `SuperLinear`'s `for n in 0..n_neurons { matvec }` loop.
     /// Computes `out[n] = W[n] @ x[n] + bias[n]` for all `n` in one
@@ -1061,6 +1114,10 @@ impl<'a> Op<'a> {
             Op::MatmulTN { .. } => "matmul_tn",
             Op::Matvec { .. } => "matvec",
             Op::MatvecResident { .. } => "matvec_resident",
+            Op::MatvecTResident { .. } => "matvec_t_resident",
+            Op::OuterProductAccResident { .. } => "outer_product_acc_resident",
+            Op::SgdUpdateResident { .. } => "sgd_update_resident",
+            Op::AxpyResident { .. } => "axpy_resident",
             Op::SuperLinearFwdResident { .. } => "super_linear_fwd_resident",
             Op::SuperLinearBwdDwResident { .. } => "super_linear_bwd_dw_resident",
             Op::SuperLinearBwdDxResident { .. } => "super_linear_bwd_dx_resident",

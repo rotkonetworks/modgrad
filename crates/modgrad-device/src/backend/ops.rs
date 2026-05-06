@@ -131,6 +131,115 @@ pub unsafe fn matvec_resident(
     Ok(())
 }
 
+/// Device-resident transposed matvec: `d_input = W^T · d_out`.
+/// See [`Op::MatvecTResident`](super::Op::MatvecTResident).
+///
+/// First backward primitive on the Path C cascade — lets
+/// `Linear<D>::backward` compute the input gradient without leaving
+/// the device.
+///
+/// # Safety
+/// Caller is responsible for:
+/// - All pointers are valid hip-device pointers from the same context.
+/// - `d_out_dev` covers at least `out_dim * 4` bytes.
+/// - `weight_dev` covers at least `out_dim * in_dim * 4` bytes (row-major).
+/// - `d_input_dev` covers at least `in_dim * 4` bytes (writable).
+/// - **`d_input_dev` does not alias `weight_dev` or `d_out_dev`.** rocBLAS
+///   `hipblasSgemv` reads the input vector and matrix while writing the
+///   output; aliased pointers produce undefined output.
+/// - The output is **overwritten** (β=0); pre-existing contents of
+///   `d_input_dev` are discarded, not accumulated.
+/// - The pointers stay valid for the duration of this call.
+#[inline]
+pub unsafe fn matvec_t_resident(
+    d_out_dev: *const f32,
+    weight_dev: *const f32,
+    d_input_dev: *mut f32,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::MatvecTResident {
+        d_out_dev, weight_dev, d_input_dev, out_dim, in_dim,
+    };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident accumulating outer product: `accum += a ⊗ b`.
+/// See [`Op::OuterProductAccResident`](super::Op::OuterProductAccResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - Pointers valid + same context.
+/// - `a_dev` ≥ `m * 4` bytes, `b_dev` ≥ `n * 4` bytes, `accum_dev` ≥ `m * n * 4` bytes.
+/// - **`accum_dev` does not alias `a_dev` or `b_dev`.** Implemented as
+///   `hipblasSgemm` with `β=1`, which reads both inputs while writing
+///   the output.
+/// - The output **accumulates** (β=1) — caller must zero `accum_dev`
+///   before the first call if a fresh gradient is desired.
+/// - Lifetime ≥ this call.
+#[inline]
+pub unsafe fn outer_product_acc_resident(
+    a_dev: *const f32,
+    b_dev: *const f32,
+    accum_dev: *mut f32,
+    m: usize,
+    n: usize,
+) -> Result<(), BackendError> {
+    let mut op = Op::OuterProductAccResident { a_dev, b_dev, accum_dev, m, n };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident SAXPY: `y = alpha * x + y` over `n` f32s.
+/// See [`Op::AxpyResident`](super::Op::AxpyResident).
+///
+/// The general linear-combination primitive that subsumes both
+/// `sgd_update_resident` (alpha = -lr) and the in-place sum that
+/// `Tensor::add_assign` needs (alpha = 1). New callers should prefer
+/// this; `sgd_update_resident` is retained as a named alias.
+///
+/// # Safety
+/// Caller is responsible for:
+/// - Pointers valid + same context.
+/// - `y_dev` and `x_dev` ≥ `n * 4` bytes.
+/// - **`y_dev` does not alias `x_dev`.** `hipblasSaxpy` does not support
+///   `x == y` aliasing.
+/// - Lifetime ≥ this call.
+#[inline]
+pub unsafe fn axpy_resident(
+    y_dev: *mut f32,
+    x_dev: *const f32,
+    n: usize,
+    alpha: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::AxpyResident { y_dev, x_dev, n, alpha };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
+/// Device-resident SGD step: `w -= lr · g`.
+/// See [`Op::SgdUpdateResident`](super::Op::SgdUpdateResident).
+///
+/// # Safety
+/// Caller is responsible for:
+/// - Pointers valid + same context.
+/// - `w_dev` and `g_dev` ≥ `n * 4` bytes.
+/// - **`w_dev` does not alias `g_dev`.** Implemented as `hipblasSaxpy`
+///   which does not support `x == y` aliasing.
+/// - Lifetime ≥ this call.
+#[inline]
+pub unsafe fn sgd_update_resident(
+    w_dev: *mut f32,
+    g_dev: *const f32,
+    n: usize,
+    lr: f32,
+) -> Result<(), BackendError> {
+    let mut op = Op::SgdUpdateResident { w_dev, g_dev, n, lr };
+    super::registry().dispatch(&mut op)?;
+    Ok(())
+}
+
 /// Device-resident batched per-neuron matvec.
 /// See [`Op::SuperLinearFwdResident`](super::Op::SuperLinearFwdResident).
 ///
