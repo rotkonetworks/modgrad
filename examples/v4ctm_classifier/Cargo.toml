@@ -1,0 +1,22 @@
+[package]
+name = "v4ctm_classifier"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rocm = [
+    "modgrad-codec/rocm",
+    "modgrad-ctm/rocm",
+    "modgrad-device/rocm",
+]
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+modgrad-traits = { path = "../../crates/modgrad-traits" }
+modgrad-device = { path = "../../crates/modgrad-device" }
+
+[[bin]]
+name = "v4ctm_classifier"
+path = "src/main.rs"

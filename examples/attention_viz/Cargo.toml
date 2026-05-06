@@ -1,0 +1,12 @@
+[package]
+name = "attention_viz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+modgrad-codec = { path = "../../crates/modgrad-codec" }
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+
+[[bin]]
+name = "attention_viz"
+path = "src/main.rs"

@@ -1358,6 +1358,24 @@ impl V4Ctm {
         output.sync_out
     }
 
+    /// Same as `forward` but also returns the per-tick × per-head softmax
+    /// attention weights over input tokens, shape `[iterations][n_heads][n_tokens]`.
+    /// Used for inspecting what the CTM is attending to (Sakana-style
+    /// saccade traces).
+    pub fn forward_with_attn_trace(
+        &self, tokens: &[f32], n_tokens: usize, token_dim: usize,
+    ) -> (Vec<f32>, Vec<Vec<Vec<f32>>>) {
+        debug_assert_eq!(tokens.len(), n_tokens * token_dim);
+        let mut state = modgrad_ctm::weights::CtmState::new(&self.weights);
+        let (output, trace) = modgrad_ctm::forward::ctm_forward_with_attn_trace(
+            &self.weights, &mut state,
+            modgrad_ctm::forward::CtmInput::Raw {
+                obs: tokens, n_tokens, raw_dim: token_dim,
+            },
+        );
+        (output.sync_out, trace)
+    }
+
     pub fn d_model(&self) -> usize { self.weights.config.d_model }
     pub fn iterations(&self) -> usize { self.weights.config.iterations }
     pub fn param_count(&self) -> usize { self.weights.n_params() }
@@ -1670,6 +1688,15 @@ impl VisualCortex {
     /// every cortical stage; we model a purely feedforward subset here.
     /// The destined retina-v2 replaces `v4` with a CTM instance to get
     /// proper attention and ticks at that level.
+    ///
+    /// **Recommended alternatives for new code:**
+    /// - [`Self::cifar_ln`] — same priors, with per-token LN at V4 (fixes
+    ///   rank-1 collapse; +10pp on cifar10_probe k-NN UNSEEN).
+    /// - [`Self::cifar_retina_only_ln`] — DoG retina + random V1/V2/V4 + LN.
+    ///   The default this constructor probably *should* be: task-neutral
+    ///   DoG priors generalize across regimes; Gabor V1 priors hurt on
+    ///   synthetic domains (-40pp on BabyAI BC) for at-most +3pp on
+    ///   natural in-distribution. See `feedback_visual_priors.md`.
     pub fn new(h: usize, w: usize) -> Self {
         // Production prior set: standard ganglion + V1 Gabor hybrid,
         // V2 random. Other variants live in `Genome`.
