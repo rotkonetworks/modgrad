@@ -1,0 +1,28 @@
+[package]
+name = "ocr_smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Phase-0 OCR smoke: synthetic line renderer + CTM/CTC training loop. CPU-only by default, wasm-friendly."
+
+[[bin]]
+name = "ocr_smoke"
+path = "src/main.rs"
+
+[[bin]]
+name = "ocr_smoke_train"
+path = "src/bin/train.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+modgrad-traits = { path = "../../crates/modgrad-traits" }
+modgrad-training = { path = "../../crates/modgrad-training" }
+modgrad-ctm = { path = "../../crates/modgrad-ctm" }
+# Pure-Rust TTF rasterizer. Already in the workspace lockfile as a
+# transitive dep so we're not adding new vendored code, just declaring
+# the direct use. Wasm-clean.
+ab_glyph = "0.2"
