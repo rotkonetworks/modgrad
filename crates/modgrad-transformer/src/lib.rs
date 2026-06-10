@@ -4,6 +4,7 @@
 //! of TransformerBlocks, each implementing Filter. Design follows:
 //!   - composable pure-function pipelines
 
+pub mod arch;
 pub mod dims;
 pub mod config;
 pub mod error;
