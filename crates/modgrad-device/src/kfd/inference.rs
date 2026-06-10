@@ -108,12 +108,24 @@ impl Gemma4Model {
         let d_model = gguf.meta_u32(&format!("{arch}.embedding_length")).unwrap_or(2560) as usize;
         let d_ff = gguf.meta_u32(&format!("{arch}.feed_forward_length")).unwrap_or(10240) as usize;
         let n_heads = gguf.meta_u32(&format!("{arch}.attention.head_count")).unwrap_or(8) as usize;
-        let n_kv_heads = gguf.meta_u32(&format!("{arch}.attention.head_count_kv")).unwrap_or(2) as usize;
-        // Gemma4 has separate key_length
-        let key_length = gguf.meta_u32(&format!("{arch}.attention.key_length")).unwrap_or(256) as usize;
-        let head_dim = key_length / n_kv_heads; // 512/2 = 256
-        let q_dim = n_heads * head_dim;       // 8*256 = 2048
-        let kv_dim = n_kv_heads * head_dim;   // 2*256 = 512
+
+        // Derive attention dims from TENSOR SHAPES (ground truth), not
+        // metadata. Some Gemma GGUFs report a misleading
+        // `attention.key_length` (e.g. 512 when head_dim is really 256) and
+        // omit `head_count_kv` — trusting those mis-sizes the KV cache and
+        // attention. GGUF linear-weight dims are [in = d_model, out].
+        let q_dim = gguf.tensors.get("blk.0.attn_q.weight")
+            .and_then(|t| t.dims.get(1).copied())
+            .unwrap_or(n_heads * 256);
+        let kv_dim = gguf.tensors.get("blk.0.attn_k.weight")
+            .and_then(|t| t.dims.get(1).copied())
+            .unwrap_or(512);
+        // head_dim from the per-head QK-norm vector (Gemma), else key_length.
+        let head_dim = gguf.tensors.get("blk.0.attn_k_norm.weight")
+            .and_then(|t| t.dims.first().copied())
+            .or_else(|| gguf.meta_u32(&format!("{arch}.attention.key_length")).map(|k| k as usize))
+            .unwrap_or(256);
+        let n_kv_heads = (kv_dim / head_dim).max(1);
         let rms_eps = gguf.meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
         let rope_base = gguf.meta_f32(&format!("{arch}.rope.freq_base")).unwrap_or(1000000.0);
         let rope_base_swa = gguf.meta_f32(&format!("{arch}.rope.freq_base_swa")).unwrap_or(10000.0);

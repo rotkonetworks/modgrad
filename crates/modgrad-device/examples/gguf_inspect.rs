@@ -53,6 +53,25 @@ fn main() {
         }
     }
 
+    // Attention dims DERIVED from tensor shapes (ground truth) — mirrors
+    // the inference.rs config derivation, validated here without a GPU load.
+    let d_model = gguf.meta_u32(&format!("{arch}.embedding_length")).unwrap_or(0) as usize;
+    let dim1 = |name: &str| gguf.tensors.get(name).and_then(|t| t.dims.get(1).copied());
+    let dim0 = |name: &str| gguf.tensors.get(name).and_then(|t| t.dims.first().copied());
+    let q_dim = dim1("blk.0.attn_q.weight");
+    let kv_dim = dim1("blk.0.attn_k.weight");
+    let head_dim = dim0("blk.0.attn_k_norm.weight");
+    println!("\n── attention dims (derived from tensor shapes) ──");
+    println!("  d_model   = {d_model}");
+    println!("  q_dim     = {q_dim:?}   (= n_heads × head_dim)");
+    println!("  kv_dim    = {kv_dim:?}   (= n_kv_heads × head_dim)");
+    println!("  head_dim  = {head_dim:?}   (from attn_k_norm)");
+    if let (Some(kv), Some(hd)) = (kv_dim, head_dim) {
+        println!("  n_kv_heads= {}   (kv_dim / head_dim)", kv / hd.max(1));
+    }
+    println!("  (metadata key_length = {:?} — the misleading field we now ignore)",
+        gguf.meta_u32(&format!("{arch}.attention.key_length")));
+
     // Per-quant-type histogram.
     let mut by_type: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // type -> (count, bytes)
     let mut total_bytes = 0usize;
