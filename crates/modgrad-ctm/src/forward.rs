@@ -403,6 +403,78 @@ fn sync_read(alpha: &[f32], beta: &[f32]) -> Vec<f32> {
     alpha.iter().zip(beta).map(|(&a, &b)| a / b.sqrt().max(1e-8)).collect()
 }
 
+// ─── Batched sync (per-example offsets) ────────────────────────
+// The sync recurrence is independent across examples, so the batched
+// variants are the scalar ones with an outer batch loop: `activated` is
+// `[batch × d_model]`, `alpha`/`beta`/`sync` are `[batch × n_pairs]`.
+// (Tiny / host-side — no GEMM here; this is plumbing so the tick loop can
+// carry B examples.)
+
+/// Batched `sync_init`: `alpha[b,i] = activated[b,left]·activated[b,right]`,
+/// `beta = 1`. Sizes `alpha`/`beta` to `batch × n_pairs`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sync_init_batched(
+    activated: &[f32], left: &[usize], right: &[usize],
+    alpha: &mut Vec<f32>, beta: &mut Vec<f32>, batch: usize, d_model: usize,
+) {
+    let n = left.len();
+    alpha.clear();
+    alpha.resize(batch * n, 0.0);
+    beta.clear();
+    beta.resize(batch * n, 1.0);
+    for b in 0..batch {
+        let ao = b * d_model;
+        for i in 0..n {
+            alpha[b * n + i] = activated[ao + left[i]] * activated[ao + right[i]];
+        }
+    }
+}
+
+/// Batched `sync_update` with exponential decay. Returns `[batch × n_pairs]`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sync_update_batched(
+    activated: &[f32], left: &[usize], right: &[usize],
+    alpha: &mut [f32], beta: &mut [f32], r: &[f32], batch: usize, d_model: usize,
+) -> Vec<f32> {
+    let n = left.len();
+    let mut sync = vec![0.0f32; batch * n];
+    for b in 0..batch {
+        let ao = b * d_model;
+        let so = b * n;
+        for i in 0..n {
+            let pw = activated[ao + left[i]] * activated[ao + right[i]];
+            alpha[so + i] = r[i] * alpha[so + i] + pw;
+            beta[so + i] = r[i] * beta[so + i] + 1.0;
+            sync[so + i] = alpha[so + i] / beta[so + i].sqrt().max(1e-8);
+        }
+    }
+    sync
+}
+
+/// Batched `sync_update_reverse_host` — the Bug-3 recurrence carry per
+/// example. `d_sync`/`alpha`/`beta`/`d_alpha_carry` are `[batch × n_pairs]`,
+/// `activated`/`d_activated` are `[batch × d_model]`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sync_update_reverse_host_batched(
+    d_sync: &[f32], activated: &[f32], _alpha: &[f32], beta: &[f32], r: &[f32],
+    left: &[usize], right: &[usize],
+    d_activated: &mut [f32], d_alpha_carry: &mut [f32],
+    batch: usize, d_model: usize,
+) {
+    let n = left.len();
+    for b in 0..batch {
+        let ao = b * d_model;
+        let so = b * n;
+        for i in 0..n {
+            let inv_sqrt_beta = 1.0 / beta[so + i].max(1e-8).sqrt();
+            let a_i = d_sync[so + i] * inv_sqrt_beta + r[i] * d_alpha_carry[so + i];
+            d_activated[ao + left[i]] += a_i * activated[ao + right[i]];
+            d_activated[ao + right[i]] += a_i * activated[ao + left[i]];
+            d_alpha_carry[so + i] = a_i;
+        }
+    }
+}
+
 // ─── NLM (trace processor) ─────────────────────────────────
 
 /// Per-neuron GLU: [n_neurons × 2k] → [n_neurons × k].
@@ -2020,6 +2092,54 @@ mod typed_forward_tests {
         trace_shift_adjoint_host(&d_trace_new, &mut d_pre_act, &mut d_trace_old, 2, 3);
         assert_eq!(d_pre_act, vec![30.0, 300.0]);
         assert_eq!(d_trace_old, vec![0.0, 10.0, 20.0, 0.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn cpu_sync_batched_matches_scalar() {
+        let (batch, d_model) = (3usize, 4usize);
+        let left = vec![0usize, 1];
+        let right = vec![2usize, 3];
+        let n = left.len();
+        let r = vec![0.5f32, 0.7];
+        let activated: Vec<f32> = (0..batch * d_model)
+            .map(|i| ((i * 3 % 5) as f32 - 2.0) * 0.4 + 0.1).collect();
+
+        // Batched: init + one update.
+        let mut alpha_b = Vec::new();
+        let mut beta_b = Vec::new();
+        sync_init_batched(&activated, &left, &right, &mut alpha_b, &mut beta_b, batch, d_model);
+        let sync_b = sync_update_batched(&activated, &left, &right, &mut alpha_b, &mut beta_b, &r, batch, d_model);
+
+        // Scalar per example.
+        for b in 0..batch {
+            let act_b = &activated[b * d_model..(b + 1) * d_model];
+            let mut a = Vec::new();
+            let mut be = Vec::new();
+            sync_init(act_b, &left, &right, &mut a, &mut be);
+            let s = sync_update(act_b, &left, &right, &mut a, &mut be, &r);
+            for i in 0..n {
+                assert!((sync_b[b * n + i] - s[i]).abs() < 1e-5, "sync[{b}][{i}]");
+                assert!((alpha_b[b * n + i] - a[i]).abs() < 1e-5, "alpha[{b}][{i}]");
+            }
+        }
+
+        // Batched reverse vs scalar reverse.
+        let d_sync: Vec<f32> = (0..batch * n).map(|i| (i as f32 - 2.0) * 0.3).collect();
+        let mut d_act_b = vec![0.0f32; batch * d_model];
+        let mut carry_b = vec![0.0f32; batch * n];
+        sync_update_reverse_host_batched(&d_sync, &activated, &alpha_b, &beta_b, &r,
+            &left, &right, &mut d_act_b, &mut carry_b, batch, d_model);
+        for b in 0..batch {
+            let act_b = &activated[b * d_model..(b + 1) * d_model];
+            let mut da = vec![0.0f32; d_model];
+            let mut carry = vec![0.0f32; n];
+            sync_update_reverse_host(&d_sync[b * n..(b + 1) * n], act_b,
+                &alpha_b[b * n..(b + 1) * n], &beta_b[b * n..(b + 1) * n], &r,
+                &left, &right, &mut da, &mut carry);
+            for j in 0..d_model {
+                assert!((d_act_b[b * d_model + j] - da[j]).abs() < 1e-5, "d_act[{b}][{j}]");
+            }
+        }
     }
 
     #[test]
