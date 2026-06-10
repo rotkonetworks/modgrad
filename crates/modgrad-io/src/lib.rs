@@ -18,8 +18,5 @@ pub mod tokenizer;
 #[cfg(feature = "onnx")]
 pub mod inference;
 
-#[cfg(feature = "gguf")]
-pub mod gguf;
-
 #[cfg(feature = "rocm")]
 pub mod qwen2;

@@ -48,6 +48,7 @@ members = [
     "examples/blt_train_real_text",
     "examples/blt_train_smoke",
     "examples/lm_validate",
+    "examples/ocr_smoke",
     "examples/qwen_cerebellum_smoke",
     "examples/qwen_chat",
     "examples/qwen_load_smoke",
@@ -81,7 +82,6 @@ path = "src/lib.rs"
 # KFD (gfx1102 flash path) stays opt-in via `--features kfd`.
 default = ["cuda"]
 onnx = ["dep:ort", "modgrad-io/onnx"]
-gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "modgrad-io/gguf"]
 cuda = ["dep:cudarc", "modgrad-device/cuda"]
 cuda-kernels = ["cuda", "modgrad-compute/cuda"]
 rocm = ["modgrad-device/rocm"]
@@ -116,11 +116,6 @@ clap = { version = "4", features = ["derive"] }
 
 # ONNX backend
 ort = { version = "2.0.0-rc.12", optional = true }
-
-# GGUF backend (candle from git — main branch has gemma4)
-candle-core = { git = "https://github.com/huggingface/candle", optional = true }
-candle-nn = { git = "https://github.com/huggingface/candle", optional = true }
-candle-transformers = { git = "https://github.com/huggingface/candle", optional = true }
 
 # Conic solver for SDP (Angeris bound, tight)
 clarabel = { version = "0.11", optional = true, default-features = false }

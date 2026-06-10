@@ -7,7 +7,6 @@ license = "MIT"
 
 [features]
 onnx = ["dep:ort"]
-gguf = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 # Enables the safetensors loader for HF-format models (Qwen2, Llama, ...)
 # and the device-resident upload path (`qwen2.rs`).  The resident upload
 # requires `modgrad-transformer/rocm`, which propagates to compute/device.
@@ -29,11 +28,6 @@ half = "2"
 
 # ONNX backend
 ort = { version = "2.0.0-rc.12", optional = true }
-
-# GGUF backend (candle from git — main branch has gemma4)
-candle-core = { git = "https://github.com/huggingface/candle", optional = true }
-candle-nn = { git = "https://github.com/huggingface/candle", optional = true }
-candle-transformers = { git = "https://github.com/huggingface/candle", optional = true }
 
 # QUIC transport for telemetry
 quinn = { version = "0.11", optional = true }
