@@ -1391,6 +1391,144 @@ impl<D: Device> SynapseUNetTyped<D> {
         }
         Ok(())
     }
+
+    /// Batched cached forward — B-aware mirror of `forward_with_cache`.
+    /// `x` is `[batch × in_dim]`; the returned cache holds B-row
+    /// intermediates for `backward_batched`.
+    pub fn forward_with_cache_batched(
+        &self,
+        x: &Tensor<D>,
+        batch: usize,
+    ) -> Result<(Tensor<D>, SynapseUNetCacheTyped<D>), BackendError> {
+        let n_blocks = self.down_blocks.len();
+        let (first_out, first_cache) = self.first_projection.forward_batched(x, batch)?;
+        let mut down_caches = Vec::with_capacity(n_blocks);
+        let mut down_outs_host: Vec<Vec<f32>> = Vec::with_capacity(n_blocks + 1);
+        down_outs_host.push(first_out.to_vec()?);
+        let mut current = first_out;
+        for i in 0..n_blocks {
+            let (next, cache) = self.down_blocks[i].forward_batched(&current, batch)?;
+            down_outs_host.push(next.to_vec()?);
+            down_caches.push(cache);
+            current = next;
+        }
+
+        let mut up_caches = Vec::with_capacity(n_blocks);
+        let mut skip_pre_ln_host: Vec<Vec<f32>> = Vec::with_capacity(n_blocks);
+        let mut skip_ln_caches: Vec<Tensor<D>> = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
+            let up_idx = n_blocks - 1 - i;
+            let (up_out, up_cache) = self.up_blocks[up_idx].forward_batched(&current, batch)?;
+            up_caches.push(up_cache);
+            let n = self.widths[up_idx];
+            let mut pre_skip = up_out;
+            tensor_api::add_assign(
+                &mut pre_skip,
+                &Tensor::<D>::from_slice(&down_outs_host[up_idx])?,
+                batch * n,
+            )?;
+            skip_pre_ln_host.push(pre_skip.to_vec()?);
+            let mut post_ln = Tensor::<D>::zeros(batch * n)?;
+            let mut ln_cache = Tensor::<D>::zeros(2 * batch)?;
+            tensor_api::layer_norm_train(
+                &pre_skip, &self.skip_ln_gamma[up_idx], &self.skip_ln_beta[up_idx],
+                &mut post_ln, &mut ln_cache, batch, n,
+            )?;
+            skip_ln_caches.push(ln_cache);
+            current = post_ln;
+        }
+
+        let cache = SynapseUNetCacheTyped {
+            first: first_cache, downs: down_caches, ups: up_caches,
+            down_outs_host, skip_pre_ln_host, skip_ln_caches,
+        };
+        Ok((current, cache))
+    }
+
+    /// Batched backward — B-aware mirror of `backward`. `d_out` is
+    /// `[batch × out_dim]`; `d_x` `[batch × in_dim]` overwritten; all
+    /// weight grads accumulate (batch-summed). Skip-LN d_gamma/d_beta go
+    /// through temps + add (layer_norm_bwd zeros them, like the blocks).
+    pub fn backward_batched(
+        &self,
+        d_out: &Tensor<D>,
+        cache: &SynapseUNetCacheTyped<D>,
+        grads: &mut UNetGradsTyped<D>,
+        d_x: &mut Tensor<D>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let n_blocks = self.down_blocks.len();
+        let mut d_outs_down: Vec<Tensor<D>> = (0..=n_blocks)
+            .map(|i| {
+                let w = if i < self.widths.len() { self.widths[i] } else { *self.widths.last().unwrap() };
+                Tensor::<D>::zeros(batch * w)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut current_grad = Tensor::<D>::from_slice(&d_out.to_vec()?)?;
+        for step in 0..n_blocks {
+            let cache_idx = n_blocks - 1 - step;
+            let down_level = step;
+            let n = self.widths[down_level];
+
+            let pre_skip_ln = Tensor::<D>::from_slice(&cache.skip_pre_ln_host[cache_idx])?;
+            let mut d_pre_skip = Tensor::<D>::zeros(batch * n)?;
+            let mut dg_tmp = Tensor::<D>::zeros(n)?;
+            let mut dbe_tmp = Tensor::<D>::zeros(n)?;
+            tensor_api::layer_norm_bwd(
+                &current_grad, &pre_skip_ln, &self.skip_ln_gamma[down_level],
+                &cache.skip_ln_caches[cache_idx],
+                &mut d_pre_skip, &mut dg_tmp, &mut dbe_tmp,
+                batch, n,
+            )?;
+            tensor_api::add_assign(&mut grads.skip_d_gamma[down_level], &dg_tmp, n)?;
+            tensor_api::add_assign(&mut grads.skip_d_beta[down_level], &dbe_tmp, n)?;
+
+            let d_skip = Tensor::<D>::from_slice(&d_pre_skip.to_vec()?)?;
+            tensor_api::add_assign(&mut d_outs_down[down_level], &d_skip, batch * n)?;
+
+            let mut d_up_in = Tensor::<D>::zeros(batch * self.up_blocks[down_level].linear.in_dim)?;
+            {
+                let ug = &mut grads.ups[down_level];
+                self.up_blocks[down_level].backward_batched(
+                    &d_pre_skip, &cache.ups[cache_idx],
+                    &mut ug.d_w, &mut ug.d_b, &mut ug.d_gamma, &mut ug.d_beta,
+                    &mut d_up_in, batch,
+                )?;
+            }
+            current_grad = d_up_in;
+        }
+
+        tensor_api::add_assign(
+            &mut d_outs_down[n_blocks], &current_grad,
+            batch * *self.widths.last().unwrap(),
+        )?;
+
+        for i in (0..n_blocks).rev() {
+            let upstream = Tensor::<D>::from_slice(&d_outs_down[i + 1].to_vec()?)?;
+            let mut d_block_in = Tensor::<D>::zeros(batch * self.down_blocks[i].linear.in_dim)?;
+            {
+                let dg = &mut grads.downs[i];
+                self.down_blocks[i].backward_batched(
+                    &upstream, &cache.downs[i],
+                    &mut dg.d_w, &mut dg.d_b, &mut dg.d_gamma, &mut dg.d_beta,
+                    &mut d_block_in, batch,
+                )?;
+            }
+            tensor_api::add_assign(&mut d_outs_down[i], &d_block_in, batch * self.widths[i])?;
+        }
+
+        let first_upstream = Tensor::<D>::from_slice(&d_outs_down[0].to_vec()?)?;
+        {
+            let fg = &mut grads.first;
+            self.first_projection.backward_batched(
+                &first_upstream, &cache.first,
+                &mut fg.d_w, &mut fg.d_b, &mut fg.d_gamma, &mut fg.d_beta,
+                d_x, batch,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Cache produced by `SynapseUNetTyped::forward_with_cache`.
@@ -1519,6 +1657,67 @@ mod typed_synapse_tests {
             let s = a.abs().max(b.abs()).max(1.0);
             assert!(d < 1e-4 || d / s < 1e-4, "unet fwd[{i}]: {a} vs {b}");
         }
+    }
+
+    /// Batched full-U-Net backward vs finite differences (loss = Σ output,
+    /// d_out = ones ⇒ dL/dw = analytic grad). Validates the whole batched
+    /// synapse backward — block GEMMs + skip-conn adjoints + skip-LN — end
+    /// to end against ground truth.
+    #[test]
+    fn cpu_synapse_unet_backward_batched_matches_fd() {
+        let unet = SynapseUNet::new(8, 4, 3, 2);
+        let typed = SynapseUNetTyped::<Cpu>::from_untyped(&unet).unwrap();
+        let (in_dim, batch) = (8usize, 4usize);
+        let x: Vec<f32> = (0..batch * in_dim).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.17).collect();
+
+        let loss_of = |u: &SynapseUNet| -> f32 {
+            let t = SynapseUNetTyped::<Cpu>::from_untyped(u).unwrap();
+            let xt = Tensor::<Cpu>::from_slice(&x).unwrap();
+            t.forward_batched(&xt, batch).unwrap().to_vec().unwrap().iter().sum()
+        };
+
+        // Analytic.
+        let xt = Tensor::<Cpu>::from_slice(&x).unwrap();
+        let (out, cache) = typed.forward_with_cache_batched(&xt, batch).unwrap();
+        let d_out = Tensor::<Cpu>::from_slice(&vec![1.0f32; out.to_vec().unwrap().len()]).unwrap();
+        let mut grads = UNetGradsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut d_x = Tensor::<Cpu>::zeros(batch * in_dim).unwrap();
+        typed.backward_batched(&d_out, &cache, &mut grads, &mut d_x, batch).unwrap();
+
+        const EPS: f32 = 1e-3;
+        const TOL: f32 = 2e-2;
+        // FD floor ≈ |L|·ulp/(2·EPS). Here L = Σ over batch·out_dim ≈ 16
+        // outputs of O(1), so |L| ~ 16 and the floor is ~1e-3 — near-zero
+        // analytic grads read ~that off FD. Floor at 1.5e-3 (real grads
+        // that pass are ≫ this).
+        const ABS: f32 = 1.5e-3;
+        #[allow(clippy::type_complexity)]
+        let probes: Vec<(&str, Vec<f32>, Box<dyn Fn(&mut SynapseUNet) -> &mut Vec<f32>>)> = vec![
+            ("first.d_w", grads.first.d_w.to_vec().unwrap(), Box::new(|u| &mut u.first_projection.linear.weight)),
+            ("down0.d_w", grads.downs[0].d_w.to_vec().unwrap(), Box::new(|u| &mut u.down_blocks[0].linear.weight)),
+            ("up0.d_w", grads.ups[0].d_w.to_vec().unwrap(), Box::new(|u| &mut u.up_blocks[0].linear.weight)),
+            ("skip0.d_gamma", grads.skip_d_gamma[0].to_vec().unwrap(), Box::new(|u| &mut u.skip_ln_gamma[0])),
+        ];
+        let mut fails: Vec<String> = Vec::new();
+        for (name, analytic, acc) in &probes {
+            let n = analytic.len();
+            for idx in [0usize, n / 3, 2 * n / 3, n - 1] {
+                let mut up = unet.clone();
+                let orig = acc(&mut up)[idx];
+                acc(&mut up)[idx] = orig + EPS;
+                let lp = loss_of(&up);
+                acc(&mut up)[idx] = orig - EPS;
+                let lm = loss_of(&up);
+                let fd = (lp - lm) / (2.0 * EPS);
+                let a = analytic[idx];
+                let ad = (fd - a).abs();
+                let rel = ad / fd.abs().max(a.abs()).max(1e-4);
+                if rel > TOL && ad > ABS {
+                    fails.push(format!("{name}[{idx}]: a={a:+e} fd={fd:+e} rel={rel:.3e}"));
+                }
+            }
+        }
+        assert!(fails.is_empty(), "U-Net batched backward vs FD:\n  {}", fails.join("\n  "));
     }
 
     /// Batched `SynapseBlockTyped` forward+backward must equal `batch`
