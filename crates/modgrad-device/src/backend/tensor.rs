@@ -142,6 +142,16 @@ pub trait Device: 'static + Send + Sync {
         n_rows: usize, n_cols: usize,
     ) -> Result<(), BackendError>;
 
+    /// Row-wise RMSNorm: `y[r,j] = x[r,j] · rsqrt(meanⱼ(x[r,*]²) + eps) · weight[j]`.
+    /// No mean subtraction, no bias — the Llama/Gemma/Qwen norm. Shapes:
+    /// `x, out: [n_rows × n_cols]`, `weight: [n_cols]`.
+    fn rms_norm(
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        out: &mut Self::Buffer,
+        n_rows: usize, n_cols: usize, eps: f32,
+    ) -> Result<(), BackendError>;
+
     /// Element-wise SiLU (sigmoid-linear unit): `y = x · σ(x)`.
     /// `x` and `out` are `[n]`. The CTM's go-to nonlinearity.
     fn silu(
@@ -451,6 +461,25 @@ impl Device for Cpu {
             n_rows, n_cols,
         };
         super::CpuBackend::new().dispatch(&mut op)
+    }
+
+    fn rms_norm(
+        x: &HostBuffer, weight: &HostBuffer,
+        out: &mut HostBuffer,
+        n_rows: usize, n_cols: usize, eps: f32,
+    ) -> Result<(), BackendError> {
+        let xs = x.as_slice();
+        let w = weight.as_slice();
+        let o = out.as_mut_slice();
+        for r in 0..n_rows {
+            let row = &xs[r * n_cols..(r + 1) * n_cols];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / n_cols as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for j in 0..n_cols {
+                o[r * n_cols + j] = row[j] * inv * w[j];
+            }
+        }
+        Ok(())
     }
 
     fn silu(
@@ -944,6 +973,21 @@ mod rocm_impl {
             }
         }
 
+        fn rms_norm(
+            x: &HipBuffer, weight: &HipBuffer,
+            out: &mut HipBuffer,
+            n_rows: usize, n_cols: usize, eps: f32,
+        ) -> Result<(), BackendError> {
+            unsafe {
+                super::super::ops::rms_norm_resident(
+                    x.device_ptr() as *const f32,
+                    weight.device_ptr() as *const f32,
+                    out.device_ptr() as *mut f32,
+                    n_rows, n_cols, eps,
+                )
+            }
+        }
+
         fn silu(
             x: &HipBuffer, out: &mut HipBuffer,
         ) -> Result<(), BackendError> {
@@ -1418,6 +1462,14 @@ pub fn layer_norm<D: Device>(
         &x.buffer, &gamma.buffer, &beta.buffer, &mut out.buffer,
         n_rows, n_cols,
     )
+}
+
+/// Row-wise RMSNorm `y = x · rsqrt(mean(x²)+eps) · weight` — see `Device::rms_norm`.
+pub fn rms_norm<D: Device>(
+    x: &Tensor<D>, weight: &Tensor<D>, out: &mut Tensor<D>,
+    n_rows: usize, n_cols: usize, eps: f32,
+) -> Result<(), BackendError> {
+    D::rms_norm(&x.buffer, &weight.buffer, &mut out.buffer, n_rows, n_cols, eps)
 }
 
 /// Element-wise SiLU `y = x · σ(x)` — see `Device::silu`.
