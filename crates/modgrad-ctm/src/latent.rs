@@ -10,7 +10,7 @@
 
 use modgrad_device::backend::tensor::{Device, Linear, Tensor};
 use modgrad_device::backend::BackendError;
-use modgrad_traits::LatentThinker;
+use modgrad_traits::{LatentThinker, SurpriseModel};
 
 use crate::forward::{ctm_backward_typed, ctm_forward_typed_with_cache, CtmCacheTyped};
 use crate::synapse::UNetGradsTyped;
@@ -161,6 +161,50 @@ impl<D: Device> LatentThinker for CtmLatent<D> {
     }
 }
 
+/// Reference `SurpriseModel` (A4): predicts the next patch from the current
+/// patch via one Linear (`patch_dim → patch_dim`). Locks the SurpriseModel
+/// contract; the production predictor (a CTM / small forward model that also
+/// serves as the cerebellum, A7) swaps in behind the same trait.
+pub struct LinearSurprise<D: Device> {
+    linear: Linear<D>,
+    pub d_w: Tensor<D>,
+    pub d_b: Tensor<D>,
+    patch_dim: usize,
+}
+
+impl<D: Device> LinearSurprise<D> {
+    pub fn from_host(weight: &[f32], bias: &[f32], patch_dim: usize) -> Result<Self, BackendError> {
+        Ok(Self {
+            linear: Linear::<D>::from_host(weight, bias, patch_dim, patch_dim)?,
+            d_w: Tensor::<D>::zeros(patch_dim * patch_dim)?,
+            d_b: Tensor::<D>::zeros(patch_dim)?,
+            patch_dim,
+        })
+    }
+}
+
+impl<D: Device> SurpriseModel for LinearSurprise<D> {
+    type Cache = Tensor<D>; // the ctx input, for backward
+    type Error = BackendError;
+
+    fn patch_dim(&self) -> usize {
+        self.patch_dim
+    }
+
+    fn predict_next(&mut self, ctx: &[f32]) -> Result<(Vec<f32>, Tensor<D>), BackendError> {
+        let x = Tensor::<D>::from_slice(ctx)?;
+        let y = self.linear.forward(&x)?;
+        Ok((y.to_vec()?, x))
+    }
+
+    fn predict_backward(&mut self, d_pred: &[f32], cache: &Tensor<D>) -> Result<Vec<f32>, BackendError> {
+        let dy = Tensor::<D>::from_slice(d_pred)?;
+        let mut dx = Tensor::<D>::zeros(self.patch_dim)?;
+        self.linear.backward(&dy, cache, &mut self.d_w, &mut self.d_b, &mut dx)?;
+        Ok(dx.to_vec()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +296,45 @@ mod tests {
             let rel = abs_diff / fd.abs().max(a.abs()).max(1e-4);
             assert!(rel < 2e-2 || abs_diff < 3e-4,
                 "out_proj_w[{idx}]: analytic={a} fd={fd} rel={rel} abs={abs_diff}");
+        }
+    }
+
+    /// A4: the SurpriseModel contract. predict_next/predict_backward
+    /// FD-gradcheck under the ½‖predicted−actual‖² surprise loss.
+    #[test]
+    fn linear_surprise_contract_fd_gradcheck() {
+        let pd = 4usize;
+        let w: Vec<f32> = (0..pd * pd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
+        let b: Vec<f32> = (0..pd).map(|i| (i as f32 - 2.0) * 0.05).collect();
+        let ctx: Vec<f32> = (0..pd).map(|i| ((i * 3 % 5) as f32 - 2.0) * 0.3).collect();
+        let actual: Vec<f32> = (0..pd).map(|i| ((i * 5 % 7) as f32 - 3.0) * 0.2).collect();
+
+        // Analytic: loss = surprise(predict(ctx), actual); d_pred = pred - actual.
+        let mut sm = LinearSurprise::<Cpu>::from_host(&w, &b, pd).unwrap();
+        let (pred, cache) = sm.predict_next(&ctx).unwrap();
+        let d_pred = sm.surprise_grad(&pred, &actual);
+        let _d_ctx = sm.predict_backward(&d_pred, &cache).unwrap();
+        let dw = sm.d_w.to_vec().unwrap();
+
+        let loss_of = |wp: &[f32]| -> f32 {
+            let mut s = LinearSurprise::<Cpu>::from_host(wp, &b, pd).unwrap();
+            let (p, _) = s.predict_next(&ctx).unwrap();
+            s.surprise(&p, &actual)
+        };
+        const EPS: f32 = 1e-3;
+        for idx in [0usize, pd * pd / 2, pd * pd - 1] {
+            let mut wp = w.clone();
+            wp[idx] += EPS;
+            let lp = loss_of(&wp);
+            let mut wm = w.clone();
+            wm[idx] -= EPS;
+            let lm = loss_of(&wm);
+            let fd = (lp - lm) / (2.0 * EPS);
+            let a = dw[idx];
+            let abs_diff = (fd - a).abs();
+            let rel = abs_diff / fd.abs().max(a.abs()).max(1e-4);
+            assert!(rel < 1e-3 || abs_diff < 3e-4,
+                "d_w[{idx}]: analytic={a} fd={fd} rel={rel} abs={abs_diff}");
         }
     }
 }
