@@ -648,13 +648,20 @@ impl Device for Cpu {
 
     fn glu_bwd(
         d_out: &HostBuffer, x: &HostBuffer, d_x: &mut HostBuffer,
-        _n_rows: usize, _half_size: usize,
+        n_rows: usize, half_size: usize,
     ) -> Result<(), BackendError> {
         use super::Backend;
-        let mut op = super::Op::GluBwd {
+        // Per-neuron GLU: each row of `x` is [half_size value | half_size gate].
+        // The flat `Op::GluBwd` treats the whole buffer as ONE GLU (half = len/2),
+        // which pairs neuron 0's values with neuron N/2's row as its gate and
+        // scrambles the value/gate split across neurons. Dispatch the per-neuron
+        // variant (the ROCm impl already does). Matches the per-neuron `glu` fwd.
+        let mut op = super::Op::PerNeuronGluBwd {
             d_out: d_out.as_slice(),
             x: x.as_slice(),
             d_x: d_x.as_mut_slice(),
+            n_neurons: n_rows,
+            feat_per_neuron: half_size,
         };
         super::CpuBackend::new().dispatch(&mut op)
     }
@@ -1679,6 +1686,56 @@ impl<D: Device> Linear<D> {
         outer_product_acc(d_y, x, d_w, self.out_dim, self.in_dim)?;
         // d_b += d_y
         add_assign(d_b, d_y, self.out_dim)?;
+        Ok(())
+    }
+
+    /// Batched forward — the GEMV→GEMM lever. `x` is `[batch × in_dim]`,
+    /// `y` is `[batch × out_dim]`, both row-major. Computes
+    /// `Y = X · Wᵀ + b` as ONE matmul that reuses `W` across all `batch`
+    /// rows (arithmetic intensity ≈ batch, vs ≈1 for the per-row matvec).
+    /// Bias is broadcast over rows via a ones-vector outer product — no
+    /// new kernel, just the already-wired NN/NT matmuls.
+    pub fn forward_batched(
+        &self,
+        x: &Tensor<D>,
+        y: &mut Tensor<D>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        // Y[B×out] = X[B×in] @ W[out×in]ᵀ
+        matmul_nt(x, &self.weight, y, batch, self.in_dim, self.out_dim)?;
+        // Broadcast bias to every row: Y += ones[B×1] @ bias[1×out].
+        let ones = Tensor::<D>::from_slice(&vec![1.0f32; batch])?;
+        let mut bias_bc = Tensor::<D>::zeros(batch * self.out_dim)?;
+        matmul_nn(&ones, &self.bias, &mut bias_bc, batch, 1, self.out_dim)?;
+        add_assign(y, &bias_bc, batch * self.out_dim)?;
+        Ok(())
+    }
+
+    /// Batched backward. `d_y` is `[batch × out_dim]`, `x` the forward
+    /// input `[batch × in_dim]`. `d_w`/`d_b` ACCUMULATE (batch-summed),
+    /// `d_x` (`[batch × in_dim]`) overwrites. All three gradients are
+    /// single GEMMs (plus a ones-matmul for `d_b`) — equivalent to, and
+    /// far faster than, `batch` independent `backward` calls.
+    pub fn backward_batched(
+        &self,
+        d_y: &Tensor<D>,
+        x: &Tensor<D>,
+        d_w: &mut Tensor<D>,
+        d_b: &mut Tensor<D>,
+        d_x: &mut Tensor<D>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        // d_X[B×in] = d_Y[B×out] @ W[out×in]
+        matmul_nn(d_y, &self.weight, d_x, batch, self.out_dim, self.in_dim)?;
+        // d_W += d_Yᵀ[out×B] @ X[B×in]  (matmul_tn overwrites → temp + add)
+        let mut dw_batch = Tensor::<D>::zeros(self.out_dim * self.in_dim)?;
+        matmul_tn(d_y, x, &mut dw_batch, self.out_dim, batch, self.in_dim)?;
+        add_assign(d_w, &dw_batch, self.out_dim * self.in_dim)?;
+        // d_b += Σ_rows d_Y = ones[1×B] @ d_Y[B×out]
+        let ones = Tensor::<D>::from_slice(&vec![1.0f32; batch])?;
+        let mut db_batch = Tensor::<D>::zeros(self.out_dim)?;
+        matmul_nn(&ones, d_y, &mut db_batch, 1, batch, self.out_dim)?;
+        add_assign(d_b, &db_batch, self.out_dim)?;
         Ok(())
     }
 }
