@@ -299,6 +299,37 @@ mod tests {
         }
     }
 
+    /// A7 — the cerebellum is the SurpriseModel (fast forward model), and
+    /// its MISS recruits the cortex. When the cerebellar prediction is good
+    /// (low surprise) the CTM exits early; when it misses (high surprise)
+    /// more ticks are recruited. This closes the brain's routine-vs-novel
+    /// loop: the cerebellum handles the routine, the cortex engages the
+    /// surprising. (Supersedes the frozen non-differentiable cerebellum
+    /// cache adapter the design review flagged — the predictor is in-loop.)
+    #[test]
+    fn cerebellar_miss_recruits_cortical_ticks() {
+        use modgrad_traits::surprise::surprise_tick_budget;
+        let pd = 4usize;
+        let w: Vec<f32> = (0..pd * pd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
+        let b = vec![0.0f32; pd];
+        let ctx: Vec<f32> = (0..pd).map(|i| (i as f32 - 2.0) * 0.3).collect();
+        let mut sm = LinearSurprise::<Cpu>::from_host(&w, &b, pd).unwrap();
+        let (pred, _) = sm.predict_next(&ctx).unwrap();
+
+        // A good cerebellar prediction (actual == pred) → ~0 surprise → min ticks.
+        let s_low = sm.surprise(&pred, &pred);
+        // A miss (actual far from pred) → high surprise → more ticks.
+        let actual_far: Vec<f32> = pred.iter().map(|&p| p + 3.0).collect();
+        let s_high = sm.surprise(&pred, &actual_far);
+
+        assert!(s_high > s_low);
+        let ticks_routine = surprise_tick_budget(s_low, 2, 8, 1.0);
+        let ticks_novel = surprise_tick_budget(s_high, 2, 8, 1.0);
+        assert!(ticks_novel > ticks_routine,
+            "cerebellar miss must recruit more cortical ticks: routine={ticks_routine} novel={ticks_novel}");
+        assert_eq!(ticks_routine, 2, "good prediction → minimum ticks");
+    }
+
     /// A8 — the property the whole architecture rests on: episodic recall
     /// is CONTENT-addressable and does not die when a window slides. Store
     /// 100 episodes (far past any fixed context window), then recall an
