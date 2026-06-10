@@ -808,6 +808,8 @@ impl Gemma4Model {
             dequant_q5k_row(row_data, &mut embedding, blocks_per_row);
         } else if matches!(dtype, GgmlType::Q4_K) {
             dequant_q4k_row(row_data, &mut embedding, blocks_per_row);
+        } else if matches!(dtype, GgmlType::Q6_K) {
+            dequant_q6k_row(row_data, &mut embedding, blocks_per_row);
         }
 
         // Clamp NaN/inf from quantization artifacts
@@ -1068,6 +1070,40 @@ fn dequant_q5k_row(data: &[u8], out: &mut [f32], n_blocks: usize) {
             is += 2;
             u1 <<= 2;
             u2 <<= 2;
+        }
+    }
+}
+
+// ─── Q6_K dequantization ─────────────────────────────────────
+
+fn dequant_q6k_row(data: &[u8], out: &mut [f32], n_blocks: usize) {
+    // Q6_K: 210 bytes / 256 elems — ql[128] | qh[64] | scales[16] i8 | d f16.
+    // Signed 6-bit quants (offset −32), per-16-element signed scales, no min.
+    // Matches llama.cpp dequantize_row_q6_K.
+    for blk in 0..n_blocks {
+        let b = &data[blk * 210..];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let sc = &b[192..208];
+        let mut d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+        if d.is_nan() || d.is_infinite() { d = 0.0; }
+        let base = blk * 256;
+        for grp in 0..2 {
+            let (qlb, qhb, scb, yb) = (grp * 64, grp * 32, grp * 8, base + grp * 128);
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = (((ql[qlb + l] & 0xF) as i32) | ((((qh[qhb + l]) & 3) as i32) << 4)) - 32;
+                let q2 = (((ql[qlb + l + 32] & 0xF) as i32) | ((((qh[qhb + l] >> 2) & 3) as i32) << 4)) - 32;
+                let q3 = (((ql[qlb + l] >> 4) as i32) | ((((qh[qhb + l] >> 4) & 3) as i32) << 4)) - 32;
+                let q4 = (((ql[qlb + l + 32] >> 4) as i32) | ((((qh[qhb + l] >> 6) & 3) as i32) << 4)) - 32;
+                let s = |k: usize| (sc[scb + k] as i8) as i32 as f32;
+                if yb + l + 96 < out.len() {
+                    out[yb + l] = d * s(is) * q1 as f32;
+                    out[yb + l + 32] = d * s(is + 2) * q2 as f32;
+                    out[yb + l + 64] = d * s(is + 4) * q3 as f32;
+                    out[yb + l + 96] = d * s(is + 6) * q4 as f32;
+                }
+            }
         }
     }
 }
