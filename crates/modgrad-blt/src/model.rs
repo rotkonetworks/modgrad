@@ -273,6 +273,54 @@ impl BltModel {
     /// never wants stale K/V across micro-batches. Without the reset,
     /// the second call's positions would index beyond the cache slots
     /// the previous call wrote.
+    /// Forward `bytes → encoder → LatentThinker → decoder → byte logits`
+    /// (A3 — the CTM-as-latent organism). Identical to [`Self::forward`]
+    /// except Stage 2 calls a pluggable [`LatentThinker`] (e.g. `CtmLatent`)
+    /// instead of the hardcoded resident transformer latent. The resident
+    /// encoder/decoder stay on-device; the latent boundary bridges through
+    /// host slices (`[n_patches × patch_dim]`) — a perf follow-up keeps it
+    /// resident. The latent's `patch_dim` must equal `config.latent.patch_dim`.
+    pub fn forward_with_latent<L>(
+        &mut self,
+        batch: &HipBatch,
+        latent: &mut L,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut BltScratch,
+        byte_logits_out: &mut GpuVec,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        L: modgrad_traits::LatentThinker,
+        L::Error: std::error::Error + 'static,
+    {
+        let n_bytes = bytes.len();
+        let n_patches = boundaries.len().saturating_sub(1);
+        let patch_dim = self.config.latent.patch_dim;
+        debug_assert_eq!(latent.patch_dim(), patch_dim, "latent patch_dim mismatch");
+        debug_assert_eq!(byte_logits_out.len(), n_bytes * 256);
+
+        self.encoder.byte_kv_cache.reset();
+        self.decoder.byte_kv_cache.reset();
+
+        // Stage 1: encoder bytes → patch reps.
+        let mut patch_reps_view = GpuVec::try_hip(n_patches * patch_dim)?;
+        self.encoder.forward(batch, bytes, boundaries, &mut scratch.encoder, &mut patch_reps_view)?;
+
+        // Stage 2: LatentThinker over patches (host bridge at the seam).
+        let mut patch_host = vec![0.0f32; n_patches * patch_dim];
+        patch_reps_view.copy_to_host(&mut patch_host);
+        let (thought_host, _cache) = latent.think_forward(&patch_host, n_patches)?;
+        let mut patch_reps_for_decoder = GpuVec::try_hip(n_patches * patch_dim)?;
+        patch_reps_for_decoder.copy_from(&thought_host);
+
+        // Stage 3: decoder patches → byte logits (seed = encoder byte_reps).
+        self.decoder.forward(
+            batch, &patch_reps_for_decoder, boundaries,
+            Some(&scratch.encoder.byte_reps), &mut scratch.decoder, byte_logits_out,
+        )?;
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         batch: &HipBatch,
@@ -1901,6 +1949,62 @@ mod tests {
                 window_pattern: WindowPattern::Full,
             },
         }
+    }
+
+    /// Trivial LatentThinker (thought = patches) to validate the A3 seam
+    /// wiring + host bridge in the real BLT pipeline without a cross-crate
+    /// dep on CtmLatent. Swapping in CtmLatent is then a one-liner.
+    struct IdentityLatent {
+        patch_dim: usize,
+    }
+    impl modgrad_traits::LatentThinker for IdentityLatent {
+        type Cache = ();
+        type Error = std::convert::Infallible;
+        fn patch_dim(&self) -> usize {
+            self.patch_dim
+        }
+        fn think_forward(
+            &mut self, patches: &[f32], _n: usize,
+        ) -> Result<(Vec<f32>, ()), std::convert::Infallible> {
+            Ok((patches.to_vec(), ()))
+        }
+        fn think_backward(
+            &mut self, d_thought: &[f32], _c: &(), _n: usize,
+        ) -> Result<Vec<f32>, std::convert::Infallible> {
+            Ok(d_thought.to_vec())
+        }
+    }
+
+    /// A3: `bytes → encoder → LatentThinker → decoder → bytes` runs
+    /// end-to-end through the real resident encoder/decoder with the host
+    /// bridge at the latent seam.
+    #[test]
+    fn forward_with_latent_runs_end_to_end() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+        let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+        let pd = config.latent.patch_dim;
+        let mut latent = IdentityLatent { patch_dim: pd };
+
+        let bytes: Vec<u8> = (0..32u8).collect();
+        let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+        let n_bytes = bytes.len();
+        let mut logits = GpuVec::try_hip(n_bytes * 256).expect("alloc logits");
+        let batch = HipBatch::new();
+        model.forward_with_latent(&batch, &mut latent, &bytes, &boundaries, &mut scratch, &mut logits)
+            .expect("forward_with_latent");
+        batch.flush().expect("flush");
+
+        let mut host = vec![0.0f32; n_bytes * 256];
+        logits.copy_to_host(&mut host);
+        assert_eq!(host.iter().filter(|v| v.is_finite()).count(), host.len(),
+            "logits contain non-finite values");
+        assert!(host.iter().any(|&x| x != 0.0), "logits all zero");
     }
 
     #[test]
