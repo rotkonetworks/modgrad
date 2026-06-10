@@ -1504,6 +1504,63 @@ pub fn rope<D: Device>(
     Tensor::<D>::from_slice(&o)
 }
 
+/// Scaled dot-product attention with grouped-query attention (GQA), causal
+/// masking, optional sliding window, and optional attention-logit soft-cap.
+/// `q: [n_tokens × n_heads × head_dim]`, `k,v: [n_tokens × n_kv_heads × head_dim]`
+/// (post-RoPE). Returns `[n_tokens × n_heads × head_dim]`. Each query head `h`
+/// attends to KV head `h / (n_heads/n_kv_heads)`. Host-bridged (a fused flash
+/// kernel can replace it later).
+pub fn sdpa<D: Device>(
+    q: &Tensor<D>, k: &Tensor<D>, v: &Tensor<D>,
+    n_tokens: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    sliding_window: Option<usize>, softcap: Option<f32>,
+) -> Result<Tensor<D>, BackendError> {
+    let q = q.to_vec()?;
+    let k = k.to_vec()?;
+    let v = v.to_vec()?;
+    let group = (n_heads / n_kv_heads).max(1);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; n_tokens * n_heads * head_dim];
+
+    for h in 0..n_heads {
+        let kvh = h / group;
+        for ti in 0..n_tokens {
+            // Causal window: attend to [lo, ti].
+            let lo = match sliding_window {
+                Some(w) if w > 0 => ti + 1 - w.min(ti + 1),
+                _ => 0,
+            };
+            let mut scores = vec![0.0f32; ti + 1];
+            let mut maxs = f32::NEG_INFINITY;
+            for tj in lo..=ti {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[(ti * n_heads + h) * head_dim + d]
+                        * k[(tj * n_kv_heads + kvh) * head_dim + d];
+                }
+                let mut s = dot * scale;
+                if let Some(cap) = softcap { s = cap * (s / cap).tanh(); }
+                scores[tj] = s;
+                if s > maxs { maxs = s; }
+            }
+            let mut denom = 0.0f32;
+            for tj in lo..=ti {
+                let e = (scores[tj] - maxs).exp();
+                scores[tj] = e;
+                denom += e;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for tj in lo..=ti {
+                    acc += (scores[tj] / denom) * v[(tj * n_kv_heads + kvh) * head_dim + d];
+                }
+                out[(ti * n_heads + h) * head_dim + d] = acc;
+            }
+        }
+    }
+    Tensor::<D>::from_slice(&out)
+}
+
 /// Element-wise SiLU `y = x · σ(x)` — see `Device::silu`.
 pub fn silu<D: Device>(
     x: &Tensor<D>, out: &mut Tensor<D>,
