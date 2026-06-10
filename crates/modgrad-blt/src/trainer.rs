@@ -830,6 +830,13 @@ impl BltModelTrainer {
             buf.step_resident(weight_dev, host_grad.as_slice(), &cfg)?;
         }
 
+        // The n-gram tables are the one param AdamW updates on-device but
+        // the forward consumes on-host (`embed_bytes` is host code). Sync
+        // the updated device mirror back into the host tables so the next
+        // step's forward sees the trained values. Every other param is
+        // read on-device, so needs no such sync.
+        self.model.encoder.sync_ngram_tables_from_dev()?;
+
         self.step += 1;
         Ok(loss)
     }
@@ -918,14 +925,15 @@ fn param_keys_for_model(model: &BltModel) -> Vec<String> {
     let n_lat = model.latent.num_layers();
     let n_dec = model.decoder.n_layers();
 
-    // 1 (byte_embed) + n_enc * (7 attn/mlp + 4 cross_attn) + n_lat * 7 + 1
-    // (latent.final_norm) + n_dec * (7 + 4) + 3 (lm_head, lm_head_bias,
-    // final_norm).
+    // 2 (byte_embed + ngram_tables) + n_enc * (7 attn/mlp + 4 cross_attn)
+    // + n_lat * 7 + 1 (latent.final_norm) + n_dec * (7 + 4) + 3 (lm_head,
+    // lm_head_bias, final_norm).
     let mut keys = Vec::with_capacity(
-        1 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3,
+        2 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3,
     );
 
     keys.push("encoder.byte_embed".to_string());
+    keys.push("encoder.ngram_tables".to_string());
     for li in 0..n_enc {
         keys.push(format!("encoder.block.{li}.wq"));
         keys.push(format!("encoder.block.{li}.wk"));
@@ -977,6 +985,7 @@ fn param_keys_for_model(model: &BltModel) -> Vec<String> {
 #[cfg(feature = "rocm")]
 fn weight_dev_for_blt_key<'a>(model: &'a BltModel, key: &str) -> &'a HipBuffer {
     if key == "encoder.byte_embed" { return &model.encoder.byte_embed_dev; }
+    if key == "encoder.ngram_tables" { return &model.encoder.ngram_tables_dev; }
     if key == "latent.final_norm" { return &model.latent_final_norm_weight_dev; }
     if key == "decoder.lm_head" { return &model.decoder.lm_head.weight_dev; }
     if key == "decoder.lm_head_bias" { return &model.decoder.lm_head.bias_dev; }
@@ -1018,6 +1027,7 @@ fn grad_dev_for_key<'a>(
     model: &BltModel,
 ) -> &'a GpuVec {
     if key == "encoder.byte_embed" { return &state.encoder_grads.d_byte_embed; }
+    if key == "encoder.ngram_tables" { return &state.encoder_grads.d_ngram_tables; }
     if key == "latent.final_norm" { return &state.d_latent_final_norm_weight; }
     if key == "decoder.lm_head" { return &state.decoder_grads.dweight_lm_head; }
     if key == "decoder.lm_head_bias" { return &state.decoder_grads.dbias_lm_head; }

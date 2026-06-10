@@ -231,6 +231,11 @@ pub fn load_blt_model_into<P: AsRef<Path>>(
         buf.copy_from_host(&scratch)
             .map_err(|e| CheckpointError::Residency(ResidencyError::Backend(e)))?;
     }
+
+    // `encoder.ngram_tables` was loaded into the device mirror; the host
+    // `ngram.tables` (read by the forward) must be refreshed to match.
+    model.encoder.sync_ngram_tables_from_dev()
+        .map_err(CheckpointError::Residency)?;
     Ok(())
 }
 
@@ -443,10 +448,11 @@ fn blt_param_keys(model: &BltModel) -> Vec<String> {
     let n_dec = model.decoder.n_layers();
 
     let mut keys = Vec::with_capacity(
-        1 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3,
+        2 + n_enc * 11 + n_lat * 7 + 1 + n_dec * 11 + 3,
     );
 
     keys.push("encoder.byte_embed".to_string());
+    keys.push("encoder.ngram_tables".to_string());
     for li in 0..n_enc {
         keys.push(format!("encoder.block.{li}.wq"));
         keys.push(format!("encoder.block.{li}.wk"));
@@ -492,6 +498,7 @@ fn blt_param_keys(model: &BltModel) -> Vec<String> {
 
 fn blt_weight_dev<'a>(model: &'a BltModel, key: &str) -> &'a HipBuffer {
     if key == "encoder.byte_embed" { return &model.encoder.byte_embed_dev; }
+    if key == "encoder.ngram_tables" { return &model.encoder.ngram_tables_dev; }
     if key == "latent.final_norm" { return &model.latent_final_norm_weight_dev; }
     if key == "decoder.lm_head" { return &model.decoder.lm_head.weight_dev; }
     if key == "decoder.lm_head_bias" { return &model.decoder.lm_head.bias_dev; }

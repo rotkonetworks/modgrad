@@ -868,6 +868,131 @@ fn blt_backward_matches_finite_difference() {
     );
 }
 
+/// 2-layer-encoder variant of [`tiny_config`]. The only field that
+/// differs is `encoder.n_layers`. A 1-layer encoder structurally cannot
+/// exercise the reverse layer-walk carry, so the default gradcheck never
+/// saw bug-4 (every non-deepest encoder layer received a zero upstream
+/// because the carry was re-zeroed each iteration and the real value was
+/// stashed in a `d_byte_carry` field nothing read).
+fn tiny_config_enc2() -> BltConfig {
+    let mut cfg = tiny_config();
+    cfg.encoder.n_layers = 2;
+    cfg
+}
+
+/// bug-4 regression. With a ≥2-layer encoder, every non-deepest layer
+/// must still receive gradient. Before the fix, `block.0` and the layer-0
+/// byte-embed scatter got an exactly-zero upstream and produced all-zero
+/// gradient buffers. Part 1 asserts those buffers are non-zero; Part 2
+/// finite-difference-checks `block.0.wq` (shallower, bug-4-affected) and
+/// `block.1.wq` (deepest, always worked) to confirm the recovered
+/// gradient is *correct*, not merely non-zero.
+#[test]
+#[ignore = "bug-4 regression (2-layer encoder carry); HIP-gated like the \
+            other gradcheck tests — run with --features rocm on the GPU host"]
+fn encoder_layer0_gradient_flows_with_two_layers() {
+    let _guard = modgrad_device::test_lock::hip_test_lock();
+    if std::env::var("MODGRAD_SKIP_HIP_TESTS").is_ok() {
+        eprintln!("gradcheck: MODGRAD_SKIP_HIP_TESTS set, skipping");
+        return;
+    }
+    if !runtime_available() {
+        eprintln!("gradcheck: HIP unavailable, skipping");
+        return;
+    }
+
+    let config = tiny_config_enc2();
+    let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+    let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+    let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+
+    let bytes: Vec<u8> = (0..32u8).collect();
+    let boundaries: Vec<usize> = (0..=8).map(|p| p * 4).collect();
+    let target: u8 = 17;
+
+    run_forward_backward(
+        &mut model, &mut scratch, &mut state, &bytes, &boundaries, target,
+    );
+
+    // ── Part 1: non-zero gradient on the shallower (non-deepest) layer. ──
+    let l2 = |state: &BltBackwardState, key: &str| -> f32 {
+        let buf = grad_dev_for_key(state, key);
+        let mut h = vec![0.0f32; buf.len()];
+        buf.copy_to_host(&mut h);
+        (h.iter().map(|x| x * x).sum::<f32>()).sqrt()
+    };
+
+    let shallow_keys = [
+        "encoder.byte_embed",
+        "encoder.block.0.wq",
+        "encoder.block.0.wk",
+        "encoder.block.0.wv",
+        "encoder.block.0.wo",
+        "encoder.block.0.gate",
+        "encoder.block.0.up",
+        "encoder.block.0.down",
+    ];
+    let mut zero_buffers = Vec::new();
+    for key in shallow_keys {
+        let norm = l2(&state, key);
+        eprintln!("bug4-regression: {key} grad_norm={norm:.3e}");
+        if norm <= 1e-9 {
+            zero_buffers.push(key);
+        }
+    }
+    assert!(
+        zero_buffers.is_empty(),
+        "bug-4 regression: these non-deepest encoder gradient buffers are \
+         all-zero (the layer-to-layer carry was dropped): {zero_buffers:?}",
+    );
+
+    // ── Part 2: the recovered carry points the right way and is the
+    //    right order of magnitude — NOT an exact FD match. ──
+    //
+    // bug-4 was a *structural* defect: the carry was dropped, so block.0
+    // got an exactly-zero (or sign-meaningless) gradient. The guard here
+    // is therefore "same sign as FD and within ~2× in magnitude", which a
+    // dropped carry (analytic=0 → rel_err=1.0) fails and a correct carry
+    // passes.
+    //
+    // It is deliberately NOT a tight FD check: the encoder byte-layer
+    // backward carries a separate, pre-existing ~15% magnitude residual
+    // (analytic too small) that the cross-attn upstream gradient injects —
+    // it shows up on `encoder.{byte_embed,block.0.wq,block.0.gate}` in the
+    // 1-layer `blt_backward_matches_finite_difference` test too, and
+    // compounds across the carry here. Tightening this assertion belongs
+    // with the fix for that residual (suspect: `cross_attn_encoder_backward`'s
+    // `d_byte_reps_out`), tracked separately — not with the bug-4 carry.
+    const EPS_CANDIDATES: [f32; 4] = [1e-2, 3e-3, 1e-3, 3e-4];
+    for key in ["encoder.block.0.wq", "encoder.block.1.wq"] {
+        let grad_buf_len = grad_dev_for_key(&state, key).len();
+        let weight_buf_len = weight_dev_for_key(&model, key).len_f32();
+        let n = grad_buf_len.min(weight_buf_len);
+        let idx = pick_index(n);
+        let analytic = read_grad_at(grad_dev_for_key(&state, key), idx);
+        let (chosen_eps, num, fd_floor, _all) = pick_eps_and_num(
+            &mut model, &mut scratch, key, idx,
+            &bytes, &boundaries, target, &EPS_CANDIDATES,
+        );
+        let denom = num.abs().max(analytic.abs()).max(1e-6);
+        let rel_err = (num - analytic).abs() / denom;
+        eprintln!(
+            "bug4-regression: {key}[{idx}] num={num:+.6e} analytic={analytic:+.6e} \
+             rel_err={rel_err:.3e} (EPS={chosen_eps:.0e}, fd_floor={fd_floor:.3e}) \
+             [carry-present guard; exact magnitude tracked by the full gradcheck]",
+        );
+        // Carry-present guard: same sign and within ~2× either way. A
+        // dropped carry yields analytic≈0 → opposite/under-magnitude → fail.
+        let same_sign = analytic == 0.0 || analytic.signum() == num.signum();
+        let ratio = analytic.abs() / num.abs().max(1e-12);
+        assert!(
+            same_sign && ratio > 0.33 && ratio < 3.0,
+            "bug-4 regression: {key}[{idx}] carry looks dropped/wrong — \
+             num={num:+e} analytic={analytic:+e} ratio={ratio:.3} rel_err={rel_err:.3e}",
+        );
+    }
+}
+
 /// Pick three indices spanning a weight buffer: first, mid, last. Used
 /// by `blt_backward_multi_idx` to characterize whether per-key failures
 /// are uniform across the buffer or position-dependent.

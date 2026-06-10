@@ -166,8 +166,15 @@ pub struct LocalEncoder {
     pub byte_embed_dev: HipBuffer,
     /// Hash n-gram embedding tables (paper §3.2.1). Host-side because
     /// augmentation is a sparse table lookup with `O(N · n_gram_sizes)`
-    /// host cost — small relative to the resident matvec budget.
+    /// host cost — small relative to the resident matvec budget. This is
+    /// the **source of truth for the forward** (`embed_bytes` reads it).
     pub ngram: NgramHashEmbeddings,
+    /// Device mirror of `ngram.flat_tables()` (`[n_params]` row-major,
+    /// table-major). The resident AdamW updates *this* buffer in place;
+    /// [`sync_ngram_tables_from_dev`](Self::sync_ngram_tables_from_dev)
+    /// then copies it back into the host `ngram` so the next forward sees
+    /// the trained values. Kept in lockstep with `ngram` at construction.
+    pub ngram_tables_dev: HipBuffer,
     /// `lE` byte-level transformer blocks.
     pub byte_layers: Vec<TransformerBlockResident>,
     /// Per-byte-layer attention window (`None` = full attention). Derived
@@ -217,6 +224,10 @@ impl LocalEncoder {
             config.ngram_min_n,
             config.ngram_max_n,
         );
+        // Device mirror of the hash tables — the AdamW-trainable copy.
+        // Seeded from the host tables so the two start identical.
+        let ngram_tables_dev = HipBuffer::new(ngram.n_params() * 4)?;
+        ngram_tables_dev.copy_from_host(&ngram.flat_tables())?;
 
         // ── Byte transformer blocks ──
         let gpt_config = config.to_gpt_config(n_layers);
@@ -299,6 +310,7 @@ impl LocalEncoder {
         Ok(Self {
             byte_embed_dev,
             ngram,
+            ngram_tables_dev,
             byte_layers,
             byte_windows,
             cross_attns,
@@ -306,6 +318,19 @@ impl LocalEncoder {
             rope,
             config,
         })
+    }
+
+    /// Download the AdamW-updated device mirror of the n-gram tables back
+    /// into the host `ngram.tables`, so the next host-side `embed_bytes`
+    /// forward observes the trained values. The trainer calls this once
+    /// per step, after the resident AdamW dispatch for
+    /// `encoder.ngram_tables`. No-op-cheap relative to the matvec budget
+    /// (one D2H of `n_params` floats).
+    pub fn sync_ngram_tables_from_dev(&mut self) -> Result<(), ResidencyError> {
+        let mut flat = vec![0.0f32; self.ngram.n_params()];
+        self.ngram_tables_dev.copy_to_host(&mut flat)?;
+        self.ngram.load_flat_tables(&flat);
+        Ok(())
     }
 
     /// Number of byte-level layers (`lE`).
@@ -568,6 +593,11 @@ pub struct LocalEncoderGrads {
     /// `[256 × byte_dim]` row-major. Sparse: row `b` accumulates the
     /// gradient for byte id `b`.
     pub d_byte_embed: GpuVec,
+    /// `[n_params]` flat (table-major, matching
+    /// [`NgramHashEmbeddings::flat_tables`]). Gradient for the n-gram hash
+    /// tables; scattered host-side in `LocalEncoder::backward`'s layer-0
+    /// branch, consumed by the trainer under key `encoder.ngram_tables`.
+    pub d_ngram_tables: GpuVec,
     byte_dim: usize,
 }
 
@@ -598,7 +628,11 @@ impl LocalEncoderGrads {
             cross_attn_grads.push(CrossAttnGrads::zeros_for_config(&cross_cfg)?);
         }
         let d_byte_embed = GpuVec::try_hip(256 * byte_dim)?;
-        Ok(Self { attn_grads, mlp_grads, cross_attn_grads, d_byte_embed, byte_dim })
+        let d_ngram_tables = GpuVec::try_hip(encoder.ngram.n_params().max(1))?;
+        Ok(Self {
+            attn_grads, mlp_grads, cross_attn_grads,
+            d_byte_embed, d_ngram_tables, byte_dim,
+        })
     }
 
     /// Reset every accumulator to zero.
@@ -628,6 +662,8 @@ impl LocalEncoderGrads {
         }
         let zeros = vec![0.0f32; 256 * self.byte_dim];
         self.d_byte_embed.copy_from(&zeros);
+        let ngram_zeros = vec![0.0f32; self.d_ngram_tables.len()];
+        self.d_ngram_tables.copy_from(&ngram_zeros);
         Ok(())
     }
 }
@@ -857,10 +893,28 @@ impl LocalEncoder {
         // TODO(blt-bwd): if a future revision adds per-layer skip
         // connections from cross-attn to model output, this needs to
         // accumulate across all `li`.
+        // Gradient on the current layer's block *output*, carried across
+        // the reverse layer walk. The deepest layer seeds it from the
+        // cross-attn gradient (+ optional decoder→encoder seed); every
+        // shallower layer inherits the `d/d(block-input)` the layer above
+        // left here, unchanged.
+        //
+        // bug-4 fix: this buffer used to be re-zeroed at the top of every
+        // iteration (and the real carry written into a `d_byte_carry` field
+        // nothing ever read), so for l_E ≥ 2 each non-deepest layer received
+        // a zero upstream and contributed no gradient at all — attn, mlp,
+        // AND the layer-0 byte-embed scatter. Latent today (every shipping
+        // config runs a 1-layer encoder) but a correctness landmine the
+        // instant the encoder goes multi-layer.
+        let mut d_layer_input_host = vec![0.0f32; n_bytes * byte_dim];
         for li in (0..n_layers).rev() {
-            d_layer_input.copy_from(&zero_byte_reps);
             let last_layer = li == n_layers - 1;
             if last_layer {
+                // Only the deepest layer's cross-attn output survives in
+                // `patch_reps_out` (each layer overwrites it in forward), so
+                // only the deepest layer seeds from the cross-attn gradient.
+                // Earlier layers carry purely through the block chain.
+                d_layer_input.copy_from(&zero_byte_reps);
                 cross_attn_encoder_backward(
                     batch,
                     &self.cross_attns[li],
@@ -872,16 +926,8 @@ impl LocalEncoder {
                     &mut d_layer_input,
                     &mut scratch.cross_scratch,
                 )?;
-            }
+                d_layer_input.copy_to_host(&mut d_layer_input_host);
 
-            // Block backward — reverse byte order so each token's KV-
-            // cache view is consistent with the forward-time state at
-            // that position. The host-side `d_layer_input` slab feeds
-            // the per-byte backward via `bwd_scratch.dy_per_byte`.
-            let mut d_layer_input_host = vec![0.0f32; n_bytes * byte_dim];
-            d_layer_input.copy_to_host(&mut d_layer_input_host);
-
-            if last_layer {
                 if let Some(d_seed) = d_seed_byte_reps_extra {
                     // Both d_patch_reps→cross_attn_bwd and d_seed contribute
                     // to the same byte_reps[last_layer] activation, so they sum.
@@ -892,6 +938,10 @@ impl LocalEncoder {
                     }
                 }
             }
+            // For li < n_layers - 1, `d_layer_input_host` already holds the
+            // upstream gradient on this layer's block output, carried from
+            // the layer above — nothing to seed. The per-byte block backward
+            // below reads it as `dy` and overwrites it in place with `dx`.
 
             // ── bug-A fix: cross-step KV gradient accumulation. ──
             //
@@ -984,36 +1034,33 @@ impl LocalEncoder {
                     [..n_bytes * attn_kv_dim],
                 &mut grads.attn_grads[li],
             )?;
-            // d_layer_input_host now holds d/d(layer_input). For the
-            // shallower layer this becomes the upstream into its
-            // cross-attn-output buffer; for layer 0 this is the byte-
-            // embed gradient.
-            if li > 0 {
-                d_layer_input.copy_from(&d_layer_input_host);
-                // The cross-attn at layer (li-1) has already been
-                // skipped (cross_attn output is overwritten by later
-                // layers). The `d_layer_input` here is the gradient
-                // flowing through layer li's block back to layer
-                // (li-1)'s block output. We hand it off via
-                // `bwd_scratch.d_byte_carry`.
-                bwd_scratch.d_byte_carry.copy_from(&d_layer_input_host);
-            } else {
-                // Layer 0: scatter into d_byte_embed by byte id.
+            // `d_layer_input_host` now holds d/d(this layer's input) =
+            // d/d(layer li-1's block output). It carries unchanged into the
+            // next (shallower) iteration as that layer's block-output
+            // gradient — no re-zero, no dead `d_byte_carry` hand-off
+            // (bug-4 fix). At layer 0 it is the byte-embed gradient.
+            if li == 0 {
+                // Scatter into d_byte_embed by byte id.
                 //
-                // FIXME(blt-bwd-bug-3) fix: forward `embed_bytes` (in
+                // bug-3 (fixed): forward `embed_bytes` (in
                 // `modgrad-codec/src/ngram_hash.rs`) computes
                 // `augmented[t] = (byte_embed[id] + Σ_n ngram_n[hash])
-                // * (1 / (n_tables + 1))`. The `* norm` factor at the
-                // end means ∂augmented/∂byte_embed = norm, so the
-                // scattered byte-embed gradient must carry the same
-                // factor. Previously the scatter ignored it, producing
-                // an `(n_tables + 1)`× over-shoot vs finite differences.
+                // * (1 / (n_tables + 1))`. The `* norm` factor means
+                // ∂augmented/∂byte_embed = norm, so the scattered
+                // byte-embed gradient carries the same factor.
                 let n_tables = self.ngram.tables.len();
                 let ngram_norm = 1.0_f32 / (n_tables + 1) as f32;
                 scatter_byte_embed_grad(
                     &d_layer_input_host, &cache.byte_ids[..n_bytes],
                     n_bytes, byte_dim, ngram_norm,
                     &mut grads.d_byte_embed,
+                )?;
+                // Same layer-0 input gradient also flows into the n-gram
+                // hash tables (the other summand of the augmented embedding).
+                // The `* norm` factor is applied inside `accumulate_table_grads`.
+                scatter_ngram_table_grad(
+                    &self.ngram, &d_layer_input_host, &cache.byte_ids[..n_bytes],
+                    n_bytes, byte_dim, &mut grads.d_ngram_tables,
                 )?;
             }
         }
@@ -1030,11 +1077,12 @@ pub struct LocalEncoderBackwardScratch {
     pub dy_per_byte: GpuVec,
     /// `[byte_dim]` — per-byte dx output of `backward_full_sequence_step`.
     pub dx_per_byte: GpuVec,
-    /// `[n_bytes × byte_dim]` — staging for the layer-to-layer carry.
-    pub d_byte_carry: GpuVec,
-    /// Single replay slot for the per-byte block backward. The encoder
-    /// uses recompute mode (the per-byte cache holds only the per-byte
-    /// `attn_input` snapshot; the rest is regenerated on demand).
+    /// Vestigial replay slot. The per-byte block backward no longer uses
+    /// recompute mode — it restores the full saved activations from
+    /// `cache.block_scratches[li][t]` (the bug-1 fix, commit `dd63d4d`),
+    /// so this buffer is never read. Kept only to avoid churning the
+    /// scratch ctor; safe to delete once the gradcheck note at
+    /// `tests/gradcheck.rs:40` is updated.
     pub block_scratch_replay: TransformerBlockScratch,
     pub attn_bwd: AttentionBackwardScratch,
     pub mlp_bwd: SwigluBackwardScratch,
@@ -1068,7 +1116,6 @@ impl LocalEncoderBackwardScratch {
         Ok(Self {
             dy_per_byte: GpuVec::try_hip(byte_dim)?,
             dx_per_byte: GpuVec::try_hip(byte_dim)?,
-            d_byte_carry: GpuVec::try_hip(max_seq * byte_dim)?,
             block_scratch_replay: TransformerBlockScratch::with_dims(
                 byte_dim, kv_dim, mlp_dim, n_heads * max_seq,
             )?,
@@ -1106,6 +1153,46 @@ fn scatter_byte_embed_grad(
         }
     }
     d_byte_embed.copy_from(&d_embed_host);
+    Ok(())
+}
+
+/// Scatter the layer-0 input gradient into the n-gram hash-table grad
+/// slab `d_ngram_tables` (`[n_params]` flat, table-major — matching
+/// [`NgramHashEmbeddings::flat_tables`]). For each byte position the
+/// upstream `d_input_host[t]` is added (× `1/(n_tables+1)`, applied
+/// inside [`NgramHashEmbeddings::accumulate_table_grads`]) into every
+/// hash row that position hit.
+///
+/// Host round-trip (download → accumulate → upload-add), mirroring
+/// [`scatter_byte_embed_grad`]; the augmentation hashing is host code, so
+/// there is no resident path to scatter into directly.
+fn scatter_ngram_table_grad(
+    ngram: &NgramHashEmbeddings,
+    d_input_host: &[f32],
+    byte_ids: &[u8],
+    n_bytes: usize,
+    byte_dim: usize,
+    d_ngram_tables: &mut GpuVec,
+) -> Result<(), ResidencyError> {
+    // Accumulate this call's contribution into a host table-grad bundle.
+    let mut table_grads: Vec<Vec<f32>> =
+        ngram.tables.iter().map(|t| vec![0.0f32; t.len()]).collect();
+    for t in 0..n_bytes {
+        let d_emb = &d_input_host[t * byte_dim..(t + 1) * byte_dim];
+        ngram.accumulate_table_grads(d_emb, byte_ids, t, &mut table_grads);
+    }
+    // Flatten (table-major) and add into the device grad slab.
+    let mut flat = Vec::with_capacity(ngram.n_params());
+    for g in &table_grads {
+        flat.extend_from_slice(g);
+    }
+    debug_assert_eq!(flat.len(), d_ngram_tables.len());
+    let mut cur = vec![0.0f32; d_ngram_tables.len()];
+    d_ngram_tables.copy_to_host(&mut cur);
+    for i in 0..cur.len() {
+        cur[i] += flat[i];
+    }
+    d_ngram_tables.copy_from(&cur);
     Ok(())
 }
 
