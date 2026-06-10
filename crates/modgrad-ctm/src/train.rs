@@ -985,6 +985,88 @@ impl CtmGradients {
     }
 }
 
+// ─── AdamW optimizer for the single-region CtmWeights ────────
+
+/// Public AdamW optimizer state for `CtmWeights` (single-region, the
+/// shape `examples/ocr_smoke` and other lone-CTM users have).
+///
+/// Internally it reuses `graph::RegionInnerAdamW` for the major weight
+/// tensors (NLM stages, KV/Q/MHA projections, output projection) and
+/// delegates the small init/scalar/LayerNorm/UNet tensors to
+/// `CtmGradients::apply_minor` (clip-SGD).
+///
+/// This matches the split used by `RegionalAdamW` in the multi-region
+/// hierarchical path: Adam where it's a well-documented win, raw SGD
+/// where the gradient distribution is small or pathological enough
+/// that Adam isn't reliably better.
+#[derive(Debug, Clone)]
+pub struct CtmAdamW {
+    pub step_count: usize,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub weight_decay: f32,
+    pub grad_clip: f32,
+    inner: crate::graph::RegionInnerAdamW,
+}
+
+impl CtmAdamW {
+    /// Zero-initialised state matching the shape of `w`. Use this once
+    /// at the start of training and reuse the same `CtmAdamW` across
+    /// every call to `step`.
+    pub fn zeros(w: &CtmWeights) -> Self {
+        Self {
+            step_count: 0,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            grad_clip: 1.0,
+            inner: crate::graph::RegionInnerAdamW::zeros(w),
+        }
+    }
+
+    /// One optimizer step. Mirrors `CtmGradients::apply`'s overall
+    /// signature: takes the current weights + accumulated gradients,
+    /// applies the update, leaves both buffers ready for the next
+    /// micro-batch (the caller zeros `grads` after).
+    ///
+    /// `lr` is the base learning rate; bias-correction factors are
+    /// computed here from the running step count.
+    pub fn step(
+        &mut self,
+        w: &mut CtmWeights,
+        grads: &mut CtmGradients,
+        lr: f32,
+    ) {
+        self.step_count += 1;
+        let t = self.step_count as i32;
+        let bc1 = 1.0 - self.beta1.powi(t);
+        let bc2 = 1.0 - self.beta2.powi(t);
+
+        // Apply AdamW to the major tensors.
+        self.inner.step(
+            w, grads, lr, self.weight_decay,
+            self.beta1, self.beta2, self.eps, bc1, bc2,
+        );
+
+        // Apply clip-SGD to the remaining minor tensors (UNet, init
+        // states, LayerNorm scale/shift, exit gate). `apply_minor`
+        // expects the already-clipped lr; mirror the global clip
+        // policy by scaling once and passing it in.
+        let scale = {
+            let g: &[&[f32]] = &[
+                &grads.nlm_s1_w, &grads.nlm_s1_b,
+                &grads.out_proj_w, &grads.out_proj_b,
+                &grads.q_proj_w,
+            ];
+            let norm = crate::grad_norm(g);
+            if norm > self.grad_clip { self.grad_clip / norm } else { 1.0 }
+        };
+        grads.apply_minor(w, lr * scale);
+    }
+}
+
 // ─── Loss ──────────────────────────────────────────────────
 
 /// Cross-entropy loss + gradient w.r.t. logits.
@@ -1429,10 +1511,17 @@ pub struct CtmCache {
     kv: Vec<f32>,
     n_tokens: usize,
     d_input: usize,
-    #[allow(dead_code)] // retained for potential future backward / inspection use
+    #[allow(dead_code)] // sync_out feeds only discarded per-region predictions,
+                        // so the region backward never reverses the out-sync;
+                        // retained for symmetry / future inspection.
     r_out: Vec<f32>,
-    #[allow(dead_code)] // retained for potential future backward / inspection use
     r_action: Vec<f32>,
+    /// Per-token raw input to `kv_proj` (length n_tokens, each token_dim).
+    /// Needed to accumulate the kv_proj weight gradient in the region backward.
+    kv_proj_inputs: Vec<Vec<f32>>,
+    /// Per-token LayerNorm cache (normalized values + inv_std) for the
+    /// post-kv_proj LN. Needed for LN-backward → kv_proj-backward.
+    kv_ln_caches: Vec<LnCache>,
 }
 
 /// Explicit state returned from forward (not mutated in place).
@@ -1492,17 +1581,17 @@ impl Brain for Ctm {
 
         // KV projection
         let mut kv = Vec::with_capacity(n_tokens * d_in);
+        let mut kv_proj_inputs: Vec<Vec<f32>> = Vec::with_capacity(n_tokens);
+        let mut kv_ln_caches: Vec<LnCache> = Vec::with_capacity(n_tokens);
         for t in 0..n_tokens {
             let tok = &tokens[t * token_dim..(t + 1) * token_dim];
             let mut projected = w.kv_proj.forward(tok);
-            let n = projected.len() as f32;
-            let mean: f32 = projected.iter().sum::<f32>() / n;
-            let var: f32 = projected.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-            let inv_std = 1.0 / (var + 1e-5).sqrt();
-            for i in 0..projected.len() {
-                projected[i] = w.kv_ln_gamma[i] * (projected[i] - mean) * inv_std + w.kv_ln_beta[i];
-            }
+            // LayerNorm with affine cache so the region backward can
+            // backprop d_kv → LN → kv_proj weights (matches forward exactly).
+            let ln_cache = affine_ln_forward(&mut projected, &w.kv_ln_gamma, &w.kv_ln_beta);
             kv.extend_from_slice(&projected);
+            kv_proj_inputs.push(tok.to_vec());
+            kv_ln_caches.push(ln_cache);
         }
 
         let r_out: Vec<f32> = w.decay_params_out.iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
@@ -1600,6 +1689,7 @@ impl Brain for Ctm {
         let cache = CtmCache {
             tick_caches, kv, n_tokens, d_input: d_in,
             r_out, r_action,
+            kv_proj_inputs, kv_ln_caches,
         };
 
         (output, state, cache)
@@ -1744,14 +1834,36 @@ pub fn backward_from_activated(
 
     let mut grads = CtmGradients::zeros(w);
 
-    // Start with the external gradient at the last tick
-    let mut d_activated: Vec<f32> = d_external.iter().copied()
+    use crate::forward::{sync_update_reverse_host, trace_shift_adjoint_host};
+
+    // The region output IS the final-tick `activated`, so `d_external` is
+    // dL/d(final activated). It seeds ONLY the last tick directly; the
+    // per-region `sync_out` readout feeds the (discarded) per-region
+    // predictions, NOT the activated recurrence, so it must NOT be routed
+    // here. (This was Bug-2 in the old code: it ran `sync_backward` on
+    // d_activated every tick and double-injected d_external.)
+    let d_act_seed: Vec<f32> = d_external.iter().copied()
         .chain(std::iter::repeat(0.0))
         .take(d)
         .collect();
 
-    // Accumulate d_kv across all ticks (gradient w.r.t. KV tokens)
+    // Accumulate d_kv across all ticks (gradient w.r.t. post-LN KV tokens).
     let mut d_kv_accumulated = vec![0.0f32; cache.n_tokens * d_in];
+
+    // Cross-tick carries (reverse-tick walk):
+    //   d_activated_carry — the synapse-input activated half emitted by
+    //     tick T's U-Net backward equals d(activated_post[T-1]); it also
+    //     receives the sync_action contribution. Threaded into the earlier
+    //     tick's d_activated. (Bug-2 carry.)
+    //   d_trace_carry — trace is persistent state; the shift-adjoint's
+    //     `d_trace_old` must be threaded across ticks or NLM(T)→older trace
+    //     slots→pre_act(T-1) is severed. (Bug-3 cross-tick trace.)
+    //   d_alpha_action_carry — A_t recurrence trail for the action sync
+    //     accumulator (Bug-1 sync recurrence): A_t = d_sync/sqrt(beta) +
+    //     r·A_{t+1}, dropping the r·A_{t+1} term loses ~37%/tick at r=e⁻¹.
+    let mut d_activated_carry = vec![0.0f32; d];
+    let mut d_trace_carry = vec![0.0f32; d * m];
+    let mut d_alpha_action_carry = vec![0.0f32; cfg.n_synch_action];
 
     // Hot-loop scratch — q_proj.in_dim is constant across ticks.
     let mut d_sync_action_scratch = vec![0.0f32; w.q_proj.in_dim];
@@ -1759,36 +1871,39 @@ pub fn backward_from_activated(
     for tick in (0..k).rev() {
         let tc = &cache.tick_caches[tick];
 
-        // Sync out backward: how activated contributes to sync readout
-        let d_from_sync = sync_backward(
-            &d_activated, &tc.activated_post, &tc.beta_out,
-            &w.sync_out_left, &w.sync_out_right, d,
-        );
+        // d_activated for this tick: at the LAST tick, seed from the
+        // external gradient on final activated; at earlier ticks it starts
+        // at zero. Then add the cross-tick carry (synapse-input activated
+        // half + action-sync contribution from the next-later tick).
+        let mut d_act_total = if tick == k - 1 {
+            d_act_seed.clone()
+        } else {
+            vec![0.0f32; d]
+        };
+        for i in 0..d { d_act_total[i] += d_activated_carry[i]; }
 
-        // At the last tick, inject the external gradient directly.
-        // At earlier ticks, gradient flows from the next tick's synapse input.
-        let mut d_act_total = vec![0.0f32; d];
-        for i in 0..d {
-            d_act_total[i] = d_from_sync[i];
-            if tick == k - 1 {
-                d_act_total[i] += d_activated[i];
-            }
-        }
-
-        // NLM backward
-        let d_trace = nlm_backward(&d_act_total, &tc.nlm_cache,
+        // NLM backward → d_trace.
+        let mut d_trace = nlm_backward(&d_act_total, &tc.nlm_cache,
             &w.nlm_stage1, w.nlm_stage2.as_ref(),
             &mut grads.nlm_s1_w, &mut grads.nlm_s1_b,
             &mut grads.nlm_s2_w, &mut grads.nlm_s2_b);
 
+        // Trace shift adjoint → d_pre_act + d_trace_old, folding in the
+        // cross-tick trace carry, then refresh the carry for the earlier tick.
+        for i in 0..d * m { d_trace[i] += d_trace_carry[i]; }
         let mut d_pre_act = vec![0.0f32; d];
-        for n in 0..d { d_pre_act[n] = d_trace[n * m + m - 1]; }
+        let mut d_trace_old = vec![0.0f32; d * m];
+        trace_shift_adjoint_host(&d_trace, &mut d_pre_act, &mut d_trace_old, d, m);
+        d_trace_carry.copy_from_slice(&d_trace_old);
 
-        // Synapse backward
+        // Synapse backward → d concat(attn_out, activated).
         let d_pre_syn = unet_backward(&w.synapse, &d_pre_act, &tc.unet_cache, &mut grads.unet);
 
         let d_attn_out = &d_pre_syn[..d_in];
-        let d_act_from_syn = &d_pre_syn[d_in..];
+        // The activated half feeds the previous tick's activated_post:
+        // reset the carry to it, then the action-sync reverse adds into it.
+        d_activated_carry.clear();
+        d_activated_carry.extend_from_slice(&d_pre_syn[d_in..]);
 
         // MHA backward — collect d_kv_tokens
         let (d_q, d_kv_tokens) = mha_backward(d_attn_out, &tc.mha_cache, cache.n_tokens, d_in, cfg.heads,
@@ -1811,32 +1926,48 @@ pub fn backward_from_activated(
             &mut d_sync_action_scratch);
         let d_sync_action: &[f32] = &d_sync_action_scratch;
 
-        let d_from_sync_action = sync_backward(d_sync_action, &tc.activated_prev, &tc.beta_action,
-            &w.sync_action_left, &w.sync_action_right, d);
-
-        // Propagate to previous tick
-        d_activated = vec![0.0f32; d];
-        for i in 0..d {
-            d_activated[i] = d_act_from_syn[i] + d_from_sync_action[i];
-        }
+        // Action-sync reverse (Bug-1): scatters A_t into activated_prev
+        // (= activated_post[T-1]) via the recurrence carry, adding into
+        // d_activated_carry for the earlier tick.
+        sync_update_reverse_host(
+            d_sync_action,
+            &tc.activated_prev,
+            // alpha is unused by the dominant-term reverse; pass beta as a
+            // placeholder slice of the right length.
+            &tc.beta_action,
+            &tc.beta_action,
+            &cache.r_action,
+            &w.sync_action_left, &w.sync_action_right,
+            &mut d_activated_carry,
+            &mut d_alpha_action_carry,
+        );
     }
 
-    for i in 0..d { grads.d_start_activated[i] += d_activated[i]; }
+    // Residual carry after tick 0 flows into the start activated state.
+    for i in 0..d { grads.d_start_activated[i] += d_activated_carry[i]; }
 
-    // Backprop d_kv through kv_proj to get d_observation
-    // kv_proj: raw_obs → d_input (per token). d_kv is in d_input space.
-    // d_observation = kv_proj.W^T @ d_kv (per token)
+    // ── kv backward: d_kv (post-LN) → LN backward → kv_proj backward ──
+    // Per token: backprop through the affine LayerNorm (accumulating
+    // kv_ln gamma/beta grads), then through kv_proj (accumulating the
+    // full kv_proj weight/bias grads), producing d_observation.
     let raw_dim = w.kv_proj.in_dim;
     let mut d_observation = vec![0.0f32; cache.n_tokens * raw_dim];
+    let mut d_proj_input_scratch = vec![0.0f32; raw_dim];
     for t in 0..cache.n_tokens {
-        let d_kv_t = &d_kv_accumulated[t * d_in..(t + 1).min(cache.n_tokens) * d_in];
-        for j in 0..raw_dim {
-            for i in 0..d_in.min(d_kv_t.len()) {
-                d_observation[t * raw_dim + j] += d_kv_t[i] * w.kv_proj.weight[i * raw_dim + j];
-            }
-            // Also accumulate kv_proj weight gradients
-            grads.kv_proj_b[j] += 0.0; // bias grad needs kv_proj input, skip for now
-        }
+        let d_kv_t = &d_kv_accumulated[t * d_in..(t + 1) * d_in];
+        // LN backward → d(pre-LN projected).
+        let d_projected = affine_ln_backward(
+            d_kv_t, &cache.kv_ln_caches[t], &w.kv_ln_gamma,
+            &mut grads.kv_ln_d_gamma, &mut grads.kv_ln_d_beta,
+        );
+        // kv_proj (Linear) backward → kv_proj weight/bias grads + d_observation.
+        let ln_cache = LinearCache { input: cache.kv_proj_inputs[t].clone() };
+        for v in d_proj_input_scratch.iter_mut() { *v = 0.0; }
+        linear_backward(&w.kv_proj, &d_projected, &ln_cache,
+            &mut grads.kv_proj_w, &mut grads.kv_proj_b,
+            &mut d_proj_input_scratch);
+        d_observation[t * raw_dim..(t + 1) * raw_dim]
+            .copy_from_slice(&d_proj_input_scratch);
     }
 
     RegionBackwardResult { grads, d_observation }
@@ -1883,5 +2014,92 @@ pub fn accumulate_gradients(dst: &mut CtmGradients, src: &CtmGradients) {
     add(&mut dst.out_proj_b, &src.out_proj_b);
     if let (Some(dw), Some(sw)) = (&mut dst.exit_gate_w, &src.exit_gate_w) { add(dw, sw); }
     if let (Some(db), Some(sb)) = (&mut dst.exit_gate_b, &src.exit_gate_b) { add(db, sb); }
+}
+
+#[cfg(test)]
+mod backward_from_activated_gradcheck {
+    use super::*;
+    use crate::config::{CtmConfig, ExitStrategy};
+    use crate::weights::CtmWeights;
+    use modgrad_traits::{Brain, TokenInput};
+
+    fn gc_cfg() -> CtmConfig {
+        CtmConfig {
+            iterations: 2, d_model: 4, d_input: 8, heads: 2,
+            n_synch_out: 4, n_synch_action: 4, synapse_depth: 2,
+            memory_length: 4, deep_nlms: false, memory_hidden_dims: 0,
+            out_dims: 3, n_random_pairing_self: 0, min_width: 2,
+            exit_strategy: ExitStrategy::None, collect_trajectories: false,
+        }
+    }
+
+    /// Finite-difference gradcheck for the UNTYPED production region backward
+    /// `backward_from_activated` — the path the brain actually trains on
+    /// (graph.rs:3104). d_external = dL/d(final activated) (region output is
+    /// `activated`, graph.rs:2949), so loss L = ½‖final_activated‖² ⇒
+    /// d_external = activated. Multi-token (n_tokens=3) so the attention/Q
+    /// path is exercised (single-token makes softmax trivially [1.0]).
+    #[test]
+    fn cpu_backward_from_activated_matches_finite_difference() {
+        let cfg = gc_cfg();
+        let raw_input_dim = 6;
+        let n_tokens = 3;
+        let token_dim = raw_input_dim;
+        let w = CtmWeights::new(cfg.clone(), raw_input_dim);
+
+        let tokens: Vec<f32> = (0..n_tokens * token_dim)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.21).collect();
+        let make_input = || TokenInput { tokens: tokens.clone(), n_tokens, token_dim };
+
+        let loss_of = |w: &CtmWeights| -> f32 {
+            let state = Ctm::init_state(w);
+            let (_o, st, _c) = Ctm::forward_cached(w, state, &make_input());
+            0.5 * st.activated.iter().map(|&a| a * a).sum::<f32>()
+        };
+
+        let state = Ctm::init_state(&w);
+        let (_o, st, cache) = Ctm::forward_cached(&w, state, &make_input());
+        let d_external = st.activated.clone();
+        let result = backward_from_activated(&w, &cache, &d_external);
+        let grads = &result.grads;
+
+        const EPS: f32 = 1e-3;
+        const TOL: f32 = 2e-2;
+        const ABS_FLOOR: f32 = 3e-4;
+
+        let probes: &[(&str, &[f32], fn(&mut CtmWeights) -> &mut Vec<f32>)] = &[
+            ("mha_in_w",  grads.mha_in_w.as_slice(),  |w| &mut w.mha_in_proj.weight),
+            ("mha_out_w", grads.mha_out_w.as_slice(), |w| &mut w.mha_out_proj.weight),
+            ("nlm_s1_w",  grads.nlm_s1_w.as_slice(),  |w| &mut w.nlm_stage1.weights),
+            ("kv_proj_w", grads.kv_proj_w.as_slice(), |w| &mut w.kv_proj.weight),
+            ("q_proj_w",  grads.q_proj_w.as_slice(),  |w| &mut w.q_proj.weight),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (name, analytic, accessor) in probes {
+            let n = analytic.len();
+            assert!(n > 0);
+            let idxs: Vec<usize> = (0..4).map(|j| (j * n / 4).min(n - 1)).collect();
+            for &idx in &idxs {
+                let mut wp = w.clone();
+                let orig = accessor(&mut wp)[idx];
+                accessor(&mut wp)[idx] = orig + EPS;
+                let lp = loss_of(&wp);
+                accessor(&mut wp)[idx] = orig - EPS;
+                let lm = loss_of(&wp);
+                let fd = (lp - lm) / (2.0 * EPS);
+                let a = analytic[idx];
+                let abs_diff = (fd - a).abs();
+                let rel = abs_diff / fd.abs().max(a.abs()).max(1e-4);
+                eprintln!("bfa-gradcheck: {name}[{idx}] analytic={a:+.6e} fd={fd:+.6e} rel={rel:.3e} abs={abs_diff:.3e}");
+                if rel > TOL && abs_diff > ABS_FLOOR {
+                    failures.push(format!("{name}[{idx}]: analytic={a:+e} fd={fd:+e} rel={rel:.3e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(),
+            "backward_from_activated disagrees with finite differences:\n  {}",
+            failures.join("\n  "));
+    }
 }
 

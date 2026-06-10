@@ -736,6 +736,7 @@ pub struct TickCacheTyped<D: TensorDevice> {
     pub mha: MhaCacheTyped<D>,
     pub attn_out: Tensor<D>,
     pub activated_pre_tick: Vec<f32>,    // activated[] before this tick's NLM
+    pub activated_post: Vec<f32>,         // activated[] after this tick's NLM (sync_out reads this)
     pub trace_pre_tick: Vec<f32>,         // trace before shift
     pub synapse_input: Tensor<D>,         // [d_input + d_model] the "concat(attn, activated)"
     pub synapse_cache: super::synapse::SynapseUNetCacheTyped<D>,
@@ -858,6 +859,7 @@ pub fn ctm_forward_typed_with_cache<D: TensorDevice>(
             &trace_t, &w.nlm_stage1, w.nlm_stage2.as_ref(), d,
         )?;
         *activated = activated_new_host;
+        let activated_post = activated.clone();
 
         // sync_out update.
         let sync_out = sync_update(activated, &w.sync_out_left, &w.sync_out_right,
@@ -879,6 +881,7 @@ pub fn ctm_forward_typed_with_cache<D: TensorDevice>(
             mha: mha_cache,
             attn_out: attn_out_t,
             activated_pre_tick,
+            activated_post,
             trace_pre_tick,
             synapse_input: pre_syn_t,
             synapse_cache,
@@ -943,6 +946,20 @@ pub fn ctm_backward_typed<D: TensorDevice>(
     //     We thread this back into the next iteration's d_activated (the earlier tick).
     let mut d_kv = Tensor::<D>::zeros(d_in)?;
     let mut d_activated_carry: Vec<f32> = vec![0.0f32; d];
+    // Cross-tick trace gradient: trace is persistent state, so the
+    // shift-adjoint's `d_trace_old` (gradient w.r.t. the pre-shift trace =
+    // the previous tick's post-shift trace) must be threaded into the next
+    // (earlier) reverse iteration. Dropping it severs NLM(tick T) → older
+    // trace slots → pre_act(tick T-1).
+    let mut d_trace_carry: Vec<f32> = vec![0.0f32; d * m];
+    // Bug-3: sync accumulator recurrence trail (A_t = dL/d alpha_t) for the
+    // out- and action-sync readouts. r[i] = exp(-decay[i]). Zero-init = A_{T+1}.
+    let r_out: Vec<f32> = w.decay_params_out.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let r_action: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let mut d_alpha_out_carry: Vec<f32> = vec![0.0f32; cfg.n_synch_out];
+    let mut d_alpha_action_carry: Vec<f32> = vec![0.0f32; cfg.n_synch_action];
 
     // Walk ticks in reverse.
     let n_ticks = d_predictions.len().min(cache.ticks.len());
@@ -963,11 +980,13 @@ pub fn ctm_backward_typed<D: TensorDevice>(
         let mut d_activated = vec![0.0f32; d];
         sync_update_reverse_host(
             &d_sync_out_h,
-            &tick_cache.activated_pre_tick,  // approx: use the post-tick state
+            &tick_cache.activated_post,      // sync_out readout is from POST-tick activated
             &tick_cache.alpha_out_post,
             &tick_cache.beta_out_post,
+            &r_out,
             &w.sync_out_left, &w.sync_out_right,
             &mut d_activated,
+            &mut d_alpha_out_carry,
         );
         for i in 0..d { d_activated[i] += d_activated_carry[i]; }
 
@@ -990,10 +1009,14 @@ pub fn ctm_backward_typed<D: TensorDevice>(
         )?;
 
         // Step 4: trace shift adjoint → d_pre_act + d_trace_old.
-        let d_trace_h: Vec<f32> = d_trace.to_vec()?;
+        // Fold in the cross-tick trace carry, then refill it from this
+        // tick's d_trace_old for the next (earlier) iteration.
+        let mut d_trace_h: Vec<f32> = d_trace.to_vec()?;
+        for i in 0..d * m { d_trace_h[i] += d_trace_carry[i]; }
         let mut d_pre_act = vec![0.0f32; d];
         let mut d_trace_old = vec![0.0f32; d * m];
         trace_shift_adjoint_host(&d_trace_h, &mut d_pre_act, &mut d_trace_old, d, m);
+        d_trace_carry.copy_from_slice(&d_trace_old);
 
         // Step 5: synapse U-Net backward → d_synapse_input (= d concat(attn, activated)).
         let d_pre_act_t = Tensor::<D>::from_slice(&d_pre_act)?;
@@ -1035,8 +1058,10 @@ pub fn ctm_backward_typed<D: TensorDevice>(
             &tick_cache.activated_pre_tick,
             &tick_cache.alpha_action_post,
             &tick_cache.beta_action_post,
+            &r_action,
             &w.sync_action_left, &w.sync_action_right,
             &mut d_activated_carry,
+            &mut d_alpha_action_carry,
         );
 
         let _ = tick_idx;
@@ -1111,6 +1136,11 @@ pub fn ctm_backward_from_d_activated<D: TensorDevice>(
         )));
     }
     let mut d_activated_carry: Vec<f32> = vec![0.0f32; d];
+    // Bug-3: sync-action recurrence trail (this entry-point reverses only
+    // the action sync; gradient enters via activated, not predictions).
+    let r_action: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let mut d_alpha_action_carry: Vec<f32> = vec![0.0f32; cfg.n_synch_action];
 
     for tick_idx in (0..n_ticks).rev() {
         let tick_cache = &cache.ticks[tick_idx];
@@ -1191,8 +1221,10 @@ pub fn ctm_backward_from_d_activated<D: TensorDevice>(
             &tick_cache.activated_pre_tick,
             &tick_cache.alpha_action_post,
             &tick_cache.beta_action_post,
+            &r_action,
             &w.sync_action_left, &w.sync_action_right,
             &mut d_activated_carry,
+            &mut d_alpha_action_carry,
         );
     }
 
@@ -1278,11 +1310,19 @@ fn nlm_forward_with_cache<D: TensorDevice>(
 ///          `beta[i]  = r[i]·beta_prev[i]  + 1`
 ///          `sync[i]  = alpha[i] / sqrt(beta[i])`
 ///
-/// Backward: given `d_sync` (length n_pairs), accumulate into
-/// `d_activated` (length d_model) the contribution from this tick's
-/// product term. The `r·alpha_prev` carry through ticks is handled
-/// by the orchestration loop (each tick consumes its slice of the
-/// d_alpha trail).
+/// Backward (Bug-3 fix): the sync accumulator is a linear recurrence
+/// `alpha_t = r·alpha_{t-1} + product_t`, so the readout at tick t
+/// receives gradient from every later tick through the `r` chain. Define
+/// `A_t = dL/d(alpha_t)`. The reverse recurrence is
+///   `A_t[i] = d_sync_t[i]/sqrt(beta_t[i]) + r[i]·A_{t+1}[i]`
+/// and `A_t` scatters into `activated_t` via the product term. The
+/// `r·A_{t+1}` carry (~37%/tick at r=e⁻¹) was previously DROPPED — only
+/// the current tick's product term was backprop'd, losing all cross-tick
+/// sync gradient. `d_alpha_carry` is the running `A` trail: it holds
+/// `A_{t+1}` on entry and is updated to `A_t` on exit (the caller
+/// zero-inits it before the reverse-tick loop and reuses it each tick).
+/// (`d_beta` stays omitted — `beta_t = r·beta_{t-1} + 1` has no
+/// dependence on `activated`, so its path is identically zero.)
 ///
 /// **Output convention:** d_activated ACCUMULATES (multiple sync
 /// pairs may touch the same neuron index).
@@ -1291,27 +1331,27 @@ pub fn sync_update_reverse_host(
     activated: &[f32],
     alpha: &[f32],
     beta: &[f32],
+    r: &[f32],                    // exponentiated decay per pair, r[i] = exp(-decay[i])
     left: &[usize],
     right: &[usize],
     d_activated: &mut [f32],
+    d_alpha_carry: &mut [f32],    // in: A_{t+1}; out: A_t
 ) {
     let n_pairs = left.len();
     debug_assert_eq!(d_sync.len(), n_pairs);
+    debug_assert_eq!(d_alpha_carry.len(), n_pairs);
     for i in 0..n_pairs {
         let beta_i = beta[i].max(1e-8);
         let inv_sqrt_beta = 1.0 / beta_i.sqrt();
-        // d_alpha = d_sync / sqrt(beta); d_beta path is for higher-
-        // order corrections — skipped here because alpha/beta carry
-        // multiplicatively through ticks via r and the dominant
-        // gradient flows through alpha.
-        let d_alpha = d_sync[i] * inv_sqrt_beta;
+        // A_t[i] = d_sync_t/sqrt(beta_t) + r[i]·A_{t+1}[i].
+        let a_i = d_sync[i] * inv_sqrt_beta + r[i] * d_alpha_carry[i];
         let l = left[i];
-        let r = right[i];
+        let ri = right[i];
         // d_product / d_activated[left]  = activated[right]
         // d_product / d_activated[right] = activated[left]
-        // alpha gradient flows directly into product (the +product term).
-        d_activated[l] += d_alpha * activated[r];
-        d_activated[r] += d_alpha * activated[l];
+        d_activated[l] += a_i * activated[ri];
+        d_activated[ri] += a_i * activated[l];
+        d_alpha_carry[i] = a_i; // carry A_t to the previous (earlier) tick
         let _ = alpha; // alpha read is reserved for the higher-order
                        // beta correction — kept in the signature so
                        // callers can plug it in when full correction
@@ -1791,6 +1831,124 @@ mod typed_forward_tests {
             "d_obs all zero — kv_proj backward did not flow");
     }
 
+    /// Finite-difference gradcheck for the typed CTM backward.
+    ///
+    /// The existing `cpu_ctm_backward_typed_full_chain_flows_gradients`
+    /// only checks gradients are *non-zero* (a smoke test). This is the
+    /// numerical check the crate was missing: with `d_preds = ones` at
+    /// every tick the loss is the smooth scalar `L = Σ_{tick,i}
+    /// predictions[tick][i]`, so `∂L/∂w` from `ctm_backward_typed` must
+    /// match central finite differences of the forward.
+    ///
+    /// Limitation (same shape as the BLT lesson): the typed forward is
+    /// single-token, so the softmax is trivially `[1.0]` and the
+    /// attention-score / Q path carries ~zero gradient — this gradcheck
+    /// validates synapse, NLM, sync, output_proj, and the K/V + kv_proj
+    /// projections, but NOT the multi-token attention score path. A
+    /// multi-token typed forward is needed to close that gap.
+    ///
+    /// STATUS 2026-06-10: PASSES. Found and fixed four bugs in the typed
+    /// backward: (1) sync_out reverse used the pre-tick activated instead
+    /// of post-tick; (2) CPU `glu_bwd` dispatched the flat GLU instead of
+    /// the per-neuron variant, scrambling NLM grads across neurons; (3)
+    /// the cross-tick trace gradient `d_trace_old` was discarded; (4) the
+    /// sync accumulator recurrence (`r·alpha_prev`) was dropped in
+    /// `sync_update_reverse_host`. With all four fixed, every probed weight
+    /// matches finite differences within tolerance (small attention grads
+    /// sit at the FD floor — see ABS_FLOOR).
+    #[test]
+    fn cpu_ctm_backward_typed_matches_finite_difference() {
+        use crate::weights::{CtmWeights, CtmGradientsTyped};
+        use crate::synapse::UNetGradsTyped;
+
+        let cfg = small_cfg();
+        let raw_input_dim = 6;
+        let w = CtmWeights::new(cfg.clone(), raw_input_dim);
+        let obs: Vec<f32> = (0..raw_input_dim).map(|i| (i as f32 - 2.5) * 0.3).collect();
+
+        // L = sum of all per-tick predictions  ⇒  d_preds = ones.
+        let loss_of = |w: &CtmWeights| -> f32 {
+            let typed = CtmWeightsTyped::<Cpu>::from_untyped(w).unwrap();
+            let mut activated = w.start_activated.clone();
+            let mut trace = w.start_trace.clone();
+            let (out, _) = ctm_forward_typed_with_cache::<Cpu>(
+                &typed, &mut activated, &mut trace, &obs,
+            ).expect("forward");
+            out.predictions.iter().flat_map(|p| p.iter()).sum::<f32>()
+        };
+
+        // Analytic grads at the base point.
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let mut activated = w.start_activated.clone();
+        let mut trace = w.start_trace.clone();
+        let (out, cache) = ctm_forward_typed_with_cache::<Cpu>(
+            &typed, &mut activated, &mut trace, &obs,
+        ).expect("forward");
+        let d_preds: Vec<Vec<f32>> =
+            out.predictions.iter().map(|p| vec![1.0; p.len()]).collect();
+        let mut grads = CtmGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut unet_grads = UNetGradsTyped::<Cpu>::zeros(&typed.synapse).unwrap();
+        let mut d_obs = Tensor::<Cpu>::zeros(raw_input_dim).unwrap();
+        ctm_backward_typed::<Cpu>(
+            &typed, &cache, &d_preds, &mut grads, &mut unet_grads, &mut d_obs,
+        ).expect("backward");
+
+        const EPS: f32 = 1e-3;
+        const TOL: f32 = 2e-2;
+        // Central-difference floor: at EPS=1e-3 with loss ~O(1) and f32 ULP
+        // ~1.2e-7 the absolute FD noise is ~|L|·ulp/(2·EPS) ≈ 1e-4. Small-
+        // magnitude grads (the ~1e-3 attention weights) hit that floor and
+        // show 3-5% relative error that is pure noise, not a backward bug.
+        // A key passes if EITHER the relative error is within TOL OR the
+        // absolute difference is below the FD floor. (Real backward bugs
+        // were 30-190% on grads ≥1e-2 — abs diffs far above this floor.)
+        const ABS_FLOOR: f32 = 3e-4;
+
+        // (name, analytic grad host vec, mutable access to the weight Vec)
+        // We FD a few interior indices per weight group. q_proj is skipped
+        // (single-token ⇒ zero grad, documented above).
+        let probes: &[(&str, Vec<f32>, fn(&mut CtmWeights) -> &mut Vec<f32>)] = &[
+            ("mha_in_w",   grads.mha_in_w.to_vec().unwrap(),   |w| &mut w.mha_in_proj.weight),
+            ("mha_out_w",  grads.mha_out_w.to_vec().unwrap(),  |w| &mut w.mha_out_proj.weight),
+            ("nlm_s1_w",   grads.nlm_s1_w.to_vec().unwrap(),   |w| &mut w.nlm_stage1.weights),
+            ("out_proj_w", grads.out_proj_w.to_vec().unwrap(), |w| &mut w.output_proj.weight),
+            ("kv_proj_w",  grads.kv_proj_w.to_vec().unwrap(),  |w| &mut w.kv_proj.weight),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (name, analytic, accessor) in probes {
+            let n = analytic.len();
+            // Sample up to 4 indices spread across the buffer.
+            let idxs: Vec<usize> = (0..4).map(|j| (j * n / 4).min(n - 1)).collect();
+            for &idx in &idxs {
+                let mut wp = w.clone();
+                let orig = accessor(&mut wp)[idx];
+                accessor(&mut wp)[idx] = orig + EPS;
+                let lp = loss_of(&wp);
+                accessor(&mut wp)[idx] = orig - EPS;
+                let lm = loss_of(&wp);
+                let fd = (lp - lm) / (2.0 * EPS);
+                let a = analytic[idx];
+                let abs_diff = (fd - a).abs();
+                let denom = fd.abs().max(a.abs()).max(1e-4);
+                let rel = abs_diff / denom;
+                eprintln!(
+                    "ctm-gradcheck: {name}[{idx}] analytic={a:+.6e} fd={fd:+.6e} rel={rel:.3e} abs={abs_diff:.3e}"
+                );
+                if rel > TOL && abs_diff > ABS_FLOOR {
+                    failures.push(format!(
+                        "{name}[{idx}]: analytic={a:+e} fd={fd:+e} rel={rel:.3e} abs={abs_diff:.3e}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "CTM typed backward disagrees with finite differences:\n  {}",
+            failures.join("\n  "),
+        );
+    }
+
     #[test]
     fn cpu_mha_backward_smoke() {
         // Build mha_in_proj (d_input → 3*d_input) and mha_out_proj (d_input → d_input).
@@ -1884,8 +2042,12 @@ mod typed_forward_tests {
         let left = vec![0, 1];
         let right = vec![2, 3];
         let mut d_activated = vec![0.0f32; 4];
+        // Single-tick: zero d_alpha carry ⇒ no recurrence term, output is
+        // purely this tick's product backward (r is unused when carry=0).
+        let r = vec![0.5f32, 0.5];
+        let mut d_alpha_carry = vec![0.0f32; 2];
         sync_update_reverse_host(&d_sync, &activated, &alpha, &beta,
-            &left, &right, &mut d_activated);
+            &r, &left, &right, &mut d_activated, &mut d_alpha_carry);
         assert!((d_activated[0] - 10.0).abs() < 1e-5);
         assert!((d_activated[1] - 20.0).abs() < 1e-5);
         assert!((d_activated[2] - 2.0).abs() < 1e-5);
