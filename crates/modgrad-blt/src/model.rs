@@ -2158,6 +2158,80 @@ mod tests {
             "encoder grads all zero — gradient did not flow through the latent bridge");
     }
 
+    /// A9 (minimal proof): the end-to-end gradient through the LatentThinker
+    /// seam is a DESCENT direction. Run forward → byte-CE loss → backward →
+    /// one SGD step on a BLT param (byte_embed) → the loss DROPS. The organism
+    /// trains. (Full trainer = the same loop with AdamW over every param group
+    /// incl. the CtmLatent — the BltTrainer restructure.)
+    #[test]
+    fn organism_train_step_decreases_loss() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        use modgrad_transformer::loss::cross_entropy;
+
+        let config = tiny_config();
+        let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+        let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+        let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+        let pd = config.latent.patch_dim;
+        let mut latent = IdentityLatent { patch_dim: pd };
+
+        let bytes: Vec<u8> = (0..32u8).collect();
+        let boundaries: Vec<usize> = (0..=16).map(|p| p * 2).collect();
+        let n_bytes = bytes.len();
+        let targets: Vec<i64> = (0..n_bytes).map(|i| bytes[(i + 1) % n_bytes] as i64).collect();
+
+        let loss_of = |model: &mut BltModel, scratch: &mut BltScratch, latent: &mut IdentityLatent| -> f32 {
+            let mut logits = GpuVec::try_hip(n_bytes * 256).unwrap();
+            let batch = HipBatch::new();
+            model.forward_with_latent(&batch, latent, &bytes, &boundaries, scratch, &mut logits).unwrap();
+            batch.flush().unwrap();
+            let mut h = vec![0.0f32; n_bytes * 256];
+            logits.copy_to_host(&mut h);
+            cross_entropy(&h, &targets, 256).0
+        };
+
+        let loss0 = loss_of(&mut model, &mut scratch, &mut latent);
+
+        // forward-for-backward + backward → encoder grads.
+        let mut logits = GpuVec::try_hip(n_bytes * 256).unwrap();
+        let batch = HipBatch::new();
+        let cache = model.forward_for_backward_with_latent(
+            &batch, &mut latent, &bytes, &boundaries, &mut scratch, &mut state, &mut logits,
+        ).unwrap();
+        batch.flush().unwrap();
+        let mut h = vec![0.0f32; n_bytes * 256];
+        logits.copy_to_host(&mut h);
+        let (_l, grad_logits) = cross_entropy(&h, &targets, 256);
+        let mut d_logits = GpuVec::try_hip(n_bytes * 256).unwrap();
+        d_logits.copy_from(&grad_logits);
+        let batch2 = HipBatch::new();
+        model.backward_with_latent(
+            &batch2, &mut latent, &bytes, &boundaries, &mut scratch, &mut state, &d_logits, &cache,
+        ).unwrap();
+        batch2.flush().unwrap();
+
+        // SGD step on byte_embed: w -= lr * d_byte_embed (host).
+        let lr = 0.5f32;
+        let n = model.encoder.byte_embed_dev.len_f32();
+        let mut w = vec![0.0f32; n];
+        model.encoder.byte_embed_dev.copy_to_host(&mut w).unwrap();
+        let mut g = vec![0.0f32; n];
+        state.encoder_grads.d_byte_embed.copy_to_host(&mut g);
+        assert!(g.iter().any(|&x| x != 0.0), "byte_embed grad is zero — no gradient to descend");
+        for i in 0..n {
+            w[i] -= lr * g[i];
+        }
+        model.encoder.byte_embed_dev.copy_from_host(&w).unwrap();
+
+        let loss1 = loss_of(&mut model, &mut scratch, &mut latent);
+        assert!(loss1 < loss0,
+            "byte-CE loss did not decrease after one SGD step through the seam: {loss0} -> {loss1}");
+    }
+
     #[test]
     fn blt_model_forward_smoke() {
         let _guard = modgrad_device::test_lock::hip_test_lock();
