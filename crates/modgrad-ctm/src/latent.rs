@@ -299,6 +299,55 @@ mod tests {
         }
     }
 
+    /// A8 — the property the whole architecture rests on: episodic recall
+    /// is CONTENT-addressable and does not die when a window slides. Store
+    /// 100 episodes (far past any fixed context window), then recall an
+    /// EARLY one (#5) by content — despite 95 episodes stored after it. A
+    /// sliding context window would have dropped #5; the hippocampus
+    /// retrieves it by similarity. This is continuous episodic memory
+    /// without the context-window death.
+    #[test]
+    fn episodic_recall_is_content_addressable_not_recency() {
+        use modgrad_memory::episodic::{retrieve, store, EpisodicConfig, EpisodicMemory};
+        let d = 4usize;
+        let cfg = EpisodicConfig {
+            capacity: 256,
+            max_ticks: 2,
+            d_model: d,
+            min_ticks_for_storage: 0,
+            min_surprise: 0.0,
+            retrieval_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut mem = EpisodicMemory::new(cfg);
+
+        let n_ep = 100usize;
+        let mut patterns: Vec<Vec<f32>> = Vec::with_capacity(n_ep);
+        for i in 0..n_ep {
+            let v: Vec<f32> = (0..d).map(|j| (((i * 7 + j * 13) % 17) as f32) - 8.0).collect();
+            patterns.push(v.clone());
+            let traj: Vec<f32> = v.iter().chain(v.iter()).copied().collect(); // [2 × d]
+            let cert = [[0.5f32, 0.5]; 2];
+            let (m, _) = store(mem, &traj, &cert, &[], 2, 1.0);
+            mem = m;
+        }
+        assert!(mem.len() > 0);
+
+        // Recall the OLD episode #5 by content.
+        let r = retrieve(&mem, &patterns[5]);
+        let recalled = &r.blended_final_state;
+        assert_eq!(recalled.len(), d);
+        let dist = |p: &[f32]| -> f32 {
+            recalled.iter().zip(p).map(|(a, b)| (a - b) * (a - b)).sum()
+        };
+        // The recall is dominated by the content-matched episode #5, not by
+        // recency (#50, #99 were stored much later).
+        assert!(dist(&patterns[5]) < dist(&patterns[50]),
+            "recall not content-addressed to #5 vs #50");
+        assert!(dist(&patterns[5]) < dist(&patterns[99]),
+            "recall not content-addressed to #5 vs #99 (recency would win a window)");
+    }
+
     /// A4: the SurpriseModel contract. predict_next/predict_backward
     /// FD-gradcheck under the ½‖predicted−actual‖² surprise loss.
     #[test]
