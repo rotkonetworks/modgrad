@@ -2651,6 +2651,45 @@ impl TransformerBlockResident {
         }
         batch.note_dispatch()?;
         // Stage B: SwiGLU backward.
+        // FIX (stale shared MLP scratch): restore THIS position's saved MLP
+        // forward activations into the shared `mlp_scratch` before the
+        // backward. `SwigluResident::backward` reads gate_out/up_out/silu/
+        // hidden directly from `mlp_scratch`; the shared scratch otherwise
+        // holds the LAST forward position's activations, so on every
+        // non-final position the MLP grad — and the dy it folds back into
+        // the attention backward (→ d_head_out → d_q_normed → dW_q, dx) —
+        // was inflated (~15% on the BLT encoder's multi-byte sequences).
+        // Mirrors the forward snapshot above (saved_* ← mlp_scratch.*).
+        {
+            let mlp_dim_restore = self.mlp.mlp_dim();
+            unsafe {
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut mlp_scratch.gate_out)?.device_ptr(),
+                    hip_buf(&block_scratch.saved_gate_out)?.device_ptr()
+                        as *const std::os::raw::c_void,
+                    mlp_dim_restore * 4,
+                )?;
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut mlp_scratch.up_out)?.device_ptr(),
+                    hip_buf(&block_scratch.saved_up_out)?.device_ptr()
+                        as *const std::os::raw::c_void,
+                    mlp_dim_restore * 4,
+                )?;
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut mlp_scratch.silu)?.device_ptr(),
+                    hip_buf(&block_scratch.saved_silu)?.device_ptr()
+                        as *const std::os::raw::c_void,
+                    mlp_dim_restore * 4,
+                )?;
+                hip_memcpy_d2d(
+                    hip_buf_mut(&mut mlp_scratch.hidden)?.device_ptr(),
+                    hip_buf(&block_scratch.saved_hidden)?.device_ptr()
+                        as *const std::os::raw::c_void,
+                    mlp_dim_restore * 4,
+                )?;
+            }
+            for _ in 0..4 { batch.note_dispatch()?; }
+        }
         let mut d_mlp_normed = GpuVec::try_hip(model_dim)?;
         self.mlp.backward(
             batch, &block_scratch.mlp_normed, &d_mlp_out,
