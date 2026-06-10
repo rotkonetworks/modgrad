@@ -12,6 +12,10 @@ use modgrad_device::backend::tensor::{Device, Linear, Tensor};
 use modgrad_device::backend::BackendError;
 use modgrad_traits::LatentThinker;
 
+use crate::forward::{ctm_backward_typed, ctm_forward_typed_with_cache, CtmCacheTyped};
+use crate::synapse::UNetGradsTyped;
+use crate::weights::{CtmGradientsTyped, CtmWeights, CtmWeightsTyped};
+
 /// One Linear over each patch, batched across the patch sequence. Proves
 /// the seam; not the production latent.
 pub struct LinearLatent<D: Device> {
@@ -66,9 +70,101 @@ impl<D: Device> LatentThinker for LinearLatent<D> {
     }
 }
 
+/// The CTM as the BLT latent (A2 — the core move). Refines each patch by
+/// *thinking* about it: the patch is the CTM's observation, the CTM runs
+/// its adaptive-tick loop, and the final-tick prediction is the refined
+/// ("thought") patch. Depth comes from thinking TIME, not stacked layers.
+///
+/// State (neuron trace/activated) resets per patch in this cut — within-
+/// event working memory only. CROSS-patch/cross-event memory is the
+/// hippocampus's job (episodic recall, A8), not raw neuron-state carry —
+/// the brain-correct split. The CTM must be configured with observation
+/// dim == out_dims == `patch_dim` (patch in, same-shape thought out).
+pub struct CtmLatent<D: Device> {
+    typed: CtmWeightsTyped<D>,
+    start_activated: Vec<f32>,
+    start_trace: Vec<f32>,
+    pub grads: CtmGradientsTyped<D>,
+    pub unet_grads: UNetGradsTyped<D>,
+    patch_dim: usize,
+}
+
+impl<D: Device> CtmLatent<D> {
+    /// `w` must be a CTM whose observation dim (raw_input_dim) and
+    /// `config.out_dims` both equal `patch_dim`.
+    pub fn from_weights(w: &CtmWeights, patch_dim: usize) -> Result<Self, BackendError> {
+        let typed = CtmWeightsTyped::<D>::from_untyped(w)?;
+        let grads = CtmGradientsTyped::<D>::zeros(&typed)?;
+        let unet_grads = UNetGradsTyped::<D>::zeros(&typed.synapse)?;
+        Ok(Self {
+            typed,
+            start_activated: w.start_activated.clone(),
+            start_trace: w.start_trace.clone(),
+            grads,
+            unet_grads,
+            patch_dim,
+        })
+    }
+}
+
+impl<D: Device> LatentThinker for CtmLatent<D> {
+    /// One CTM forward cache per patch.
+    type Cache = Vec<CtmCacheTyped<D>>;
+    type Error = BackendError;
+
+    fn patch_dim(&self) -> usize {
+        self.patch_dim
+    }
+
+    fn think_forward(
+        &mut self,
+        patches: &[f32],
+        n_patches: usize,
+    ) -> Result<(Vec<f32>, Self::Cache), BackendError> {
+        let pd = self.patch_dim;
+        let mut thought = vec![0.0f32; n_patches * pd];
+        let mut caches = Vec::with_capacity(n_patches);
+        for p in 0..n_patches {
+            let mut act = self.start_activated.clone();
+            let mut tr = self.start_trace.clone();
+            let (out, cache) = ctm_forward_typed_with_cache::<D>(
+                &self.typed, &mut act, &mut tr, &patches[p * pd..(p + 1) * pd],
+            )?;
+            let last = out.predictions.last().expect("at least one tick");
+            thought[p * pd..(p + 1) * pd].copy_from_slice(last);
+            caches.push(cache);
+        }
+        Ok((thought, caches))
+    }
+
+    fn think_backward(
+        &mut self,
+        d_thought: &[f32],
+        cache: &Self::Cache,
+        n_patches: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let pd = self.patch_dim;
+        let k = self.typed.config.iterations;
+        let mut d_patches = vec![0.0f32; n_patches * pd];
+        for p in 0..n_patches {
+            // Loss touches only the final-tick prediction (the thought).
+            let mut d_preds: Vec<Vec<f32>> = vec![vec![0.0f32; pd]; k];
+            d_preds[k - 1].copy_from_slice(&d_thought[p * pd..(p + 1) * pd]);
+            let mut d_obs = Tensor::<D>::zeros(pd)?;
+            ctm_backward_typed::<D>(
+                &self.typed, &cache[p], &d_preds,
+                &mut self.grads, &mut self.unet_grads, &mut d_obs,
+            )?;
+            d_patches[p * pd..(p + 1) * pd].copy_from_slice(&d_obs.to_vec()?);
+        }
+        Ok(d_patches)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CtmConfig, ExitStrategy};
     use modgrad_device::backend::tensor::Cpu;
 
     /// Lock the LatentThinker contract: think_forward/think_backward
@@ -109,6 +205,53 @@ mod tests {
             // Near-zero grads sit at the FD floor (~|L|·ulp/2EPS ~1e-4).
             assert!(rel < 1e-3 || abs_diff < 3e-4,
                 "d_w[{idx}]: analytic={a} fd={fd} rel={rel} abs={abs_diff}");
+        }
+    }
+
+    /// A2 core move: the CTM-as-latent contract. think_forward streams
+    /// patches through the CTM's tick loop; think_backward must match FD
+    /// (loss = Σ thought, d_thought = ones) on a CTM weight (output_proj).
+    #[test]
+    fn ctm_latent_contract_fd_gradcheck() {
+        let pd = 4usize;
+        let cfg = CtmConfig {
+            iterations: 2, d_model: 4, d_input: 8, heads: 2,
+            n_synch_out: 4, n_synch_action: 4, synapse_depth: 2,
+            memory_length: 4, deep_nlms: false, memory_hidden_dims: 0,
+            out_dims: pd, n_random_pairing_self: 0, min_width: 2,
+            exit_strategy: ExitStrategy::None, collect_trajectories: false,
+        };
+        let w = CtmWeights::new(cfg.clone(), pd); // raw_input_dim = pd
+        let n_patches = 3usize;
+        let patches: Vec<f32> = (0..n_patches * pd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
+
+        // Analytic.
+        let mut lat = CtmLatent::<Cpu>::from_weights(&w, pd).unwrap();
+        let (_th, cache) = lat.think_forward(&patches, n_patches).unwrap();
+        let d_thought = vec![1.0f32; n_patches * pd];
+        let d_patches = lat.think_backward(&d_thought, &cache, n_patches).unwrap();
+        assert_eq!(d_patches.len(), n_patches * pd);
+        let dw = lat.grads.out_proj_w.to_vec().unwrap();
+
+        let loss_of = |wp: &CtmWeights| -> f32 {
+            let mut l = CtmLatent::<Cpu>::from_weights(wp, pd).unwrap();
+            l.think_forward(&patches, n_patches).unwrap().0.iter().sum()
+        };
+        const EPS: f32 = 1e-3;
+        let n = dw.len();
+        for idx in [0usize, n / 2, n - 1] {
+            let mut wp = w.clone();
+            let orig = wp.output_proj.weight[idx];
+            wp.output_proj.weight[idx] = orig + EPS;
+            let lp = loss_of(&wp);
+            wp.output_proj.weight[idx] = orig - EPS;
+            let lm = loss_of(&wp);
+            let fd = (lp - lm) / (2.0 * EPS);
+            let a = dw[idx];
+            let abs_diff = (fd - a).abs();
+            let rel = abs_diff / fd.abs().max(a.abs()).max(1e-4);
+            assert!(rel < 2e-2 || abs_diff < 3e-4,
+                "out_proj_w[{idx}]: analytic={a} fd={fd} rel={rel} abs={abs_diff}");
         }
     }
 }
