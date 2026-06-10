@@ -243,16 +243,72 @@ pub fn vec_dot_q4k_q8k(q4k_data: &[u8], q8k: &[Q8KBlock], n_blocks: usize) -> f3
     sumf
 }
 
+/// Q6_K × Q8_K vec_dot. Matches `ggml_vec_dot_q6_K_q8_K_generic`.
+///
+/// Q6_K block (210 bytes / 256 elems): `ql[128] | qh[64] | scales[16] (i8) | d (f16)`.
+/// Unlike Q4_K/Q5_K there is **no** min/dmin — the 6-bit quants are signed
+/// (offset −32) and each 16-element sub-block has its own signed int8 scale.
+pub fn vec_dot_q6k_q8k(q6k_data: &[u8], q8k: &[Q8KBlock], n_blocks: usize) -> f32 {
+    let mut sums = [0.0f32; 8];
+    let mut sumf = 0.0f32;
+
+    for i in 0..n_blocks {
+        let xb = &q6k_data[i * 210..];
+        let ql = &xb[0..128];
+        let qh = &xb[128..192];
+        let scales = &xb[192..208]; // 16 signed int8 scales
+        let q8 = &q8k[i].qs;
+
+        // Dequantize 256 6-bit quants to signed int8 (offset −32). Two
+        // groups of 128, mirroring ggml's `for j in 0..QK_K step 128`.
+        let mut aux8 = [0i8; 256];
+        for grp in 0..2 {
+            let ab = grp * 128;
+            let qlb = grp * 64;
+            let qhb = grp * 32;
+            for l in 0..32 {
+                let q4l0 = ql[qlb + l] as i32;
+                let q4l32 = ql[qlb + l + 32] as i32;
+                let h = qh[qhb + l] as i32;
+                aux8[ab + l] = (((q4l0 & 0xF) | (((h) & 3) << 4)) - 32) as i8;
+                aux8[ab + l + 32] = (((q4l32 & 0xF) | (((h >> 2) & 3) << 4)) - 32) as i8;
+                aux8[ab + l + 64] = (((q4l0 >> 4) | (((h >> 4) & 3) << 4)) - 32) as i8;
+                aux8[ab + l + 96] = (((q4l32 >> 4) | (((h >> 6) & 3) << 4)) - 32) as i8;
+            }
+        }
+
+        // Integer dot with per-16-element signed scales (16 sub-blocks).
+        let mut aux32 = [0i32; 8];
+        let mut a_off = 0usize;
+        let mut q8_off = 0usize;
+        for j in 0..16 {
+            let scale = (scales[j] as i8) as i32;
+            for l in 0..8 { aux32[l] += scale * (q8[q8_off + l] as i32 * aux8[a_off + l] as i32); }
+            q8_off += 8; a_off += 8;
+            for l in 0..8 { aux32[l] += scale * (q8[q8_off + l] as i32 * aux8[a_off + l] as i32); }
+            q8_off += 8; a_off += 8;
+        }
+
+        let mut d_q6 = f16_to_f32(u16::from_le_bytes([xb[208], xb[209]]));
+        if d_q6.is_nan() || d_q6.is_infinite() { d_q6 = 0.0; }
+        let d = d_q6 * q8k[i].d;
+        for l in 0..8 { sums[l] += d * aux32[l] as f32; }
+    }
+
+    for l in 0..8 { sumf += sums[l]; }
+    sumf
+}
+
 /// Quantized matvec: y = Q_weight @ x_f32.
 /// Quantizes x to Q8_K first, then uses quantized vec_dot per row.
 /// This produces correct results where dequant→f32→dot fails.
 pub fn qmatvec(
-    weight_data: &[u8],     // raw Q4_K or Q5_K data, [out_dim * blocks_per_row * block_size] bytes
+    weight_data: &[u8],     // raw K-quant data, [out_dim * blocks_per_row * block_size] bytes
     x: &[f32],              // f32 input vector [in_dim]
     y: &mut [f32],          // output [out_dim]
     out_dim: usize,
     in_dim: usize,
-    block_size: usize,      // 144 for Q4_K, 176 for Q5_K
+    block_size: usize,      // 144 Q4_K, 176 Q5_K, 210 Q6_K
     is_q5k: bool,
 ) {
     let blocks_per_row = in_dim / 256;
@@ -266,7 +322,9 @@ pub fn qmatvec(
 
     for row in 0..out_dim {
         let row_data = &weight_data[row * row_bytes..row * row_bytes + row_bytes];
-        y[row] = if is_q5k {
+        y[row] = if block_size == 210 {
+            vec_dot_q6k_q8k(row_data, &q8k, blocks_per_row)
+        } else if is_q5k {
             vec_dot_q5k_q8k(row_data, &q8k, blocks_per_row)
         } else {
             vec_dot_q4k_q8k(row_data, &q8k, blocks_per_row)
@@ -301,5 +359,36 @@ mod tests {
         let sum: i32 = q8k[0].qs.iter().map(|&v| v as i32).sum();
         let bsum: i32 = q8k[0].bsums.iter().map(|&v| v as i32).sum();
         assert_eq!(sum, bsum);
+    }
+
+    /// Q6_K dot, uniform case: ql=qh=0 → every 6-bit quant = (0)−32 = −32,
+    /// scales=1, d=1. Dotted with x = all 1.0 → 256·(−32)·1 = −8192.
+    #[test]
+    fn test_q6k_vec_dot_uniform() {
+        let mut block = vec![0u8; 210];
+        for s in &mut block[192..208] { *s = 1; } // scales = 1
+        block[208] = 0x00; // f16(1.0) = 0x3C00
+        block[209] = 0x3C;
+        let x = vec![1.0f32; 256];
+        let q8k = quantize_f32_to_q8k(&x);
+        let dot = vec_dot_q6k_q8k(&block, &q8k, 1);
+        assert!((dot + 8192.0).abs() < 1.0, "q6k uniform dot = {dot}, expected -8192");
+    }
+
+    /// Q6_K dot exercising the low-nibble + high-2-bit unpacking for one
+    /// element: ql[0]=5, qh[0]=1 → quant[0] = (5 | (1<<4)) − 32 = −11; the
+    /// other 255 quants stay −32. Dot with x=all 1.0 → −11 + 255·(−32) = −8171.
+    #[test]
+    fn test_q6k_vec_dot_unpack_one() {
+        let mut block = vec![0u8; 210];
+        block[0] = 0x05; // ql[0] low nibble = 5
+        block[128] = 0x01; // qh[0] bits 0-1 = 1
+        for s in &mut block[192..208] { *s = 1; }
+        block[208] = 0x00;
+        block[209] = 0x3C;
+        let x = vec![1.0f32; 256];
+        let q8k = quantize_f32_to_q8k(&x);
+        let dot = vec_dot_q6k_q8k(&block, &q8k, 1);
+        assert!((dot + 8171.0).abs() < 1.0, "q6k unpack dot = {dot}, expected -8171");
     }
 }
