@@ -1158,6 +1158,38 @@ impl<D: Device> SynapseUNetTyped<D> {
         Ok(current)
     }
 
+    /// Batched forward — `x` is `[batch × in_dim]`, output
+    /// `[batch × out_dim]`. Mechanical B-aware mirror of `forward`: every
+    /// block is a GEMM (`forward_batched`), skip-adds run over `batch × n`,
+    /// and the skip LayerNorms run per-row (`n_rows = batch`). This batches
+    /// the whole synapse forward — the tick loop's dominant FLOP consumer.
+    pub fn forward_batched(
+        &self,
+        x: &Tensor<D>,
+        batch: usize,
+    ) -> Result<Tensor<D>, BackendError> {
+        let n_blocks = self.down_blocks.len();
+        let mut outs_down: Vec<Tensor<D>> = Vec::with_capacity(n_blocks + 1);
+        outs_down.push(self.first_projection.forward_batched(x, batch)?.0);
+        for i in 0..n_blocks {
+            let next = self.down_blocks[i].forward_batched(outs_down.last().unwrap(), batch)?.0;
+            outs_down.push(next);
+        }
+        let mut current = outs_down.pop().expect("bottleneck present");
+        for i in 0..n_blocks {
+            let up_idx = n_blocks - 1 - i;
+            let up_out = self.up_blocks[up_idx].forward_batched(&current, batch)?.0;
+            let n = self.widths[up_idx];
+            let mut accumulated = up_out;
+            tensor_api::add_assign(&mut accumulated, &outs_down[up_idx], batch * n)?;
+            let mut normed = Tensor::<D>::zeros(batch * n)?;
+            tensor_api::layer_norm(&accumulated, &self.skip_ln_gamma[up_idx],
+                &self.skip_ln_beta[up_idx], &mut normed, batch, n)?;
+            current = normed;
+        }
+        Ok(current)
+    }
+
     /// Output dimension (= widths[0]).
     pub fn out_dim(&self) -> usize { self.widths[0] }
 
@@ -1454,6 +1486,38 @@ mod typed_synapse_tests {
         for (i, (a, b)) in ref_out.iter().zip(&typed_out).enumerate() {
             assert!((a - b).abs() < 1e-4,
                 "synapse_unet typed/untyped disagree at {}: ref={} typed={}", i, a, b);
+        }
+    }
+
+    /// Batched full-U-Net forward must equal `batch` independent scalar
+    /// forwards — proves the whole synapse forward batches end-to-end
+    /// (blocks as GEMMs, skip-adds + skip-LN per row).
+    #[test]
+    fn cpu_synapse_unet_forward_batched_matches_scalar() {
+        let unet = SynapseUNet::new(8, 4, 3, 2);
+        let typed = SynapseUNetTyped::<Cpu>::from_untyped(&unet).unwrap();
+        let (in_dim, out_dim, batch) = (8usize, typed.out_dim(), 5usize);
+
+        let x: Vec<f32> = (0..batch * in_dim)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.17).collect();
+
+        // Batched.
+        let xt = Tensor::<Cpu>::from_slice(&x).unwrap();
+        let y_batched = typed.forward_batched(&xt, batch).unwrap().to_vec().unwrap();
+
+        // Scalar reference.
+        let mut y_scalar = vec![0.0f32; batch * out_dim];
+        for bi in 0..batch {
+            let xr = Tensor::<Cpu>::from_slice(&x[bi * in_dim..(bi + 1) * in_dim]).unwrap();
+            let yr = typed.forward(&xr).unwrap().to_vec().unwrap();
+            y_scalar[bi * out_dim..(bi + 1) * out_dim].copy_from_slice(&yr);
+        }
+
+        assert_eq!(y_batched.len(), y_scalar.len());
+        for (i, (a, b)) in y_batched.iter().zip(&y_scalar).enumerate() {
+            let d = (a - b).abs();
+            let s = a.abs().max(b.abs()).max(1.0);
+            assert!(d < 1e-4 || d / s < 1e-4, "unet fwd[{i}]: {a} vs {b}");
         }
     }
 
