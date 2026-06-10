@@ -22,8 +22,9 @@ pub enum GgmlType {
     Q2_K = 10,
     Q3_K = 11,
     Q4_K = 12,
-    Q5_K = 14,
-    Q6_K = 15,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
     IQ2_XXS = 16,
     BF16 = 30,
     Unknown(u32),
@@ -34,8 +35,8 @@ impl From<u32> for GgmlType {
         match v {
             0 => Self::F32, 1 => Self::F16, 2 => Self::Q4_0, 3 => Self::Q4_1,
             6 => Self::Q5_0, 7 => Self::Q5_1, 8 => Self::Q8_0, 9 => Self::Q8_1,
-            10 => Self::Q2_K, 11 => Self::Q3_K, 12 => Self::Q4_K, 14 => Self::Q5_K,
-            15 => Self::Q6_K, 16 => Self::IQ2_XXS, 30 => Self::BF16,
+            10 => Self::Q2_K, 11 => Self::Q3_K, 12 => Self::Q4_K, 13 => Self::Q5_K,
+            14 => Self::Q6_K, 15 => Self::Q8_K, 16 => Self::IQ2_XXS, 30 => Self::BF16,
             other => Self::Unknown(other),
         }
     }
@@ -60,6 +61,7 @@ impl GgmlType {
             Self::Q4_K => (144, 256),
             Self::Q5_K => (176, 256),
             Self::Q6_K => (210, 256),
+            Self::Q8_K => (292, 256),
             _ => (0, 1),
         }
     }
