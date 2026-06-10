@@ -991,6 +991,152 @@ pub fn ctm_forward_typed_with_cache<D: TensorDevice>(
     Ok((output, cache))
 }
 
+/// Batched per-neuron GLU over `[batch × n_neurons × out_per]`.
+fn per_neuron_glu_batched(x: &[f32], n_neurons: usize, out_per: usize, batch: usize) -> Vec<f32> {
+    let ex_in = n_neurons * out_per;
+    let ex_out = n_neurons * (out_per / 2);
+    let mut out = vec![0.0f32; batch * ex_out];
+    for b in 0..batch {
+        let g = per_neuron_glu(&x[b * ex_in..(b + 1) * ex_in], n_neurons, out_per);
+        out[b * ex_out..(b + 1) * ex_out].copy_from_slice(&g);
+    }
+    out
+}
+
+/// Batched NLM forward — `trace` is `[batch × d_model × m]`, returns the
+/// batched activated `[batch × d_model × out/2]` (flattened per example).
+fn nlm_forward_batched<D: TensorDevice>(
+    trace: &Tensor<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_model: usize,
+    batch: usize,
+) -> Result<Vec<f32>, BackendError> {
+    let s1 = stage1.forward_batched(trace, batch)?;
+    let s1_glu = per_neuron_glu_batched(&s1.to_vec()?, d_model, stage1.out_per, batch);
+    if let Some(s2) = stage2 {
+        let s1_glu_t = Tensor::<D>::from_slice(&s1_glu)?;
+        let s2_out = s2.forward_batched(&s1_glu_t, batch)?;
+        Ok(per_neuron_glu_batched(&s2_out.to_vec()?, d_model, s2.out_per, batch))
+    } else {
+        Ok(s1_glu)
+    }
+}
+
+/// Batched forward tick loop — the wiring capstone. Threads `batch`
+/// through the whole per-tick op chain: GEMM-batched synapse / q_proj /
+/// output_proj / kv_proj, batched NLM + sync, B-loop attention (small).
+/// `activated` is `[batch × d_model]`, `trace` `[batch × d_model × m]`,
+/// `obs` `[batch × raw_input_dim]`. Returns per-tick predictions, each
+/// `[batch × out_dims]`. Forward only (no cache) — validates the batched
+/// composition against B scalar `ctm_forward_typed_with_cache` calls.
+/// (Backward + adaptive-exit halt-mask are the remaining wiring step.)
+pub fn ctm_forward_typed_batched<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    activated: &mut Vec<f32>,
+    trace: &mut Vec<f32>,
+    obs: &[f32],
+    batch: usize,
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+    let raw = obs.len() / batch;
+    let n_tokens = 1;
+
+    // KV projection + LN (batched).
+    let obs_t = Tensor::<D>::from_slice(obs)?;
+    let mut kv_pre = Tensor::<D>::zeros(batch * d_in)?;
+    w.kv_proj.forward_batched(&obs_t, &mut kv_pre, batch)?;
+    let mut kv_post = Tensor::<D>::zeros(batch * d_in)?;
+    let mut kv_ln_cache = Tensor::<D>::zeros(2 * batch)?;
+    tensor_typed::layer_norm_train(&kv_pre, &w.kv_ln_gamma, &w.kv_ln_beta,
+        &mut kv_post, &mut kv_ln_cache, batch, d_in)?;
+    let kv_host: Vec<f32> = kv_post.to_vec()?;
+    let _ = raw;
+
+    let decay_out: Vec<f32> = w.decay_params_out.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let decay_action: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+
+    let mut alpha_out = Vec::new();
+    let mut beta_out = Vec::new();
+    sync_init_batched(activated, &w.sync_out_left, &w.sync_out_right,
+        &mut alpha_out, &mut beta_out, batch, d);
+    let mut alpha_action = Vec::new();
+    let mut beta_action = Vec::new();
+    let mut action_init = false;
+
+    let mut predictions: Vec<Vec<f32>> = Vec::with_capacity(k);
+    for _tick in 0..k {
+        // sync_action (batched).
+        let sync_action: Vec<f32> = if !action_init {
+            sync_init_batched(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, batch, d);
+            action_init = true;
+            sync_read(&alpha_action, &beta_action)
+        } else {
+            sync_update_batched(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, &decay_action, batch, d)
+        };
+
+        // q_proj (batched).
+        let sa_t = Tensor::<D>::from_slice(&sync_action)?;
+        let mut q_t = Tensor::<D>::zeros(batch * d_in)?;
+        w.q_proj.forward_batched(&sa_t, &mut q_t, batch)?;
+        let q_host: Vec<f32> = q_t.to_vec()?;
+
+        // MHA (B-loop — small).
+        let mut attn_all = vec![0.0f32; batch * d_in];
+        for b in 0..batch {
+            let (ao, _c) = multihead_attention_with_cache_typed::<D>(
+                &q_host[b * d_in..(b + 1) * d_in],
+                &kv_host[b * d_in..(b + 1) * d_in],
+                n_tokens, d_in, cfg.heads, &w.mha_in_proj, &w.mha_out_proj,
+            )?;
+            attn_all[b * d_in..(b + 1) * d_in].copy_from_slice(&ao);
+        }
+
+        // synapse input = concat(attn_out, activated) per example.
+        let mut pre_syn = vec![0.0f32; batch * (d_in + d)];
+        for b in 0..batch {
+            let o = b * (d_in + d);
+            pre_syn[o..o + d_in].copy_from_slice(&attn_all[b * d_in..(b + 1) * d_in]);
+            pre_syn[o + d_in..o + d_in + d].copy_from_slice(&activated[b * d..(b + 1) * d]);
+        }
+        let pre_syn_t = Tensor::<D>::from_slice(&pre_syn)?;
+        let pre_act_t = w.synapse.forward_batched(&pre_syn_t, batch)?;
+        let pre_act_host: Vec<f32> = pre_act_t.to_vec()?;
+
+        // Trace shift (per example).
+        for b in 0..batch {
+            let to = b * d * m;
+            let ao = b * d;
+            for n in 0..d {
+                let base = to + n * m;
+                trace.copy_within(base + 1..base + m, base);
+                trace[base + m - 1] = pre_act_host[ao + n];
+            }
+        }
+
+        // NLM (batched).
+        let trace_t = Tensor::<D>::from_slice(trace)?;
+        *activated = nlm_forward_batched::<D>(&trace_t, &w.nlm_stage1, w.nlm_stage2.as_ref(), d, batch)?;
+
+        // sync_out (batched) → output_proj (batched).
+        let sync_out = sync_update_batched(activated, &w.sync_out_left, &w.sync_out_right,
+            &mut alpha_out, &mut beta_out, &decay_out, batch, d);
+        let so_t = Tensor::<D>::from_slice(&sync_out)?;
+        let mut pred_t = Tensor::<D>::zeros(batch * cfg.out_dims)?;
+        w.output_proj.forward_batched(&so_t, &mut pred_t, batch)?;
+        predictions.push(pred_t.to_vec()?);
+    }
+    Ok(predictions)
+}
+
 /// CTM backward orchestration. Given upstream `d_predictions[t]` for
 /// each tick (typically from a loss function), walk reverse-tick and
 /// accumulate gradients into `grads`. Returns `d_obs` (gradient flowing
@@ -1844,6 +1990,39 @@ mod typed_forward_tests {
     /// every CtmGradientsTyped buffer has non-zero entries (gradient
     /// flowed through every weight). Confirms the full backward chain
     /// composes correctly.
+    /// The wiring capstone: the batched forward tick loop must produce the
+    /// same per-tick predictions as `batch` independent scalar forwards.
+    /// Validates the whole batched composition end-to-end.
+    #[test]
+    fn cpu_ctm_forward_typed_batched_matches_scalar() {
+        let cfg = small_cfg();
+        let raw = 6usize;
+        let batch = 3usize;
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let obs: Vec<f32> = (0..batch * raw).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
+
+        let mut act_b: Vec<f32> = (0..batch).flat_map(|_| w.start_activated.clone()).collect();
+        let mut tr_b: Vec<f32> = (0..batch).flat_map(|_| w.start_trace.clone()).collect();
+        let preds_b = ctm_forward_typed_batched::<Cpu>(&typed, &mut act_b, &mut tr_b, &obs, batch).unwrap();
+
+        for b in 0..batch {
+            let mut a = w.start_activated.clone();
+            let mut t = w.start_trace.clone();
+            let (out, _) = ctm_forward_typed_with_cache::<Cpu>(
+                &typed, &mut a, &mut t, &obs[b * raw..(b + 1) * raw],
+            ).unwrap();
+            for tick in 0..cfg.iterations {
+                let pb = &preds_b[tick][b * cfg.out_dims..(b + 1) * cfg.out_dims];
+                for j in 0..cfg.out_dims {
+                    let exp = out.predictions[tick][j];
+                    assert!((pb[j] - exp).abs() < 1e-4,
+                        "pred[tick{tick}][b{b}][{j}]: {} vs {}", pb[j], exp);
+                }
+            }
+        }
+    }
+
     #[test]
     fn cpu_ctm_backward_typed_full_chain_flows_gradients() {
         use crate::weights::{CtmWeights, CtmGradientsTyped};
