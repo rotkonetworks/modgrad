@@ -11,6 +11,7 @@ pub mod config;
 pub mod synapse;
 pub mod weights;
 pub mod forward;
+pub mod latent;
 pub mod train;
 pub mod loss;
 /// Per-dispatch-type timing for the brain forward path. Activated by

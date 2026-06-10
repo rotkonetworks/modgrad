@@ -18,6 +18,9 @@ pub use vjp::Vjp;
 
 pub mod cerebellum;
 
+pub mod latent;
+pub use latent::LatentThinker;
+
 /// Trait for weight types that can be viewed as a flat f32 slice.
 /// Enables Optimizer to operate on Brain weights directly.
 pub trait Flattenable {
