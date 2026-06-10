@@ -178,6 +178,30 @@ mod tests {
         assert_eq!(b.last().copied(), Some(bytes.len()));
     }
 
+    /// A5: the SurpriseModel↔patcher unification. A SurpriseModel emits a
+    /// per-byte surprise array (the byte-granularity analog of
+    /// `SurpriseModel::surprise`); the patcher cuts a new patch wherever
+    /// surprise exceeds the threshold — content-dependent chunking, NOT the
+    /// fixed-stride placeholder. This is the one signal allocating spatial
+    /// compute (where to cut patches), the same signal that gates the CTM's
+    /// thinking time (A6).
+    #[test]
+    fn surprise_drives_content_dependent_boundaries() {
+        let p = EntropyPatcher::new(PatchMode::GlobalThreshold(1.0)).without_newline_reset();
+        let bytes: Vec<u8> = (0..8u8).collect();
+
+        // Low surprise everywhere except a spike at t=4 (a "surprising" byte).
+        let mut surprise = vec![0.2f32; 8];
+        surprise[4] = 2.5;
+        let b = p.boundaries(&bytes, &surprise);
+        assert!(b.contains(&4), "surprise spike at 4 must create a boundary: {b:?}");
+
+        // Uniform low surprise ⇒ no internal cut (one big patch).
+        let flat = vec![0.2f32; 8];
+        let b2 = p.boundaries(&bytes, &flat);
+        assert_eq!(b2, vec![0, 8], "flat surprise ⇒ single patch: {b2:?}");
+    }
+
     #[test]
     fn global_threshold_below_theta_yields_one_patch() {
         // Disable newline reset so we can isolate the entropy rule.
