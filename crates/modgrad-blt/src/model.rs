@@ -668,6 +668,109 @@ impl BltModel {
         Ok(())
     }
 
+    /// Forward-for-backward with a pluggable [`LatentThinker`] (A3). Mirrors
+    /// [`Self::forward_for_backward`] but Stage 2 calls `latent.think_forward`
+    /// (host bridge) and returns the latent's cache for the matching
+    /// [`Self::backward_with_latent`]. Encoder/decoder caches populate
+    /// `state` as usual; the latent's grads live in the latent itself.
+    pub fn forward_for_backward_with_latent<L>(
+        &mut self,
+        batch: &HipBatch,
+        latent: &mut L,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut BltScratch,
+        state: &mut BltBackwardState,
+        byte_logits_out: &mut GpuVec,
+    ) -> Result<L::Cache, Box<dyn std::error::Error>>
+    where
+        L: modgrad_traits::LatentThinker,
+        L::Error: std::error::Error + 'static,
+    {
+        let n_patches = boundaries.len().saturating_sub(1);
+        let patch_dim = self.config.latent.patch_dim;
+        debug_assert_eq!(latent.patch_dim(), patch_dim);
+
+        self.encoder.byte_kv_cache.reset();
+        self.decoder.byte_kv_cache.reset();
+
+        // Stage 1: encoder forward-for-backward → patch reps + encoder cache.
+        let mut patch_reps_view = GpuVec::try_hip(n_patches * patch_dim)?;
+        self.encoder.forward_for_backward(
+            batch, bytes, boundaries, &mut scratch.encoder,
+            &mut state.encoder_cache, &mut patch_reps_view,
+        )?;
+
+        // Stage 2: LatentThinker (host bridge), retaining its cache.
+        let mut patch_host = vec![0.0f32; n_patches * patch_dim];
+        patch_reps_view.copy_to_host(&mut patch_host);
+        let (thought_host, latent_cache) = latent.think_forward(&patch_host, n_patches)?;
+        let mut patch_reps_for_decoder = GpuVec::try_hip(n_patches * patch_dim)?;
+        patch_reps_for_decoder.copy_from(&thought_host);
+
+        // Stage 3: decoder forward-for-backward.
+        self.decoder.forward_for_backward(
+            batch, &patch_reps_for_decoder, boundaries,
+            Some(&scratch.encoder.byte_reps), &mut scratch.decoder,
+            &mut state.decoder_cache, byte_logits_out,
+        )?;
+        Ok(latent_cache)
+    }
+
+    /// Backward with a pluggable [`LatentThinker`] (A3). Mirrors
+    /// [`Self::backward`] but Stage 2 bridges the post-latent patch
+    /// gradient through `latent.think_backward` (which accumulates the
+    /// latent's own grads) instead of the resident transformer latent
+    /// backward. `latent_cache` is the value returned by
+    /// `forward_for_backward_with_latent`.
+    pub fn backward_with_latent<L>(
+        &mut self,
+        batch: &HipBatch,
+        latent: &mut L,
+        bytes: &[u8],
+        boundaries: &[usize],
+        scratch: &mut BltScratch,
+        state: &mut BltBackwardState,
+        d_byte_logits: &GpuVec,
+        latent_cache: &L::Cache,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        L: modgrad_traits::LatentThinker,
+        L::Error: std::error::Error + 'static,
+    {
+        let n_patches = boundaries.len().saturating_sub(1);
+        let patch_dim = self.config.latent.patch_dim;
+
+        zero_gpuvec_full(&mut state.d_patch_reps_post_latent)?;
+        zero_gpuvec_full(&mut state.d_patch_reps_pre_latent)?;
+        zero_gpuvec_full(&mut state.d_seed_byte_reps)?;
+
+        // Stage 1: decoder backward → d_patch_reps_post_latent + d_seed.
+        self.decoder.backward(
+            batch, boundaries, &mut state.decoder_cache, d_byte_logits,
+            &mut state.decoder_grads, &mut state.d_patch_reps_post_latent,
+            Some(&mut state.d_seed_byte_reps), &mut scratch.decoder,
+        )?;
+
+        // Stage 2: LatentThinker backward (host bridge). d_thought is the
+        // valid n_patches prefix of the post-latent grad buffer.
+        let mut post_full = vec![0.0f32; state.d_patch_reps_post_latent.len()];
+        state.d_patch_reps_post_latent.copy_to_host(&mut post_full);
+        let d_patches = latent.think_backward(&post_full[..n_patches * patch_dim], latent_cache, n_patches)?;
+        let mut pre_full = vec![0.0f32; state.d_patch_reps_pre_latent.len()];
+        pre_full[..n_patches * patch_dim].copy_from_slice(&d_patches);
+        state.d_patch_reps_pre_latent.copy_from(&pre_full);
+
+        // Stage 3: encoder backward.
+        self.encoder.backward(
+            batch, bytes, boundaries, &mut scratch.encoder,
+            &mut state.encoder_bwd_scratch, &mut state.encoder_cache,
+            &state.d_patch_reps_pre_latent, Some(&state.d_seed_byte_reps),
+            &mut state.encoder_grads,
+        )?;
+        Ok(())
+    }
+
     /// Generate `n_new_bytes` bytes given a prompt. Greedy if
     /// `temperature == 0.0`; temperature-sampled otherwise.
     ///
@@ -2005,6 +2108,54 @@ mod tests {
         assert_eq!(host.iter().filter(|v| v.is_finite()).count(), host.len(),
             "logits contain non-finite values");
         assert!(host.iter().any(|&x| x != 0.0), "logits all zero");
+    }
+
+    /// A3 backward: `forward_for_backward_with_latent` + `backward_with_latent`
+    /// flow gradient end-to-end through decoder → latent bridge → encoder.
+    /// With IdentityLatent (d_patches = d_thought passthrough), the encoder
+    /// grads must become non-zero — proving the seam's backward + host bridge.
+    #[test]
+    fn backward_with_latent_flows_gradients() {
+        let _guard = modgrad_device::test_lock::hip_test_lock();
+        if !runtime_available() {
+            eprintln!("hip runtime unavailable, skipping");
+            return;
+        }
+        let config = tiny_config();
+        let mut model = BltModel::new(config.clone()).expect("BltModel::new");
+        let mut scratch = BltScratch::new(&config).expect("BltScratch::new");
+        let mut state = BltBackwardState::new(&model).expect("BltBackwardState::new");
+        let pd = config.latent.patch_dim;
+        let mut latent = IdentityLatent { patch_dim: pd };
+
+        let bytes: Vec<u8> = (0..32u8).collect();
+        // n_patches must equal latent.max_patches (16) — the BLT backward
+        // contract (decoder cross-attn backward asserts it).
+        let boundaries: Vec<usize> = (0..=16).map(|p| p * 2).collect();
+        let n_bytes = bytes.len();
+        let mut logits = GpuVec::try_hip(n_bytes * 256).expect("alloc logits");
+
+        let batch = HipBatch::new();
+        let cache = model.forward_for_backward_with_latent(
+            &batch, &mut latent, &bytes, &boundaries, &mut scratch, &mut state, &mut logits,
+        ).expect("forward_for_backward_with_latent");
+        batch.flush().expect("flush fwd");
+
+        let d_logits_host = vec![1.0f32; n_bytes * 256];
+        let mut d_logits = GpuVec::try_hip(n_bytes * 256).expect("alloc d_logits");
+        d_logits.copy_from(&d_logits_host);
+
+        let batch2 = HipBatch::new();
+        model.backward_with_latent(
+            &batch2, &mut latent, &bytes, &boundaries, &mut scratch, &mut state, &d_logits, &cache,
+        ).expect("backward_with_latent");
+        batch2.flush().expect("flush bwd");
+
+        let mut eg = vec![0.0f32; state.encoder_grads.d_byte_embed.len()];
+        state.encoder_grads.d_byte_embed.copy_to_host(&mut eg);
+        assert!(eg.iter().all(|v| v.is_finite()), "encoder grad non-finite");
+        assert!(eg.iter().any(|&x| x != 0.0),
+            "encoder grads all zero — gradient did not flow through the latent bridge");
     }
 
     #[test]
