@@ -1037,7 +1037,7 @@ pub fn ctm_forward_typed_batched<D: TensorDevice>(
     trace: &mut Vec<f32>,
     obs: &[f32],
     batch: usize,
-) -> Result<Vec<Vec<f32>>, BackendError> {
+) -> Result<(Vec<Vec<f32>>, Vec<usize>), BackendError> {
     let cfg = &w.config;
     let d = cfg.d_model;
     let d_in = cfg.d_input;
@@ -1134,7 +1134,37 @@ pub fn ctm_forward_typed_batched<D: TensorDevice>(
         w.output_proj.forward_batched(&so_t, &mut pred_t, batch)?;
         predictions.push(pred_t.to_vec()?);
     }
-    Ok(predictions)
+
+    // ── Adaptive-exit halt mask (run max-T, mask the output per example). ──
+    // All B examples ran all k ticks (uniform shape — GPU-friendly). Now,
+    // per example, find the first tick whose exit condition fires and FREEZE
+    // its output there: later ticks' predictions are overwritten with the
+    // halt-tick prediction (equivalent to freezing that example's state,
+    // since a frozen state re-emits the same output_proj result).
+    let od = cfg.out_dims;
+    let mut ticks_used = vec![k; batch];
+    for b in 0..batch {
+        for tick in 0..k {
+            let pred_b = &predictions[tick][b * od..(b + 1) * od];
+            let halt = match &cfg.exit_strategy {
+                crate::config::ExitStrategy::Certainty { threshold } => {
+                    compute_certainty(pred_b)[1] > *threshold
+                }
+                // None and AdaptiveGate (needs the per-tick gate forward —
+                // a follow-up) run all ticks here.
+                _ => false,
+            };
+            if halt {
+                ticks_used[b] = tick + 1;
+                let frozen: Vec<f32> = pred_b.to_vec();
+                for later in (tick + 1)..k {
+                    predictions[later][b * od..(b + 1) * od].copy_from_slice(&frozen);
+                }
+                break;
+            }
+        }
+    }
+    Ok((predictions, ticks_used))
 }
 
 /// CTM backward orchestration. Given upstream `d_predictions[t]` for
@@ -2004,7 +2034,9 @@ mod typed_forward_tests {
 
         let mut act_b: Vec<f32> = (0..batch).flat_map(|_| w.start_activated.clone()).collect();
         let mut tr_b: Vec<f32> = (0..batch).flat_map(|_| w.start_trace.clone()).collect();
-        let preds_b = ctm_forward_typed_batched::<Cpu>(&typed, &mut act_b, &mut tr_b, &obs, batch).unwrap();
+        // exit_strategy is None in small_cfg ⇒ all ticks run, no masking.
+        let (preds_b, ticks_used) = ctm_forward_typed_batched::<Cpu>(&typed, &mut act_b, &mut tr_b, &obs, batch).unwrap();
+        assert!(ticks_used.iter().all(|&t| t == cfg.iterations));
 
         for b in 0..batch {
             let mut a = w.start_activated.clone();
@@ -2018,6 +2050,41 @@ mod typed_forward_tests {
                     let exp = out.predictions[tick][j];
                     assert!((pb[j] - exp).abs() < 1e-4,
                         "pred[tick{tick}][b{b}][{j}]: {} vs {}", pb[j], exp);
+                }
+            }
+        }
+    }
+
+    /// Adaptive-exit halt mask: with a Certainty exit, each example's output
+    /// freezes at its halt tick (later ticks == halt-tick prediction) and
+    /// ticks_used records where it stopped.
+    #[test]
+    fn cpu_ctm_forward_batched_halt_mask() {
+        let mut cfg = small_cfg();
+        cfg.iterations = 4;
+        // Low threshold so at least some examples halt before the last tick.
+        cfg.exit_strategy = crate::config::ExitStrategy::Certainty { threshold: 0.0 };
+        let raw = 6usize;
+        let batch = 3usize;
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let obs: Vec<f32> = (0..batch * raw).map(|i| ((i * 5 % 7) as f32 - 3.0) * 0.2).collect();
+        let mut act_b: Vec<f32> = (0..batch).flat_map(|_| w.start_activated.clone()).collect();
+        let mut tr_b: Vec<f32> = (0..batch).flat_map(|_| w.start_trace.clone()).collect();
+        let (preds, ticks_used) = ctm_forward_typed_batched::<Cpu>(&typed, &mut act_b, &mut tr_b, &obs, batch).unwrap();
+        let od = cfg.out_dims;
+        for b in 0..batch {
+            let tu = ticks_used[b];
+            assert!(tu >= 1 && tu <= cfg.iterations);
+            // Post-halt ticks must equal the halt-tick prediction (frozen).
+            if tu < cfg.iterations {
+                let halt_pred = preds[tu - 1][b * od..b * od + od].to_vec();
+                for tick in tu..cfg.iterations {
+                    let later = &preds[tick][b * od..b * od + od];
+                    for j in 0..od {
+                        assert!((later[j] - halt_pred[j]).abs() < 1e-6,
+                            "frozen pred mismatch b{b} tick{tick}");
+                    }
                 }
             }
         }
