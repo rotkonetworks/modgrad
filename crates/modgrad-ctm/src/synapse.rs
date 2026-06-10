@@ -1004,6 +1004,74 @@ impl<D: Device> SynapseBlockTyped<D> {
 
         Ok(())
     }
+
+    /// Batched forward — `x` is `[batch × in_dim]`, output `[batch × out_dim]`.
+    /// Same chain as `forward_with_cache`, but the Linear is a GEMM and the
+    /// LayerNorm/SiLU run per-row over `batch` rows (they already take
+    /// `n_rows`). The matmul win flows straight through.
+    pub fn forward_batched(
+        &self,
+        x: &Tensor<D>,
+        batch: usize,
+    ) -> Result<(Tensor<D>, SynapseBlockCacheTyped<D>), BackendError> {
+        let lin_in_host: Vec<f32> = x.to_vec()?;
+        let mut pre_ln = Tensor::<D>::zeros(batch * self.out_dim)?;
+        self.linear.forward_batched(x, &mut pre_ln, batch)?;
+        let pre_ln_host: Vec<f32> = pre_ln.to_vec()?;
+
+        let mut post_ln = Tensor::<D>::zeros(batch * self.out_dim)?;
+        let mut ln_cache = Tensor::<D>::zeros(2 * batch)?; // mean+rstd per row
+        tensor_api::layer_norm_train(&pre_ln, &self.ln_gamma, &self.ln_beta,
+            &mut post_ln, &mut ln_cache, batch, self.out_dim)?;
+        let post_ln_host: Vec<f32> = post_ln.to_vec()?;
+
+        let mut out = Tensor::<D>::zeros(batch * self.out_dim)?;
+        tensor_api::silu(&post_ln, &mut out)?;
+
+        let cache = SynapseBlockCacheTyped {
+            linear_in: Tensor::<D>::from_slice(&lin_in_host)?,
+            ln_in: Tensor::<D>::from_slice(&pre_ln_host)?,
+            ln_cache,
+            silu_in: Tensor::<D>::from_slice(&post_ln_host)?,
+        };
+        Ok((out, cache))
+    }
+
+    /// Batched backward. `d_out` is `[batch × out_dim]`; `d_input`
+    /// `[batch × in_dim]` overwritten; `d_w/d_b/d_gamma/d_beta` accumulate
+    /// (batch-summed). Equivalent to `batch` scalar `backward` calls.
+    pub fn backward_batched(
+        &self,
+        d_out: &Tensor<D>,
+        cache: &SynapseBlockCacheTyped<D>,
+        d_w: &mut Tensor<D>,
+        d_b: &mut Tensor<D>,
+        d_gamma: &mut Tensor<D>,
+        d_beta: &mut Tensor<D>,
+        d_input: &mut Tensor<D>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let mut d_post_ln = Tensor::<D>::zeros(batch * self.out_dim)?;
+        tensor_api::silu_bwd(d_out, &cache.silu_in, &mut d_post_ln)?;
+
+        let mut d_pre_ln = Tensor::<D>::zeros(batch * self.out_dim)?;
+        // `layer_norm_bwd` ZEROS d_gamma/d_beta internally (overwrite),
+        // unlike the Linear grads which accumulate. Run it into temps and
+        // add, so d_gamma/d_beta follow the same accumulate convention as
+        // d_w/d_b (caller zeros once per batch; this batch's row-sum adds in).
+        let mut dg_tmp = Tensor::<D>::zeros(self.out_dim)?;
+        let mut dbe_tmp = Tensor::<D>::zeros(self.out_dim)?;
+        tensor_api::layer_norm_bwd(
+            &d_post_ln, &cache.ln_in, &self.ln_gamma, &cache.ln_cache,
+            &mut d_pre_ln, &mut dg_tmp, &mut dbe_tmp,
+            batch, self.out_dim,
+        )?;
+        tensor_api::add_assign(d_gamma, &dg_tmp, self.out_dim)?;
+        tensor_api::add_assign(d_beta, &dbe_tmp, self.out_dim)?;
+
+        self.linear.backward_batched(&d_pre_ln, &cache.linear_in, d_w, d_b, d_input, batch)?;
+        Ok(())
+    }
 }
 
 /// Cache produced by `SynapseBlockTyped::forward_with_cache`.
@@ -1387,6 +1455,71 @@ mod typed_synapse_tests {
             assert!((a - b).abs() < 1e-4,
                 "synapse_unet typed/untyped disagree at {}: ref={} typed={}", i, a, b);
         }
+    }
+
+    /// Batched `SynapseBlockTyped` forward+backward must equal `batch`
+    /// independent scalar calls — the GEMV→GEMM lever for the tick loop's
+    /// synapse (its biggest FLOP consumer).
+    #[test]
+    fn cpu_synapse_block_batched_matches_scalar() {
+        let (in_dim, out_dim, batch) = (6usize, 5usize, 4usize);
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i * 11 % 13) as f32 - 6.0) * 0.1).collect();
+        let b: Vec<f32> = (0..out_dim).map(|i| (i as f32 - 2.0) * 0.05).collect();
+        let gamma: Vec<f32> = (0..out_dim).map(|i| 1.0 + (i as f32) * 0.05).collect();
+        let beta: Vec<f32> = (0..out_dim).map(|i| (i as f32 - 2.0) * 0.03).collect();
+        let blk = SynapseBlockTyped::<Cpu>::from_host(&w, &b, &gamma, &beta, in_dim, out_dim).unwrap();
+
+        let x: Vec<f32> = (0..batch * in_dim).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.2).collect();
+        let dy: Vec<f32> = (0..batch * out_dim).map(|i| ((i * 5 % 9) as f32 - 4.0) * 0.15).collect();
+
+        // Batched.
+        let xt = Tensor::<Cpu>::from_slice(&x).unwrap();
+        let (y_b, cache_b) = blk.forward_batched(&xt, batch).unwrap();
+        let dyt = Tensor::<Cpu>::from_slice(&dy).unwrap();
+        let mut dw_b = Tensor::<Cpu>::zeros(out_dim * in_dim).unwrap();
+        let mut db_b = Tensor::<Cpu>::zeros(out_dim).unwrap();
+        let mut dg_b = Tensor::<Cpu>::zeros(out_dim).unwrap();
+        let mut dbe_b = Tensor::<Cpu>::zeros(out_dim).unwrap();
+        let mut dx_b = Tensor::<Cpu>::zeros(batch * in_dim).unwrap();
+        blk.backward_batched(&dyt, &cache_b, &mut dw_b, &mut db_b, &mut dg_b, &mut dbe_b, &mut dx_b, batch).unwrap();
+
+        // Scalar reference. d_w/d_b accumulate (Linear), but scalar
+        // block.backward OVERWRITES d_gamma/d_beta (layer_norm_bwd zeros
+        // them), so accumulate those by hand over the batch.
+        let mut y_s = vec![0.0f32; batch * out_dim];
+        let mut dx_s = vec![0.0f32; batch * in_dim];
+        let mut dw_s = Tensor::<Cpu>::zeros(out_dim * in_dim).unwrap();
+        let mut db_s = Tensor::<Cpu>::zeros(out_dim).unwrap();
+        let mut dg_acc = vec![0.0f32; out_dim];
+        let mut dbe_acc = vec![0.0f32; out_dim];
+        for bi in 0..batch {
+            let xr = Tensor::<Cpu>::from_slice(&x[bi * in_dim..(bi + 1) * in_dim]).unwrap();
+            let (yr, cr) = blk.forward_with_cache(&xr).unwrap();
+            y_s[bi * out_dim..(bi + 1) * out_dim].copy_from_slice(&yr.to_vec().unwrap());
+            let dyr = Tensor::<Cpu>::from_slice(&dy[bi * out_dim..(bi + 1) * out_dim]).unwrap();
+            let mut dxr = Tensor::<Cpu>::zeros(in_dim).unwrap();
+            let mut dg_tmp = Tensor::<Cpu>::zeros(out_dim).unwrap();
+            let mut dbe_tmp = Tensor::<Cpu>::zeros(out_dim).unwrap();
+            blk.backward(&dyr, &cr, &mut dw_s, &mut db_s, &mut dg_tmp, &mut dbe_tmp, &mut dxr).unwrap();
+            dx_s[bi * in_dim..(bi + 1) * in_dim].copy_from_slice(&dxr.to_vec().unwrap());
+            for (a, v) in dg_acc.iter_mut().zip(dg_tmp.to_vec().unwrap()) { *a += v; }
+            for (a, v) in dbe_acc.iter_mut().zip(dbe_tmp.to_vec().unwrap()) { *a += v; }
+        }
+
+        let cmp = |a: &[f32], b: &[f32], n: &str| {
+            assert_eq!(a.len(), b.len(), "{n} len");
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                let d = (x - y).abs();
+                let s = x.abs().max(y.abs()).max(1.0);
+                assert!(d < 1e-4 || d / s < 1e-4, "{n}[{i}]: {x} vs {y}");
+            }
+        };
+        cmp(&y_b.to_vec().unwrap(), &y_s, "fwd");
+        cmp(&dx_b.to_vec().unwrap(), &dx_s, "d_x");
+        cmp(&dw_b.to_vec().unwrap(), &dw_s.to_vec().unwrap(), "d_w");
+        cmp(&db_b.to_vec().unwrap(), &db_s.to_vec().unwrap(), "d_b");
+        cmp(&dg_b.to_vec().unwrap(), &dg_acc, "d_gamma");
+        cmp(&dbe_b.to_vec().unwrap(), &dbe_acc, "d_beta");
     }
 
     /// Smoke-test SynapseUNetTyped<D>::backward — full U-Net reverse
