@@ -1472,6 +1472,38 @@ pub fn rms_norm<D: Device>(
     D::rms_norm(&x.buffer, &weight.buffer, &mut out.buffer, n_rows, n_cols, eps)
 }
 
+/// Apply rotary position embedding (RoPE) to `x` `[n_tokens × n_heads × head_dim]`
+/// using NEOX pairing (rotate dims `i` and `i+head_dim/2`). `positions[t]` is the
+/// absolute position of token `t`; `base` is the RoPE frequency base. Optional
+/// `freq_factors` `[head_dim/2]` divide per-pair frequencies (Gemma; 1.0 = normal,
+/// huge = frozen dimension). Returns a new rotated tensor — host-bridged so it runs
+/// on any device; a fused GPU kernel can replace it later (rope is cheap vs matmul).
+pub fn rope<D: Device>(
+    x: &Tensor<D>,
+    positions: &[usize],
+    n_tokens: usize, n_heads: usize, head_dim: usize,
+    base: f32, freq_factors: Option<&[f32]>,
+) -> Result<Tensor<D>, BackendError> {
+    let mut o = x.to_vec()?;
+    let half = head_dim / 2;
+    for t in 0..n_tokens {
+        let pos = positions[t] as f32;
+        for h in 0..n_heads {
+            let off = (t * n_heads + h) * head_dim;
+            for i in 0..half {
+                let ff = freq_factors.map(|f| f[i]).unwrap_or(1.0);
+                let freq = base.powf(-2.0 * i as f32 / head_dim as f32) / ff;
+                let (s, c) = (pos * freq).sin_cos();
+                let x0 = o[off + i];
+                let x1 = o[off + i + half];
+                o[off + i] = x0 * c - x1 * s;
+                o[off + i + half] = x0 * s + x1 * c;
+            }
+        }
+    }
+    Tensor::<D>::from_slice(&o)
+}
+
 /// Element-wise SiLU `y = x · σ(x)` — see `Device::silu`.
 pub fn silu<D: Device>(
     x: &Tensor<D>, out: &mut Tensor<D>,
