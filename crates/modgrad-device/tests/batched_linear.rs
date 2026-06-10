@@ -9,7 +9,7 @@
 //!      actual GEMM-vs-GEMV wall-clock win on the live GPU at CTM sizes —
 //!      the number that justifies the whole batching refactor.
 
-use modgrad_device::backend::tensor::{Cpu, Linear, Tensor};
+use modgrad_device::backend::tensor::{Cpu, Linear, SuperLinear, Tensor};
 
 fn approx(a: &[f32], b: &[f32], name: &str) {
     assert_eq!(a.len(), b.len(), "{name}: length mismatch");
@@ -66,6 +66,48 @@ fn batched_linear_matches_scalar_cpu() {
     approx(&dx_b.to_vec().unwrap(), &dx_scalar, "d_x");
     approx(&dw_b.to_vec().unwrap(), &dw_s.to_vec().unwrap(), "d_w");
     approx(&db_b.to_vec().unwrap(), &db_s.to_vec().unwrap(), "d_b");
+}
+
+#[test]
+fn batched_super_linear_matches_scalar_cpu() {
+    let (n_neurons, in_per, out_per, batch) = (4usize, 3usize, 2usize, 5usize);
+    let w: Vec<f32> = (0..n_neurons * out_per * in_per)
+        .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
+    let bias: Vec<f32> = (0..n_neurons * out_per).map(|i| (i as f32 - 3.0) * 0.05).collect();
+    let sl = SuperLinear::<Cpu>::from_host(&w, &bias, n_neurons, in_per, out_per).unwrap();
+    let in_sz = n_neurons * in_per;
+    let out_sz = n_neurons * out_per;
+    let x: Vec<f32> = (0..batch * in_sz).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
+    let dy: Vec<f32> = (0..batch * out_sz).map(|i| ((i * 5 % 9) as f32 - 4.0) * 0.15).collect();
+
+    // Batched.
+    let xt = Tensor::<Cpu>::from_slice(&x).unwrap();
+    let y_b = sl.forward_batched(&xt, batch).unwrap().to_vec().unwrap();
+    let dyt = Tensor::<Cpu>::from_slice(&dy).unwrap();
+    let mut dw_b = Tensor::<Cpu>::zeros(w.len()).unwrap();
+    let mut db_b = Tensor::<Cpu>::zeros(bias.len()).unwrap();
+    let mut dtr_b = Tensor::<Cpu>::zeros(batch * in_sz).unwrap();
+    sl.backward_batched(&dyt, &xt, &mut dw_b, &mut db_b, &mut dtr_b, batch).unwrap();
+
+    // Scalar reference (d_w/d_b accumulate; d_trace per row).
+    let mut y_s = vec![0.0f32; batch * out_sz];
+    let mut dtr_s = vec![0.0f32; batch * in_sz];
+    let mut dw_s = Tensor::<Cpu>::zeros(w.len()).unwrap();
+    let mut db_s = Tensor::<Cpu>::zeros(bias.len()).unwrap();
+    for bi in 0..batch {
+        let xr = Tensor::<Cpu>::from_slice(&x[bi * in_sz..(bi + 1) * in_sz]).unwrap();
+        let yr = sl.forward(&xr).unwrap();
+        y_s[bi * out_sz..(bi + 1) * out_sz].copy_from_slice(&yr.to_vec().unwrap());
+        let dyr = Tensor::<Cpu>::from_slice(&dy[bi * out_sz..(bi + 1) * out_sz]).unwrap();
+        let mut dtrr = Tensor::<Cpu>::zeros(in_sz).unwrap();
+        sl.backward(&dyr, &xr, &mut dw_s, &mut db_s, &mut dtrr).unwrap();
+        dtr_s[bi * in_sz..(bi + 1) * in_sz].copy_from_slice(&dtrr.to_vec().unwrap());
+    }
+
+    approx(&y_b, &y_s, "sl_fwd");
+    approx(&dtr_b.to_vec().unwrap(), &dtr_s, "sl_d_trace");
+    approx(&dw_b.to_vec().unwrap(), &dw_s.to_vec().unwrap(), "sl_d_w");
+    approx(&db_b.to_vec().unwrap(), &db_s.to_vec().unwrap(), "sl_d_b");
 }
 
 #[cfg(feature = "rocm")]

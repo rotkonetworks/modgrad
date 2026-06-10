@@ -1884,6 +1884,61 @@ impl<D: Device> SuperLinear<D> {
         add_assign(d_biases, d_out, self.n_neurons * self.out_per)?;
         Ok(())
     }
+
+    /// Batch-capable forward. `x` is `[batch × n_neurons × in_per]`,
+    /// output `[batch × n_neurons × out_per]`. Makes the NLM usable in a
+    /// batched tick loop.
+    ///
+    /// NOTE: this loops over the batch reusing the per-neuron kernel — it
+    /// is batch-*capable*, not yet batch-*optimal*. The full GEMM win for
+    /// the NLM (grow the strided-batched inner `n` from 1 to B so each
+    /// neuron's RHS is `[in_per × B]`) is a device-kernel follow-up; the
+    /// synapse — the dominant per-tick FLOP — already has the full GEMM.
+    pub fn forward_batched(
+        &self,
+        x: &Tensor<D>,
+        batch: usize,
+    ) -> Result<Tensor<D>, BackendError> {
+        let in_sz = self.n_neurons * self.in_per;
+        let out_sz = self.n_neurons * self.out_per;
+        let x_host = x.to_vec()?;
+        let mut out_host = vec![0.0f32; batch * out_sz];
+        for b in 0..batch {
+            let xb = Tensor::<D>::from_slice(&x_host[b * in_sz..(b + 1) * in_sz])?;
+            let ob = self.forward(&xb)?;
+            out_host[b * out_sz..(b + 1) * out_sz].copy_from_slice(&ob.to_vec()?);
+        }
+        Tensor::<D>::from_slice(&out_host)
+    }
+
+    /// Batch-capable backward. `d_out`/`trace` are `[batch × n_neurons ×
+    /// {out_per,in_per}]`; `d_weights`/`d_biases` ACCUMULATE (batch-summed,
+    /// via the per-example backward); `d_trace` (`[batch × n_neurons ×
+    /// in_per]`) overwritten.
+    pub fn backward_batched(
+        &self,
+        d_out: &Tensor<D>,
+        trace: &Tensor<D>,
+        d_weights: &mut Tensor<D>,
+        d_biases: &mut Tensor<D>,
+        d_trace: &mut Tensor<D>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let in_sz = self.n_neurons * self.in_per;
+        let out_sz = self.n_neurons * self.out_per;
+        let do_host = d_out.to_vec()?;
+        let tr_host = trace.to_vec()?;
+        let mut dtr_host = vec![0.0f32; batch * in_sz];
+        for b in 0..batch {
+            let dob = Tensor::<D>::from_slice(&do_host[b * out_sz..(b + 1) * out_sz])?;
+            let trb = Tensor::<D>::from_slice(&tr_host[b * in_sz..(b + 1) * in_sz])?;
+            let mut dtrb = Tensor::<D>::zeros(in_sz)?;
+            self.backward(&dob, &trb, d_weights, d_biases, &mut dtrb)?;
+            dtr_host[b * in_sz..(b + 1) * in_sz].copy_from_slice(&dtrb.to_vec()?);
+        }
+        *d_trace = Tensor::<D>::from_slice(&dtr_host)?;
+        Ok(())
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────
