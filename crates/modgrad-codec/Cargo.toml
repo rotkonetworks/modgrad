@@ -28,3 +28,6 @@ rayon = "1"
 tracing = "0.1"
 wincode = "0.5"
 wincode-derive = "0.4"
+
+[dev-dependencies]
+serde_json = "1"

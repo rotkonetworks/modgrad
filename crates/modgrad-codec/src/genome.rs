@@ -361,9 +361,93 @@ impl Genome {
     }
 }
 
+// ─── ByteCortexGenome (A10) ───────────────────────────────────────
+//
+// The CTM-as-BLT-latent organism (bytes→encoder→CTM→decoder→bytes) as a
+// serializable spec, so ablations are config edits, not code forks —
+// mirroring `Genome::default_human_visual()` for the byte cortex.
+
+/// Innate spec of the whole byte-cortex organism.
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub struct ByteCortexGenome {
+    /// Patch representation width (encoder out == latent obs == latent out).
+    pub patch_dim: usize,
+    /// The latent thinker — CTM (recurrent thinking) is the North Star.
+    pub latent: LatentKind,
+    /// The unified surprise predictor (patcher + cerebellum + loss).
+    pub surprise: SurpriseSpec,
+    /// Episodic (hippocampus) recall — continuous memory, no window death.
+    pub episodic: EpisodicSpec,
+}
+
+/// Which `LatentThinker` the BLT mounts.
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub enum LatentKind {
+    /// Recurrent CTM — depth from thinking ticks. The North Star.
+    Ctm { d_model: usize, d_input: usize, iterations: usize, memory_length: usize },
+    /// Feedforward transformer latent — depth from stacked layers (legacy).
+    Transformer { n_layers: usize },
+    /// Identity passthrough — ablation: no latent thinking.
+    Identity,
+}
+
+/// The unified next-patch predictor (one model = patcher + cerebellum + loss).
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub struct SurpriseSpec {
+    /// Surprise threshold for a patch boundary (spatial chunking — A5).
+    pub boundary_threshold: f32,
+    /// Tick-budget bounds gated by surprise (temporal compute — A6).
+    pub min_ticks: usize,
+    pub max_ticks: usize,
+    pub tick_scale: f32,
+}
+
+/// Episodic memory — content-addressable recall (continuous memory — A8).
+#[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
+pub struct EpisodicSpec {
+    pub capacity: usize,
+    pub retrieval_threshold: f32,
+    /// `false` ablates episodic recall (back to bounded within-event memory).
+    pub enabled: bool,
+}
+
+impl ByteCortexGenome {
+    /// The production CTM-as-BLT-latent organism, mirroring
+    /// `default_human_visual()` for the byte cortex.
+    pub fn default_byte_cortex() -> Self {
+        Self {
+            patch_dim: 256,
+            latent: LatentKind::Ctm { d_model: 512, d_input: 1024, iterations: 8, memory_length: 16 },
+            surprise: SurpriseSpec { boundary_threshold: 1.0, min_ticks: 2, max_ticks: 8, tick_scale: 1.0 },
+            episodic: EpisodicSpec { capacity: 4096, retrieval_threshold: 0.7, enabled: true },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A10: the organism is a config — serde round-trips, and ablations
+    /// (no thinking / no memory) are pure config edits.
+    #[test]
+    fn byte_cortex_genome_round_trips_and_ablates() {
+        let g = ByteCortexGenome::default_byte_cortex();
+        let json = serde_json::to_string(&g).expect("serialize");
+        let back: ByteCortexGenome = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(serde_json::to_string(&back).unwrap(), json, "round-trip mismatch");
+
+        // Ablations are config edits, not code forks.
+        let mut no_think = g.clone();
+        no_think.latent = LatentKind::Identity;
+        let mut no_memory = g.clone();
+        no_memory.episodic.enabled = false;
+        assert!(matches!(no_think.latent, LatentKind::Identity));
+        assert!(!no_memory.episodic.enabled);
+        // Both still serialize.
+        serde_json::to_string(&no_think).unwrap();
+        serde_json::to_string(&no_memory).unwrap();
+    }
 
     #[test]
     fn default_human_visual_expresses() {
