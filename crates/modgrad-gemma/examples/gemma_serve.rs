@@ -22,7 +22,7 @@ fn main() {
     use std::net::{TcpListener, TcpStream};
     use std::time::Instant;
     use modgrad_device::kfd::gguf::GgufFile;
-    use modgrad_device::rocm_gemma::RocmGemma;
+    use modgrad_gemma::rocm_gemma::RocmGemma;
     use tokenizers::Tokenizer;
 
     let gguf_path = std::env::var("GEMMA_GGUF").unwrap_or_else(|_|
@@ -141,12 +141,12 @@ struct GenResult { thinking: String, answer: String, tokens: usize, prompt_token
 
 /// Ensure the model is resident in VRAM (lazy load), returning a mutable handle.
 #[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
-fn ensure_loaded<'a>(model: &'a mut Option<modgrad_device::rocm_gemma::RocmGemma>,
+fn ensure_loaded<'a>(model: &'a mut Option<modgrad_gemma::rocm_gemma::RocmGemma>,
     g: &modgrad_device::kfd::gguf::GgufFile, file: &[u8], max_seq: usize)
-    -> Result<&'a mut modgrad_device::rocm_gemma::RocmGemma, String> {
+    -> Result<&'a mut modgrad_gemma::rocm_gemma::RocmGemma, String> {
     if model.is_none() {
         eprintln!("[gemma_serve] (re)loading model into VRAM ...");
-        *model = Some(modgrad_device::rocm_gemma::RocmGemma::load(g, file, max_seq)?);
+        *model = Some(modgrad_gemma::rocm_gemma::RocmGemma::load(g, file, max_seq)?);
     }
     Ok(model.as_mut().unwrap())
 }
@@ -167,7 +167,7 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 #[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
 #[allow(clippy::too_many_arguments)]
 fn stream_generate(out: &mut std::net::TcpStream,
-    model: &mut Option<modgrad_device::rocm_gemma::RocmGemma>,
+    model: &mut Option<modgrad_gemma::rocm_gemma::RocmGemma>,
     g: &modgrad_device::kfd::gguf::GgufFile, file: &[u8], max_seq: usize,
     tok: &tokenizers::Tokenizer, bos: u32, stop: &[u32],
     prompt: &str, max_tokens: usize, wrap_chat: bool) -> Result<(), String> {
@@ -212,11 +212,11 @@ fn stream_generate(out: &mut std::net::TcpStream,
 /// Ensure the model is loaded (lazy), then tokenize + generate + split channels.
 #[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
 #[allow(clippy::too_many_arguments)]
-fn gen_answer(model: &mut Option<modgrad_device::rocm_gemma::RocmGemma>,
+fn gen_answer(model: &mut Option<modgrad_gemma::rocm_gemma::RocmGemma>,
               g: &modgrad_device::kfd::gguf::GgufFile, file: &[u8], max_seq: usize,
               tok: &tokenizers::Tokenizer, bos: u32, stop: &[u32],
               prompt: &str, max_tokens: usize, wrap_chat: bool) -> Result<GenResult, String> {
-    use modgrad_device::rocm_gemma::RocmGemma;
+    use modgrad_gemma::rocm_gemma::RocmGemma;
     use std::time::Instant;
     if prompt.is_empty() { return Err("missing prompt".into()); }
     let _ = RocmGemma::load; // keep import referenced
@@ -243,7 +243,7 @@ fn gen_answer(model: &mut Option<modgrad_device::rocm_gemma::RocmGemma>,
 /// Handle one MCP JSON-RPC request. Returns ("200"|"202", json-body).
 #[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
 #[allow(clippy::too_many_arguments)]
-fn handle_mcp(body: &[u8], model: &mut Option<modgrad_device::rocm_gemma::RocmGemma>,
+fn handle_mcp(body: &[u8], model: &mut Option<modgrad_gemma::rocm_gemma::RocmGemma>,
               g: &modgrad_device::kfd::gguf::GgufFile, file: &[u8], max_seq: usize,
               tok: &tokenizers::Tokenizer, bos: u32, stop: &[u32]) -> (&'static str, String) {
     use serde_json::{json, Value};
@@ -305,7 +305,7 @@ fn handle_mcp(body: &[u8], model: &mut Option<modgrad_device::rocm_gemma::RocmGe
                 }
                 "gemma_load" => {
                     if model.is_none() {
-                        match modgrad_device::rocm_gemma::RocmGemma::load(g, file, max_seq) {
+                        match modgrad_gemma::rocm_gemma::RocmGemma::load(g, file, max_seq) {
                             Ok(m) => { *model = Some(m); ok(tool_text("model loaded into VRAM".into(), false)) }
                             Err(e) => ok(tool_text(format!("load failed: {e}"), true)),
                         }
@@ -354,7 +354,7 @@ fn extract_text(v: &serde_json::Value) -> String {
 #[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
 #[allow(clippy::too_many_arguments)]
 fn handle_messages(out: &mut std::net::TcpStream, body: &[u8],
-    model: &mut Option<modgrad_device::rocm_gemma::RocmGemma>,
+    model: &mut Option<modgrad_gemma::rocm_gemma::RocmGemma>,
     g: &modgrad_device::kfd::gguf::GgufFile, file: &[u8], max_seq: usize,
     tok: &tokenizers::Tokenizer, bos: u32, stop: &[u32]) -> Result<(), String> {
     use std::io::Write;

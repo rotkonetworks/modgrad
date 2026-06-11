@@ -12,8 +12,9 @@ pub mod cuda;
 pub mod gpu;
 pub mod kfd;
 pub mod backend;
-#[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
-pub mod rocm_gemma;
+// NOTE: the Gemma-4 model (rocm_gemma) moved to the `modgrad-gemma` crate — it's
+// an application, not part of this general device SDK. The reusable primitives it
+// uses (HIP backend, K-quant matvec kernels, GGUF loader) stay here.
 
 // Shared lock for HIP-using tests across the workspace. Gated behind
 // `test-utils` so non-test builds are unaffected; downstream crates

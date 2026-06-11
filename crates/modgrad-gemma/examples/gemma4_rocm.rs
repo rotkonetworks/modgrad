@@ -7,7 +7,7 @@ fn main() {
     use std::io::Cursor;
     use std::time::Instant;
     use modgrad_device::kfd::gguf::GgufFile;
-    use modgrad_device::rocm_gemma::RocmGemma;
+    use modgrad_gemma::rocm_gemma::RocmGemma;
 
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).cloned().unwrap_or_else(||

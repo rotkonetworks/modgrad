@@ -12,9 +12,9 @@
 #![cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
 
 use std::collections::HashMap;
-use crate::backend::rocm::{HipBuffer, kern};
-use crate::backend::BackendError;
-use crate::kfd::gguf::{GgufFile, GgmlType, dequantize_row_q6_k};
+use modgrad_device::backend::rocm::{HipBuffer, kern};
+use modgrad_device::backend::BackendError;
+use modgrad_device::kfd::gguf::{GgufFile, GgmlType, dequantize_row_q6_k};
 
 /// Apply a repetition penalty to the logits of tokens seen in the last `last_n`
 /// of `hist` (deduped — once per distinct token), matching llama.cpp/ollama.
@@ -127,7 +127,7 @@ impl RocmGemma {
         // buffers + the display. Too small a margin → "Not enough memory for
         // command submission" → GPU reset → Xorg crash (learned the hard way).
         let margin: usize = 1536 * 1024 * 1024;
-        let (free, total) = crate::backend::rocm::kern::vram_free_total().map_err(|e| e.to_string())?;
+        let (free, total) = modgrad_device::backend::rocm::kern::vram_free_total().map_err(|e| e.to_string())?;
         eprintln!("VRAM guard: need ~{:.2} GiB resident; free {:.2} / {:.2} GiB",
             resident as f64 / 1.073741824e9, free as f64 / 1.073741824e9, total as f64 / 1.073741824e9);
         if resident + margin > free {
@@ -234,7 +234,7 @@ impl RocmGemma {
 
         // Keep token_embd resident (GPU lm_head) if it still fits with margin —
         // otherwise CPU lm_head fallback. Re-query free VRAM after the layer uploads.
-        let (free_now, _) = crate::backend::rocm::kern::vram_free_total().map_err(|e| e.to_string())?;
+        let (free_now, _) = modgrad_device::backend::rocm::kern::vram_free_total().map_err(|e| e.to_string())?;
         // Keep token_embd resident (GPU lm_head) if ≥0.9 GiB headroom remains
         // after. GPU lm_head at AUTO clocks was proven stable at ~1 GiB headroom
         // (the crash only happened when ALSO forcing clocks — do NOT force clocks

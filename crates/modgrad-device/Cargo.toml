@@ -58,8 +58,3 @@ ash = { version = "0.38", optional = true }
 # reference. Catches shape-specific bugs the hand-written parity cases
 # can't cover.
 proptest = "1"
-# The gemma_serve example (HTTP inference server) loads the canonical
-# Gemma tokenizer.json and parses JSON requests. tokenizers is already a
-# workspace dep (modgrad-io); kept as dev-deps so the library stays lean.
-tokenizers = "0.21"
-serde_json = "1"

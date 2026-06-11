@@ -4625,8 +4625,6 @@ dependencies = [
  "libc",
  "proptest",
  "rayon",
- "serde_json",
- "tokenizers",
 ]
 
 [[package]]
@@ -4643,6 +4641,17 @@ dependencies = [
  "serde",
  "wincode",
  "wincode-derive",
+]
+
+[[package]]
+name = "modgrad-gemma"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "modgrad-device",
+ "rayon",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]
