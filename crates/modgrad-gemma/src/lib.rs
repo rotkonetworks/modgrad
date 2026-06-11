@@ -7,3 +7,5 @@
 //! K-quant matvec kernels, the GGUF loader — live in `modgrad-device`.
 
 pub mod rocm_gemma;
+// `LanguageModel` impl that serves Gemma over the model-agnostic modgrad-serve.
+pub mod serve_model;

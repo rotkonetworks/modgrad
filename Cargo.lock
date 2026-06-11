@@ -4649,8 +4649,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "modgrad-device",
+ "modgrad-serve",
  "rayon",
- "serde_json",
  "tokenizers",
 ]
 
@@ -4700,6 +4700,13 @@ dependencies = [
 [[package]]
 name = "modgrad-prompts"
 version = "0.1.0"
+
+[[package]]
+name = "modgrad-serve"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "modgrad-substrate"

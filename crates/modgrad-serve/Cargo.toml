@@ -1,0 +1,11 @@
+[package]
+name = "modgrad-serve"
+version = "0.1.0"
+edition = "2024"
+description = "Model-agnostic local inference server: REST + Anthropic Messages API + MCP, over a LanguageModel trait"
+license = "MIT"
+
+[dependencies]
+# JSON for the MCP JSON-RPC + Anthropic /v1/messages payloads. No model deps:
+# this crate knows nothing about any specific model.
+serde_json = "1"

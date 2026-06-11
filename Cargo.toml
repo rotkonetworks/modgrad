@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/modgrad-traits",
     "crates/modgrad-device",
+    "crates/modgrad-serve",
     "crates/modgrad-gemma",
     "crates/modgrad-persist",
     "crates/modgrad-compute",
