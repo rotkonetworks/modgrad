@@ -12,6 +12,8 @@ pub mod cuda;
 pub mod gpu;
 pub mod kfd;
 pub mod backend;
+#[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
+pub mod rocm_gemma;
 
 // Shared lock for HIP-using tests across the workspace. Gated behind
 // `test-utils` so non-test builds are unaffected; downstream crates

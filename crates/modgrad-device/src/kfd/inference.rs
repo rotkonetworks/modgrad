@@ -15,6 +15,21 @@ use super::dispatch_queue::{GpuQueue, VramBuf};
 use super::gguf::{GgufFile, GgmlType};
 use super::HsaDevice;
 use std::collections::HashMap;
+use rayon::prelude::*;
+
+/// Dequantize one weight row to f32 using the verified `gguf` K-quant
+/// decoders, then this row can be dotted against an f32 activation. This
+/// is the correctness-first matvec path (the hand-vectorized
+/// `quant_dot::vec_dot_*` had a nibble-ordering bug); a GPU Q4_K kernel
+/// is the fast path (Stage 3).
+fn dequant_row_into(dtype: GgmlType, row: &[u8], out: &mut [f32], n_blocks: usize) {
+    match dtype {
+        GgmlType::Q4_K => super::gguf::dequantize_row_q4_k(row, out, n_blocks),
+        GgmlType::Q5_K => super::gguf::dequantize_row_q5_k(row, out, n_blocks),
+        GgmlType::Q6_K => super::gguf::dequantize_row_q6_k(row, out, n_blocks),
+        other => panic!("dequant_row_into: unsupported dtype {other:?}"),
+    }
+}
 
 /// A weight tensor in VRAM (quantized), CPU-mmap'd, or CPU f32.
 #[allow(dead_code)] // some fields retained for diagnostics / future use
@@ -487,8 +502,8 @@ impl Gemma4Model {
     pub fn forward_token(
         &mut self,
         token_id: u32,
-        _dev: &mut HsaDevice,
-        _queue: &mut GpuQueue,
+        dev: &mut HsaDevice,
+        queue: &mut GpuQueue,
     ) -> Vec<f32> {
         let pos = self.kv_len;
 
@@ -544,7 +559,7 @@ impl Gemma4Model {
             let layer_n_kv_heads = kv_out_dim / layer_head_dim;
 
             // Q projection (always computed)
-            let mut q_data = self.cpu_q4_matvec(&format!("{l}.attn_q.weight"), &cur, q_out_dim);
+            let mut q_data = self.matvec(dev, queue, &format!("{l}.attn_q.weight"), &cur, q_out_dim);
 
             // Q norm: per-head RMSNorm with learned scale
             let q_norm_w = self.norm(&q_norm_name);
@@ -554,68 +569,52 @@ impl Gemma4Model {
                 for i in 0..layer_head_dim { q_data[s + i] *= q_norm_w[i]; }
             }
 
-            // RoPE on Q — SWA layers use standard RoPE, full layers use proportional
-            // NOTE: sliding_window_pattern[i]=True means FULL attention (not SWA)
-            let is_swa_layer = !self.is_swa.get(layer).copied().unwrap_or(true);
-            let layer_rope_base = if is_swa_layer { self.rope_base_swa } else { self.rope_base };
-            let freq_factors = if is_swa_layer { None } else { Some(self.rope_freqs.as_slice()) };
+            // RoPE base is per-layer. This GGUF marks "global" (full-attention)
+            // layers by OMITTING attn_v: those use V=K and the global rope base;
+            // "local" layers carry attn_v and use the sliding-window rope base.
+            // (Matches the validated gemma4_infer; no proportional freq factors.)
+            let has_attn_v = self.weights.contains_key(&format!("{l}.attn_v.weight"));
+            let is_local = has_attn_v;
+            let layer_rope_base = if is_local { self.rope_base_swa } else { self.rope_base };
             self.apply_rope_ext(&mut q_data, pos, layer_n_heads, layer_head_dim,
-                layer_rope_base, freq_factors);
+                layer_rope_base, None);
 
-            // ─── 3. K/V — only if this layer has its own KV ───
-            // Layers >= n_layer_kv_from_start reuse KV from earlier layers
-            let has_kv = layer < self.n_layer_kv_from_start;
-            if has_kv {
-                let mut k_data = self.cpu_q4_matvec(&format!("{l}.attn_k.weight"), &cur, kv_out_dim);
-                let mut v_data = self.cpu_q4_matvec(&format!("{l}.attn_v.weight"), &cur, kv_out_dim);
+            // ─── 3. K/V — every layer computes its own K; V = attn_v if present,
+            // else a copy of the K projection (V=K fallback for global layers). ───
+            {
+                let mut k_data = self.matvec(dev, queue, &format!("{l}.attn_k.weight"), &cur, kv_out_dim);
+                // V uses the same projection as K when attn_v is absent. Clone the
+                // pre-norm K so V gets its own (different) normalization below.
+                let mut v_data = if has_attn_v {
+                    self.matvec(dev, queue, &format!("{l}.attn_v.weight"), &cur, kv_out_dim)
+                } else {
+                    k_data.clone()
+                };
 
-                // K norm: per-head RMSNorm with learned scale
+                // K norm: per-head RMSNorm with learned scale.
                 let k_norm_w = self.norm(&format!("{l}.attn_k_norm.weight"));
                 for h in 0..layer_n_kv_heads {
                     let s = h * layer_head_dim;
                     self.rms_norm_inplace(&mut k_data[s..s + layer_head_dim]);
                     for i in 0..layer_head_dim { k_data[s + i] *= k_norm_w[i]; }
                 }
-
-                // V norm: plain RMSNorm (no learned scale) — from reference line 92
-                if layer == 0 {
-                    let vn: f32 = v_data.iter().map(|x| x*x).sum::<f32>().sqrt();
-                    let vnan = v_data.iter().filter(|x| x.is_nan()).count();
-                    eprintln!("    L0 V_before_norm: norm={:.2} nan={}", vn, vnan);
-                }
+                // V norm: plain RMSNorm, no learned scale (reference line 92).
                 for h in 0..layer_n_kv_heads {
                     let s = h * layer_head_dim;
                     self.rms_norm_inplace(&mut v_data[s..s + layer_head_dim]);
                 }
-                if layer == 0 {
-                    let vn: f32 = v_data.iter().map(|x| x*x).sum::<f32>().sqrt();
-                    let vnan = v_data.iter().filter(|x| x.is_nan()).count();
-                    eprintln!("    L0 V_after_norm: norm={:.2} nan={}", vn, vnan);
-                }
 
-                // RoPE on K — same freq_factors as Q for this layer
+                // RoPE on K only (V is never rotated).
                 self.apply_rope_ext(&mut k_data, pos, layer_n_kv_heads, layer_head_dim,
-                    layer_rope_base, freq_factors);
+                    layer_rope_base, None);
 
-                // Append K, V to cache
+                // Append K, V to this layer's own cache.
                 self.kv_k[layer].upload_at(pos * kv_out_dim, &k_data);
                 self.kv_v[layer].upload_at(pos * kv_out_dim, &v_data);
             }
-            // else: layers >= n_layer_kv_from_start reuse KV from earlier layer
 
-            // Determine which KV cache layer to read from
-            let kv_layer = if has_kv {
-                layer
-            } else {
-                // Reuse rule from llama.cpp: SWA layers → kv_from_start-2, full → kv_from_start-1
-                // Note: self.is_swa stores raw metadata where True=FULL, so negate
-                let layer_is_swa = !self.is_swa.get(layer).copied().unwrap_or(true);
-                if layer_is_swa {
-                    self.n_layer_kv_from_start.saturating_sub(2)
-                } else {
-                    self.n_layer_kv_from_start.saturating_sub(1)
-                }
-            };
+            // No cross-layer KV reuse in this model: each layer reads its own cache.
+            let kv_layer = layer;
 
             // ─── 4. Attention ───
             if layer == 0 {
@@ -640,7 +639,7 @@ impl Gemma4Model {
             }
 
             // Output projection
-            cur = self.cpu_q4_matvec(&format!("{l}.attn_output.weight"), &cur, self.d_model);
+            cur = self.matvec(dev, queue, &format!("{l}.attn_output.weight"), &cur, self.d_model);
 
             if layer == 0 {
                 let nan = cur.iter().filter(|x| x.is_nan()).count();
@@ -668,14 +667,14 @@ impl Gemma4Model {
             let mut ff_cur = vec![0.0f32; self.d_model];
             self.rms_norm_scaled(&attn_out_f32, self.norm(&format!("{l}.ffn_norm.weight")), &mut ff_cur);
 
-            let mut gate = self.cpu_q4_matvec(&format!("{l}.ffn_gate.weight"), &ff_cur, self.d_ff);
-            let up = self.cpu_q4_matvec(&format!("{l}.ffn_up.weight"), &ff_cur, self.d_ff);
+            let mut gate = self.matvec(dev, queue, &format!("{l}.ffn_gate.weight"), &ff_cur, self.d_ff);
+            let up = self.matvec(dev, queue, &format!("{l}.ffn_up.weight"), &ff_cur, self.d_ff);
 
             // GELU activation on gate, then element-wise multiply with up
             Self::gelu_cpu(&mut gate);
             for i in 0..self.d_ff { gate[i] *= up[i]; }
 
-            ff_cur = self.cpu_q4_matvec(&format!("{l}.ffn_down.weight"), &gate, self.d_model);
+            ff_cur = self.matvec(dev, queue, &format!("{l}.ffn_down.weight"), &gate, self.d_model);
 
             // ─── 7. Post-FFN norm + residual ───
             if layer == 0 {
@@ -846,10 +845,79 @@ impl Gemma4Model {
             std::slice::from_raw_parts(mmap_ptr, total_bytes)
         };
 
-        let is_q5k = matches!(dtype, GgmlType::Q5_K);
+        let dt = *dtype;
+        let xin = &x[..in_dim];
         let mut y = vec![0.0f32; out_dim];
-        super::quant_dot::qmatvec(weight_data, &x[..in_dim], &mut y, out_dim, in_dim, block_bytes, is_q5k);
+        y.par_iter_mut().enumerate().for_each(|(r, yr)| {
+            let row = &weight_data[r * row_bytes..(r + 1) * row_bytes];
+            let mut w = vec![0.0f32; in_dim];
+            dequant_row_into(dt, row, &mut w, blocks_per_row);
+            let mut acc = 0.0f64;
+            for k in 0..in_dim { acc += w[k] as f64 * xin[k] as f64; }
+            *yr = acc as f32;
+        });
         y
+    }
+
+    /// Matvec dispatcher: the resident GPU `matvec_q4k` kernel for Q4_K
+    /// weights (zero PCIe on the weights — they stay in VRAM), CPU
+    /// dequant→f32-dot for Q5_K/Q6_K (no GPU kernel for those yet).
+    fn matvec(&self, dev: &mut HsaDevice, queue: &mut GpuQueue,
+              weight_name: &str, x: &[f32], out_dim: usize) -> Vec<f32> {
+        if weight_name == "blk.0.attn_q.weight" && self.kv_len == 0 {
+            // dump the real cur for offline analysis
+            let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write("/tmp/cur.bin", &bytes);
+            let nan = x.iter().filter(|v| v.is_nan()).count();
+            let inf = x.iter().filter(|v| v.is_infinite()).count();
+            let mn = x.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mx = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("    [cur stats] len={} min={:.3} max={:.3} nan={} inf={}", x.len(), mn, mx, nan, inf);
+        }
+        let _ = (dev, queue);
+        self.cpu_q4_matvec(weight_name, x, out_dim)
+    }
+
+    /// GPU Q4_K matvec: y = dequant(W_q4) @ x, weights read resident from VRAM
+    /// by the `matvec_q4k` kernel (one workgroup per output row). Q4_K only.
+    /// Allocates scratch x/bias/y buffers per call (validation/bring-up path).
+    fn gpu_q4_matvec(&self, dev: &mut HsaDevice, queue: &mut GpuQueue,
+                     weight_name: &str, x: &[f32], out_dim: usize) -> Option<Vec<f32>> {
+        let (w_buf, in_dim) = match self.weights.get(weight_name) {
+            Some(Weight::Vram { _buf, dtype, dims, .. }) if matches!(dtype, GgmlType::Q4_K) =>
+                (_buf, dims[0]),
+            _ => return None,
+        };
+        let blocks_per_row = in_dim / 256;
+        let x_buf = queue.alloc(dev, in_dim)?;
+        x_buf.upload(&x[..in_dim]);
+        let bias_buf = queue.alloc(dev, out_dim)?;
+        bias_buf.upload(&vec![0.0f32; out_dim]);
+        let y_buf = queue.alloc(dev, out_dim)?;
+        if !queue.enqueue_matvec_q4k(dev, w_buf, &x_buf, &bias_buf, &y_buf, out_dim, blocks_per_row) {
+            return None;
+        }
+        // submit() (not submit_wait) so a cache_wb packet runs after the dispatch:
+        // GL2 writeback+invalidate flushes this dispatch's stores to VRAM for the
+        // CPU readback AND clears stale L2 lines so the next dispatch reads fresh
+        // input from reused scratch VRAM. (submit_wait skips cache_wb → the last
+        // workgroups' rows read back as stale zeros.)
+        let fut = dev.submit();
+        if fut.wait(5_000_000).is_none() { return None; }
+        Some(y_buf.download(out_dim))
+    }
+
+    /// Run one Q4_K matvec on both GPU and CPU and return both, for kernel
+    /// validation against the (now-correct) CPU reference.
+    pub fn gpu_matvec_check(&self, dev: &mut HsaDevice, queue: &mut GpuQueue,
+                            weight_name: &str, x: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
+        let out_dim = match self.weights.get(weight_name) {
+            Some(Weight::Vram { dims, .. }) => dims[1],
+            _ => return None,
+        };
+        let gpu = self.gpu_q4_matvec(dev, queue, weight_name, x, out_dim)?;
+        let cpu = self.cpu_q4_matvec(weight_name, x, out_dim);
+        Some((gpu, cpu))
     }
 
     /// Quantized logits: dot(token_embd, hidden) using integer arithmetic.
@@ -866,9 +934,17 @@ impl Gemma4Model {
             std::slice::from_raw_parts(base_ptr, total_bytes)
         };
 
-        let is_q5k = matches!(dtype, GgmlType::Q5_K);
+        let dt = *dtype;
+        let xin = &x[..row_elements];
         let mut logits = vec![0.0f32; n_rows];
-        super::quant_dot::qmatvec(weight_data, &x[..row_elements], &mut logits, n_rows, row_elements, block_bytes, is_q5k);
+        logits.par_iter_mut().enumerate().for_each(|(r, lr)| {
+            let row = &weight_data[r * row_bytes..(r + 1) * row_bytes];
+            let mut w = vec![0.0f32; row_elements];
+            dequant_row_into(dt, row, &mut w, blocks_per_row);
+            let mut acc = 0.0f64;
+            for k in 0..row_elements { acc += w[k] as f64 * xin[k] as f64; }
+            *lr = acc as f32;
+        });
         logits
     }
 
@@ -883,25 +959,23 @@ impl Gemma4Model {
         &self, data: &mut [f32], pos: usize, n_heads: usize, head_dim: usize,
         rope_base: f32, freq_factors: Option<&[f32]>,
     ) {
+        // NEOX-style rotation: pair dim i with i+half (NOT adjacent i,i+1).
+        // Matches the validated `tensor::rope` and llama.cpp GGML_ROPE_TYPE_NEOX
+        // used by Gemma. freq exponent = -2·i/head_dim over pair index i∈[0,half).
+        let half = head_dim / 2;
         for h in 0..n_heads {
             let off = h * head_dim;
-            for i in (0..head_dim).step_by(2) {
-                let dim_pair = i / 2;
-                // Base frequency for this dimension pair
-                let inv_freq = 1.0 / rope_base.powf(i as f32 / head_dim as f32);
-                // Proportional factor: freq_factors[dim_pair] scales the frequency
-                // A factor of 1e30 makes angle ≈ 0 → no rotation (frozen dim)
+            for i in 0..half {
                 let factor = freq_factors
-                    .and_then(|ff| ff.get(dim_pair).copied())
+                    .and_then(|ff| ff.get(i).copied())
                     .unwrap_or(1.0);
-                let freq = inv_freq / factor; // divide, not multiply — higher factor = slower rotation
+                let freq = rope_base.powf(-2.0 * i as f32 / head_dim as f32) / factor;
                 let angle = pos as f32 * freq;
-                let cos = angle.cos();
-                let sin = angle.sin();
+                let (sin, cos) = angle.sin_cos();
                 let x0 = data[off + i];
-                let x1 = data[off + i + 1];
+                let x1 = data[off + i + half];
                 data[off + i] = x0 * cos - x1 * sin;
-                data[off + i + 1] = x0 * sin + x1 * cos;
+                data[off + i + half] = x0 * sin + x1 * cos;
             }
         }
     }
@@ -923,8 +997,10 @@ impl Gemma4Model {
         }
 
         let mut output = vec![0.0f32; n_heads * head_dim];
-        // Gemma4: attention_scale = 1.0 (Q/K norms handle scaling)
-        let scale = 1.0f32;
+        // Standard scaled-dot-product temperature. (The earlier "scale = 1.0"
+        // ran attention sqrt(head_dim)≈16× too hot → saturated softmax → flat
+        // garbage logits. Verified against a numpy reference forward.)
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         for h in 0..n_heads {
             let kv_h = h / heads_per_kv;

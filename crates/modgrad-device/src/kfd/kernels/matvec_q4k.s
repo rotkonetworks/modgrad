@@ -42,19 +42,19 @@ matvec_q4k:
 
     // ─── Precompute per-thread constants (same for all blocks) ───
 
-    // qs_idx and is_high from tid
-    v_cmp_ge_u32 vcc_lo, v0, 128
-    v_sub_nc_u32 v1, v0, 128
-    v_cndmask_b32 v1, v0, v1, vcc_lo    // v1 = qs_idx
-    v_cndmask_b32 v2, 0, 1, vcc_lo      // v2 = is_high
-
-    // scale_idx (is): 0-7
-    v_lshrrev_b32 v3, 5, v0
-    v_lshrrev_b32 v4, 5, v1
-    v_cmp_lt_u32 vcc_lo, v0, 128
-    v_cndmask_b32 v3, v4, v3, vcc_lo
-    v_lshlrev_b32 v3, 1, v3
-    v_add_nc_u32 v4, v3, v2              // v4 = is (0..7)
+    // Element index within the 256-block = tid (v0). ggml Q4_K layout:
+    //   is (sub-block / scale) = tid >> 5            (0..7)
+    //   is_high (which nibble) = (tid >> 5) & 1
+    //   qs_idx (byte in qs[])  = ((tid >> 6) << 5) | (tid & 31)
+    // (The previous mapping reconstructed all-low-then-all-high within the
+    //  block, a permutation of the correct layout — the same nibble-ordering
+    //  bug that was in the CPU dequant. x stays in natural position order.)
+    v_lshrrev_b32 v4, 5, v0             // v4 = is = tid/32
+    v_and_b32    v2, 1, v4              // v2 = is_high = is & 1
+    v_lshrrev_b32 v1, 6, v0             // tid/64
+    v_lshlrev_b32 v1, 5, v1             // (tid/64)*32
+    v_and_b32    v6, 31, v0             // tid & 31
+    v_or_b32     v1, v1, v6             // v1 = qs_idx
 
     // Byte position in scales: shift = (is%4)*8
     v_and_b32    v5, 3, v4

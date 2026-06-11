@@ -373,29 +373,137 @@ pub fn dequantize_row_q4_k(data: &[u8], out: &mut [f32], n_blocks: usize) {
         let scales = &b[4..16];
         let qs = &b[16..144];
 
+        // ggml `dequantize_row_q4_K` order: for each 32-byte group of qs,
+        // emit its 32 low-nibble values then its 32 high-nibble values,
+        // writing the output sequentially. The previous code wrote
+        // all-low-then-all-high within the 256-block, which is a *permutation*
+        // of the correct layout — same values, wrong positions — so every
+        // matvec silently misaligned weights against activations.
         let base = blk * Q4K_BLOCK_ELEMS;
+        let mut out_idx = base;
         let mut is = 0;
         for j in (0..128).step_by(32) {
             let (sc, m) = q4k_get_scale_min_k4(is, scales);
             let d1 = d * sc as f32;
             let m1 = dmin * m as f32;
             for l in 0..32 {
-                if base + j + l < out.len() {
-                    out[base + j + l] = d1 * (qs[j + l] & 0xF) as f32 - m1;
-                }
+                if out_idx < out.len() { out[out_idx] = d1 * (qs[j + l] & 0xF) as f32 - m1; }
+                out_idx += 1;
             }
             is += 1;
             let (sc, m) = q4k_get_scale_min_k4(is, scales);
             let d2 = d * sc as f32;
             let m2 = dmin * m as f32;
             for l in 0..32 {
-                if base + j + l + 128 < out.len() {
-                    out[base + j + l + 128] = d2 * (qs[j + l] >> 4) as f32 - m2;
-                }
+                if out_idx < out.len() { out[out_idx] = d2 * (qs[j + l] >> 4) as f32 - m2; }
+                out_idx += 1;
             }
             is += 1;
         }
     }
+}
+
+/// Unpack the 6-bit packed scale/min for K-quant sub-block `j` (shared by
+/// Q4_K and Q5_K). Mirrors llama.cpp `get_scale_min_k4`.
+#[inline]
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Dequantize Q5_K (176 bytes / 256 elems). Matches llama.cpp `dequantize_row_q5_K`.
+pub fn dequantize_row_q5_k(data: &[u8], out: &mut [f32], n_blocks: usize) {
+    for blk in 0..n_blocks {
+        let b = &data[blk * 176..];
+        let mut d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let mut dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        if d.is_nan() || d.is_infinite() { d = 0.0; }
+        if dmin.is_nan() || dmin.is_infinite() { dmin = 0.0; }
+        let scales = &b[4..16];
+        let qh = &b[16..48];
+        let mut ql = &b[48..176];
+        let base = blk * 256;
+        let (mut is, mut u1, mut u2, mut out_idx): (usize, u8, u8, usize) = (0, 1, 2, base);
+        for _j in (0..256).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (d1, dm1) = (d * sc1 as f32, dmin * m1 as f32);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let (d2, dm2) = (d * sc2 as f32, dmin * m2 as f32);
+            for l in 0..32 {
+                let hbit = if qh[l] & u1 != 0 { 16u8 } else { 0u8 };
+                if out_idx < out.len() { out[out_idx] = d1 * ((ql[l] & 0xF) + hbit) as f32 - dm1; }
+                out_idx += 1;
+            }
+            for l in 0..32 {
+                let hbit = if qh[l] & u2 != 0 { 16u8 } else { 0u8 };
+                if out_idx < out.len() { out[out_idx] = d2 * ((ql[l] >> 4) + hbit) as f32 - dm2; }
+                out_idx += 1;
+            }
+            ql = &ql[32..];
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+/// Dequantize Q6_K (210 bytes / 256 elems). Matches llama.cpp `dequantize_row_q6_K`.
+pub fn dequantize_row_q6_k(data: &[u8], out: &mut [f32], n_blocks: usize) {
+    for blk in 0..n_blocks {
+        let b = &data[blk * 210..];
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let sc = &b[192..208];
+        let mut d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+        if d.is_nan() || d.is_infinite() { d = 0.0; }
+        let base = blk * 256;
+        for grp in 0..2 {
+            let (qlb, qhb, scb, yb) = (grp * 64, grp * 32, grp * 8, base + grp * 128);
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = (((ql[qlb + l] & 0xF) as i32) | ((((qh[qhb + l]) & 3) as i32) << 4)) - 32;
+                let q2 = (((ql[qlb + l + 32] & 0xF) as i32) | ((((qh[qhb + l] >> 2) & 3) as i32) << 4)) - 32;
+                let q3 = (((ql[qlb + l] >> 4) as i32) | ((((qh[qhb + l] >> 4) & 3) as i32) << 4)) - 32;
+                let q4 = (((ql[qlb + l + 32] >> 4) as i32) | ((((qh[qhb + l] >> 6) & 3) as i32) << 4)) - 32;
+                let s = |k: usize| (sc[scb + k] as i8) as i32 as f32;
+                if yb + l + 96 < out.len() {
+                    out[yb + l] = d * s(is) * q1 as f32;
+                    out[yb + l + 32] = d * s(is + 2) * q2 as f32;
+                    out[yb + l + 64] = d * s(is + 4) * q3 as f32;
+                    out[yb + l + 96] = d * s(is + 6) * q4 as f32;
+                }
+            }
+        }
+    }
+}
+
+/// Dequantize a whole tensor's raw bytes into `n_elements` f32 values. Handles
+/// F32, F16, and the K-quants (Q4_K/Q5_K/Q6_K) used by Gemma/Llama GGUFs.
+pub fn dequantize_tensor(dtype: GgmlType, data: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_elements];
+    match dtype {
+        GgmlType::F32 => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = f32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
+            }
+        }
+        GgmlType::F16 => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = f16_to_f32(u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]));
+            }
+        }
+        GgmlType::Q4_K => dequantize_row_q4_k(data, &mut out, n_elements / 256),
+        GgmlType::Q5_K => dequantize_row_q5_k(data, &mut out, n_elements / 256),
+        GgmlType::Q6_K => dequantize_row_q6_k(data, &mut out, n_elements / 256),
+        other => panic!("dequantize_tensor: unsupported dtype {other:?}"),
+    }
+    out
 }
 
 /// Per-sub-block (min, max) of `x` clamped to fit Q4_K's packing

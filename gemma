@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# gemma — control the local Gemma-4-12B inference + MCP server.
+#
+#   gemma start     launch the server (loads model into VRAM, ~6.5 GiB)
+#   gemma stop      kill the server  -> VRAM fully freed (go game)
+#   gemma unload    free VRAM but KEEP the server running (MCP stays up)
+#   gemma load      reload the model into VRAM
+#   gemma status    is it running? loaded?
+#   gemma restart   stop + start
+#   gemma ask "..." quick one-shot question (REST)
+#
+# Env: GEMMA_ADDR (default 127.0.0.1:8080), GEMMA_MAX_SEQ (512), GEMMA_LAZY=1.
+set -uo pipefail
+DIR="/steam/rotko/modgrad"
+BIN="$DIR/target/release/examples/gemma_serve"
+PIDF="/tmp/gemma_serve.pid"
+LOG="/tmp/gemma_serve.log"
+ADDR="${GEMMA_ADDR:-127.0.0.1:8080}"
+URL="http://$ADDR"
+
+# robust: detect the actual process, not just our PID file (works even if it was
+# started some other way).
+running() { pgrep -f "examples/gemma_serve" >/dev/null 2>&1; }
+mcp() { # mcp <tool>
+  curl -s -X POST "$URL/mcp" -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":{}}}" \
+    | python3 -c 'import sys,json;
+try: print(json.load(sys.stdin)["result"]["content"][0]["text"])
+except Exception: print("(no response — is the server up?)")' 2>/dev/null
+}
+
+case "${1:-status}" in
+  start)
+    if running; then echo "already running (pid $(pgrep -f 'examples/gemma_serve' | head -1))"; exit 0; fi
+    echo "starting gemma_serve ..."
+    GEMMA_MAX_SEQ="${GEMMA_MAX_SEQ:-512}" nohup "$BIN" >"$LOG" 2>&1 &
+    echo $! > "$PIDF"
+    for _ in $(seq 1 90); do
+      grep -q READY "$LOG" 2>/dev/null && { echo "READY  ($URL  — MCP at $URL/mcp)"; exit 0; }
+      grep -qiE "panic|over-commit" "$LOG" 2>/dev/null && { echo "FAILED:"; tail -3 "$LOG"; exit 1; }
+      sleep 1
+    done
+    echo "timed out waiting for READY; see $LOG" ;;
+  stop)
+    pkill -9 -f gemma_serve 2>/dev/null
+    rm -f "$PIDF"
+    echo "stopped — VRAM freed" ;;
+  restart) "$0" stop; sleep 2; "$0" start ;;
+  status)
+    if running; then
+      echo "running (pid $(pgrep -f 'examples/gemma_serve' | head -1)) @ $URL"
+      curl -s --max-time 3 "$URL/health" >/dev/null 2>&1 && echo "  reachable; $(mcp gemma_status)" || echo "  not yet reachable"
+    else echo "not running"; fi ;;
+  unload) mcp gemma_unload ;;
+  load)   mcp gemma_load ;;
+  ask)
+    shift
+    q="$*"
+    curl -s --max-time 120 "$URL/generate" -H 'content-type: application/json' \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"prompt": sys.argv[1], "max_tokens": 256}))' "$q")" \
+      | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("text",""));
+t=d.get("thinking","");
+print("\n[reasoning] "+t) if t else None' 2>/dev/null ;;
+  *) echo "usage: gemma {start|stop|restart|status|load|unload|ask <question>}" ;;
+esac

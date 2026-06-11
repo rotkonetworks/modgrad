@@ -35,6 +35,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed=kernels/rms_norm.hip");
     println!("cargo:rerun-if-changed=kernels/dequant_q4k.hip");
+    println!("cargo:rerun-if-changed=kernels/matvec_q4k.hip");
+    println!("cargo:rerun-if-changed=kernels/matvec_q5k.hip");
+    println!("cargo:rerun-if-changed=kernels/matvec_q4k_dp4a.hip");
+    println!("cargo:rerun-if-changed=kernels/matvec_q6k.hip");
+    println!("cargo:rerun-if-changed=kernels/gemma_glue.hip");
+    println!("cargo:rerun-if-changed=kernels/sdpa_decode.hip");
     println!("cargo:rerun-if-changed=kernels/per_neuron_glu_batched.hip");
     println!("cargo:rerun-if-changed=kernels/rope_backward.hip");
 
@@ -85,6 +91,12 @@ fn compile_hipcc_kernels(rocm: &str) {
         "kernels/rms_norm.hip",
         "kernels/rms_norm_backward.hip",
         "kernels/dequant_q4k.hip",
+        "kernels/matvec_q4k.hip",
+        "kernels/matvec_q5k.hip",
+        "kernels/matvec_q4k_dp4a.hip",
+        "kernels/matvec_q6k.hip",
+        "kernels/gemma_glue.hip",
+        "kernels/sdpa_decode.hip",
         "kernels/per_neuron_glu_batched.hip",
         "kernels/adamw.hip",
         "kernels/rope_backward.hip",

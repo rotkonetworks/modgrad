@@ -54,6 +54,7 @@ pub mod ffi {
     #[link(name = "amdhip64")]
     unsafe extern "C" {
         pub fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
+        pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
         pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
         pub fn hipFree(ptr: *mut c_void) -> hipError_t;
         pub fn hipMemcpy(
@@ -432,6 +433,55 @@ pub mod ffi {
             fp32_out: *mut f32,
         ) -> hipError_t;
 
+        // Fused Q4_K matvec: y = dequant(W_q4) @ x. All pointers are
+        // device buffers. `w_q4` is `out_dim * blocks_per_row * 144`
+        // bytes of resident Q4_K; `x` is `blocks_per_row * 256` f32;
+        // `y` receives `out_dim` f32. See `kernels/matvec_q4k.hip`.
+        pub fn launch_matvec_q4k(
+            w_q4: *const u8,
+            x: *const f32,
+            y: *mut f32,
+            out_dim: c_int,
+            blocks_per_row: c_int,
+        ) -> hipError_t;
+
+        // Fused Q5_K matvec (ffn_down / attn_v). Same ABI as q4k; weight
+        // is `out_dim * blocks_per_row * 176` bytes. See matvec_q5k.hip.
+        pub fn launch_matvec_q5k(
+            w_q5: *const u8,
+            x: *const f32,
+            y: *mut f32,
+            out_dim: c_int,
+            blocks_per_row: c_int,
+        ) -> hipError_t;
+
+        // dp4a Q4_K path: quantize activation to int8 (Q8_1, per 32-block), then
+        // matvec with int32 wide loads + __dp4a. See matvec_q4k_dp4a.hip.
+        pub fn launch_quantize_q8_1(x: *const f32, xq: *mut i8, xd: *mut f32, xsum: *mut f32, n: c_int) -> hipError_t;
+        pub fn launch_matvec_q4k_dp4a(w: *const u8, xq: *const i8, xd: *const f32, xsum: *const f32,
+            y: *mut f32, out_dim: c_int, bpr: c_int) -> hipError_t;
+
+        // Q6_K matvec (tied lm_head). Weight `out_dim*blocks_per_row*210` bytes.
+        pub fn launch_matvec_q6k(
+            w_q6: *const u8, x: *const f32, y: *mut f32,
+            out_dim: c_int, blocks_per_row: c_int,
+        ) -> hipError_t;
+
+        // Resident Gemma glue (gemma_glue.hip) — all in-place / device ptrs.
+        pub fn launch_residual_add(h: *mut f32, x: *const f32, n: c_int) -> hipError_t;
+        pub fn launch_scale(h: *mut f32, s: f32, n: c_int) -> hipError_t;
+        pub fn launch_geglu(gate: *const f32, up: *const f32, out: *mut f32, n: c_int) -> hipError_t;
+        pub fn launch_softcap(y: *mut f32, cap: f32, n: c_int) -> hipError_t;
+        pub fn launch_rope_neox(data: *mut f32, pos: c_int, n_heads: c_int, head_dim: c_int, base: f32, freq_factors: *const f32) -> hipError_t;
+        pub fn launch_copy(dst: *mut f32, src: *const f32, n: c_int) -> hipError_t;
+
+        // Decode attention (sdpa_decode.hip).
+        pub fn launch_sdpa_decode(
+            q: *const f32, k_cache: *const f32, v_cache: *const f32, out: *mut f32,
+            n_heads: c_int, n_kv_heads: c_int, head_dim: c_int, seq_len: c_int,
+            kv_dim: c_int, scale: f32, win_start: c_int,
+        ) -> hipError_t;
+
         // AdamW (decoupled-weight-decay) optimizer step. One thread per
         // element; updates `w`, `m`, `v` in place. `bc1_inv` / `bc2_inv`
         // are the bias-correction reciprocals computed by the caller
@@ -566,6 +616,133 @@ impl HipBuffer {
         self.upload_f32(src)
     }
 
+    /// Stage raw host bytes (e.g. quantized GGUF weight data) into this
+    /// device buffer. Used to make Q4_K weights resident for the fused
+    /// matvec kernel.
+    pub fn copy_from_host_bytes(&self, src: &[u8]) -> Result<(), BackendError> {
+        if src.len() > self.bytes {
+            return Err(BackendError::Runtime(format!(
+                "copy_from_host_bytes: src {} > buf {}", src.len(), self.bytes,
+            )));
+        }
+        let err = unsafe {
+            ffi::hipMemcpy(
+                self.ptr,
+                src.as_ptr() as *const std::os::raw::c_void,
+                src.len(),
+                ffi::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipMemcpy H2D bytes: {}", ffi::hip_err_str(err)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fused Q4_K matvec with this buffer as the resident weight:
+    /// `y = dequant(self) @ x`. `x` is host f32 (uploaded), the
+    /// `out_dim`-length result is returned on host. Entirely on the HIP
+    /// runtime (stable dispatch) — no raw KFD.
+    #[cfg(modgrad_hipcc_kernels)]
+    pub fn matvec_q4k(&self, x: &[f32], out_dim: usize, blocks_per_row: usize)
+        -> Result<Vec<f32>, BackendError>
+    {
+        let in_dim = blocks_per_row * 256;
+        let x_dev = HipBuffer::new(in_dim * 4)?;
+        x_dev.copy_from_host(&x[..in_dim])?;
+        let y_dev = HipBuffer::new(out_dim * 4)?;
+        let err = unsafe {
+            ffi::launch_matvec_q4k(
+                self.ptr as *const u8,
+                x_dev.ptr as *const f32,
+                y_dev.ptr as *mut f32,
+                out_dim as std::os::raw::c_int,
+                blocks_per_row as std::os::raw::c_int,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_matvec_q4k: {}", ffi::hip_err_str(err))));
+        }
+        let serr = unsafe { ffi::hipDeviceSynchronize() };
+        if serr != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipDeviceSynchronize: {}", ffi::hip_err_str(serr))));
+        }
+        let mut y = vec![0.0f32; out_dim];
+        y_dev.copy_to_host(&mut y)?;
+        Ok(y)
+    }
+
+    /// Steady-state fused Q4_K matvec: caller provides resident device
+    /// `x_dev` (already filled, `blocks_per_row*256` f32) and `y_dev`
+    /// (`out_dim` f32) — no per-call alloc/copy. This is what the engine
+    /// uses (weights + scratch all resident; only the small activation
+    /// vector is refreshed per call).
+    #[cfg(modgrad_hipcc_kernels)]
+    pub fn matvec_q4k_into(&self, x_dev: &HipBuffer, y_dev: &HipBuffer,
+                           out_dim: usize, blocks_per_row: usize) -> Result<(), BackendError> {
+        let err = unsafe {
+            ffi::launch_matvec_q4k(
+                self.ptr as *const u8,
+                x_dev.ptr as *const f32,
+                y_dev.ptr as *mut f32,
+                out_dim as std::os::raw::c_int,
+                blocks_per_row as std::os::raw::c_int,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!(
+                "launch_matvec_q4k: {}", ffi::hip_err_str(err))));
+        }
+        let serr = unsafe { ffi::hipDeviceSynchronize() };
+        if serr != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipDeviceSynchronize: {}", ffi::hip_err_str(serr))));
+        }
+        Ok(())
+    }
+
+    /// Q5_K matvec with this buffer as the resident weight; host x in, host
+    /// result out (validation/bring-up). See `matvec_q4k`.
+    #[cfg(modgrad_hipcc_kernels)]
+    pub fn matvec_q5k(&self, x: &[f32], out_dim: usize, blocks_per_row: usize)
+        -> Result<Vec<f32>, BackendError>
+    {
+        let in_dim = blocks_per_row * 256;
+        let x_dev = HipBuffer::new(in_dim * 4)?;
+        x_dev.copy_from_host(&x[..in_dim])?;
+        let y_dev = HipBuffer::new(out_dim * 4)?;
+        let err = unsafe {
+            ffi::launch_matvec_q5k(self.ptr as *const u8, x_dev.ptr as *const f32,
+                y_dev.ptr as *mut f32, out_dim as std::os::raw::c_int,
+                blocks_per_row as std::os::raw::c_int)
+        };
+        if err != 0 { return Err(BackendError::Runtime(format!("launch_matvec_q5k: {}", ffi::hip_err_str(err)))); }
+        let serr = unsafe { ffi::hipDeviceSynchronize() };
+        if serr != 0 { return Err(BackendError::Runtime(format!("hipDeviceSynchronize: {}", ffi::hip_err_str(serr)))); }
+        let mut y = vec![0.0f32; out_dim];
+        y_dev.copy_to_host(&mut y)?;
+        Ok(y)
+    }
+
+    /// Steady-state Q5_K matvec with caller-provided resident device buffers.
+    #[cfg(modgrad_hipcc_kernels)]
+    pub fn matvec_q5k_into(&self, x_dev: &HipBuffer, y_dev: &HipBuffer,
+                           out_dim: usize, blocks_per_row: usize) -> Result<(), BackendError> {
+        let err = unsafe {
+            ffi::launch_matvec_q5k(self.ptr as *const u8, x_dev.ptr as *const f32,
+                y_dev.ptr as *mut f32, out_dim as std::os::raw::c_int,
+                blocks_per_row as std::os::raw::c_int)
+        };
+        if err != 0 { return Err(BackendError::Runtime(format!("launch_matvec_q5k: {}", ffi::hip_err_str(err)))); }
+        let serr = unsafe { ffi::hipDeviceSynchronize() };
+        if serr != 0 { return Err(BackendError::Runtime(format!("hipDeviceSynchronize: {}", ffi::hip_err_str(serr)))); }
+        Ok(())
+    }
+
     /// Public alias for `download_f32`.
     pub fn copy_to_host(&self, dst: &mut [f32]) -> Result<(), BackendError> {
         self.download_f32(dst)
@@ -688,6 +865,110 @@ impl HipBuffer {
     /// Raw device pointer as f32* (for BLAS calls).
     fn as_f32_ptr(&self) -> *mut f32 {
         self.ptr as *mut f32
+    }
+
+    /// Device-f32 pointer at an f32 element offset (resident-engine slicing,
+    /// e.g. KV-cache append at `pos*kv_dim`).
+    pub fn f32_at(&self, off: usize) -> *mut f32 {
+        unsafe { (self.ptr as *mut f32).add(off) }
+    }
+    /// Device-f32 const pointer.
+    pub fn f32_ptr(&self) -> *const f32 { self.ptr as *const f32 }
+    /// Device-byte const pointer (quantized weights).
+    pub fn u8_ptr(&self) -> *const u8 { self.ptr as *const u8 }
+    /// Device-byte const pointer at a byte offset (sub-slice of a consolidated
+    /// weight arena — one big alloc instead of hundreds, less VRAM fragmentation).
+    pub fn u8_at(&self, off: usize) -> *const u8 { unsafe { (self.ptr as *const u8).add(off) } }
+
+    /// Stage host bytes into this buffer at a byte offset (for packing many
+    /// tensors into one consolidated allocation).
+    pub fn copy_from_host_bytes_at(&self, off: usize, src: &[u8]) -> Result<(), BackendError> {
+        if off + src.len() > self.bytes {
+            return Err(BackendError::Runtime(format!(
+                "copy_from_host_bytes_at: off {off} + {} > buf {}", src.len(), self.bytes)));
+        }
+        let err = unsafe {
+            ffi::hipMemcpy(
+                (self.ptr as *mut u8).add(off) as *mut std::os::raw::c_void,
+                src.as_ptr() as *const std::os::raw::c_void,
+                src.len(),
+                ffi::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        if err != 0 {
+            return Err(BackendError::Runtime(format!("hipMemcpy H2D at: {}", ffi::hip_err_str(err))));
+        }
+        Ok(())
+    }
+}
+
+/// Launch-only kernel wrappers for the resident Gemma engine. They take raw
+/// device pointers (so weight / activation / KV-cache buffers mix freely) and
+/// do NOT synchronize — every kernel runs on the default stream in order, and
+/// the engine syncs ONCE per token via [`hip_sync`]. This is what keeps the
+/// activation in VRAM with zero PCIe bounce.
+#[cfg(all(feature = "rocm", modgrad_hipcc_kernels))]
+pub mod kern {
+    use super::{ffi, BackendError};
+    use std::os::raw::c_int;
+
+    #[inline] fn chk(err: i32, what: &str) -> Result<(), BackendError> {
+        if err != 0 { Err(BackendError::Runtime(format!("{what}: {}", ffi::hip_err_str(err)))) } else { Ok(()) }
+    }
+    /// One device sync — call once after a token's kernels are all queued.
+    pub fn hip_sync() -> Result<(), BackendError> {
+        chk(unsafe { ffi::hipDeviceSynchronize() }, "hipDeviceSynchronize")
+    }
+    /// (free, total) VRAM in bytes — used to refuse loads that would
+    /// over-commit the display GPU (which resets the GPU and crashes Xorg).
+    pub fn vram_free_total() -> Result<(usize, usize), BackendError> {
+        let mut free = 0usize; let mut total = 0usize;
+        chk(unsafe { ffi::hipMemGetInfo(&mut free, &mut total) }, "hipMemGetInfo")?;
+        Ok((free, total))
+    }
+    pub unsafe fn matvec_q4k(w: *const u8, x: *const f32, y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_matvec_q4k(w, x, y, out_dim as c_int, bpr as c_int) }, "matvec_q4k")
+    }
+    pub unsafe fn matvec_q5k(w: *const u8, x: *const f32, y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_matvec_q5k(w, x, y, out_dim as c_int, bpr as c_int) }, "matvec_q5k")
+    }
+    pub unsafe fn matvec_q6k(w: *const u8, x: *const f32, y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_matvec_q6k(w, x, y, out_dim as c_int, bpr as c_int) }, "matvec_q6k")
+    }
+    pub unsafe fn quantize_q8_1(x: *const f32, xq: *mut i8, xd: *mut f32, xsum: *mut f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_quantize_q8_1(x, xq, xd, xsum, n as c_int) }, "quantize_q8_1")
+    }
+    pub unsafe fn matvec_q4k_dp4a(w: *const u8, xq: *const i8, xd: *const f32, xsum: *const f32,
+        y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_matvec_q4k_dp4a(w, xq, xd, xsum, y, out_dim as c_int, bpr as c_int) }, "matvec_q4k_dp4a")
+    }
+    pub unsafe fn rms_norm(x: *const f32, w: *const f32, y: *mut f32, n: usize, hidden: usize, eps: f32) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_rms_norm(x, w, y, n as c_int, hidden as c_int, eps) }, "rms_norm")
+    }
+    pub unsafe fn residual_add(h: *mut f32, x: *const f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_residual_add(h, x, n as c_int) }, "residual_add")
+    }
+    pub unsafe fn scale(h: *mut f32, s: f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_scale(h, s, n as c_int) }, "scale")
+    }
+    pub unsafe fn geglu(gate: *const f32, up: *const f32, out: *mut f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_geglu(gate, up, out, n as c_int) }, "geglu")
+    }
+    pub unsafe fn softcap(y: *mut f32, cap: f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_softcap(y, cap, n as c_int) }, "softcap")
+    }
+    pub unsafe fn rope_neox(data: *mut f32, pos: usize, n_heads: usize, head_dim: usize, base: f32, freq_factors: *const f32) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_rope_neox(data, pos as c_int, n_heads as c_int, head_dim as c_int, base, freq_factors) }, "rope_neox")
+    }
+    pub unsafe fn copy(dst: *mut f32, src: *const f32, n: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_copy(dst, src, n as c_int) }, "copy")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sdpa_decode(q: *const f32, k: *const f32, v: *const f32, out: *mut f32,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, kv_dim: usize,
+        scale: f32, win_start: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_sdpa_decode(q, k, v, out, n_heads as c_int, n_kv_heads as c_int,
+            head_dim as c_int, seq_len as c_int, kv_dim as c_int, scale, win_start as c_int) }, "sdpa_decode")
     }
 }
 

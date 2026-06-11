@@ -109,23 +109,47 @@ fn main() {
         total_bytes as f64 / (1u64 << 30) as f64,
         8.0 - total_bytes as f64 / (1u64 << 30) as f64);
 
-    // Show a few representative tensor names + shapes.
-    println!("\n── sample tensors ──");
-    let mut names: Vec<&String> = gguf.tensor_list.iter().take(6).collect();
-    for n in ["output.weight", "token_embd.weight", "output_norm.weight"] {
-        if let Some(t) = gguf.tensors.get(n) {
-            let s = &t.name;
-            if !names.iter().any(|x| *x == s) {
-                names.push(s);
+    // Per-layer tensor dump — reveals local/global structure + shared KV.
+    for layer in [0usize, 1, 4, 5, 6] {
+        let prefix = format!("blk.{layer}.");
+        let mut lt: Vec<&String> = gguf.tensor_list.iter().filter(|n| n.starts_with(&prefix)).collect();
+        lt.sort();
+        println!("\n── blk.{layer} ({} tensors) ──", lt.len());
+        for n in lt {
+            if let Some(t) = gguf.tensors.get(n) {
+                println!("    {:34} {:?} {:?}", n.strip_prefix(&prefix).unwrap_or(n), t.dims, t.dtype);
             }
         }
     }
-    for n in names {
-        if let Some(t) = gguf.tensors.get(n) {
-            println!("  {:40} {:?} {:?}", t.name, t.dims, t.dtype);
+
+    // All gemma4.* + general.* metadata (layer_types, sliding_window_pattern, etc.).
+    println!("\n── metadata ({arch}.* + general.*) ──");
+    let mut keys: Vec<&String> = gguf.metadata.keys().collect();
+    keys.sort();
+    for k in keys {
+        if k.starts_with(&arch) || k.starts_with("general") || k.contains("rope") {
+            if k.contains("tokenizer") { continue; }
+            println!("    {k} = {}", meta_brief(&gguf.metadata[k]));
         }
     }
-    let _ = GgmlType::F32; // keep the import if unused above
+    let _ = GgmlType::F32;
+}
+
+fn meta_brief(v: &modgrad_device::kfd::gguf::MetaValue) -> String {
+    use modgrad_device::kfd::gguf::MetaValue as M;
+    match v {
+        M::Str(s) => format!("\"{s}\""),
+        M::U32(n) => n.to_string(),
+        M::I32(n) => n.to_string(),
+        M::U64(n) => n.to_string(),
+        M::F32(f) => f.to_string(),
+        M::Bool(b) => b.to_string(),
+        M::Array(a) => {
+            let head: Vec<String> = a.iter().take(8).map(meta_brief).collect();
+            format!("[{} items: {}{}]", a.len(), head.join(", "), if a.len() > 8 { ", …" } else { "" })
+        }
+        other => format!("{other:?}"),
+    }
 }
 
 // Tiny helper to pull a string MetaValue without importing the enum variants.
