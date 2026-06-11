@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "ocr_smoke_train"
 path = "src/bin/train.rs"
 
+[[bin]]
+name = "ocr_smoke_bench"
+path = "src/bin/bench.rs"
+
 [lib]
 path = "src/lib.rs"
 
@@ -26,3 +30,6 @@ modgrad-ctm = { path = "../../crates/modgrad-ctm" }
 # transitive dep so we're not adding new vendored code, just declaring
 # the direct use. Wasm-clean.
 ab_glyph = "0.2"
+# PNG output for the head-to-head benchmark (dump test images that
+# Node-side PP-OCRv5 can read). Default features = no other formats.
+png = "0.17"

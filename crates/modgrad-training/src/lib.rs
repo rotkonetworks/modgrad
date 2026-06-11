@@ -19,3 +19,4 @@ pub use outer_optimizer::{OuterOptimizer, NoOpOuter};
 pub mod metrics;
 pub mod grad_accum;
 pub mod grad_ckpt;
+pub mod ctc;

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0d1117" />
+
+    <!-- ── Primary SEO ── -->
+    <title>OCR Online — Browser-side OCR for PDFs and images</title>
+    <meta name="description" content="PDFs and images are processed locally with PP-OCRv5 mobile via onnxruntime-web. No upload, no backend. Open source." />
+    <meta name="keywords" content="OCR, PDF OCR, image to text, browser OCR, client-side OCR, PaddleOCR, PP-OCRv5, onnxruntime-web" />
+    <meta name="author" content="rotko.net" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://ocr.rotko.net/" />
+
+    <!--
+      Hint the browser to open TCP+TLS to the model + runtime origins
+      while the rest of the page is still loading. Shaves ≈300-500 ms
+      off the first-paint → first-OCR-ready interval on cold connect.
+    -->
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link rel="preconnect" href="https://media.githubusercontent.com" crossorigin />
+    <link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin />
+
+    <!-- ── Open Graph ── -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://ocr.rotko.net/" />
+    <meta property="og:title" content="OCR Online" />
+    <meta property="og:description" content="Browser-side OCR for PDFs and images. PP-OCRv5 mobile via onnxruntime-web. No backend." />
+    <meta property="og:site_name" content="OCR Online" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:image" content="https://ocr.rotko.net/og.svg" />
+    <meta property="og:image:type" content="image/svg+xml" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="OCR Online — browser-side OCR for PDFs and images" />
+
+    <!-- ── Twitter card ── -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="OCR Online" />
+    <meta name="twitter:description" content="Browser-side OCR for PDFs and images." />
+    <meta name="twitter:image" content="https://ocr.rotko.net/og.svg" />
+    <meta name="twitter:image:alt" content="OCR Online — browser-side OCR" />
+
+    <!-- ── Schema.org structured data ── -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "OCR Online",
+      "description": "Browser-side OCR for PDFs and images. PP-OCRv5 mobile via onnxruntime-web. No backend.",
+      "url": "https://ocr.rotko.net/",
+      "applicationCategory": "Utility",
+      "operatingSystem": "Any (browser)",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "browserRequirements": "WebAssembly",
+      "featureList": [
+        "PDF text-layer extraction (no model invoked)",
+        "Image OCR (PP-OCRv5 mobile)",
+        "Embed via iframe + postMessage SDK",
+        "Plain-text and JSON export"
+      ],
+      "publisher": { "@type": "Organization", "name": "rotko.net", "url": "https://rotko.net/" }
+    }
+    </script>
+    <!--
+      FAQPage structured data. Kept in sync with /content.json by hand
+      because Google reads it from the HTML head, not at runtime.
+    -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        { "@type": "Question", "name": "Is it free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. There is no backend, so there is no per-request cost on the host side. Static assets and model weights are served by public CDNs." } },
+        { "@type": "Question", "name": "What model is used?", "acceptedAnswer": { "@type": "Answer", "text": "PaddleOCR PP-OCRv5 mobile, via ppu-paddle-ocr and onnxruntime-web." } },
+        { "@type": "Question", "name": "What about large PDFs?", "acceptedAnswer": { "@type": "Answer", "text": "Pages are rasterised one at a time and processed in parallel by the worker pool. Files above 500 MB require explicit confirmation to avoid out-of-memory failures." } },
+        { "@type": "Question", "name": "Can I embed this?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. A hidden iframe + postMessage SDK is published at /embed.html and /embed-client.js. See /embed-demo.html." } },
+        { "@type": "Question", "name": "Is the source code open?", "acceptedAnswer": { "@type": "Answer", "text": "github.com/rotkonetworks/modgrad, examples/ocr_wasm." } },
+        { "@type": "Question", "name": "Are documents uploaded anywhere?", "acceptedAnswer": { "@type": "Answer", "text": "No. The pipeline is entirely client-side. Verify in the browser's network tab during processing." } }
+      ]
+    }
+    </script>
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <!--
+      Content-Security-Policy is delivered as an HTTP response header by
+      nginx so directives like `frame-ancestors` (which the browser
+      ignores when delivered via <meta>) take effect. See the nginx
+      site config in deploy/ocr-rotko.conf.
+    -->
+
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%E2%97%89%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <noscript>
+      <div style="max-width:720px;margin:3rem auto;padding:1rem 1.5rem;font-family:Verdana,sans-serif;color:#14171a">
+        <h1 style="font-size:1.2rem;background:#000066;color:#fff;padding:.5rem .75rem;margin:0 0 .75rem">OCR Online</h1>
+        <p>Browser-side OCR for PDFs and images. This page needs JavaScript and
+          WebAssembly. PP-OCRv5 mobile runs via onnxruntime-web; PDFs with an
+          embedded text layer are read directly without invoking the model.</p>
+        <p>Source: <a href="https://github.com/rotkonetworks/modgrad">github.com/rotkonetworks/modgrad</a>,
+          examples/ocr_wasm.</p>
+      </div>
+    </noscript>
+
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

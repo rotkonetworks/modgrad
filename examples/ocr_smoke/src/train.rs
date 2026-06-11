@@ -28,12 +28,23 @@ use crate::render::ALPHABET_SIZE;
 /// Class 0 is blank. The wrapped loss is identical to the underlying
 /// `ctc_loss_grad`; this adapter only handles the `Vec<Vec<f32>>` ↔
 /// flat conversion the modgrad pipeline needs.
+///
+/// `smoothing` (0.0 default): label-smoothing strength. Mixes the CTC
+/// gradient with `eps * (softmax(y) - uniform)`, which pulls the
+/// predicted distribution gently toward uniform. Helps escape the
+/// classic CTC "predict mostly blank" attractor by penalising
+/// over-confident wrong predictions. Values around 0.05–0.1 are
+/// typical; pure CTC = 0.0.
 pub struct CtcLossFn {
     pub alphabet_size: usize,
+    pub smoothing: f32,
 }
 
 impl CtcLossFn {
-    pub fn new() -> Self { Self { alphabet_size: ALPHABET_SIZE } }
+    pub fn new() -> Self { Self { alphabet_size: ALPHABET_SIZE, smoothing: 0.0 } }
+    pub fn with_smoothing(eps: f32) -> Self {
+        Self { alphabet_size: ALPHABET_SIZE, smoothing: eps }
+    }
 }
 
 impl Default for CtcLossFn {
@@ -62,7 +73,35 @@ impl LossFn for CtcLossFn {
             debug_assert_eq!(row.len(), a, "prediction width != alphabet_size");
             flat.extend_from_slice(row);
         }
-        let (nll, grad_flat) = ctc_loss_grad(&flat, a, target);
+        let (nll, mut grad_flat) = ctc_loss_grad(&flat, a, target);
+
+        // Label smoothing: add eps * (softmax(logits) - uniform) at
+        // every (t, k). This is the gradient of the entropy-pull term
+        //   eps * KL(softmax(logits) || uniform)
+        // w.r.t. the logits — analytically clean and cheap.
+        if self.smoothing > 0.0 {
+            let eps = self.smoothing;
+            let inv_a = 1.0 / a as f32;
+            for ti in 0..t {
+                // Row-wise softmax for numerical stability.
+                let off = ti * a;
+                let row = &flat[off..off + a];
+                let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let mut sum = 0.0f32;
+                let mut sm = vec![0.0f32; a];
+                for k in 0..a {
+                    let e = (row[k] - max).exp();
+                    sm[k] = e;
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                for k in 0..a {
+                    let pk = sm[k] * inv;
+                    grad_flat[off + k] += eps * (pk - inv_a);
+                }
+            }
+        }
+
         // Reshape grad back into Vec<Vec<f32>>.
         let mut d_preds = Vec::with_capacity(t);
         for ti in 0..t {
@@ -122,7 +161,7 @@ mod tests {
             vec![0.1, 0.1, 0.8],
         ];
         let target: Vec<usize> = vec![1, 2];
-        let loss_fn = CtcLossFn { alphabet_size: a };
+        let loss_fn = CtcLossFn { alphabet_size: a, smoothing: 0.0 };
         let (loss, d_preds) = loss_fn.compute(&predictions, &[], &target);
         assert!(loss.is_finite() && loss > 0.0);
         assert_eq!(d_preds.len(), 4);

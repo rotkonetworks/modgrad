@@ -3954,17 +3954,17 @@ fn regional_train_step_inner(
 
 /// Per-parameter AdamW state: first moment, second moment.
 #[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
-pub(crate) struct AdamWBuf {
-    pub(crate) m: Vec<f32>,
-    pub(crate) v: Vec<f32>,
+pub struct AdamWBuf {
+    pub m: Vec<f32>,
+    pub v: Vec<f32>,
 }
 
 impl AdamWBuf {
-    fn zeros(n: usize) -> Self {
+    pub fn zeros(n: usize) -> Self {
         Self { m: vec![0.0; n], v: vec![0.0; n] }
     }
 
-    pub(crate) fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
+    pub fn step(&mut self, weights: &mut [f32], grads: &mut [f32], lr: f32, wd: f32, b1: f32, b2: f32, eps: f32, bc1: f32, bc2: f32) {
         use modgrad_device::backend::{ops, AdamWArgs};
         ops::adamw(AdamWArgs {
             w: weights, g: grads, m: &mut self.m, v: &mut self.v,
@@ -3987,25 +3987,25 @@ impl AdamWBuf {
 /// region shapes are static post-construction), the bufs would need
 /// rebuild; that's out of scope for the static-graph training path.
 #[derive(Debug, Clone, Serialize, Deserialize, SchemaRead, SchemaWrite)]
-pub(crate) struct RegionInnerAdamW {
-    nlm_s1_w: AdamWBuf,
-    nlm_s1_b: AdamWBuf,
-    nlm_s2_w: Option<AdamWBuf>,
-    nlm_s2_b: Option<AdamWBuf>,
-    kv_proj_w: AdamWBuf,
-    kv_proj_b: AdamWBuf,
-    q_proj_w: AdamWBuf,
-    q_proj_b: AdamWBuf,
-    mha_in_w: AdamWBuf,
-    mha_in_b: AdamWBuf,
-    mha_out_w: AdamWBuf,
-    mha_out_b: AdamWBuf,
-    out_proj_w: AdamWBuf,
-    out_proj_b: AdamWBuf,
+pub struct RegionInnerAdamW {
+    pub nlm_s1_w: AdamWBuf,
+    pub nlm_s1_b: AdamWBuf,
+    pub nlm_s2_w: Option<AdamWBuf>,
+    pub nlm_s2_b: Option<AdamWBuf>,
+    pub kv_proj_w: AdamWBuf,
+    pub kv_proj_b: AdamWBuf,
+    pub q_proj_w: AdamWBuf,
+    pub q_proj_b: AdamWBuf,
+    pub mha_in_w: AdamWBuf,
+    pub mha_in_b: AdamWBuf,
+    pub mha_out_w: AdamWBuf,
+    pub mha_out_b: AdamWBuf,
+    pub out_proj_w: AdamWBuf,
+    pub out_proj_b: AdamWBuf,
 }
 
 impl RegionInnerAdamW {
-    pub(crate) fn zeros(rw: &CtmWeights) -> Self {
+    pub fn zeros(rw: &CtmWeights) -> Self {
         Self {
             nlm_s1_w: AdamWBuf::zeros(rw.nlm_stage1.weights.len()),
             nlm_s1_b: AdamWBuf::zeros(rw.nlm_stage1.biases.len()),
@@ -4028,7 +4028,7 @@ impl RegionInnerAdamW {
     /// LayerNorm tensors get `wd=0` (no weight decay), weight tensors
     /// get the caller's `wd`. Mirrors the convention used by
     /// `RegionalAdamW::step` for outer weights.
-    pub(crate) fn step(
+    pub fn step(
         &mut self,
         rw: &mut CtmWeights,
         rg: &mut crate::train::CtmGradients,

@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0d1117" />
+    <title>OCR Online — Embed API Demo</title>
+    <meta name="description" content="Live demo and integration guide for the OCR Online embed API. Drop a hidden iframe into your page and call recognize(file) — documents never leave the browser." />
+    <link rel="canonical" href="https://ocr.rotko.net/embed-demo.html" />
+    <meta property="og:title" content="OCR Online — Embed API" />
+    <meta property="og:description" content="Stripe-Elements-style iframe API for client-side OCR. No backend." />
+    <meta property="og:type" content="article" />
+    <style>
+      :root { color-scheme: light dark; font-family: Verdana, Geneva, Tahoma, sans-serif; font-size: 15px; line-height: 1.55; }
+      body { margin: 0; padding: 0; background: #f7f7f5; color: #14171a; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #0d1117; color: #e6edf3; }
+        .panel, pre { background: #161b22; border-color: #30363d; }
+        kbd, .pill { border-color: #30363d; background: #1c222b; }
+        a { color: #5b85ff; }
+      }
+      .wrap { max-width: 880px; margin: 0 auto; padding: 0 1rem 4rem; }
+      h1 { background: #000066; color: #fff; padding: 1rem 1.25rem; margin: 0 0 1rem; font-size: 1.4rem; font-weight: bold; }
+      .lead { background: #eaeaea; padding: .5rem 1.25rem; margin: 0 0 1.25rem; font-size: .85rem; }
+      @media (prefers-color-scheme: dark) { .lead { background: #1c222b; color: #a8b2bf; } }
+      h2 { font-size: 1rem; background: #000066; color: #fff; padding: .4rem .75rem; margin: 1.5rem 0 .75rem; font-weight: bold; letter-spacing: .04em; text-transform: uppercase; }
+      .panel { background: #ebebe8; border: 1px solid #7a7a76; padding: 1rem; }
+      pre { background: #fff; border: 1px solid #b8b8b4; padding: .75rem 1rem; overflow-x: auto; font-family: ui-monospace, monospace; font-size: 13px; }
+      code { font-family: ui-monospace, monospace; }
+      kbd { font: inherit; font-size: .85em; border: 1px solid #999; padding: 0 .35em; background: #f3f3f3; }
+      .pill { display: inline-block; padding: .1em .55em; border: 1px solid #999; background: #f8f8f8; font-family: ui-monospace, monospace; font-size: .8em; }
+      .row { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+      @media (min-width: 720px) { .row { grid-template-columns: 1fr 1fr; } }
+      input[type=file] { display: block; margin: .5rem 0; }
+      button { font: inherit; padding: .35rem .75rem; background: #000066; color: #fff; border: 1px solid #2245c2; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      #status { font-family: ui-monospace, monospace; font-size: 12px; margin-top: .5rem; min-height: 1.2em; }
+      #output { white-space: pre-wrap; word-break: break-word; min-height: 4rem; max-height: 22rem; overflow: auto; }
+      ul { padding-left: 1.1rem; }
+      footer { margin-top: 3rem; font-size: .8rem; color: #888; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>OCR Online — Embed API</h1>
+      <div class="lead">A client-side OCR component you embed in your app, like Stripe Elements. Documents never reach a server.</div>
+
+      <h2>Try it</h2>
+      <div class="panel">
+        <p style="margin:0 0 .5rem">Pick an image or paste one from your clipboard. Recognition happens inside a hidden iframe pointing at <code>/embed.html</code>; this page never sees the pixel data after handing it over.</p>
+        <input id="file" type="file" accept="image/*,application/pdf" />
+        <button id="run" disabled>Recognise</button>
+        <div id="status">loading model…</div>
+        <pre id="output" aria-live="polite"></pre>
+      </div>
+
+      <h2>Integration</h2>
+      <div class="panel">
+        <p style="margin:0 0 .5rem">Drop a hidden iframe in your page and import the SDK. The iframe runs OCR locally; your page calls <code>recognize()</code> like a normal async function.</p>
+<pre>&lt;script type="module"&gt;
+  import { OcrClient } from 'https://ocr.rotko.net/embed-client.js'
+
+  const ocr = await OcrClient.attach('https://ocr.rotko.net/embed.html')
+  const result = await ocr.recognize(file)   // File | Blob | ImageBitmap | ImageData
+  console.log(result.text, result.items, result.avgConfidence)
+&lt;/script&gt;</pre>
+      </div>
+
+      <h2>What the embed does</h2>
+      <div class="panel">
+        <ul>
+          <li>Loads the PP-OCRv5 mobile model (≈17 MB) + the onnxruntime wasm (≈26 MB) once; subsequent calls are zero-network.</li>
+          <li>Receives <code>Blob</code> / <code>ImageBitmap</code> / <code>ImageData</code> via <code>postMessage</code>; runs OCR inside a Web Worker on its own origin.</li>
+          <li>Posts back <code>{text, items, avgConfidence}</code>. No persistence; closing the embed clears everything.</li>
+          <li>Source code: <a href="https://github.com/rotkonetworks/modgrad/tree/main/examples/ocr_wasm" target="_blank" rel="noopener">github.com/rotkonetworks/modgrad</a></li>
+        </ul>
+      </div>
+
+      <h2>Wire protocol</h2>
+      <div class="panel">
+        <p style="margin:0 0 .5rem">If you'd rather not use the SDK, the postMessage envelopes are tiny:</p>
+<pre>// parent → embed
+{ type: 'ocr/recognize', id: number, blob | bitmap | imageData }
+
+// embed → parent
+{ type: 'ocr/hello',  version: 1 }      // on iframe load
+{ type: 'ocr/ready' }                    // once models are cached
+{ type: 'ocr/result', id, text, items, avgConfidence }
+{ type: 'ocr/error',  id, error }</pre>
+      </div>
+
+      <footer>OCR Online · runs in your browser · <a href="/">main app</a> · <a href="/embed.html">embed entry</a></footer>
+    </div>
+
+    <iframe id="ocr" src="/embed.html" hidden></iframe>
+    <!--
+      In production: `/embed-client.js` is emitted at the document root
+      by the Vite build (see vite.config.ts entryFileNames).
+      In dev (`npm run dev`): there is no such file — Vite serves
+      modules from /src instead. We dynamic-import via the right URL.
+    -->
+    <script type="module">
+      ;(async () => {
+        // In production: `/embed-client.js` is emitted at the document root.
+        // In dev: that path doesn't exist; load from /src instead.
+        const sdkUrl = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+          ? '/src/embed-client.ts'
+          : '/embed-client.js'
+        const { OcrClient } = await import(/* @vite-ignore */ sdkUrl)
+        const statusEl = document.getElementById('status')
+        const outputEl = document.getElementById('output')
+        const fileEl = document.getElementById('file')
+        const runBtn = document.getElementById('run')
+
+        let ocr = null
+        try {
+          ocr = await OcrClient.attach(
+            document.getElementById('ocr'),
+            { awaitModelReady: true },
+          )
+          statusEl.textContent = 'model ready · pick a file or paste an image'
+          runBtn.disabled = false
+        } catch (e) {
+          statusEl.textContent = 'failed to attach embed: ' + e.message
+          return
+        }
+
+        async function run(file) {
+          outputEl.textContent = ''
+          statusEl.textContent = 'recognising…'
+          const t0 = performance.now()
+          try {
+            const r = await ocr.recognize(file)
+            const ms = Math.round(performance.now() - t0)
+            statusEl.textContent =
+              'done · ' + r.items.length + ' lines · ' +
+              (r.avgConfidence * 100).toFixed(0) + '% avg conf · ' + ms + ' ms'
+            outputEl.textContent = r.text || '(no text recognised)'
+          } catch (e) {
+            statusEl.textContent = 'error: ' + e.message
+          }
+        }
+        runBtn.addEventListener('click', () => {
+          const f = fileEl.files && fileEl.files[0]
+          if (f) run(f)
+        })
+        window.addEventListener('paste', (e) => {
+          const items = (e.clipboardData && e.clipboardData.items) || []
+          for (const it of items) {
+            if (it.type.startsWith('image/')) {
+              const f = it.getAsFile()
+              if (f) { e.preventDefault(); run(f); return }
+            }
+          }
+        })
+      })()
+    </script>
+  </body>
+</html>

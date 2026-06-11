@@ -1,0 +1,33 @@
+# haproxy patch for ocr.rotko.net
+# Applied via deploy/apply-haproxy.py to the haproxy.cfg on every
+# anycast peer (bkk06, bkk07, bkk08 hosts AND their LXC haproxies).
+#
+# Three insertion points:
+
+# 1. In `frontend ssl-frontend`, after the astrolabe ACL:
+#       acl is_ocr hdr_end(host) -i ocr.rotko.net
+# and after the astrolabe use_backend:
+#       use_backend ocr-backend if is_ocr
+
+# 2. Add the backend block, after the astrolabe backend block:
+#
+#       # OCR Online (ocr.rotko.net)
+#       backend ocr-backend
+#           mode http
+#           balance leastconn
+#           # nginx sets framing per location (SPA=SAMEORIGIN,
+#           # embed=*); signal the ssl-frontend NOT to override
+#           # X-Frame-Options on ocr-backend responses.
+#           http-request set-var(txn.skip_xfo) bool(true)
+#           option httpchk
+#           http-check send meth GET uri /__health hdr Host ocr.rotko.net
+#           http-check expect status 200
+#           http-response set-header X-Served-By "ocr-rotko-net"
+#           server bkk07-ocr 192.168.77.92:80 check inter 5s fall 3 rise 2
+#           server bkk08-ocr 192.168.78.92:80 check inter 5s fall 3 rise 2
+
+# 3. Modify the global ssl-frontend X-Frame-Options line:
+#   FROM:
+#       http-response set-header X-Frame-Options "DENY"
+#   TO:
+#       http-response set-header X-Frame-Options "DENY" if !{ var(txn.skip_xfo) -m bool }

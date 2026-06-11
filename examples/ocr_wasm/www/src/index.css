@@ -1,0 +1,83 @@
+:root {
+  color-scheme: light dark;
+  font-family: Verdana, Geneva, Tahoma, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* Light theme — flrval flavor but readable. */
+:root, :root[data-theme='light'] {
+  --bg: #f7f7f5;
+  --panel: #ebebe8;
+  --panel-alt: #f1f1ee;
+  --border: #b8b8b4;
+  --border-strong: #7a7a76;
+  --ink: #14171a;        /* near-black, body contrast against panel ≈ 14:1 */
+  --muted: #545862;      /* secondary text, contrast ≥ 6.5:1 */
+  --key: #3a3e46;        /* labels, contrast ≥ 9:1 */
+  --accent: #001a66;     /* slightly lighter navy than #000066 for hover legibility */
+  --accent-bright: #2245c2;
+  --amber: #714a00;      /* darker than #886600 — was failing AA on white */
+  --ok: #0a5b1e;
+  --warn: #714a00;
+  --err: #a4151f;
+  --on-accent: #ffffff;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-alt: #1c222b;
+  --border: #30363d;
+  --border-strong: #4a525c;
+  --ink: #e6edf3;
+  --muted: #a8b2bf;      /* contrast against panel ≥ 6:1 — was 4.7:1 */
+  --key: #b8c0cb;        /* labels readable */
+  --accent: #1f3da0;     /* lighter navy for dark mode legibility */
+  --accent-bright: #5b85ff;
+  --amber: #f0b53d;
+  --ok: #5fd07a;
+  --warn: #f0b53d;
+  --err: #ff8088;
+  --on-accent: #ffffff;
+}
+
+body { background: var(--bg); color: var(--ink); }
+* { box-sizing: border-box; }
+body, #root { margin: 0; min-height: 100vh; }
+
+button, input, select, textarea { font: inherit; border-radius: 0; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+
+a { color: var(--accent-bright); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-style: dotted; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--panel); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+
+input[type='text'],
+input[type='number'],
+input[type='url'],
+select,
+textarea {
+  background: var(--bg);
+  color: var(--ink);
+  border: 1px solid var(--border-strong);
+  padding: 5px 7px;
+  font-size: 13px;
+  caret-color: var(--accent-bright);
+}
+textarea { line-height: 1.55; tab-size: 2; }
+textarea::placeholder { color: var(--muted); }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent-bright); }
+textarea::selection, input::selection { background: var(--accent); color: var(--on-accent); }
+
+kbd {
+  background: var(--panel-alt);
+  color: var(--ink);
+  border: 1px solid var(--border-strong);
+  padding: 0 4px;
+  font-family: ui-monospace, monospace;
+}

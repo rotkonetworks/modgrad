@@ -1,0 +1,37 @@
+# cdn.rotko.net — front for MinIO. Browser GETs only.
+#
+# Set MINIO_BACKEND in .env to point at the MinIO upstream. Within the
+# compose network it is just `minio:9000`.
+
+cdn.rotko.net {
+	encode zstd gzip
+
+	# CORS for browser fetch from app origins. Lock down origins when
+	# deploying — '*' is fine while the app is on localhost during dev.
+	@cors {
+		header Origin *
+	}
+	header @cors Access-Control-Allow-Origin "*"
+	header @cors Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
+	header @cors Access-Control-Expose-Headers "Content-Length, ETag, Last-Modified"
+
+	# Weights are content-addressable by URL path version (e.g. /ocr/v1/…)
+	# so cache forever. Bumping the version means a new URL, which busts.
+	header Cache-Control "public, max-age=31536000, immutable"
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "no-referrer"
+
+	# Only proxy reads. PUT / POST / DELETE go through the admin path
+	# below (separate subdomain), never through the public face.
+	@reads method GET HEAD OPTIONS
+	reverse_proxy @reads minio:9000
+
+	respond "method not allowed" 405
+}
+
+# Console + admin API. Restrict to internal network; mTLS or a basic-
+# auth gate is recommended in production. Public exposure is opt-in.
+admin.cdn.rotko.net {
+	# Reverse-proxy the MinIO console for occasional manual ops.
+	reverse_proxy minio:9001
+}

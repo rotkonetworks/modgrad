@@ -1,0 +1,73 @@
+{
+  "title": "OCR Online",
+  "tagline": "Browser-side OCR for PDFs and images.",
+  "summary": "PDFs and images are processed locally. The pipeline lifts text from the PDF's own text layer where one exists, and runs PP-OCRv5 mobile on raster pages otherwise. There is no server.",
+  "sections": [
+    {
+      "id": "pipeline",
+      "heading": "Pipeline",
+      "items": [
+        "PDF pages with an embedded text layer are read with pdf.js. No model is invoked.",
+        "Scanned pages and images are processed by PP-OCRv5 mobile (detection + recognition) running in a Web Worker.",
+        "Results stream into the queue as pages finish; the queue runs at most two documents in parallel to bound memory."
+      ]
+    },
+    {
+      "id": "model",
+      "heading": "Model + runtime",
+      "items": [
+        "PP-OCRv5 mobile, served from media.githubusercontent.com (≈17 MB).",
+        "onnxruntime-web wasm, served from cdn.jsdelivr.net (≈26 MB).",
+        "Both are HTTP-cached by the browser after first load; a service worker keeps them available offline."
+      ]
+    },
+    {
+      "id": "network",
+      "heading": "Network surface",
+      "items": [
+        "Three external hosts are contacted at startup: cdn.jsdelivr.net, media.githubusercontent.com, raw.githubusercontent.com.",
+        "After load, no network activity is required for recognition.",
+        "The header counter splits cross-origin requests into allowlisted (model + runtime) and unknown."
+      ]
+    },
+    {
+      "id": "confidentiality",
+      "heading": "Confidentiality",
+      "items": [
+        "Documents are held in memory in the open tab. Closing the tab releases them.",
+        "There is no backend processing component.",
+        "Both claims are checkable with the browser's DevTools network and memory panels."
+      ]
+    }
+  ],
+  "faq": [
+    {
+      "q": "Is it free?",
+      "a": "Yes. There is no backend, so there is no per-request cost on the host side. Static assets and model weights are served by public CDNs."
+    },
+    {
+      "q": "What model is used?",
+      "a": "PaddleOCR PP-OCRv5 mobile, via ppu-paddle-ocr and onnxruntime-web."
+    },
+    {
+      "q": "What about large PDFs?",
+      "a": "Pages are rasterised one at a time and processed in parallel by the worker pool. Files above 500 MB require explicit confirmation to avoid out-of-memory failures."
+    },
+    {
+      "q": "Can I embed this?",
+      "a": "Yes. A hidden iframe + postMessage SDK is published at /embed.html and /embed-client.js. See /embed-demo.html."
+    },
+    {
+      "q": "Is the source code open?",
+      "a": "github.com/rotkonetworks/modgrad, examples/ocr_wasm."
+    },
+    {
+      "q": "Are documents uploaded anywhere?",
+      "a": "No. The pipeline is entirely client-side. Verify in the browser's network tab during processing."
+    }
+  ],
+  "links": {
+    "source": "https://github.com/rotkonetworks/modgrad/tree/main/examples/ocr_wasm",
+    "embedDemo": "/embed-demo.html"
+  }
+}
