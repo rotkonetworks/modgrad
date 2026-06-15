@@ -19,6 +19,7 @@ members = [
     "crates/modgrad-substrate",
     "crates/modgrad-blt",
     "crates/modgrad-attribution",
+    "anneal",
     "isis",
     "isis/runtime",
     "examples/minictm",

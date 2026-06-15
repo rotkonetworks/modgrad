@@ -1,0 +1,11 @@
+[package]
+name = "anneal"
+version = "0.1.0"
+edition = "2024"
+description = "Anneal — decentralized, verifiable DiffusionBlocks training. A crowd anneals a shared model out of noise."
+license = "MIT"
+
+[dependencies]
+# The ML engine. DiffusionBlocks primitives + the block-wise denoising trainer
+# live in modgrad-transformer; Anneal is the distributed/verification layer on top.
+modgrad-transformer = { path = "../crates/modgrad-transformer" }
