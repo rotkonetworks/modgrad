@@ -35,6 +35,9 @@ pub mod diffusion;
 /// AdaLN noise conditioning (conditional RMS norm) for DiffusionBlocks — fwd+bwd,
 /// finite-difference gradchecked. The intrusive bit of converting a block.
 pub mod adaln;
+/// A self-contained conditioned residual block (AdaLN + MLP + residual), fwd+bwd
+/// gradchecked — the denoiser block for the DiffusionBlocks convergence experiment.
+pub mod dblock;
 
 // Re-exports
 pub use config::GptConfig;
