@@ -38,6 +38,9 @@ pub mod adaln;
 /// A self-contained conditioned residual block (AdaLN + MLP + residual), fwd+bwd
 /// gradchecked — the denoiser block for the DiffusionBlocks convergence experiment.
 pub mod dblock;
+/// Minimal DiffusionBlocks denoiser + EDM denoising training step. Its smoke test
+/// is the decisive convergence experiment: does block-wise denoising loss drop?
+pub mod denoiser;
 
 // Re-exports
 pub use config::GptConfig;
