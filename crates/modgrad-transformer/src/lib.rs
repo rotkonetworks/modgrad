@@ -32,6 +32,9 @@ pub mod loop_lm;
 /// equi-probability block partitioning. Model-agnostic; consumed by the
 /// (forthcoming) block-wise denoising trainer.
 pub mod diffusion;
+/// AdaLN noise conditioning (conditional RMS norm) for DiffusionBlocks — fwd+bwd,
+/// finite-difference gradchecked. The intrusive bit of converting a block.
+pub mod adaln;
 
 // Re-exports
 pub use config::GptConfig;

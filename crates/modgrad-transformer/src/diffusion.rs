@@ -125,6 +125,25 @@ impl NoiseSchedule {
     }
 }
 
+/// Sinusoidal embedding of a scalar conditioning value (typically `c_noise = ¼·ln σ`
+/// from [`NoiseSchedule::c_noise`]) into `dim` features — the input AdaLN noise
+/// conditioning projects into `(scale, shift, gate)`. `dim` must be even; output is
+/// `[sin(v·ω_0)…sin(v·ω_{h-1}), cos(v·ω_0)…cos(v·ω_{h-1})]` with geometrically
+/// spaced frequencies ω_i = max_period^(−i/h), h = dim/2 (the DiT/transformer scheme).
+pub fn timestep_embedding(value: f32, dim: usize, max_period: f32) -> Vec<f32> {
+    assert!(dim % 2 == 0, "timestep embedding dim must be even");
+    let half = dim / 2;
+    let mut out = vec![0.0f32; dim];
+    let ln_mp = (max_period as f64).ln();
+    for i in 0..half {
+        let freq = (-ln_mp * (i as f64) / half as f64).exp(); // max_period^(−i/half)
+        let a = (value as f64) * freq;
+        out[i] = a.sin() as f32;
+        out[half + i] = a.cos() as f32;
+    }
+    out
+}
+
 // ── special functions (no external stats crate) ─────────────────────────────
 
 /// Standard normal CDF Φ(x) via erf: 0.5·(1 + erf(x/√2)).
@@ -231,6 +250,21 @@ mod tests {
                 assert!(approx(m, m0, 1e-4), "block {k} mass {m} != {m0} (B={b})");
             }
         }
+    }
+
+    #[test]
+    fn timestep_embedding_shape_and_bounds() {
+        // dim even, at value 0 the sin half is 0 and the cos half is 1, everything
+        // bounded in [-1,1], and distinct values give distinct embeddings.
+        let e0 = timestep_embedding(0.0, 8, 10_000.0);
+        assert_eq!(e0.len(), 8);
+        for i in 0..4 { assert!(e0[i].abs() < 1e-6, "sin half nonzero at v=0"); }
+        for i in 4..8 { assert!((e0[i] - 1.0).abs() < 1e-6, "cos half != 1 at v=0"); }
+        let e1 = timestep_embedding(0.3, 16, 10_000.0);
+        assert_eq!(e1.len(), 16);
+        assert!(e1.iter().all(|&x| x.abs() <= 1.0 + 1e-6), "embedding out of [-1,1]");
+        let e2 = timestep_embedding(-1.7, 16, 10_000.0);
+        assert!(e1.iter().zip(&e2).any(|(a, b)| (a - b).abs() > 1e-3), "distinct values collide");
     }
 
     #[test]
