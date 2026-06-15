@@ -95,6 +95,18 @@ impl Denoiser {
         }
         loss
     }
+
+    /// Denoising loss at one (y, σ, ε) WITHOUT updating — the F-space MSE used for eval.
+    pub fn loss(&self, y: &[f32], sigma: f32, eps: &[f32]) -> f32 {
+        let m = self.model_dim;
+        let (cskip, cout, cin) = (self.schedule.c_skip(sigma), self.schedule.c_out(sigma), self.schedule.c_in(sigma));
+        let cond = timestep_embedding(self.schedule.c_noise(sigma), self.cond_dim, 10_000.0);
+        let z: Vec<f32> = (0..m).map(|i| y[i] + sigma * eps[i]).collect();
+        let zin: Vec<f32> = z.iter().map(|&v| cin * v).collect();
+        let (f, _) = self.stack_forward(&cond, &zin);
+        let t: Vec<f32> = (0..m).map(|i| (y[i] - cskip * z[i]) / cout).collect();
+        (0..m).map(|i| (f[i] - t[i]).powi(2)).sum::<f32>() / m as f32
+    }
 }
 
 #[cfg(test)]

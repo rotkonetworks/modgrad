@@ -24,3 +24,7 @@
 
 // Re-export the noise-side primitives so the network layer speaks the same units.
 pub use modgrad_transformer::diffusion;
+
+/// Slice 3 — the distributed-convergence experiment: does independent, per-noise-range
+/// block training match joint training? (The claim Anneal rests on.)
+pub mod convergence;
