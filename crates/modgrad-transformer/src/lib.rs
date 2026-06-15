@@ -28,6 +28,10 @@ pub mod offload;
 pub mod train;
 pub mod loss;
 pub mod loop_lm;
+/// DiffusionBlocks noise-side primitives: EDM schedule + preconditioning +
+/// equi-probability block partitioning. Model-agnostic; consumed by the
+/// (forthcoming) block-wise denoising trainer.
+pub mod diffusion;
 
 // Re-exports
 pub use config::GptConfig;
