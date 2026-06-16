@@ -69,6 +69,43 @@ where
     }
 }
 
+/// Serialize to in-memory bytes (binary, with the 5-byte ISIS header).
+/// The filesystem-free twin of `save`, used by wasm / in-browser builds.
+pub fn save_to_bytes<T>(value: &T) -> io::Result<Vec<u8>>
+where
+    T: Serialize + wincode::SchemaWrite<ModgradConfig, Src = T>,
+{
+    let payload = wincode::config::serialize(value, MODGRAD_CONFIG)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("wincode serialize: {e:?}")))?;
+    let mut data = Vec::with_capacity(5 + payload.len());
+    data.extend_from_slice(MAGIC);
+    data.push(VERSION);
+    data.extend_from_slice(&payload);
+    Ok(data)
+}
+
+/// Deserialize from in-memory bytes (binary, ISIS magic header).
+/// The filesystem-free twin of `load`, used by wasm / in-browser builds.
+pub fn load_from_bytes<T>(data: &[u8]) -> io::Result<T>
+where
+    T: for<'de> wincode::SchemaRead<'de, ModgradConfig, Dst = T>,
+{
+    if data.len() >= 5 && &data[..4] == MAGIC {
+        let version = data[4];
+        if version > VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("file version {} > supported {}", version, VERSION)));
+        }
+        wincode::config::deserialize(&data[5..], MODGRAD_CONFIG)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                format!("wincode deserialize: {e:?}")))
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData,
+            "missing ISIS magic header"))
+    }
+}
+
 /// Load any type from a file.
 /// Format selected by extension: `.json` → JSON, anything else → binary.
 /// Binary files must have the ISIS magic header. Falls back to JSON for legacy.
