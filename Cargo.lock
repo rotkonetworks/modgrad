@@ -4352,6 +4352,8 @@ dependencies = [
  "modgrad-substrate",
  "modgrad-training",
  "modgrad-traits",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5464,6 +5466,8 @@ dependencies = [
  "modgrad-ctm",
  "modgrad-persist",
  "modgrad-training",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
