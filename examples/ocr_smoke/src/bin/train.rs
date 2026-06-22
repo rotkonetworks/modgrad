@@ -259,6 +259,7 @@ fn main() {
         min_width: 16,
         exit_strategy: modgrad_ctm::config::ExitStrategy::None,
         collect_trajectories: false,
+        spatial: None,
     };
 
     // Optionally warm-start from saved weights, otherwise initialise

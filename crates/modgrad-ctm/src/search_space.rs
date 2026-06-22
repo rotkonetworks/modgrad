@@ -307,6 +307,7 @@ impl BrainArch {
                 None
             },
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 

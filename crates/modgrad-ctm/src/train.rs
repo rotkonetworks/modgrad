@@ -1524,6 +1524,66 @@ pub struct CtmCache {
     kv_ln_caches: Vec<LnCache>,
 }
 
+impl CtmCache {
+    /// The final-tick per-region synchronization readout (`sync_out`).
+    ///
+    /// This is the same vector returned as `CtmOutput.sync_out` from the
+    /// forward pass — the region's OWN sync readout, sized `n_synch_out`.
+    /// Used by the OUTPUT-local move head in `regional_*` to read a move
+    /// directly from a spatial region's state, bypassing global-sync
+    /// pooling. Empty if the region never ran a tick.
+    pub fn final_sync_out(&self) -> &[f32] {
+        self.tick_caches.last().map(|tc| tc.sync_out.as_slice()).unwrap_or(&[])
+    }
+
+    /// Backprop a gradient on the final-tick `sync_out` into a gradient on
+    /// the region's `activated` state at EACH inner tick, summed.
+    ///
+    /// The final sync readout is `sync_out[i] = alpha_out[i]/sqrt(beta[i])`
+    /// where `alpha_out` accumulates each inner tick's pairwise product with
+    /// a geometric decay: tick `t`'s contribution to the final alpha is
+    /// `r_out[i]^(K-1-t) · activated_post[t][l]·activated_post[t][r]`. So
+    /// the gradient on `d_sync_out` flows to EVERY tick's activated state,
+    /// scaled by that decay weight (and `1/sqrt(beta_final)`). Distributing
+    /// across all ticks — not just the last — was necessary: the
+    /// final-tick-only approximation produced a biased outer-readout
+    /// gradient that destabilised training.
+    ///
+    /// The returned `d_activated` (length d_model) is the gradient w.r.t.
+    /// the region's final `activated` state — every inner tick's
+    /// `activated_post` is the same quantity threaded through the recurrence,
+    /// and `backward_from_activated` seeds it onto the final tick and carries
+    /// it backward, so summing the per-tick contributions here and seeding
+    /// once is consistent with how the region BPTT consumes `d_external`.
+    pub fn final_sync_out_backward(
+        &self, w: &CtmWeights, d_sync_out: &[f32],
+    ) -> Vec<f32> {
+        let d = w.config.d_model;
+        let k = self.tick_caches.len();
+        if k == 0 { return vec![0.0f32; d]; }
+        // beta from the FINAL tick (the denominator of the readout).
+        let beta_final = &self.tick_caches[k - 1].beta_out;
+        let mut d_act = vec![0.0f32; d];
+        // Per inner tick t, weight by r_out^(K-1-t).
+        for (t, tc) in self.tick_caches.iter().enumerate() {
+            let pow = (k - 1 - t) as i32;
+            // Pre-scale d_sync_out by the decay weight for this tick.
+            let scaled: Vec<f32> = d_sync_out.iter().enumerate()
+                .map(|(i, &g)| {
+                    let r = self.r_out.get(i).copied().unwrap_or(1.0);
+                    g * r.powi(pow)
+                })
+                .collect();
+            let contrib = sync_backward(
+                &scaled, &tc.activated_post, beta_final,
+                &w.sync_out_left, &w.sync_out_right, d,
+            );
+            for j in 0..d { d_act[j] += contrib[j]; }
+        }
+        d_act
+    }
+}
+
 /// Explicit state returned from forward (not mutated in place).
 pub struct CtmStateExplicit {
     pub trace: Vec<f32>,
@@ -2029,7 +2089,7 @@ mod backward_from_activated_gradcheck {
             n_synch_out: 4, n_synch_action: 4, synapse_depth: 2,
             memory_length: 4, deep_nlms: false, memory_hidden_dims: 0,
             out_dims: 3, n_random_pairing_self: 0, min_width: 2,
-            exit_strategy: ExitStrategy::None, collect_trajectories: false,
+            exit_strategy: ExitStrategy::None, collect_trajectories: false, spatial: None,
         }
     }
 

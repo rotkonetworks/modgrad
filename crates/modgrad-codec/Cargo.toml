@@ -25,9 +25,14 @@ modgrad-traits = { path = "../modgrad-traits" }
 modgrad-ctm = { path = "../modgrad-ctm" }
 serde = { version = "1", features = ["derive"] }
 rayon = "1"
+wide  = "0.7"
 tracing = "0.1"
 wincode = "0.5"
 wincode-derive = "0.4"
+# Used by snac::SnacDecoder24k::load_from_safetensors to read the
+# weights dumped by scripts/snac_export.py.
+safetensors = "0.4"
+memmap2 = "0.9"
 
 [dev-dependencies]
 serde_json = "1"

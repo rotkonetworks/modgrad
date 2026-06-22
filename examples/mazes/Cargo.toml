@@ -8,6 +8,26 @@ description = "Maze solving benchmark for CTM — visual reasoning with spatial 
 name = "mazes"
 path = "src/main.rs"
 
+[[bin]]
+name = "brain_oracle"
+path = "src/bin/brain_oracle.rs"
+
+[[bin]]
+name = "brain_train"
+path = "src/bin/brain_train.rs"
+
+[[bin]]
+name = "brain_flat"
+path = "src/bin/brain_flat.rs"
+
+[[bin]]
+name = "brain_wide"
+path = "src/bin/brain_wide.rs"
+
+[[bin]]
+name = "brain_real"
+path = "src/bin/brain_real.rs"
+
 [features]
 # Opt-in GPU backends. ROCm is the supported path (rocBLAS SGEMM
 # dispatch). KFD has been retired — the hand-written gfx1102 ISA

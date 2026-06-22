@@ -14,13 +14,17 @@ rocm = ["modgrad-device/rocm"]
 
 [dependencies]
 modgrad-device = { path = "../modgrad-device" }
-rayon = "1"
 serde = { version = "1", features = ["derive"] }
 wincode = "0.5"
 wincode-derive = "0.4"
 # Pure-Rust SIMD GEMM used by `CpuTensor::matmul`. Same version as the FFN
 # crate already uses; shared so Cargo resolves one copy.
 matrixmultiply = "0.3"
+
+# rayon has no threads on wasm32; the rayon_shim provides a serial fallback
+# there, so rayon is native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"
 
 # CUDA (optional)
 cudarc = { version = "0.19", optional = true, default-features = false, features = [

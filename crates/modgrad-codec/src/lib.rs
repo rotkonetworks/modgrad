@@ -2,6 +2,8 @@
 
 pub mod vqvae;
 pub mod audio_codec;
+pub mod snac;
+pub mod snac_loader;
 pub mod fsq;
 pub mod ngram_hash;
 pub mod retina;

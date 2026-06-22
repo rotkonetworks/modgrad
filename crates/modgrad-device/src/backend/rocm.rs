@@ -27,6 +27,9 @@ pub mod ffi {
 
     pub type hipError_t = c_int;
     pub type hipblasHandle_t = *mut c_void;
+    pub type hipStream_t = *mut c_void;
+    pub type hipGraph_t = *mut c_void;
+    pub type hipGraphExec_t = *mut c_void;
     pub type hipblasStatus_t = c_int;
 
     /// hipMemcpyKind enumeration.
@@ -65,6 +68,20 @@ pub mod ffi {
         ) -> hipError_t;
         pub fn hipDeviceSynchronize() -> hipError_t;
         pub fn hipGetErrorString(error: hipError_t) -> *const c_char;
+
+        // HIP stream + graph API (for kernel launch overhead amortization).
+        pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
+        pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
+        pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+        pub fn hipStreamBeginCapture(stream: hipStream_t, mode: c_int) -> hipError_t;
+        pub fn hipStreamEndCapture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t;
+        pub fn hipGraphInstantiate(
+            graph_exec: *mut hipGraphExec_t, graph: hipGraph_t,
+            error_node: *mut c_void, log_buffer: *mut c_char, buffer_size: usize,
+        ) -> hipError_t;
+        pub fn hipGraphLaunch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t;
+        pub fn hipGraphExecDestroy(graph_exec: hipGraphExec_t) -> hipError_t;
+        pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
     }
 
     #[link(name = "hipblas")]
@@ -465,6 +482,21 @@ pub mod ffi {
         pub fn launch_matvec_q6k(
             w_q6: *const u8, x: *const f32, y: *mut f32,
             out_dim: c_int, blocks_per_row: c_int,
+        ) -> hipError_t;
+
+        // Q6_K dp4a path: INT8 activations (from launch_quantize_q8_1) ×
+        // INT4+2bit Q6 weights. Same xq/xd/xsum layout as Q4_K dp4a, so
+        // a single quantize_q8_1 call can feed both Q4_K and Q6_K matvecs.
+        pub fn launch_matvec_q6k_dp4a(w: *const u8, xq: *const i8, xd: *const f32, xsum: *const f32,
+            y: *mut f32, out_dim: c_int, bpr: c_int) -> hipError_t;
+
+        // Flash-attention-style decode SDPA. Online softmax in registers, one
+        // pass over KV cache. No O(seq_len) shared memory. Significantly faster
+        // for large seq_len than the naive sdpa_decode kernel.
+        pub fn launch_sdpa_decode_flash(
+            q: *const f32, k_cache: *const f32, v_cache: *const f32, out: *mut f32,
+            n_heads: c_int, n_kv_heads: c_int, head_dim: c_int, seq_len: c_int,
+            kv_dim: c_int, scale: f32, win_start: c_int,
         ) -> hipError_t;
 
         // Resident Gemma glue (gemma_glue.hip) — all in-place / device ptrs.
@@ -942,6 +974,10 @@ pub mod kern {
         y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
         chk(unsafe { ffi::launch_matvec_q4k_dp4a(w, xq, xd, xsum, y, out_dim as c_int, bpr as c_int) }, "matvec_q4k_dp4a")
     }
+    pub unsafe fn matvec_q6k_dp4a(w: *const u8, xq: *const i8, xd: *const f32, xsum: *const f32,
+        y: *mut f32, out_dim: usize, bpr: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_matvec_q6k_dp4a(w, xq, xd, xsum, y, out_dim as c_int, bpr as c_int) }, "matvec_q6k_dp4a")
+    }
     pub unsafe fn rms_norm(x: *const f32, w: *const f32, y: *mut f32, n: usize, hidden: usize, eps: f32) -> Result<(), BackendError> {
         chk(unsafe { ffi::launch_rms_norm(x, w, y, n as c_int, hidden as c_int, eps) }, "rms_norm")
     }
@@ -969,6 +1005,75 @@ pub mod kern {
         scale: f32, win_start: usize) -> Result<(), BackendError> {
         chk(unsafe { ffi::launch_sdpa_decode(q, k, v, out, n_heads as c_int, n_kv_heads as c_int,
             head_dim as c_int, seq_len as c_int, kv_dim as c_int, scale, win_start as c_int) }, "sdpa_decode")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sdpa_decode_flash(q: *const f32, k: *const f32, v: *const f32, out: *mut f32,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, kv_dim: usize,
+        scale: f32, win_start: usize) -> Result<(), BackendError> {
+        chk(unsafe { ffi::launch_sdpa_decode_flash(q, k, v, out, n_heads as c_int, n_kv_heads as c_int,
+            head_dim as c_int, seq_len as c_int, kv_dim as c_int, scale, win_start as c_int) }, "sdpa_decode_flash")
+    }
+
+    /// Singleton hipblas handle for the resident-Gemma / sonotxt FP16 path.
+    /// Created on first call, never destroyed (process lifetime).
+    /// Thread-safe via `OnceLock`. SgemvF32 below dispatches through this.
+    fn hipblas_handle() -> ffi::hipblasHandle_t {
+        use std::sync::OnceLock;
+        // Wrap pointer in a struct because raw pointers aren't Send/Sync by default.
+        struct H(ffi::hipblasHandle_t);
+        unsafe impl Send for H {}
+        unsafe impl Sync for H {}
+        static H_CELL: OnceLock<H> = OnceLock::new();
+        H_CELL.get_or_init(|| {
+            let mut handle: ffi::hipblasHandle_t = std::ptr::null_mut();
+            let status = unsafe { ffi::hipblasCreate(&mut handle) };
+            if status != 0 { panic!("hipblasCreate failed (status {status})"); }
+            H(handle)
+        }).0
+    }
+
+    /// y = W @ x + bias, where W is row-major [out_dim × in_dim], all f32 in VRAM.
+    /// Dispatched as `hipblasSgemv` with TRANS=T (column-major-via-transpose trick).
+    /// `bias_ptr` may be null — then y starts at 0.
+    pub unsafe fn sgemv_f32(
+        weight: *const f32, x: *const f32, bias: *const f32, y: *mut f32,
+        in_dim: usize, out_dim: usize,
+    ) -> Result<(), BackendError> {
+        let in_i = in_dim as c_int;
+        let out_i = out_dim as c_int;
+        // Initialize y from bias (or zero) so SGEMV can β=1 accumulate.
+        if !bias.is_null() {
+            let err = unsafe { ffi::hipMemcpy(y as *mut std::os::raw::c_void,
+                bias as *const std::os::raw::c_void, out_dim * 4, 3) };
+            if err != 0 {
+                return Err(BackendError::Runtime(format!(
+                    "hipMemcpy D2D bias→y: {}", ffi::hip_err_str(err))));
+            }
+        } else {
+            // Zero y by issuing a memset-like memcpy from a small zero region.
+            // hipMemsetAsync would be better but isn't bound yet — use hipMemset.
+            unsafe extern "C" {
+                fn hipMemset(dst: *mut std::os::raw::c_void, value: c_int, size: usize) -> i32;
+            }
+            let err = unsafe { hipMemset(y as *mut std::os::raw::c_void, 0, out_dim * 4) };
+            if err != 0 {
+                return Err(BackendError::Runtime(format!("hipMemset y: {err}")));
+            }
+        }
+        let alpha: f32 = 1.0;
+        let beta: f32 = 1.0;
+        let handle = hipblas_handle();
+        let status = unsafe {
+            ffi::hipblasSgemv(handle, ffi::HIPBLAS_OP_T,
+                in_i, out_i,
+                &alpha, weight, in_i,
+                x, 1, &beta, y, 1)
+        };
+        if status != 0 {
+            return Err(BackendError::Runtime(format!(
+                "hipblasSgemv (sgemv_f32): status {status}")));
+        }
+        Ok(())
     }
 }
 

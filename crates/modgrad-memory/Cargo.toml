@@ -8,4 +8,8 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+
+# rayon has no threads on wasm32-unknown-unknown; the rayon_shim module
+# provides a serial fallback there, so rayon is native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1"

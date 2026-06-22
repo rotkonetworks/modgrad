@@ -65,6 +65,7 @@ fn make_config() -> CtmConfig {
         min_width: 8,
         exit_strategy: ExitStrategy::None,
         collect_trajectories: true, // populate per-tick activations for the viz
+        spatial: None,
     }
 }
 

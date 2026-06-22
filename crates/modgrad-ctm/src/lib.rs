@@ -7,6 +7,9 @@
 //!
 //! Reference: arxiv 2505.05522
 
+// Threading prelude shim: rayon on native, serial fallback on wasm32.
+pub mod rayon_shim;
+
 pub mod config;
 pub mod synapse;
 pub mod weights;

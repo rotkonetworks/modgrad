@@ -90,8 +90,13 @@ pub trait OptimizerState: Send {
 // here (or a cuda_backend.rs sibling), plus the appropriate branch
 // in the `make_optimizer_state` factory in lib.rs.
 
+// The VramMirror impl is the KFD-backed device optimizer. `modgrad_device::kfd`
+// is native-only, so this impl is gated out on wasm — the trait itself stays
+// available for CPU implementations. Inference doesn't run the optimizer.
+#[cfg(not(target_arch = "wasm32"))]
 use modgrad_device::kfd::vram_mirror::VramMirror;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl OptimizerState for VramMirror {
     fn n_tensors(&self) -> usize { self.sizes.len() }
     fn tensor_len(&self, idx: usize) -> usize { self.sizes[idx] }

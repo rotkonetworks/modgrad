@@ -3,7 +3,7 @@
 //! Collects (input, output) pairs from synapses during waking,
 //! then runs least-squares to find optimal weights (REM sleep analogue).
 
-use rayon::prelude::*;
+use crate::rayon_shim::*;
 
 /// Offline cross-layer weight optimization (REM sleep analogue).
 /// Collects (input, output) pairs from synapses during waking,

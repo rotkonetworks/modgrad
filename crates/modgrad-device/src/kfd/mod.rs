@@ -24,6 +24,9 @@ pub mod vram_mirror;
 pub mod dispatch_queue;
 pub mod gguf;
 pub mod inference;
+pub mod llm;
+pub mod tokenizer;
+pub mod safetensors_loader;
 pub mod quant_dot;
 
 use memory::{GpuAllocator, GpuBuffer};

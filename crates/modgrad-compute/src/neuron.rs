@@ -4,7 +4,7 @@
 //! isis-specific neuron layers (NeuronLayer, NeuronLayerWeights, etc.)
 //! live in `crate::runtime::neuron`.
 
-use rayon::prelude::*;
+use crate::rayon_shim::*;
 use serde::{Deserialize, Serialize};
 use wincode_derive::{SchemaRead, SchemaWrite};
 
@@ -1409,7 +1409,7 @@ impl SuperLinear {
         let out_per = self.out_per;
 
         if n_neurons * in_per * out_per >= 100_000 {
-            let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
+            let chunk_size = (n_neurons / current_num_threads()).max(4);
             out.par_chunks_mut(chunk_size * out_per)
                 .enumerate()
                 .for_each(|(chunk_idx, out_chunk)| {

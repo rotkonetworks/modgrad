@@ -44,6 +44,21 @@ pub struct CtmConfig {
     /// Zero-cost when false.
     #[serde(default)]
     pub collect_trajectories: bool,
+    /// Spatial-attention input: `Some((n_tokens, raw_dim_per_token))`.
+    ///
+    /// When `Some`, this region's observation is interpreted as
+    /// `n_tokens × raw_dim` per-token features and attended over via the
+    /// multi-head attention KV stream (the same mechanism the single CTM
+    /// uses to localize over a grid). The region's `kv_proj` is sized
+    /// `raw_dim → d_input` and the raw spatial observation is fed straight
+    /// into `CtmInput::Raw { n_tokens, raw_dim }`, bypassing the flat
+    /// connection-merged observation.
+    ///
+    /// `None` (default) = the original flat behaviour: the region runs
+    /// with `n_tokens = 1` over its (projected, d_input-wide) observation.
+    /// Existing configs/weights deserialize unchanged.
+    #[serde(default)]
+    pub spatial: Option<(usize, usize)>,
 }
 
 /// Tick-loop exit strategy. Exactly one mechanism — no overlap, no ambiguity.
@@ -124,6 +139,7 @@ impl Default for CtmConfig {
             min_width: 16,
             exit_strategy: ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         }
     }
 }
@@ -179,6 +195,7 @@ impl CtmConfig {
             min_width,
             exit_strategy,
             collect_trajectories: false,
+            spatial: None,
         }
     }
 

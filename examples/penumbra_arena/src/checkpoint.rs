@@ -315,6 +315,7 @@ mod tests {
             aux_losses: AuxLossConfig::default(),
             router: None,
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 

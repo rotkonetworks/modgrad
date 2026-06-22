@@ -263,7 +263,7 @@ mod tests {
             n_synch_out: 4, n_synch_action: 4, synapse_depth: 2,
             memory_length: 4, deep_nlms: false, memory_hidden_dims: 0,
             out_dims: pd, n_random_pairing_self: 0, min_width: 2,
-            exit_strategy: ExitStrategy::None, collect_trajectories: false,
+            exit_strategy: ExitStrategy::None, collect_trajectories: false, spatial: None,
         };
         let w = CtmWeights::new(cfg.clone(), pd); // raw_input_dim = pd
         let n_patches = 3usize;

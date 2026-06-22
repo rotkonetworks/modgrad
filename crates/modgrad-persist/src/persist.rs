@@ -35,9 +35,21 @@ const VERSION: u8 = 1;
 /// with the 32 GiB cap applied at the checkpoint-bundle layer. The
 /// zero-copy + LEN-encoding bits stay at their bincode-compatible
 /// defaults so existing .bin files still round-trip.
+// The preallocation ceiling is a const-generic `usize`. On wasm32 `usize`
+// is 32-bit, so `16 * 1024^3` overflows at compile time — cap it at the
+// 32-bit max instead. Native (64-bit usize) keeps the full 16 GiB ceiling
+// byte-for-byte; wincode's wire format does not depend on this value, so
+// existing .bin files round-trip identically on both targets.
+#[cfg(not(target_arch = "wasm32"))]
 pub type ModgradConfig = Configuration<
     true,
     { 16 * 1024 * 1024 * 1024 }, // 16 GiB
+    UseIntLen<u64, 0>,
+>;
+#[cfg(target_arch = "wasm32")]
+pub type ModgradConfig = Configuration<
+    true,
+    { usize::MAX }, // 4 GiB-1 on wasm32 (32-bit usize); ceiling only
     UseIntLen<u64, 0>,
 >;
 

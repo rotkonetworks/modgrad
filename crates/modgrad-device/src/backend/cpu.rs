@@ -8,7 +8,7 @@
 //! Parallelism via rayon where it's a clear win (matmul, sync, outer
 //! product). Small ops stay serial because rayon overhead dominates.
 
-use rayon::prelude::*;
+use crate::rayon_shim::*;
 
 use super::{AdamWArgs, Backend, BackendError, BufferBackend, ComputeCtx, DeviceInfo, DeviceKind, HostBuffer, Op, QuantKind, SyncBackwardScatterArgs};
 
@@ -19,7 +19,12 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self { threads: rayon::current_num_threads() }
+        // rayon is native-only; wasm runs single-threaded via rayon_shim.
+        #[cfg(not(target_arch = "wasm32"))]
+        let threads = rayon::current_num_threads();
+        #[cfg(target_arch = "wasm32")]
+        let threads = 1;
+        Self { threads }
     }
 }
 

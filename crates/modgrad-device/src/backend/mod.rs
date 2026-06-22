@@ -20,9 +20,16 @@ pub mod ops;
 pub mod optim;
 pub mod buffer;
 pub mod cpu;
+// GPU sub-backends pull in libc/mmap/ioctl/FFI that don't exist on
+// wasm32-unknown-unknown. Inference uses only the CPU backend, so these
+// are gated out on wasm. Native is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod kfd;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cuda_be;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod vulkan;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod rocm;
 /// Path C — JAX-style location-aware tensor (`Tensor<Cpu>`,
 /// `Tensor<Rocm>`). Type system enforces same-device ops, no
@@ -36,17 +43,25 @@ pub use buffer::{DeviceBuffer, HostBuffer};
 // feature-gated. Re-exported here so callers write
 //   `use modgrad_device::backend::{BatchedOptimizer, CpuBatchedOptimizer};`
 // without reaching into the sub-module.
-pub use optim::{BatchedOptimizer, CpuBatchedOptimizer, KfdBatchedOptimizer};
+pub use optim::{BatchedOptimizer, CpuBatchedOptimizer};
+#[cfg(not(target_arch = "wasm32"))]
+pub use optim::KfdBatchedOptimizer;
 // `BufferBackend` + `ComputeCtx` are defined below in this file.
 // Re-export them explicitly so call sites can write
 //   `use modgrad_device::backend::{ComputeCtx, BufferBackend};`
 // without digging into the module layout.
 pub use cpu::CpuBackend;
+// GPU backend re-exports are gated off on wasm (their modules don't
+// compile there). Inference dispatches only through CpuBackend.
+#[cfg(not(target_arch = "wasm32"))]
 pub use kfd::KfdBackend;
+#[cfg(not(target_arch = "wasm32"))]
 pub use cuda_be::CudaBackend;
+#[cfg(not(target_arch = "wasm32"))]
 pub use vulkan::VulkanBackend;
+#[cfg(not(target_arch = "wasm32"))]
 pub use rocm::RocmBackend;
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", not(target_arch = "wasm32")))]
 pub use rocm::{HipBatch, HipBuffer};
 pub use op::{ActivationMode, AdamWArgs, BinaryOpKind, Op, QuantKind, SyncBackwardScatterArgs};
 
@@ -321,17 +336,21 @@ impl BackendRegistry {
         // HSA runtime (used by hipblas) and KFD's direct device access
         // can't coexist — the first one to open the device wins.
         // Probing KFD first ensures the fast path gets the handle.
-        if let Some(kfd) = KfdBackend::try_new() {
-            reg.register(Box::new(kfd));
-        }
-        if let Some(rocm) = RocmBackend::try_new() {
-            reg.register(Box::new(rocm));
-        }
-        if let Some(cuda) = CudaBackend::try_new() {
-            reg.register(Box::new(cuda));
-        }
-        if let Some(vk) = VulkanBackend::try_new() {
-            reg.register(Box::new(vk));
+        // GPU backend probes are native-only; on wasm only CPU registers.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(kfd) = KfdBackend::try_new() {
+                reg.register(Box::new(kfd));
+            }
+            if let Some(rocm) = RocmBackend::try_new() {
+                reg.register(Box::new(rocm));
+            }
+            if let Some(cuda) = CudaBackend::try_new() {
+                reg.register(Box::new(cuda));
+            }
+            if let Some(vk) = VulkanBackend::try_new() {
+                reg.register(Box::new(vk));
+            }
         }
         reg.register(Box::new(CpuBackend::new()));
         reg

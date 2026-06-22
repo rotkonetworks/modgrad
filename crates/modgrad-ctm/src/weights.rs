@@ -516,6 +516,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let w = CtmWeights::new(cfg.clone(), 8);
         let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w)
@@ -548,6 +549,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let w = CtmWeights::new(cfg, 8);
         let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
@@ -573,6 +575,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let raw_in = 4;
         let w = CtmWeights::new(cfg, raw_in);
@@ -622,6 +625,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let w = CtmWeights::new(cfg.clone(), 4);
         let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
@@ -672,6 +676,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let w = CtmWeights::new(cfg, 4);
         let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
@@ -711,6 +716,7 @@ mod ctm_weights_typed_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let w = CtmWeights::new(cfg, 8);
         let typed = match CtmWeightsTyped::<Rocm>::from_untyped(&w) {
@@ -798,6 +804,7 @@ mod tests {
             min_width: 4,
             exit_strategy: ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         }
     }
 

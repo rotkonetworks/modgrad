@@ -14,7 +14,7 @@
 //!   - All data as slices — zero allocation on the hot path
 //!   - Default methods for fused operations so backends can override
 
-use rayon::prelude::*;
+use crate::rayon_shim::*;
 
 // ─── VRAM-aware allocation ─────────────────────────────────
 
@@ -68,13 +68,15 @@ impl GpuVec {
 
     /// Try to allocate from the VRAM arena. Falls back to heap.
     pub fn try_vram(n: usize) -> Self {
+        // The KFD VRAM arena is native-only; on wasm there's no GPU, so
+        // this always takes the heap fallback (same as a host with no arena).
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(ptr) = modgrad_device::kfd::accel::arena_alloc(n) {
             // Zero the buffer through BAR
             unsafe { std::ptr::write_bytes(ptr, 0, n); }
-            GpuVec::Vram { ptr, len: n }
-        } else {
-            GpuVec::heap(n)
+            return GpuVec::Vram { ptr, len: n };
         }
+        GpuVec::heap(n)
     }
 
     /// Try to allocate a hip-resident device buffer of `n` f32s.
@@ -468,7 +470,7 @@ fn synapse_fused(weight: &[f32], bias: &[f32], x: &[f32],
 fn synapse_fused_parallel(weight: &[f32], bias: &[f32], x: &[f32],
                           output: &mut [f32], out_dim: usize, in_dim: usize) {
     // Phase 1: Parallel fused matvec + GLU + SiLU
-    let chunk_rows = (out_dim / rayon::current_num_threads()).max(4);
+    let chunk_rows = (out_dim / current_num_threads()).max(4);
     output[..out_dim].par_chunks_mut(chunk_rows)
         .enumerate()
         .for_each(|(ci, chunk)| {
@@ -657,7 +659,7 @@ impl CpuBackend {
         let total = out_dim * in_dim;
         if total >= self.config.par_threshold {
             // Parallel: each thread processes a tile of rows
-            let chunk_rows = (out_dim / rayon::current_num_threads()).max(self.config.tile_rows);
+            let chunk_rows = (out_dim / current_num_threads()).max(self.config.tile_rows);
             y[..out_dim].par_chunks_mut(chunk_rows)
                 .enumerate()
                 .for_each(|(ci, chunk)| {
@@ -709,7 +711,7 @@ impl CpuBackend {
         debug_assert!(output.len() >= total, "superlinear output too small: {} < {}", output.len(), total);
         let total_flops = n_neurons * in_per * out_per;
         if total_flops >= self.config.par_threshold && total <= output.len() {
-            let chunk_size = (n_neurons / rayon::current_num_threads()).max(4);
+            let chunk_size = (n_neurons / current_num_threads()).max(4);
             output[..total]
                 .par_chunks_mut(chunk_size * out_per)
                 .enumerate()
@@ -1177,6 +1179,10 @@ pub fn set_backend(b: Box<dyn ComputeBackend>) -> Result<(), Box<dyn ComputeBack
 // `--gpu` flag in CLIs is now a no-op (the registry already picks KFD
 // when the kernel driver is reachable).
 
+// VramGpuBackend is the GPU-only (KFD VRAM arena) ComputeBackend. It is
+// native-only — `modgrad_device::kfd` does not exist on wasm, and inference
+// runs on the CPU backend. Gated out on wasm; native is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct VramGpuBackend {
     // No cpu fallback — VRAM mode is GPU-only by design. A silent CPU
     // fallback would defeat the "zero PCIe in the inner loop" promise
@@ -1184,6 +1190,7 @@ pub struct VramGpuBackend {
     _private: (),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl VramGpuBackend {
     pub fn new(arena_mb: usize) -> Self {
         modgrad_device::kfd::accel::enable_vram_mode();
@@ -1192,6 +1199,7 @@ impl VramGpuBackend {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ComputeBackend for VramGpuBackend {
     fn alloc_f32(&self, n: usize) -> GpuVec {
         // Arena suballocation, not `ComputeCtx::alloc_buffer`.

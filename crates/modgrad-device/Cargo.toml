@@ -40,8 +40,17 @@ kfd = []
 test-utils = []
 
 [dependencies]
+
+# libc (mmap/ioctl), safetensors + memmap2 (mmap weight loading) and
+# rayon (threads) are only reachable from the native-only GPU/platform
+# modules and the rayon_shim's parallel path. wasm32-unknown-unknown has
+# none of these, so they're native-only deps; on wasm the rayon_shim
+# provides a serial fallback. Native is unchanged.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"
 rayon = "1"
+safetensors = "0.4"
+memmap2 = "0.9"
 
 # CUDA compute (NVIDIA)
 cudarc = { version = "0.19", optional = true, default-features = false, features = [

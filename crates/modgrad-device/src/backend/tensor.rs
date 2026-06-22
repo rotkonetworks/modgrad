@@ -795,7 +795,7 @@ fn cpu_matvec(
     x: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32],
     _out_dim: usize, in_dim: usize,
 ) {
-    use rayon::prelude::*;
+    use crate::rayon_shim::*;
     const PAR_THRESHOLD: usize = 16_384;
     let n_rows = out.len();
     if n_rows * in_dim < PAR_THRESHOLD {

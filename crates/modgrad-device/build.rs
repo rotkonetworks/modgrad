@@ -39,8 +39,10 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/matvec_q5k.hip");
     println!("cargo:rerun-if-changed=kernels/matvec_q4k_dp4a.hip");
     println!("cargo:rerun-if-changed=kernels/matvec_q6k.hip");
+    println!("cargo:rerun-if-changed=kernels/matvec_q6k_dp4a.hip");
     println!("cargo:rerun-if-changed=kernels/transformer_ops.hip");
     println!("cargo:rerun-if-changed=kernels/sdpa_decode.hip");
+    println!("cargo:rerun-if-changed=kernels/sdpa_decode_flash.hip");
     println!("cargo:rerun-if-changed=kernels/per_neuron_glu_batched.hip");
     println!("cargo:rerun-if-changed=kernels/rope_backward.hip");
 
@@ -95,8 +97,10 @@ fn compile_hipcc_kernels(rocm: &str) {
         "kernels/matvec_q5k.hip",
         "kernels/matvec_q4k_dp4a.hip",
         "kernels/matvec_q6k.hip",
+        "kernels/matvec_q6k_dp4a.hip",
         "kernels/transformer_ops.hip",
         "kernels/sdpa_decode.hip",
+        "kernels/sdpa_decode_flash.hip",
         "kernels/per_neuron_glu_batched.hip",
         "kernels/adamw.hip",
         "kernels/rope_backward.hip",

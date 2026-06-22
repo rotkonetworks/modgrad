@@ -1,0 +1,25 @@
+[package]
+name        = "sonotxt"
+version     = "0.1.0"
+edition     = "2024"
+description = "rocm tts — Orpheus 3B + SNAC, 100% rust, runs on your AMD GPU"
+license     = "MIT"
+repository  = "https://github.com/rotkonetworks/modgrad"
+homepage    = "https://sonotxt.com"
+readme      = "README.md"
+keywords    = ["tts", "speech", "rocm", "amd", "orpheus"]
+categories  = ["command-line-utilities", "multimedia::audio"]
+
+[[bin]]
+name = "sonotxt"
+path = "src/main.rs"
+
+[dependencies]
+modgrad-codec  = { path = "../modgrad-codec" }
+modgrad-device = { path = "../modgrad-device" }
+
+[features]
+default = []
+# Enable ROCm/HIP GPU dispatch through modgrad-device. Without this the
+# matvec path falls back to CPU dequant (slow but correct).
+rocm = ["modgrad-device/rocm"]

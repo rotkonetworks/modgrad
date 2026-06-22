@@ -385,6 +385,7 @@ fn main() {
         min_width: 16,
         exit_strategy,
         collect_trajectories: false,
+        spatial: None,
     };
 
     let mut w = CtmWeights::new(cfg, token_dim);

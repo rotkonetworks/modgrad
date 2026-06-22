@@ -75,6 +75,59 @@ pub fn silu_forward(x: &Tensor) -> Tensor {
     y
 }
 
+/// Snake activation: y = x + (1/α) · sin(αx)²
+///
+/// Per-channel learnable α. Used by SNAC and other neural audio codecs to
+/// preserve periodic features (Liu et al. 2020, "Neural Networks Fail to
+/// Learn Periodic Functions"). At α→0 it degenerates to the identity, at
+/// α→∞ it approaches a square wave. SNAC initialises α≈1.
+///
+/// Layout: `x` is [batch × channels], `alpha` is one scalar per channel
+/// (length = `x.cols`). Each column gets multiplied by its own α.
+///
+/// α is clamped to ≥1e-6 to avoid 1/α blowing up at exactly zero.
+pub fn snake_forward(x: &Tensor, alpha: &[f32]) -> Tensor {
+    assert_eq!(alpha.len(), x.cols, "snake: one α per channel");
+    let mut y = Tensor::zeros(x.rows, x.cols);
+    for r in 0..x.rows {
+        let row_off = r * x.cols;
+        for c in 0..x.cols {
+            let xi = x.data[row_off + c];
+            let a = alpha[c].max(1e-6);
+            let s = (a * xi).sin();
+            y.data[row_off + c] = xi + (s * s) / a;
+        }
+    }
+    y
+}
+
+/// Backward for Snake.
+///
+/// ∂y/∂x = 1 + sin(2αx)
+/// ∂y/∂α = -(1/α²)·sin(αx)² + (x/α)·sin(2αx)
+///
+/// Returns (`dx`, `dalpha`) where `dalpha[c]` is summed over batch+rows
+/// (one accumulated gradient per channel, same shape as `alpha`).
+pub fn snake_backward(dy: &Tensor, x: &Tensor, alpha: &[f32]) -> (Tensor, Vec<f32>) {
+    assert_eq!(alpha.len(), x.cols);
+    let mut dx = Tensor::zeros(x.rows, x.cols);
+    let mut dalpha = vec![0.0f32; alpha.len()];
+    for r in 0..x.rows {
+        let row_off = r * x.cols;
+        for c in 0..x.cols {
+            let xi = x.data[row_off + c];
+            let dyi = dy.data[row_off + c];
+            let a = alpha[c].max(1e-6);
+            let ax = a * xi;
+            let s2 = (2.0 * ax).sin();
+            dx.data[row_off + c] = dyi * (1.0 + s2);
+            let s = ax.sin();
+            dalpha[c] += dyi * (-(s * s) / (a * a) + (xi / a) * s2);
+        }
+    }
+    (dx, dalpha)
+}
+
 /// Cat along cols: [batch × a] + [batch × b] → [batch × (a+b)]
 pub fn cat_cols(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.rows, b.rows);
@@ -564,5 +617,92 @@ impl MiniCtmGrads {
             energy_w: Tensor::zeros(model.energy_w.rows, model.energy_w.cols),
             energy_b: vec![0.0; model.energy_b.len()],
         }
+    }
+}
+
+#[cfg(test)]
+mod snake_tests {
+    use super::*;
+
+    /// Snake(x, α) = x + (1/α)·sin(αx)²
+    /// Reference values computed by hand:
+    ///   x= 1.0, α=1.0  →  1 + sin(1)² ≈ 1.7080734
+    ///   x= 0.0, α=1.0  →  0
+    ///   x=-1.0, α=1.0  → -1 + sin(-1)² ≈ -0.2919266
+    ///   x= 2.0, α=0.5  →  2 + sin(1)²/0.5 ≈ 3.4161469
+    #[test]
+    fn snake_forward_matches_reference() {
+        let x = Tensor {
+            rows: 4,
+            cols: 1,
+            data: vec![1.0, 0.0, -1.0, 2.0],
+        };
+        let alpha_a = vec![1.0];
+        let y_a = snake_forward(&x, &alpha_a);
+        assert!((y_a.data[0] - 1.7080734).abs() < 1e-4, "got {}", y_a.data[0]);
+        assert!(y_a.data[1].abs() < 1e-7, "got {}", y_a.data[1]);
+        assert!((y_a.data[2] + 0.2919266).abs() < 1e-4, "got {}", y_a.data[2]);
+
+        let alpha_b = vec![0.5];
+        let y_b = snake_forward(&x, &alpha_b);
+        assert!((y_b.data[3] - 3.4161469).abs() < 1e-4, "got {}", y_b.data[3]);
+    }
+
+    /// Per-channel α: each column gets its own α.
+    #[test]
+    fn snake_forward_per_channel_alpha() {
+        let x = Tensor { rows: 1, cols: 3, data: vec![1.0, 1.0, 1.0] };
+        let alpha = vec![1.0, 0.5, 2.0];
+        let y = snake_forward(&x, &alpha);
+        // α=1: 1+sin(1)² ≈ 1.7081
+        // α=0.5: 1+sin(0.5)²/0.5 = 1 + 2·sin(0.5)² ≈ 1.4596
+        // α=2: 1+sin(2)²/2 ≈ 1.4135
+        assert!((y.data[0] - 1.7080734).abs() < 1e-4, "ch0 {}", y.data[0]);
+        assert!((y.data[1] - 1.4596976).abs() < 1e-4, "ch1 {}", y.data[1]);
+        assert!((y.data[2] - 1.4134730).abs() < 1e-4, "ch2 {}", y.data[2]);
+    }
+
+    /// Backward check: ∂y/∂x = 1 + sin(2αx), ∂y/∂α = -sin(αx)²/α² + x·sin(2αx)/α
+    /// At x=1, α=1: dx = 1+sin(2) ≈ 1.9093, dα = -sin(1)² + sin(2) ≈ 0.2012
+    #[test]
+    fn snake_backward_matches_reference() {
+        let x = Tensor { rows: 1, cols: 1, data: vec![1.0] };
+        let alpha = vec![1.0];
+        let dy = Tensor { rows: 1, cols: 1, data: vec![1.0] };
+        let (dx, dalpha) = snake_backward(&dy, &x, &alpha);
+        assert!((dx.data[0] - 1.9092974).abs() < 1e-4, "dx {}", dx.data[0]);
+        assert!((dalpha[0] - 0.2011686).abs() < 1e-4, "dα {}", dalpha[0]);
+    }
+
+    /// Numerical gradient sanity: finite-difference dx vs analytical dx at a few points.
+    #[test]
+    fn snake_backward_matches_finite_diff() {
+        let alpha = vec![1.3];
+        let eps = 1e-4;
+        for &xv in &[0.5_f32, -0.7, 1.2, -2.1] {
+            let x = Tensor { rows: 1, cols: 1, data: vec![xv] };
+            let dy = Tensor { rows: 1, cols: 1, data: vec![1.0] };
+            let (dx, _) = snake_backward(&dy, &x, &alpha);
+
+            let xp = Tensor { rows: 1, cols: 1, data: vec![xv + eps] };
+            let xm = Tensor { rows: 1, cols: 1, data: vec![xv - eps] };
+            let yp = snake_forward(&xp, &alpha).data[0];
+            let ym = snake_forward(&xm, &alpha).data[0];
+            let fd = (yp - ym) / (2.0 * eps);
+
+            // FD has eps² truncation + extra error growth at large |αx| (the
+            // sin(2α(x±eps)) terms expand more aggressively). 5e-3 is still
+            // tight enough to catch any sign or formula bugs.
+            assert!((dx.data[0] - fd).abs() < 5e-3, "x={xv}: analytical {} vs FD {}", dx.data[0], fd);
+        }
+    }
+
+    /// α=0 must not blow up (clamped to ≥1e-6 internally).
+    #[test]
+    fn snake_handles_zero_alpha() {
+        let x = Tensor { rows: 1, cols: 1, data: vec![1.0] };
+        let alpha = vec![0.0];
+        let y = snake_forward(&x, &alpha);
+        assert!(y.data[0].is_finite(), "y must be finite, got {}", y.data[0]);
     }
 }

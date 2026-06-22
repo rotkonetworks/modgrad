@@ -1972,6 +1972,7 @@ mod typed_forward_tests {
             min_width: 2,
             exit_strategy: crate::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         }
     }
 

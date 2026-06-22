@@ -16,7 +16,7 @@
 //! You can use it however you want.
 
 use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
+use crate::rayon_shim::*;
 use modgrad_compute::neuron::{Linear, SimpleRng};
 use wincode_derive::{SchemaRead, SchemaWrite};
 use crate::config::CtmConfig;
@@ -541,6 +541,16 @@ pub struct RegionalConfig {
     /// forward model instead of the CTM tick loop. Default: Ctm.
     #[serde(default)]
     pub cereb_mode: crate::cerebellum::CerebMode,
+    /// OUTPUT-local move head: when `Some(r)`, the move/output logits are
+    /// read DIRECTLY from region `r`'s own synchronization readout
+    /// (`sync_out`) via a learned `output_local_head: Linear(n_synch_out
+    /// → out_dims)`, instead of from the global-sync pooling over all
+    /// regions. Designed for spatial tasks (e.g. per-cell maze moves)
+    /// where the holistic global sync averages away a region's localized
+    /// per-position signal. `None` (default) keeps the legacy global-sync
+    /// readout, so existing brains/weights are unaffected.
+    #[serde(default)]
+    pub output_local_region: Option<usize>,
 }
 
 impl RegionalConfig {
@@ -635,6 +645,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -702,6 +713,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: None, // no router at this scale
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -790,6 +802,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: None,
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -897,6 +910,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: None,
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -934,6 +948,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: None,
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1000,6 +1015,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1115,6 +1131,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1178,6 +1195,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1247,6 +1265,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1315,6 +1334,7 @@ impl RegionalConfig {
             aux_losses: AuxLossConfig::default(),
             router: Some(RouterConfig::default()),
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 
@@ -1507,6 +1527,7 @@ impl RegionalConfig {
             // RegionalConfig is responsible for swapping in a
             // FrozenCerebellum-backed mode when the LLM is mounted.
             cereb_mode: Default::default(),
+            output_local_region: None,
         }
     }
 }
@@ -1540,6 +1561,16 @@ pub struct RegionalWeights {
 
     /// Output projection: global_sync → next byte logits (head 0).
     pub output_proj: Linear,
+
+    /// OUTPUT-local move head: reads the move/output logits DIRECTLY from
+    /// one region's own synchronization readout (`sync_out`), sized
+    /// `region.n_synch_out → out_dims`. Present iff
+    /// `config.output_local_region` is `Some(_)`. When present it
+    /// REPLACES `output_proj(global_sync)` as the prediction. Gated +
+    /// `#[serde(default)]` so legacy brains (which never set
+    /// `output_local_region`) deserialize and behave identically.
+    #[serde(default)]
+    pub output_local_head: Option<Linear>,
 
     /// Outer-level adaptive exit gate: global_sync → scalar → sigmoid.
     /// Present iff exit_strategy is AdaptiveGate.
@@ -1622,9 +1653,18 @@ impl RegionalWeights {
             }
         }
 
-        // Build per-region CTM weights
+        // Build per-region CTM weights. A spatial region's kv_proj must be
+        // sized `raw_dim → d_input` (it attends over per-token raw features),
+        // so build it with raw_input_dim = raw_dim; flat regions keep the
+        // legacy raw_input_dim = d_input.
         let regions: Vec<CtmWeights> = config.regions.iter()
-            .map(|cfg| CtmWeights::new(cfg.clone(), cfg.d_input))
+            .map(|cfg| {
+                let raw_input_dim = match cfg.spatial {
+                    Some((_n, rd)) => rd,
+                    None => cfg.d_input,
+                };
+                CtmWeights::new(cfg.clone(), raw_input_dim)
+            })
             .collect();
 
         // Build connection synapses. Each connection picks one
@@ -1657,6 +1697,13 @@ impl RegionalWeights {
 
         // Output projection (head 0: next byte)
         let output_proj = Linear::new(n_sync, config.out_dims);
+
+        // OUTPUT-local move head — sized to the chosen region's own
+        // sync_out readout. Only built when the config opts in.
+        let output_local_head = config.output_local_region.map(|r| {
+            let n_synch_out = config.regions[r].n_synch_out;
+            Linear::new(n_synch_out, config.out_dims)
+        });
 
         // Outer-level adaptive exit gate
         let outer_exit_gate = if config.exit_strategy.has_gate() {
@@ -1718,6 +1765,7 @@ impl RegionalWeights {
             global_sync_right,
             global_decay,
             output_proj,
+            output_local_head,
             outer_exit_gate,
             extra_heads,
             cereb_predict,
@@ -1772,6 +1820,7 @@ impl RegionalWeights {
         n += self.obs_proj.weight.len() + self.obs_proj.bias.len();
         n += self.global_decay.len();
         n += self.output_proj.weight.len() + self.output_proj.bias.len();
+        if let Some(ref h) = self.output_local_head { n += h.weight.len() + h.bias.len(); }
         if let Some(ref g) = self.outer_exit_gate { n += g.weight.len() + g.bias.len(); }
         for h in &self.extra_heads { n += h.weight.len() + h.bias.len(); }
         if let Some(ref r) = self.router { n += r.n_params(); }
@@ -1854,6 +1903,11 @@ pub struct RegionalOutput {
     pub exit_lambdas: Vec<f32>,
     /// How many outer ticks actually ran (may be < outer_ticks if early exit).
     pub ticks_used: usize,
+    /// The OUTPUT-local region's own `sync_out` readout from the final outer
+    /// tick (the exact input the local move head consumes). `None` unless
+    /// `config.output_local_region` is set. Exposed for diagnostics — lets a
+    /// caller measure whether the head's INPUT varies with agent position.
+    pub output_local_sync: Option<Vec<f32>>,
 }
 
 /// GPU-accelerated sync backward scatter: compute d_activations from d_sync gradients.
@@ -1908,6 +1962,8 @@ pub fn regional_forward(
     let n_sync = cfg.n_global_sync;
     let mut gs_buf = vec![0.0f32; n_sync];
     let mut pred_buf = vec![0.0f32; cfg.out_dims];
+    // Last outer tick's OUTPUT-local sync readout (head input), for telemetry.
+    let mut last_local_sync: Option<Vec<f32>> = None;
 
     for outer_tick in 0..cfg.outer_ticks {
         // Swap double-buffer: prev_outputs gets current, region_outputs ready for writes.
@@ -1969,19 +2025,45 @@ pub fn regional_forward(
         // ctm_forward branches on rs.episodic.is_some() internally now —
         // the caller used to dispatch via two function names; that's
         // collapsed into a single entry point.
+        let local_region = cfg.output_local_region;
         let mut states_vec: Vec<CtmState> = std::mem::take(&mut state.region_states);
-        let results: Vec<Vec<f32>> = states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
-            let d_input = w.regions[r].config.d_input;
-            let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
-                obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
-            });
-            rs.activated.clone()
+        let results: Vec<(Vec<f32>, Option<Vec<f32>>)> =
+            states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
+            // Spatial region: attend over the RAW per-cell observation as
+            // `n × rd` tokens (bypassing the flat connection-merged obs).
+            // Flat region: legacy single-token path over its d_input obs.
+            let output = match w.regions[r].config.spatial {
+                Some((n_tok, rd)) => {
+                    ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                        obs: observation, n_tokens: n_tok, raw_dim: rd,
+                    })
+                }
+                None => {
+                    let d_input = w.regions[r].config.d_input;
+                    ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                        obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
+                    })
+                }
+            };
+            // Capture this region's OWN sync readout when it is the
+            // OUTPUT-local move source (the move head reads it directly).
+            let local_sync = if local_region == Some(r) {
+                Some(output.sync_out)
+            } else {
+                None
+            };
+            (rs.activated.clone(), local_sync)
         }).collect();
         state.region_states = states_vec;
 
+        // Capture the OUTPUT-local region's sync readout for the move head.
+        let local_sync_out: Option<Vec<f32>> = local_region
+            .and_then(|r| results[r].1.clone());
+        last_local_sync = local_sync_out.clone();
+
         // Phase C: Commit outputs (sequential — cheap copy)
         for r in 0..n_regions {
-            state.region_outputs[r] = results[r].clone();
+            state.region_outputs[r] = results[r].0.clone();
         }
 
         // Phase 3: Global sync — flatten into pre-allocated buffer
@@ -2009,13 +2091,19 @@ pub fn regional_forward(
             gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
         }
 
-        // Phase 4: Output prediction — reuse buffer
-        {
-            let _g = crate::dispatch_profile::Guard::new(
-                crate::dispatch_profile::DispatchKind::OutputProj);
-            w.output_proj.forward_into(&gs_buf, &mut pred_buf);
-        }
-        let prediction = pred_buf.clone(); // need owned copy for predictions vec
+        // Phase 4: Output prediction — reuse buffer.
+        // When the OUTPUT-local move head is enabled, read the move DIRECTLY
+        // from the OUTPUT region's own sync readout (bypassing global-sync
+        // pooling). Otherwise use the legacy global-sync output_proj.
+        let prediction = match (&w.output_local_head, &local_sync_out) {
+            (Some(head), Some(sync)) => head.forward(sync),
+            _ => {
+                let _g = crate::dispatch_profile::Guard::new(
+                    crate::dispatch_profile::DispatchKind::OutputProj);
+                w.output_proj.forward_into(&gs_buf, &mut pred_buf);
+                pred_buf.clone()
+            }
+        };
         predictions.push(prediction);
 
         // Phase 5: Exit decision
@@ -2044,6 +2132,7 @@ pub fn regional_forward(
         region_activations: state.region_outputs.clone(),
         exit_lambdas,
         ticks_used,
+        output_local_sync: last_local_sync,
     }
 }
 
@@ -2188,10 +2277,22 @@ pub fn regional_forward_with_service(
         // `regional_forward`).
         let mut states_vec: Vec<CtmState> = std::mem::take(&mut state.region_states);
         let results: Vec<Vec<f32>> = states_vec.par_iter_mut().enumerate().map(|(r, rs)| {
-            let d_input = w.regions[r].config.d_input;
-            let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
-                obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
-            });
+            // Spatial region: attend over the RAW per-cell observation as
+            // `n × rd` tokens (bypassing the flat connection-merged obs).
+            // Flat region: legacy single-token path over its d_input obs.
+            match w.regions[r].config.spatial {
+                Some((n_tok, rd)) => {
+                    let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                        obs: observation, n_tokens: n_tok, raw_dim: rd,
+                    });
+                }
+                None => {
+                    let d_input = w.regions[r].config.d_input;
+                    let _output = ctm_forward(&w.regions[r], rs, crate::forward::CtmInput::Raw {
+                        obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
+                    });
+                }
+            }
             rs.activated.clone()
         }).collect();
         state.region_states = states_vec;
@@ -2247,6 +2348,8 @@ pub fn regional_forward_with_service(
         region_activations: state.region_outputs.clone(),
         exit_lambdas,
         ticks_used,
+        // The service-aware variant doesn't run the OUTPUT-local move head.
+        output_local_sync: None,
     }
 }
 
@@ -2331,6 +2434,9 @@ pub struct RegionalGradients {
     /// Output projection gradients.
     pub output_proj_dw: Vec<f32>,
     pub output_proj_db: Vec<f32>,
+    /// OUTPUT-local move head gradients (None when feature disabled).
+    pub output_local_head_dw: Option<Vec<f32>>,
+    pub output_local_head_db: Option<Vec<f32>>,
     /// Outer exit gate gradients.
     pub outer_exit_gate_dw: Option<Vec<f32>>,
     pub outer_exit_gate_db: Option<Vec<f32>>,
@@ -2367,6 +2473,8 @@ impl RegionalGradients {
             global_decay_grad: vec![0.0; w.global_decay.len()],
             output_proj_dw: vec![0.0; w.output_proj.weight.len()],
             output_proj_db: vec![0.0; w.output_proj.bias.len()],
+            output_local_head_dw: w.output_local_head.as_ref().map(|h| vec![0.0; h.weight.len()]),
+            output_local_head_db: w.output_local_head.as_ref().map(|h| vec![0.0; h.bias.len()]),
             outer_exit_gate_dw: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.weight.len()]),
             outer_exit_gate_db: w.outer_exit_gate.as_ref().map(|g| vec![0.0; g.bias.len()]),
             router_grads: w.router.as_ref().map(RouterGradients::zeros),
@@ -2391,6 +2499,8 @@ impl RegionalGradients {
         self.global_decay_grad.fill(0.0);
         self.output_proj_dw.fill(0.0);
         self.output_proj_db.fill(0.0);
+        if let Some(w) = &mut self.output_local_head_dw { w.fill(0.0); }
+        if let Some(b) = &mut self.output_local_head_db { b.fill(0.0); }
         if let Some(w) = &mut self.outer_exit_gate_dw { w.fill(0.0); }
         if let Some(b) = &mut self.outer_exit_gate_db { b.fill(0.0); }
         if let Some(rg) = &mut self.router_grads { rg.zero(); }
@@ -2425,6 +2535,8 @@ impl RegionalGradients {
         buf.extend_from_slice(&self.global_decay_grad);
         buf.extend_from_slice(&self.output_proj_dw);
         buf.extend_from_slice(&self.output_proj_db);
+        if let Some(w) = &self.output_local_head_dw { buf.extend_from_slice(w); }
+        if let Some(b) = &self.output_local_head_db { buf.extend_from_slice(b); }
         if let Some(w) = &self.outer_exit_gate_dw { buf.extend_from_slice(w); }
         if let Some(b) = &self.outer_exit_gate_db { buf.extend_from_slice(b); }
         if let Some(rg) = &self.router_grads { rg.flatten_into(buf); }
@@ -2933,11 +3045,24 @@ pub fn regional_train_step(
         // Run each region with caching for BPTT (state persists across outer ticks)
         let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
         for r in 0..n_regions {
-            let d_input = w.regions[r].config.d_input;
-            let input = TokenInput {
-                tokens: region_obs[r].clone(),
-                n_tokens: 1,
-                token_dim: d_input,
+            // Spatial region: cache-forward over the RAW `n × rd` observation
+            // (the same tokens the forward pass attends over), so the cached
+            // backward threads gradients through per-token attention. Flat
+            // region: legacy single-token path over the merged d_input obs.
+            let input = match w.regions[r].config.spatial {
+                Some((n_tok, rd)) => TokenInput {
+                    tokens: observation.to_vec(),
+                    n_tokens: n_tok,
+                    token_dim: rd,
+                },
+                None => {
+                    let d_input = w.regions[r].config.d_input;
+                    TokenInput {
+                        tokens: region_obs[r].clone(),
+                        n_tokens: 1,
+                        token_dim: d_input,
+                    }
+                }
             };
             let region_state = std::mem::replace(
                 &mut region_explicit_states[r],
@@ -2996,9 +3121,23 @@ pub fn regional_train_step(
     }
 
     // ── Loss: imagination (default) ──
-    let predictions: Vec<Vec<f32>> = tick_caches.iter()
-        .map(|tc| w.output_proj.forward(&tc.global_sync))
-        .collect();
+    // When the OUTPUT-local move head is enabled, predictions are read
+    // DIRECTLY from the local region's own per-tick sync_out (bypassing the
+    // global-sync pooling). Otherwise the legacy global-sync output_proj.
+    let local_region = cfg.output_local_region;
+    let predictions: Vec<Vec<f32>> = match (&w.output_local_head, local_region) {
+        (Some(head), Some(lr)) => tick_caches.iter()
+            .map(|tc| {
+                let sync = tc.region_caches[lr].as_ref()
+                    .map(|c| c.final_sync_out())
+                    .unwrap_or(&[]);
+                head.forward(sync)
+            })
+            .collect(),
+        _ => tick_caches.iter()
+            .map(|tc| w.output_proj.forward(&tc.global_sync))
+            .collect(),
+    };
     let pred_class = predictions.last().unwrap().iter().enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i).unwrap_or(0);
@@ -3049,28 +3188,68 @@ pub fn regional_train_step(
         .map(|r| vec![0.0f32; w.regions[r].config.d_model])
         .collect();
 
+    // OUTPUT-local head backward path: accumulate into d_region_activated[lr]
+    // (computed below per-tick). The global-sync path is skipped when the
+    // local head supplies the prediction, since global_sync never fed it.
+    let local_head_active = w.output_local_head.is_some() && local_region.is_some();
+
     for (t, mut tc) in tick_caches.into_iter().enumerate().rev() {
         let d_logits = &d_per_tick[t];
 
-        // Output proj backward
+        // Per-region d on the LOCAL region's final activated, from the
+        // OUTPUT-local move head backward. Computed before the global scatter
+        // so it can be folded into d_region_activated[lr].
+        let local_d_activated: Option<(usize, Vec<f32>)> = if local_head_active {
+            let head = w.output_local_head.as_ref().unwrap();
+            let lr = local_region.unwrap();
+            let (out_dim, in_dim) = (head.out_dim, head.in_dim);
+            // sync_out fed to the head this tick.
+            let sync = tc.region_caches[lr].as_ref()
+                .map(|c| c.final_sync_out().to_vec())
+                .unwrap_or_default();
+            let dw = grads.output_local_head_dw.as_mut().unwrap();
+            let db = grads.output_local_head_db.as_mut().unwrap();
+            for i in 0..out_dim { db[i] += d_logits[i]; }
+            modgrad_device::backend::ops::outer_product_acc(
+                d_logits, &sync, dw, out_dim, in_dim,
+            ).expect("output_local_head backward: outer_product_acc dispatch");
+            let mut d_sync_out = vec![0.0f32; in_dim];
+            modgrad_device::backend::ops::matvec_t(
+                d_logits, &head.weight, &mut d_sync_out, out_dim, in_dim,
+            ).expect("output_local_head backward: matvec_t dispatch");
+            // d_sync_out → d_activated for the local region's final tick.
+            let d_act = tc.region_caches[lr].as_ref()
+                .map(|c| c.final_sync_out_backward(&w.regions[lr], &d_sync_out))
+                .unwrap_or_else(|| vec![0.0f32; w.regions[lr].config.d_model]);
+            Some((lr, d_act))
+        } else {
+            None
+        };
+
+        // Output proj backward (global-sync path) — skipped when the local
+        // head supplied the prediction (global_sync had no role then).
         let out_dim = w.output_proj.out_dim;
         let in_dim = w.output_proj.in_dim;
         let mut d_global_sync = vec![0.0f32; in_dim];
-        // Bias grad — trivial elementwise, no Op variant worth it.
-        for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
-        // Weight grad (outer product accumulate) + input grad (matvec_t)
-        // through the Backend registry — output-projection backward now
-        // matches the dispatch pattern used in `linear_backward`.
-        modgrad_device::backend::ops::outer_product_acc(
-            d_logits, &tc.global_sync, &mut grads.output_proj_dw,
-            out_dim, in_dim,
-        ).expect("output_proj backward: outer_product_acc dispatch");
-        modgrad_device::backend::ops::matvec_t(
-            d_logits, &w.output_proj.weight, &mut d_global_sync,
-            out_dim, in_dim,
-        ).expect("output_proj backward: matvec_t dispatch");
+        if !local_head_active {
+            // Bias grad — trivial elementwise, no Op variant worth it.
+            for i in 0..out_dim { grads.output_proj_db[i] += d_logits[i]; }
+            // Weight grad (outer product accumulate) + input grad (matvec_t)
+            // through the Backend registry — output-projection backward now
+            // matches the dispatch pattern used in `linear_backward`.
+            modgrad_device::backend::ops::outer_product_acc(
+                d_logits, &tc.global_sync, &mut grads.output_proj_dw,
+                out_dim, in_dim,
+            ).expect("output_proj backward: outer_product_acc dispatch");
+            modgrad_device::backend::ops::matvec_t(
+                d_logits, &w.output_proj.weight, &mut d_global_sync,
+                out_dim, in_dim,
+            ).expect("output_proj backward: matvec_t dispatch");
+        }
 
-        // Global sync backward → d_all_activations (GPU-accelerated)
+        // Global sync backward → d_all_activations (GPU-accelerated).
+        // d_global_sync is all-zero when the local head is active, so this
+        // contributes nothing then; the local-head d_activated is added below.
         let total_act_dim = tc.all_activations.len();
         let d_all_activations = global_sync_backward(
             &d_global_sync, &tc.all_activations, &tc.global_beta,
@@ -3090,6 +3269,14 @@ pub fn regional_train_step(
             }
             d_region_activated.push(row);
             offset += dim;
+        }
+        // Fold in the OUTPUT-local move head's gradient on the local region's
+        // final activated state (from its sync_out backward). This is what
+        // makes the move-head gradient flow into the region that attends over
+        // the maze, instead of through the global-sync pooling.
+        if let Some((lr, d_act)) = local_d_activated {
+            let row = &mut d_region_activated[lr];
+            for k in 0..row.len().min(d_act.len()) { row[k] += d_act[k]; }
         }
         // Reset the carry; the router-backward below will repopulate it
         // for this tick's sources (feeding tick t-1 on the next iteration).
@@ -3129,8 +3316,14 @@ pub fn regional_train_step(
                 // populates `result.grads.unet` correctly; it just
                 // wasn't being copied across to the outer accumulator.
                 dst.unet.add_from(&result.grads.unet);
-                // Store d_observation for connection synapse backward
-                d_region_obs[r] = result.d_observation;
+                // Store d_observation for connection synapse backward.
+                // A spatial region attends over the RAW maze observation and
+                // ignores its incoming connections (v1), so its d_observation
+                // is gradient w.r.t. raw input pixels (no params there) —
+                // leave d_region_obs empty so the connection backward skips it.
+                if w.regions[r].config.spatial.is_none() {
+                    d_region_obs[r] = result.d_observation;
+                }
             }
         }
 
@@ -3485,11 +3678,22 @@ fn regional_train_step_inner(
 
         let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
         for r in 0..n_regions {
-            let d_input = w.regions[r].config.d_input;
-            let input = TokenInput {
-                tokens: region_obs[r].clone(),
-                n_tokens: 1,
-                token_dim: d_input,
+            // Spatial region: cache-forward over the RAW `n × rd` observation.
+            // Flat region: legacy single-token path over the merged obs.
+            let input = match w.regions[r].config.spatial {
+                Some((n_tok, rd)) => TokenInput {
+                    tokens: observation.to_vec(),
+                    n_tokens: n_tok,
+                    token_dim: rd,
+                },
+                None => {
+                    let d_input = w.regions[r].config.d_input;
+                    TokenInput {
+                        tokens: region_obs[r].clone(),
+                        n_tokens: 1,
+                        token_dim: d_input,
+                    }
+                }
             };
             let region_state = std::mem::replace(
                 &mut region_explicit_states[r],
@@ -3740,7 +3944,11 @@ fn regional_train_step_inner(
                 add(&mut dst.out_proj_b, &result.grads.out_proj_b);
                 // U-Net grads — same outer-merge gap as fixed elsewhere.
                 dst.unet.add_from(&result.grads.unet);
-                d_region_obs[r] = result.d_observation;
+                // Spatial region ignores incoming connections (v1): its
+                // d_observation is gradient w.r.t. raw input, not routed.
+                if w.regions[r].config.spatial.is_none() {
+                    d_region_obs[r] = result.d_observation;
+                }
             }
         }
 
@@ -4093,6 +4301,10 @@ pub struct RegionalAdamW {
     global_decay: AdamWBuf,
     output_proj_w: AdamWBuf,
     output_proj_b: AdamWBuf,
+    #[serde(default)]
+    output_local_head_w: Option<AdamWBuf>,
+    #[serde(default)]
+    output_local_head_b: Option<AdamWBuf>,
     cereb_predict_w: Option<AdamWBuf>,
     cereb_predict_b: Option<AdamWBuf>,
     bg_value_w: Option<AdamWBuf>,
@@ -4127,6 +4339,8 @@ impl RegionalAdamW {
             global_decay: AdamWBuf::zeros(w.global_decay.len()),
             output_proj_w: AdamWBuf::zeros(w.output_proj.weight.len()),
             output_proj_b: AdamWBuf::zeros(w.output_proj.bias.len()),
+            output_local_head_w: w.output_local_head.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
+            output_local_head_b: w.output_local_head.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
             cereb_predict_w: w.cereb_predict.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
             cereb_predict_b: w.cereb_predict.as_ref().map(|h| AdamWBuf::zeros(h.bias.len())),
             bg_value_w: w.bg_value.as_ref().map(|h| AdamWBuf::zeros(h.weight.len())),
@@ -4157,6 +4371,8 @@ impl RegionalAdamW {
             &grads.embed_grad, &grads.output_proj_dw, &grads.output_proj_db,
             &grads.obs_proj_dw, &grads.obs_proj_db,
         ];
+        if let Some(dw) = &grads.output_local_head_dw { slices.push(dw); }
+        if let Some(db) = &grads.output_local_head_db { slices.push(db); }
         for dw in &grads.connection_dw { slices.push(dw); }
         for db in &grads.connection_db { slices.push(db); }
         for rg in &grads.region_grads {
@@ -4202,6 +4418,22 @@ impl RegionalAdamW {
         self.global_decay.step(&mut w.global_decay, &mut grads.global_decay_grad, lr, 0.0, b1, b2, eps, bc1, bc2);
         self.output_proj_w.step(&mut w.output_proj.weight, &mut grads.output_proj_dw, lr, wd, b1, b2, eps, bc1, bc2);
         self.output_proj_b.step(&mut w.output_proj.bias, &mut grads.output_proj_db, lr, 0.0, b1, b2, eps, bc1, bc2);
+
+        // OUTPUT-local move head — AdamW (only when feature enabled). Lazily
+        // init the optimizer state when missing (older deserialized opts get
+        // `None` via `#[serde(default)]`).
+        if let Some(head) = w.output_local_head.as_mut() {
+            if let (Some(dw), Some(db)) =
+                (grads.output_local_head_dw.as_mut(), grads.output_local_head_db.as_mut())
+            {
+                let ow = self.output_local_head_w
+                    .get_or_insert_with(|| AdamWBuf::zeros(head.weight.len()));
+                ow.step(&mut head.weight, dw, lr, wd, b1, b2, eps, bc1, bc2);
+                let ob = self.output_local_head_b
+                    .get_or_insert_with(|| AdamWBuf::zeros(head.bias.len()));
+                ob.step(&mut head.bias, db, lr, 0.0, b1, b2, eps, bc1, bc2);
+            }
+        }
 
         // Aux heads — AdamW (only when enabled)
         if let (Some(head), Some(opt_w), Some(opt_b),
@@ -6093,6 +6325,86 @@ mod regional_weights_typed_tests {
         assert_eq!(dh.len(), raw_obs_dim);
         assert!(dh.iter().any(|&x| x.abs() > 1e-9),
             "d_observation all zero — connection-tail backward did not populate it");
+    }
+
+    #[test]
+    fn output_local_head_gradcheck_and_flows_into_output_region() {
+        // The OUTPUT-local move head reads the move from one region's own
+        // sync_out. This verifies (a) the analytic gradient of the local
+        // head weight matches central finite differences, and (b) the
+        // gradient actually flows back INTO the OUTPUT region (its kv_proj
+        // weight gets a non-zero grad) — i.e. the move-head signal reaches
+        // the region that attends over the input, which is the whole point.
+        const OUTPUT_R: usize = 2;
+        let mut cfg = RegionalConfig::eight_region_small(16, 4, 2);
+        cfg.router = None; // exercise the fixed-connection backward path
+        // Make OUTPUT spatial (attends over raw tokens) and route the move
+        // through its own sync_out.
+        let raw_dim = 4usize;
+        let n_tok = cfg.raw_obs_dim / raw_dim;
+        cfg.regions[OUTPUT_R].spatial = Some((n_tok, raw_dim));
+        cfg.output_local_region = Some(OUTPUT_R);
+
+        let mut w = RegionalWeights::new(cfg);
+        assert!(w.output_local_head.is_some(), "local head not built");
+
+        let obs: Vec<f32> = (0..w.config.raw_obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.21).sin()).collect();
+        let target = 2usize;
+
+        // Analytic gradients.
+        let mut grads = RegionalGradients::zeros(&w);
+        let (_loss, _) = regional_train_step(&w, &mut grads, &obs, target);
+
+        // (b) The OUTPUT region received gradient (move-head → sync_out →
+        //     activated → region BPTT → kv_proj).
+        let out_kv_grad_norm: f32 = grads.region_grads[OUTPUT_R].kv_proj_w
+            .iter().map(|g| g * g).sum::<f32>().sqrt();
+        assert!(out_kv_grad_norm > 1e-8,
+            "OUTPUT region kv_proj got no gradient from the local head ({out_kv_grad_norm})");
+
+        // The global output_proj should be UNTOUCHED (local head replaces it).
+        let global_grad_norm: f32 = grads.output_proj_dw.iter()
+            .map(|g| g * g).sum::<f32>().sqrt();
+        assert!(global_grad_norm < 1e-12,
+            "global output_proj got gradient but local head is active ({global_grad_norm})");
+
+        // (a) Analytic-vs-finite-difference gradcheck of the local-head
+        //     readout, against the EXACT scalar the analytic backward
+        //     differentiates: the imagination loss restricted to the single
+        //     committed tick whose CE the loss actually weights. With
+        //     outer_ticks=2 and the default imagine_ratio, both selected
+        //     ticks collapse to the committed tick, so for that tick the loss
+        //     IS smooth (plain 0.5·CE + 0.5·CE on the same logits = CE) and
+        //     FD matches the analytic head gradient up to f32 noise. We check
+        //     the weights carrying the largest analytic gradient.
+        let head_w = grads.output_local_head_dw.as_ref().unwrap().clone();
+        let mut by_mag: Vec<usize> = (0..head_w.len()).collect();
+        by_mag.sort_by(|&a, &b| head_w[b].abs().partial_cmp(&head_w[a].abs()).unwrap());
+        let eps = 5e-4f32;
+        let mut checked = 0;
+        for &idx in by_mag.iter().take(3) {
+            let an = head_w[idx];
+            if an.abs() < 1e-4 { continue; }
+            let orig = w.output_local_head.as_ref().unwrap().weight[idx];
+            w.output_local_head.as_mut().unwrap().weight[idx] = orig + eps;
+            let mut gp = RegionalGradients::zeros(&w);
+            let (lp, _) = regional_train_step(&w, &mut gp, &obs, target);
+            w.output_local_head.as_mut().unwrap().weight[idx] = orig - eps;
+            let mut gm = RegionalGradients::zeros(&w);
+            let (lm, _) = regional_train_step(&w, &mut gm, &obs, target);
+            w.output_local_head.as_mut().unwrap().weight[idx] = orig;
+            let fd = (lp - lm) / (2.0 * eps);
+            let denom = fd.abs().max(an.abs()).max(1e-3);
+            let rel = (fd - an).abs() / denom;
+            // Same sign, and within tolerance that accommodates the loss's
+            // discrete tick-selection surrogate (the analytic omits the
+            // imagination-bonus / argmax-cert terms FD captures).
+            assert!(fd * an > 0.0 && rel < 0.2,
+                "local-head gradcheck idx={idx}: analytic={an:.6} fd={fd:.6} rel={rel:.4}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no local-head weight had a checkable gradient");
     }
 
     #[test]

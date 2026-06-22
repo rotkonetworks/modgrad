@@ -176,6 +176,7 @@ fn build_classifier(token_dim: usize, ticks: usize) -> CtmWeights {
         min_width: (d_model / 4).max(4),
         exit_strategy: ExitStrategy::None,
         collect_trajectories: false,
+        spatial: None,
     };
     CtmWeights::new(cfg, token_dim)
 }

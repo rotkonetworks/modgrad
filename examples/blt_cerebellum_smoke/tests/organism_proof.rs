@@ -89,6 +89,7 @@ fn ctm_latent() -> CtmLatent<Cpu> {
         min_width: 2,
         exit_strategy: ExitStrategy::None,
         collect_trajectories: false,
+        spatial: None,
     };
     let w = CtmWeights::new(cfg, PATCH_DIM); // raw_input_dim == PATCH_DIM
     CtmLatent::<Cpu>::from_weights(&w, PATCH_DIM).expect("CtmLatent")

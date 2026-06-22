@@ -111,6 +111,7 @@ fn make_config(ticks: usize, d_model: usize, adaptive: bool) -> CtmConfig {
             ExitStrategy::None
         },
         collect_trajectories: false,
+        spatial: None,
     }
 }
 

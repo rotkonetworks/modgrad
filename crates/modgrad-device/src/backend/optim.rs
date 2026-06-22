@@ -106,8 +106,12 @@ impl BatchedOptimizer for CpuBatchedOptimizer {
 // backend registration. Consumers that care about binary size get the
 // benefit on the registration surface; they still link VramMirror's
 // code, which is dominated by the buffer allocation pathway anyway.
+// kfd_impls depends on `crate::kfd`, which is native-only. Gate it (and
+// its re-export) out on wasm; the CPU BatchedOptimizer covers inference.
+#[cfg(not(target_arch = "wasm32"))]
 pub use self::kfd_impls::KfdBatchedOptimizer;
 
+#[cfg(not(target_arch = "wasm32"))]
 mod kfd_impls {
     use super::{AdamWArgs, BatchedOptimizer};
     use crate::kfd::accel;

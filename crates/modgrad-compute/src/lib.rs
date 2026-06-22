@@ -3,11 +3,17 @@
 //! Generic building blocks: Linear layers, activations, tensor ops.
 //! No architecture-specific or runtime-specific code.
 
+// Threading prelude shim: rayon on native, serial fallback on wasm32.
+pub mod rayon_shim;
+
 pub mod neuron;
 pub mod ops;
 pub mod tensor;
 pub mod backend;
 pub mod kv_buffer;
+// tensor_device is built entirely on `modgrad_device::kfd` GPU buffers,
+// which are native-only. Gated out on wasm; inference never touches it.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tensor_device;
 pub mod optimizer_state;
 
@@ -17,6 +23,11 @@ pub mod optimizer_state;
 ///
 /// Today this resolves to the KFD `VramMirror` on AMD; a future CUDA
 /// impl slots in here without caller-side changes.
+///
+/// Native-only: the device-backed optimizer state lives behind
+/// `modgrad_device::kfd`. wasm inference uses the CPU AdamW loop, so this
+/// factory isn't compiled there.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn make_optimizer_state(sizes: Vec<usize>) -> Option<Box<dyn optimizer_state::OptimizerState>> {
     let mirror = modgrad_device::kfd::accel::make_vram_mirror(sizes)?;
     Some(Box::new(mirror))

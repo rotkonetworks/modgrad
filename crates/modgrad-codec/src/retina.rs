@@ -1339,6 +1339,7 @@ impl V4Ctm {
             min_width: (d_model / 4).max(4),
             exit_strategy: modgrad_ctm::config::ExitStrategy::None,
             collect_trajectories: false,
+            spatial: None,
         };
         let weights = modgrad_ctm::weights::CtmWeights::new(config, token_dim);
         Self { weights }
