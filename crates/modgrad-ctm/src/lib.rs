@@ -11,6 +11,16 @@
 pub mod rayon_shim;
 
 pub mod config;
+/// Fixed 2D sinusoidal positional encoding (no trainable params). Added
+/// in place to a flattened `[n_tokens × raw_dim]` spatial-token buffer so
+/// attention can recover token grid position.
+pub mod pos;
+/// Value-Iteration-Network readout (arXiv:1602.02867). Convolutional
+/// value-propagation over the 2D grid of V4 spatial tokens, read
+/// ego-centrically at the agent's own cell — never pooled. Forward-only
+/// alternative readout that makes local walls linearly decodable. See
+/// module docs and `examples/mazes --vin-readout`.
+pub mod vin;
 pub mod synapse;
 pub mod weights;
 pub mod forward;

@@ -1856,6 +1856,20 @@ pub struct RegionalState {
     /// Global sync accumulators.
     pub global_alpha: Vec<f32>,
     pub global_beta: Vec<f32>,
+
+    /// Per-region CTM states for the CACHED forward path
+    /// (`forward_cached`). Distinct type from `region_states` because the
+    /// cached path uses `Ctm`'s value-shaped `CtmStateExplicit` (no
+    /// episodic). Threaded across calls (FIX 1) so CTM recurrence carries.
+    /// Lazily (re)built when empty or shape-mismatched.
+    pub region_explicit_states: Vec<crate::train::CtmStateExplicit>,
+
+    /// The OUTPUT-local region's own `sync_out` readout from the most
+    /// recent `forward_cached` call, when `config.output_local_region`
+    /// is set and the OUTPUT region is spatial. This is the EXACT input
+    /// the local move head consumes — exposed for the wall-probe so it
+    /// can decode walls from the readout's true input. `None` otherwise.
+    pub last_output_local_sync: Option<Vec<f32>>,
 }
 
 impl RegionalState {
@@ -1885,6 +1899,10 @@ impl RegionalState {
             prev_outputs,
             global_alpha: vec![0.0; n],
             global_beta: vec![1.0; n],
+            region_explicit_states: w.regions.iter()
+                .map(|rw| Ctm::init_state(rw))
+                .collect(),
+            last_output_local_sync: None,
         }
     }
 }
@@ -6794,10 +6812,17 @@ impl RegionalBrain {
             .unwrap_or(4);
 
         let obs_projected = weights.obs_proj.forward(&input.tokens);
-        let mut state = RegionalState::new(weights);
-        let mut region_explicit_states: Vec<_> = weights.regions.iter()
-            .map(|rw| Ctm::init_state(rw))
-            .collect();
+        // FIX 1: thread the passed-in state (mirror forward_cached). The
+        // spatial readout (FIX 2) is DEFERRED for the frozen path — it is
+        // not exercised by the wall-probe (run without --frozen-cereb).
+        let mut state = state;
+        let mut region_explicit_states: Vec<_> =
+            std::mem::take(&mut state.region_explicit_states);
+        if region_explicit_states.len() != n_regions {
+            region_explicit_states = weights.regions.iter()
+                .map(|rw| Ctm::init_state(rw))
+                .collect();
+        }
         let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
 
         for outer_tick in 0..cfg.outer_ticks {
@@ -6913,6 +6938,9 @@ impl RegionalBrain {
             });
         }
 
+        // FIX 1: thread region CTM states back into the returned state.
+        state.region_explicit_states = region_explicit_states;
+
         let predictions: Vec<Vec<f32>> = tick_caches.iter()
             .map(|tc| weights.output_proj.forward(&tc.global_sync))
             .collect();
@@ -6982,31 +7010,51 @@ impl modgrad_traits::Brain for RegionalBrain {
 
     fn forward_cached(
         weights: &RegionalWeights,
-        _state: RegionalState,
+        state: RegionalState,
         input: &modgrad_traits::TokenInput,
     ) -> (modgrad_traits::BrainOutput, RegionalState, RegionalCache) {
-        // KNOWN REGRESSION (tracked by PR-AB): the `Brain` trait is
-        // value-shaped — caller passes a state in, expects the new
-        // state out. This impl IGNORES `_state` and constructs a
-        // fresh `RegionalState::new(weights)` below. Same bug as
-        // SaaF review #2.3: outer regional loop is `&mut state`-shaped
-        // while the inner `Ctm::forward_cached` (train.rs:1321) is
-        // correctly value-shaped. Fix lands with the AdamW value-shape
-        // refactor (PR-AB) which makes the whole optimizer-update-cache
-        // chain value-shaped. Today the practical effect is bounded:
-        // continuous-thinking-across-calls isn't currently expressed
-        // anywhere (mazes/main.rs:1366 constructs fresh state per
-        // eval sample anyway), so eval numbers are unaffected.
+        // FIX 1 (was: KNOWN REGRESSION, tracked by PR-AB): this impl now
+        // THREADS the passed-in `state` (mirroring `forward`) instead of
+        // rebuilding a fresh `RegionalState::new(weights)`. CTM recurrence
+        // (per-region activated/trace, global sync accumulators) carries
+        // across calls so continuous-thinking-across-calls is expressed.
+        // The inner region CTM states (`state.region_states`) are threaded
+        // through `Ctm::forward_cached` per outer tick. NOTE: the
+        // BACKWARD/training rewiring of the spatial readout below is
+        // DEFERRED — the cache populated here still records the legacy
+        // single-token region inputs/global-sync output_proj path for
+        // backprop. The spatial forward additions (pos-encoded raw tokens
+        // + output_local_head readout) affect only the returned
+        // BrainOutput + the stashed local sync, which is all the
+        // wall-probe consumes.
         let cfg = &weights.config;
         let n_regions = cfg.regions.len();
         let n_sync = cfg.n_global_sync;
 
         let obs_projected = weights.obs_proj.forward(&input.tokens);
-        let mut state = RegionalState::new(weights);
-        let mut region_explicit_states: Vec<_> = weights.regions.iter()
-            .map(|rw| Ctm::init_state(rw))
-            .collect();
+        let mut state = state;
+        // Thread the per-region CTM states from the incoming state.
+        let mut region_explicit_states: Vec<_> =
+            std::mem::take(&mut state.region_explicit_states);
+        if region_explicit_states.len() != n_regions {
+            // Defensive: a mismatched incoming state (shouldn't happen for
+            // a state built from these weights) — rebuild region states.
+            region_explicit_states = weights.regions.iter()
+                .map(|rw| Ctm::init_state(rw))
+                .collect();
+        }
         let mut tick_caches = Vec::with_capacity(cfg.outer_ticks);
+
+        // FIX 2: positional encoding can be disabled (ablation) via
+        // env var MODGRAD_DISABLE_POS=1.
+        let pos_enabled = std::env::var("MODGRAD_DISABLE_POS")
+            .map(|v| v != "1" && v != "true")
+            .unwrap_or(true);
+        // Pre-compute the pos-encoded raw token buffer once per call, used
+        // by any spatial region. Grid width = sqrt(n_tokens) (square grid).
+        let local_region = cfg.output_local_region;
+        // The OUTPUT region's local sync from the final outer tick.
+        let mut last_local_sync: Option<Vec<f32>> = None;
 
         for outer_tick in 0..cfg.outer_ticks {
             let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
@@ -7045,28 +7093,58 @@ impl modgrad_traits::Brain for RegionalBrain {
                 }
             }
 
-            // Run regions in parallel — take ownership for disjoint mut
+            // Run regions in parallel — take ownership for disjoint mut.
+            // FIX 2: spatial regions are fed the RAW pos-encoded tokens as
+            // `n_tok × raw_dim` (so attention sees per-cell position),
+            // bypassing the flat connection-merged single-token obs. The
+            // OUTPUT-local region additionally reports its own sync_out
+            // (the readout the move head consumes).
             let states_taken: Vec<_> = region_explicit_states.drain(..).collect();
             let region_results: Vec<_> = states_taken.into_par_iter().enumerate().map(|(r, rstate)| {
-                let d_input = weights.regions[r].config.d_input;
-                let rinput = TokenInput {
-                    tokens: region_obs[r].clone(),
-                    n_tokens: 1,
-                    token_dim: d_input,
+                let rinput = match weights.regions[r].config.spatial {
+                    Some((n_tok, raw_dim)) => {
+                        let mut toks = input.tokens.clone();
+                        if pos_enabled {
+                            let grid_w = (n_tok as f64).sqrt().round() as usize;
+                            crate::pos::add_sinusoidal_pos_2d(
+                                &mut toks, n_tok, raw_dim, grid_w.max(1));
+                        }
+                        TokenInput { tokens: toks, n_tokens: n_tok, token_dim: raw_dim }
+                    }
+                    None => {
+                        let d_input = weights.regions[r].config.d_input;
+                        TokenInput {
+                            tokens: region_obs[r].clone(),
+                            n_tokens: 1,
+                            token_dim: d_input,
+                        }
+                    }
                 };
-                let (_output, new_state, cache) = Ctm::forward_cached(
+                let (output, new_state, cache) = Ctm::forward_cached(
                     &weights.regions[r], rstate, &rinput,
                 );
-                (new_state.activated.clone(), new_state, cache)
+                // The OUTPUT-local region's sync readout (BrainOutput.sync
+                // == final-tick sync_out) is the exact move-head input.
+                let local_sync = if local_region == Some(r) {
+                    Some(output.sync.clone())
+                } else {
+                    None
+                };
+                (new_state.activated.clone(), new_state, cache, local_sync)
             }).collect();
 
             state.region_outputs.clear();
             let mut region_caches: Vec<Option<CtmCache>> = Vec::with_capacity(n_regions);
-            for (activated, new_state, cache) in region_results {
+            let mut tick_local_sync: Option<Vec<f32>> = None;
+            for (activated, new_state, cache, local_sync) in region_results {
                 state.region_outputs.push(activated);
                 region_explicit_states.push(new_state);
                 region_caches.push(Some(cache));
+                if local_sync.is_some() { tick_local_sync = local_sync; }
             }
+            // Carry the OUTPUT region's readout from THIS outer tick;
+            // overwritten each tick so the final value reflects the last.
+            if tick_local_sync.is_some() { last_local_sync = tick_local_sync; }
 
             let mut all_activations = Vec::new();
             for r in 0..n_regions {
@@ -7110,14 +7188,38 @@ impl modgrad_traits::Brain for RegionalBrain {
             });
         }
 
-        let predictions: Vec<Vec<f32>> = tick_caches.iter()
-            .map(|tc| weights.output_proj.forward(&tc.global_sync))
-            .collect();
+        // Thread the per-region CTM states back into the returned state so
+        // the next call carries recurrence (FIX 1).
+        state.region_explicit_states = region_explicit_states;
+        // Stash the OUTPUT region's local sync for the wall-probe (FIX 2).
+        state.last_output_local_sync = last_local_sync.clone();
+
+        // FIX 2: when the OUTPUT-local head is active, predictions come
+        // from `output_local_head.forward(local_sync)` (the spatial
+        // readout) instead of `output_proj(global_sync)`. We only have the
+        // FINAL-tick local sync here (the per-tick spatial syncs are not
+        // cached), so the local-head path emits a single prediction for
+        // the committed (final) tick; the legacy path emits one per tick.
+        let local_head_active = weights.output_local_head.is_some()
+            && local_region.is_some()
+            && last_local_sync.is_some();
+        let predictions: Vec<Vec<f32>> = if local_head_active {
+            let head = weights.output_local_head.as_ref().unwrap();
+            let sync = last_local_sync.as_ref().unwrap();
+            vec![head.forward(sync)]
+        } else {
+            tick_caches.iter()
+                .map(|tc| weights.output_proj.forward(&tc.global_sync))
+                .collect()
+        };
         let certainties: Vec<[f32; 2]> = predictions.iter().map(|p| {
             let c = compute_certainty(p);
             [1.0 - c, c]
         }).collect();
 
+        // BrainOutput.sync stays the GLOBAL sync (the probe's baseline
+        // representation A). The spatial readout (representation C) is read
+        // from `state.last_output_local_sync`.
         let brain_output = modgrad_traits::BrainOutput {
             predictions,
             certainties,
