@@ -298,6 +298,36 @@ pub fn render_input(maze: &Maze) -> Vec<f32> {
     }
 }
 
+/// Like `render_maze`, but draws the agent (red) at an arbitrary CURRENT
+/// position rather than pinning it at `start`. This is what closed-loop
+/// navigation needs: the agent moves and the board is re-observed each step,
+/// so the model sees the agent at every cell — not just (1,1). Goal stays
+/// green; walls black; path white. Matches the in-browser engine's scheme.
+pub fn render_maze_with_agent(maze: &Maze, agent: (usize, usize)) -> Vec<f32> {
+    let s = maze.grid_size;
+    let mut pixels = vec![0.0f32; 3 * s * s];
+    for r in 0..s {
+        for c in 0..s {
+            if !maze.grid[r * s + c] {
+                for ch in 0..3 {
+                    pixels[ch * s * s + r * s + c] = 1.0;
+                }
+            }
+        }
+    }
+    // Goal: green
+    let (er, ec) = maze.end;
+    pixels[0 * s * s + er * s + ec] = 0.0;
+    pixels[1 * s * s + er * s + ec] = 1.0;
+    pixels[2 * s * s + er * s + ec] = 0.0;
+    // Agent: red (drawn last so it shows even atop the goal cell = reached)
+    let (ar, ac) = agent;
+    pixels[0 * s * s + ar * s + ac] = 1.0;
+    pixels[1 * s * s + ar * s + ac] = 0.0;
+    pixels[2 * s * s + ar * s + ac] = 0.0;
+    pixels
+}
+
 pub fn render_maze(maze: &Maze) -> Vec<f32> {
     let s = maze.grid_size;
     let mut pixels = vec![0.0f32; 3 * s * s];

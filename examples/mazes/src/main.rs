@@ -10,6 +10,7 @@
 //!   mazes --size 39 --ticks 32 --steps 50000 --route-len 50
 
 mod maze_gen;
+mod wall_probe;
 
 use maze_gen::*;
 use modgrad_ctm::config::{CtmConfig, ExitStrategy};
@@ -124,6 +125,7 @@ fn main() {
     let mut batch_size = 8usize;
     let mut imagination = false;
     let mut brain = false;
+    let mut rl = false;
     let mut pain_mode = false;
     let mut plural_mode = false;
     let mut csv_mode = false;
@@ -196,12 +198,29 @@ fn main() {
     // on; `Some(1.0)` gives the original full-strength sigmoid.
     let mut topdown_alpha_override: Option<f32> = None;
 
+    // --export DIR: after training, write the trained brain to DIR in the
+    // wasm engine's JSON format (`brain_solver_weights.json` +
+    // `brain_solver_reference.json`). Brain mode only; no effect on a
+    // single-CTM run. Does NOT change training — pure post-training save.
+    let mut export_dir: Option<String> = None;
+
     // --multiscale: brain regions wire to V1 / V2 / V4 directly
     // instead of all consuming V4. INPUT/MOTOR get V4 (categorical),
     // ATTENTION gets V2 (mid-contour), MOTOR/CEREBELLUM get V1
     // (fine spatial). Mirrors real cortical wiring where V1 has
     // direct projections to many areas, not only via the V2→V4 path.
     let mut multiscale = false;
+
+    // --wall-probe: run the wall-probe gate harness (no training). Builds
+    // the brain with the spatial readout enabled on the OUTPUT region and
+    // measures whether walls are linearly decodable from global_sync (A)
+    // vs the spatial readout (C), with a pos-encoding ablation.
+    let mut wall_probe = false;
+    let mut probe_samples = 2000usize;
+    // --vin-readout: add the VIN (Value-Iteration-Network) ego-centric
+    // readout as an alternative path in the wall-probe (read move at the
+    // agent's own cell, no global pooling). Keeps the legacy readout intact.
+    let mut vin_readout = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -217,6 +236,7 @@ fn main() {
             "--no-adaptive" => { adaptive = false; i += 1; }
             "--imagination" => { imagination = true; i += 1; }
             "--brain" => { brain = true; i += 1; }
+            "--rl" => { rl = true; brain = true; i += 1; }
             "--pain" => { pain_mode = true; i += 1; }
             "--plural" => { plural_mode = true; pain_mode = true; i += 1; }
             "--csv" => { csv_mode = true; i += 1; }
@@ -245,6 +265,10 @@ fn main() {
             "--topdown" => { topdown = true; i += 1; }
             "--topdown-alpha" => { topdown_alpha_override = Some(args[i+1].parse().unwrap()); i += 2; }
             "--multiscale" => { multiscale = true; i += 1; }
+            "--wall-probe" => { wall_probe = true; i += 1; }
+            "--probe-samples" => { probe_samples = args[i+1].parse().unwrap(); i += 2; }
+            "--vin-readout" => { vin_readout = true; i += 1; }
+            "--export" => { export_dir = Some(args[i+1].clone()); i += 2; }
             "--help" | "-h" => {
                 eprintln!("Usage: mazes [--size N] [--ticks N] [--steps N] [--route-len N]");
                 eprintln!("             [--d-model N] [--lr F] [--batch N] [--no-adaptive]");
@@ -290,8 +314,16 @@ fn main() {
         b[0].grid_size
     } else { maze_size };
 
+    if wall_probe {
+        wall_probe::run_wall_probe(maze_size, ticks, probe_samples, seed, vin_readout);
+        return;
+    }
+    if rl {
+        run_rl(maze_size, ticks, steps, route_len, lr, seed, export_dir);
+        return;
+    }
     if brain {
-        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs, train_bank, test_bank, ghl_retina, ghl_lr, ghl_tau, topdown, topdown_alpha_override, multiscale);
+        run_brain(maze_size, ticks, steps, route_len, lr, seed, batch_size, imagination, pain_mode, plural_mode, csv_mode, cereb_size, frozen_cereb, autoresearch_summary, budget_secs, train_bank, test_bank, ghl_retina, ghl_lr, ghl_tau, topdown, topdown_alpha_override, multiscale, export_dir);
         return;
     }
 
@@ -859,6 +891,218 @@ fn eval(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// CLOSED-LOOP REINFORCE MODE  (--rl)
+//
+// The behaviour-cloning path (run_brain) shows the agent ONE image with
+// itself pinned at the start, and trains it to copy the BFS-optimal route.
+// It never sees itself anywhere else, never acts, never learns from a
+// mistake — so it memorises one route and collapses to a down/right prior.
+//
+// This path closes the loop: the agent ACTS in the maze, the board is
+// re-rendered with it at its new cell, and learning is driven by OUTCOME
+// (reach goal = +1, bump a wall = penalty) via REINFORCE — policy gradient
+// through the brain's own backward. No expert, no fixed start. It learns
+// the rule ("step to the open neighbour toward the goal") that generalises.
+// ═══════════════════════════════════════════════════════════════
+
+fn rl_softmax(logits: &[f32]) -> Vec<f32> {
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut e: Vec<f32> = logits.iter().map(|&x| (x - m).exp()).collect();
+    let s: f32 = e.iter().sum::<f32>().max(1e-9);
+    for v in &mut e { *v /= s; }
+    e
+}
+
+fn rl_sample(probs: &[f32], rng: &mut MazeRng) -> usize {
+    let u = rng.range(1_000_000) as f32 / 1_000_000.0;
+    let mut acc = 0.0;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if u < acc { return i; }
+    }
+    probs.len().saturating_sub(1)
+}
+
+/// BFS distance-to-goal for every open cell (i32::MAX = wall/unreachable).
+/// Used only as a dense reward *potential* — the agent is rewarded for getting
+/// closer, but still has to discover HOW. It's an outcome signal, not a move label.
+fn rl_dist(maze: &Maze) -> Vec<i32> {
+    let s = maze.grid_size;
+    let mut d = vec![i32::MAX; s * s];
+    let (gr, gc) = maze.end;
+    d[gr * s + gc] = 0;
+    let mut q = std::collections::VecDeque::new();
+    q.push_back((gr, gc));
+    let dirs = [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)];
+    while let Some((r, c)) = q.pop_front() {
+        for (dr, dc) in dirs {
+            let (nr, nc) = (r as i64 + dr, c as i64 + dc);
+            if nr < 0 || nr >= s as i64 || nc < 0 || nc >= s as i64 { continue; }
+            let (nr, nc) = (nr as usize, nc as usize);
+            if maze.grid[nr * s + nc] || d[nr * s + nc] != i32::MAX { continue; }
+            d[nr * s + nc] = d[r * s + c] + 1;
+            q.push_back((nr, nc));
+        }
+    }
+    d
+}
+
+/// Environment transition with dense reward shaping. Returns (new_pos, reward, done).
+/// DIR: U D L R WAIT. Reward = progress toward goal (Δdistance) − small step cost;
+/// wall/edge bump is penalised; reaching the goal pays a terminal bonus.
+fn rl_step(maze: &Maze, pos: (usize, usize), action: usize, dist: &[i32]) -> ((usize, usize), f32, bool) {
+    let sz = maze.grid_size;
+    let s = sz as i64;
+    let (r, c) = (pos.0 as i64, pos.1 as i64);
+    let (nr, nc) = match action {
+        0 => (r - 1, c),
+        1 => (r + 1, c),
+        2 => (r, c - 1),
+        3 => (r, c + 1),
+        _ => return (pos, -0.3, false), // WAIT — wasted step
+    };
+    if nr < 0 || nr >= s || nc < 0 || nc >= s {
+        return (pos, -0.3, false); // off the board — bump
+    }
+    let (nr, nc) = (nr as usize, nc as usize);
+    if maze.grid[nr * sz + nc] {
+        return (pos, -0.3, false); // wall — bump, stay put
+    }
+    if (nr, nc) == maze.end {
+        return ((nr, nc), 5.0, true); // reached the goal
+    }
+    // dense shaping: +1 per cell closer, −1 per cell farther, minus a tiny time cost
+    let progress = (dist[pos.0 * sz + pos.1] - dist[nr * sz + nc]) as f32;
+    ((nr, nc), progress - 0.05, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rl(
+    maze_size: usize, ticks: usize, steps: usize, route_len: usize,
+    lr: f32, seed: u64, export_dir: Option<String>,
+) {
+    use modgrad_codec::genome::{ExpressedBrain, Genome};
+    let out_dims = route_len * N_DIRECTIONS;
+    let genome = Genome::blank_slate(maze_size, maze_size, out_dims, ticks);
+    let ExpressedBrain { cortex, config } = genome.express();
+    let encoder = cortex;
+    let mut w = RegionalWeights::new(config);
+    w.print_summary();
+    // No AdamW: RL's landscape is non-stationary, so momentum points in stale
+    // directions and adaptive LR is far less load-bearing than in SFT (Mukherjee
+    // et al. 2026, "Do We Need Adam?"). We use the SDK's plain SGD apply — which
+    // is also what `three_factor`'s ΔW = θ·advantage·trace amounts to: a
+    // momentum-free, eligibility-weighted update. SGD wants a much larger LR.
+    let mut rng = MazeRng::new(seed);
+
+    let gamma = 0.95f32;
+    let max_ep = maze_size * maze_size; // step budget per episode
+    let mut baseline = 0.0f32;          // EMA of episode return (variance reduction)
+
+    // rolling 100-episode metrics
+    let (mut solved, mut wall_moves, mut total_moves, mut updir_moves) = (0usize, 0usize, 0usize, 0usize);
+
+    eprintln!("RL: closed-loop REINFORCE — {maze_size}x{maze_size}, ticks={ticks}, lr={lr}, steps={steps}");
+
+    for step in 1..=steps {
+        let maze = generate_maze(maze_size, &mut rng);
+        if maze.path_length < 3 { continue; }
+        let goal = maze.end;
+        let dist = rl_dist(&maze);
+        let mut pos = maze.start;
+        let mut traj: Vec<(Vec<f32>, usize, f32)> = Vec::new(); // (pixels, action, reward)
+        let mut reached = false;
+        // The CTM's continuous-thought state is carried across the WHOLE episode
+        // — the brain integrates every observation it's seen, instead of waking
+        // up blank each step. This is the recurrence the CTM exists for.
+        let mut state = RegionalBrain::init_state(&w);
+
+        // ---- rollout: act in the env under the current policy ----
+        for _t in 0..max_ep {
+            let pixels = render_maze_with_agent(&maze, pos);
+            let input = encoder.encode(&pixels);
+            let (output, new_state, _c) = RegionalBrain::forward_cached(&w, state, &input);
+            state = new_state; // carry the thought forward
+            let last = output.predictions.last().expect("no ticks");
+            let probs = rl_softmax(&last[0..N_DIRECTIONS]);
+            let action = rl_sample(&probs, &mut rng);
+
+            total_moves += 1;
+            if action == 0 || action == 2 { updir_moves += 1; } // up or left = "against the prior"
+            let (npos, reward, done) = rl_step(&maze, pos, action, &dist);
+            if npos == pos && action != 4 { wall_moves += 1; }
+            traj.push((pixels, action, reward));
+            pos = npos;
+            if done { reached = pos == goal; break; }
+        }
+        if reached { solved += 1; }
+
+        // ---- returns (discounted) ----
+        let n = traj.len();
+        let mut returns = vec![0.0f32; n];
+        let mut g = 0.0f32;
+        for t in (0..n).rev() { g = traj[t].2 + gamma * g; returns[t] = g; }
+
+        // ---- GRPO-style advantage: A = (R - mean) / std. The mean is the
+        // baseline (variance reduction); the std-normalization keeps the
+        // gradient scale ~unit so momentum-free SGD takes well-conditioned
+        // steps. This is the standard RL normalization, not a hand-tuned hack. ----
+        let mean = returns.iter().sum::<f32>() / n.max(1) as f32;
+        let var = returns.iter().map(|r| (r - mean) * (r - mean)).sum::<f32>() / n.max(1) as f32;
+        let std = var.sqrt().max(1e-3);
+        let advs: Vec<f32> = returns.iter().map(|r| (r - mean) / std).collect();
+
+        // ---- REINFORCE updates: re-forward under current w, policy gradient.
+        // We apply per timestep but scale the LR by 1/n, so the episode's
+        // correlated steps sum to ONE effective update on the mean gradient
+        // (standard REINFORCE is one update per episode; this approximates it
+        // without needing a RegionalGradients accumulator). ----
+        let eff_lr = lr / n.max(1) as f32;
+        // replay the episode forward carrying state (truncated BPTT: state is
+        // carried so each decision is memory-conditioned, gradient flows through
+        // the single step). Forward every step to keep the state sequence intact.
+        let mut up_state = RegionalBrain::init_state(&w);
+        for t in 0..n {
+            let (pixels, action, _r) = &traj[t];
+            let input = encoder.encode(pixels);
+            let (output, new_state, cache) = RegionalBrain::forward_cached(&w, up_state, &input);
+            up_state = new_state;
+            let adv = advs[t];
+            if adv.abs() < 1e-4 { continue; }
+            let k = output.predictions.len();
+            let last = &output.predictions[k - 1];
+            let probs = rl_softmax(&last[0..N_DIRECTIONS]);
+            // d(-adv*logπ)/dlogit_i = -adv*(1{i=a} - p_i), placed on the committed tick
+            let mut d_preds = vec![vec![0.0f32; last.len()]; k];
+            for i in 0..N_DIRECTIONS {
+                let ind = if i == *action { 1.0 } else { 0.0 };
+                d_preds[k - 1][i] = -adv * (ind - probs[i]);
+            }
+            let mut grads = RegionalBrain::backward(&w, cache, &d_preds);
+            // SGD step via the SDK's own apply (momentum-free), clip-norm 5.
+            RegionalBrain::apply_gradients(&mut w, &mut grads, eff_lr, 5.0);
+        }
+
+        baseline = 0.95 * baseline + 0.05 * returns.first().copied().unwrap_or(0.0);
+
+        if step % 100 == 0 {
+            let solv = solved as f32;
+            let wall = wall_moves as f32 / total_moves.max(1) as f32 * 100.0;
+            let updir = updir_moves as f32 / total_moves.max(1) as f32 * 100.0;
+            eprintln!(
+                "rl {step:5}: solved={solv:.0}/100  wall_bumps={wall:.0}%  up|left_moves={updir:.0}%  avg_ep_len={:.1}  baseline={baseline:.3}",
+                total_moves as f32 / 100.0
+            );
+            solved = 0; wall_moves = 0; total_moves = 0; updir_moves = 0;
+        }
+    }
+
+    if let Some(dir) = export_dir {
+        eprintln!("RL: (export to {dir} not yet wired for the RL path)");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 8-REGION BRAIN MODE
 // ═══════════════════════════════════════════════════════════════
 
@@ -871,6 +1115,7 @@ fn run_brain(
     ghl_retina: bool, ghl_lr: f32, ghl_tau: f32,
     topdown: bool, topdown_alpha_override: Option<f32>,
     multiscale: bool,
+    export_dir: Option<String>,
 ) {
     let t_train_start = std::time::Instant::now();
     let budget = budget_secs.map(std::time::Duration::from_secs);
@@ -1418,6 +1663,412 @@ fn run_brain(
         eprintln!("  (task=mazes-brain size={maze_size} route_len={route_len}, \
                    val_bpb = 1 - first_step_acc = {:.6})",
                    1.0 - first_step_acc);
+    }
+
+    // ── Export the trained brain in the wasm-engine JSON format ──
+    // Pure post-training save: training above is unchanged. Skipped
+    // unless --export DIR was passed. The exported observation path
+    // uses the plain (non-multiscale) retina, so refuse to export a
+    // multiscale brain — its token layout would not match the engine's
+    // `spatial_tokens` consumer.
+    if let Some(dir) = export_dir {
+        if multiscale {
+            eprintln!("--export: refusing to export a --multiscale brain \
+                       (engine consumes plain spatial_tokens); skipping save.");
+        } else {
+            export_brain::export(
+                &dir, &w, &encoder, maze_size, ticks, route_len,
+                out_dims, first_step_acc,
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXPORT: save trained brain in the wasm engine's JSON format.
+//
+// Writes:
+//   brain_solver_weights.json   = { cortex: VisualCortex, regional: RegionalWeights (embeddings stripped) }
+//   brain_solver_reference.json = config echo + held-out accuracy + oracle traces
+//
+// The oracle replicates `regional_forward`'s outer loop so it can
+// capture per-outer-tick {prediction, region_activations, global_sync,
+// exit_lambda}, then cross-checks the replicated final-tick predictions
+// against the real `regional_forward` to guarantee the trace is faithful.
+// Mirrors examples/mazes/src/bin/brain_oracle.rs exactly.
+// ═══════════════════════════════════════════════════════════════
+
+mod export_brain {
+    use crate::{MAZE_N_CLASSES, N_DIRECTIONS};
+    use modgrad_codec::retina::VisualCortex;
+    use modgrad_ctm::graph::{RegionalWeights, RegionalState, regional_forward};
+    use modgrad_ctm::forward::{ctm_forward, CtmInput};
+    use serde::Serialize;
+    use serde_json::Value;
+
+    // Four fixed deterministic 9×9 mazes (1 = wall, 0 = open), row-major.
+    // Identical to brain_oracle::fixed_mazes so the engine test bank lines up.
+    fn fixed_mazes(size: usize) -> Vec<(Vec<u8>, (usize, usize), (usize, usize))> {
+        let parse = |rows: &[&str]| -> Vec<u8> {
+            let mut g = vec![0u8; size * size];
+            for (r, row) in rows.iter().enumerate() {
+                for (c, ch) in row.chars().enumerate() {
+                    g[r * size + c] = if ch == '#' { 1 } else { 0 };
+                }
+            }
+            g
+        };
+        let m0 = parse(&[
+            "#########", "#.......#", "#.#####.#", "#.#...#.#", "#.#.#.#.#",
+            "#.#.#.#.#", "#...#...#", "#.#####.#", "#########",
+        ]);
+        let m1 = parse(&[
+            "#########", "#.#.....#", "#.#.###.#", "#...#...#", "###.#.###",
+            "#...#...#", "#.###.#.#", "#.....#.#", "#########",
+        ]);
+        let m2 = parse(&[
+            "#########", "#.......#", "#######.#", "#.......#", "#.#######",
+            "#.......#", "#######.#", "#.......#", "#########",
+        ]);
+        let m3 = parse(&[
+            "#########", "#...#...#", "#.#.#.#.#", "#.#...#.#", "#.#####.#",
+            "#.....#.#", "#####.#.#", "#.......#", "#########",
+        ]);
+        vec![
+            (m0, (1, 1), (7, 7)),
+            (m1, (1, 1), (7, 7)),
+            (m2, (1, 1), (7, 7)),
+            (m3, (1, 1), (7, 7)),
+        ]
+    }
+
+    // Render a grid+agent+goal to RGB pixels [3 × H × W] CHW using the
+    // EXACT scheme `render_maze` (the proven recipe's renderer, SDF off):
+    //   wall  → (0,0,0)   open  → (1,1,1)
+    //   agent → (1,0,0)   goal  → (0,1,0)
+    // Channel-major [R plane][G plane][B plane].
+    fn render_pixels(
+        grid: &[u8], size: usize, agent: (usize, usize), goal: (usize, usize),
+    ) -> Vec<f32> {
+        let n = size * size;
+        let mut px = vec![0.0f32; 3 * n];
+        // open cells white first
+        for idx in 0..n {
+            if grid[idx] == 0 {
+                px[idx] = 1.0; px[n + idx] = 1.0; px[2 * n + idx] = 1.0;
+            }
+        }
+        // agent: red (overwrites)
+        let ai = agent.0 * size + agent.1;
+        px[ai] = 1.0; px[n + ai] = 0.0; px[2 * n + ai] = 0.0;
+        // goal: green (overwrites)
+        let gi = goal.0 * size + goal.1;
+        px[gi] = 0.0; px[n + gi] = 1.0; px[2 * n + gi] = 0.0;
+        px
+    }
+
+    struct TraceOut {
+        predictions: Vec<Vec<f32>>,
+        region_acts: Vec<Vec<Vec<f32>>>,
+        global_sync: Vec<Vec<f32>>,
+        exit_lambdas: Vec<f32>,
+        ticks_used: usize,
+    }
+
+    // Faithful replica of regional_forward with per-outer-tick capture.
+    // Mirrors modgrad_ctm::graph::regional_forward operation-for-operation
+    // (fixed-connection path, no router), sequential so the FP order is
+    // deterministic. Uses the real SDK ctm_forward per region.
+    fn regional_forward_traced(
+        w: &RegionalWeights, state: &mut RegionalState, observation: &[f32],
+    ) -> TraceOut {
+        let cfg = &w.config;
+        let n_regions = cfg.regions.len();
+
+        let mut predictions: Vec<Vec<f32>> = Vec::new();
+        let mut region_acts: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut global_sync_trace: Vec<Vec<f32>> = Vec::new();
+        let mut exit_lambdas: Vec<f32> = Vec::new();
+        let mut exit_cdf = 0.0f32;
+        let mut survival = 1.0f32;
+
+        let obs_projected = w.obs_proj.forward(observation);
+        let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+        let n_sync = cfg.n_global_sync;
+
+        let mut prev_outputs: Vec<Vec<f32>> = state.region_outputs.clone();
+
+        for _outer_tick in 0..cfg.outer_ticks {
+            // Phase A: build each region's observation via fixed connections.
+            let region_obs: Vec<Vec<f32>> = (0..n_regions).map(|r| {
+                let mut slot: Vec<f32> = Vec::new();
+                for (ci, conn) in cfg.connections.iter().enumerate() {
+                    if conn.to == r {
+                        let mut src = Vec::new();
+                        for &from_idx in &conn.from {
+                            src.extend_from_slice(&prev_outputs[from_idx]);
+                        }
+                        if conn.receives_observation {
+                            src.extend_from_slice(observation);
+                        }
+                        let projected = w.connection_synapses[ci].forward(&src);
+                        if slot.is_empty() {
+                            slot = projected;
+                        } else {
+                            let nmin = slot.len().min(projected.len());
+                            for i in 0..nmin { slot[i] += projected[i]; }
+                        }
+                    }
+                }
+                if slot.is_empty() { obs_projected.clone() } else { slot }
+            }).collect();
+
+            // Phase B: run each region's CTM (sequential).
+            let mut results: Vec<Vec<f32>> = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let d_input = w.regions[r].config.d_input;
+                let _out = ctm_forward(&w.regions[r], &mut state.region_states[r], CtmInput::Raw {
+                    obs: &region_obs[r], n_tokens: 1, raw_dim: d_input,
+                });
+                results.push(state.region_states[r].activated.clone());
+            }
+
+            // Phase C: commit outputs.
+            for r in 0..n_regions {
+                state.region_outputs[r] = results[r].clone();
+            }
+            prev_outputs = state.region_outputs.clone();
+
+            // Phase 3: global sync.
+            let mut all_act = vec![0.0f32; total_neurons];
+            {
+                let mut offset = 0;
+                for r in 0..n_regions {
+                    let d = state.region_outputs[r].len();
+                    all_act[offset..offset + d].copy_from_slice(&state.region_outputs[r]);
+                    offset += d;
+                }
+            }
+            for i in 0..n_sync {
+                let l = w.global_sync_left[i];
+                let rr = w.global_sync_right[i];
+                if l < all_act.len() && rr < all_act.len() {
+                    let pw = all_act[l] * all_act[rr];
+                    let decay = (-w.global_decay[i].clamp(0.0, 15.0)).exp();
+                    state.global_alpha[i] = decay * state.global_alpha[i] + pw;
+                    state.global_beta[i] = decay * state.global_beta[i] + 1.0;
+                }
+            }
+            let mut gs_buf = vec![0.0f32; n_sync];
+            for i in 0..n_sync {
+                gs_buf[i] = state.global_alpha[i] / state.global_beta[i].sqrt().max(1e-8);
+            }
+
+            // Phase 4: output prediction.
+            let prediction = w.output_proj.forward(&gs_buf);
+
+            predictions.push(prediction);
+            region_acts.push(state.region_outputs.clone());
+            global_sync_trace.push(gs_buf.clone());
+
+            // Phase 5: AdaptiveGate outer exit.
+            if let Some(ref gate) = w.outer_exit_gate {
+                let gate_logit = gate.forward(&gs_buf);
+                let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
+                exit_lambdas.push(lambda);
+                let p_exit = lambda * survival;
+                exit_cdf += p_exit;
+                survival *= 1.0 - lambda;
+                if exit_cdf > 0.99 { break; }
+            }
+        }
+
+        let ticks_used = predictions.len();
+        TraceOut { predictions, region_acts, global_sync: global_sync_trace, exit_lambdas, ticks_used }
+    }
+
+    #[derive(Serialize)]
+    struct TickTrace {
+        prediction: Vec<f32>,
+        region_activations: Vec<Vec<f32>>,
+        global_sync: Vec<f32>,
+        exit_lambda: Option<f32>,
+    }
+
+    #[derive(Serialize)]
+    struct MazeSample {
+        grid: Vec<u8>,
+        agent: [usize; 2],
+        goal: [usize; 2],
+        pixels: Vec<f32>,
+        observation: Vec<f32>,
+        n_tokens: usize,
+        token_dim: usize,
+        ticks_used: usize,
+        ticks: Vec<TickTrace>,
+    }
+
+    #[derive(Serialize)]
+    struct RegionInfo {
+        name: String,
+        d_model: usize,
+        d_input: usize,
+        memory_length: usize,
+        iterations: usize,
+    }
+
+    #[derive(Serialize)]
+    struct ConnectionInfo {
+        from: Vec<usize>,
+        to: usize,
+        receives_observation: bool,
+        observation_scale: usize,
+    }
+
+    #[derive(Serialize)]
+    struct PixelSpec {
+        layout: String,
+        channels: usize,
+        height: usize,
+        width: usize,
+        sdf: bool,
+        scheme: String,
+    }
+
+    #[derive(Serialize)]
+    struct Reference {
+        task: String,
+        size: usize,
+        ticks: usize,
+        out_dims: usize,
+        route_len: usize,
+        n_classes: usize,
+        n_directions: usize,
+        raw_obs_dim: usize,
+        obs_scale_dims: Vec<usize>,
+        n_global_sync: usize,
+        region_names: Vec<String>,
+        regions: Vec<RegionInfo>,
+        connections: Vec<ConnectionInfo>,
+        heldout_first_move_acc: f32,
+        pixel_spec: PixelSpec,
+        samples: Vec<MazeSample>,
+    }
+
+    pub fn export(
+        out_dir: &str,
+        w: &RegionalWeights,
+        cortex: &VisualCortex,
+        size: usize,
+        ticks: usize,
+        route_len: usize,
+        out_dims: usize,
+        heldout_first_move_acc: f32,
+    ) {
+        std::fs::create_dir_all(out_dir).expect("--export: create out dir");
+        let cfg = &w.config;
+
+        let region_infos: Vec<RegionInfo> = cfg.region_names.iter().zip(&cfg.regions)
+            .map(|(name, rc)| RegionInfo {
+                name: name.clone(), d_model: rc.d_model, d_input: rc.d_input,
+                memory_length: rc.memory_length, iterations: rc.iterations,
+            }).collect();
+        let conn_infos: Vec<ConnectionInfo> = cfg.connections.iter().map(|c| ConnectionInfo {
+            from: c.from.clone(), to: c.to,
+            receives_observation: c.receives_observation,
+            observation_scale: c.observation_scale,
+        }).collect();
+
+        // Oracle: run the trained retina + brain on each fixed maze.
+        let mazes = fixed_mazes(size);
+        let mut samples: Vec<MazeSample> = Vec::new();
+        for (mi, (grid, agent, goal)) in mazes.iter().enumerate() {
+            let pixels = render_pixels(grid, size, *agent, *goal);
+            let (tokens, n_tokens, token_dim) = cortex.spatial_tokens(&pixels);
+
+            let mut traced_state = RegionalState::new(w);
+            let traced = regional_forward_traced(w, &mut traced_state, &tokens);
+
+            // Cross-check the traced predictions against the real
+            // regional_forward to guarantee the trace is faithful.
+            let mut real_state = RegionalState::new(w);
+            let real_out = regional_forward(w, &mut real_state, &tokens);
+            assert_eq!(real_out.predictions.len(), traced.predictions.len(),
+                "export maze {mi}: tick count mismatch");
+            let mut max_d = 0.0f32;
+            for (t, (rp, tp)) in real_out.predictions.iter().zip(&traced.predictions).enumerate() {
+                for (j, (&a, &b)) in rp.iter().zip(tp).enumerate() {
+                    let d = (a - b).abs();
+                    if d > max_d { max_d = d; }
+                    assert!(d < 1e-4,
+                        "export maze {mi} tick {t} pred[{j}]: traced {b} vs real {a}");
+                }
+            }
+            eprintln!("--export: oracle maze {mi} cross-check OK \
+                       (max |Δpred| = {max_d:.2e}, ticks_used={})", traced.ticks_used);
+
+            let tick_traces: Vec<TickTrace> = (0..traced.ticks_used).map(|t| TickTrace {
+                prediction: traced.predictions[t].clone(),
+                region_activations: traced.region_acts[t].clone(),
+                global_sync: traced.global_sync[t].clone(),
+                exit_lambda: traced.exit_lambdas.get(t).copied(),
+            }).collect();
+
+            samples.push(MazeSample {
+                grid: grid.clone(),
+                agent: [agent.0, agent.1],
+                goal: [goal.0, goal.1],
+                pixels,
+                observation: tokens,
+                n_tokens, token_dim,
+                ticks_used: traced.ticks_used,
+                ticks: tick_traces,
+            });
+        }
+
+        let reference = Reference {
+            task: "brain_maze_solver".to_string(),
+            size, ticks, out_dims, route_len,
+            n_classes: MAZE_N_CLASSES,
+            n_directions: N_DIRECTIONS,
+            raw_obs_dim: cfg.raw_obs_dim,
+            obs_scale_dims: cfg.obs_scale_dims.clone(),
+            n_global_sync: cfg.n_global_sync,
+            region_names: cfg.region_names.clone(),
+            regions: region_infos,
+            connections: conn_infos,
+            heldout_first_move_acc,
+            pixel_spec: PixelSpec {
+                layout: "CHW [3 x H x W]".to_string(),
+                channels: 3, height: size, width: size,
+                sdf: false,
+                scheme: "wall=(0,0,0) open=(1,1,1) agent/start=(1,0,0) goal/end=(0,1,0)".to_string(),
+            },
+            samples,
+        };
+
+        // Serialize weights MINUS the (huge, unused) embeddings table.
+        let mut weights_val: Value = serde_json::to_value(w).expect("serialize regional weights");
+        if let Some(obj) = weights_val.as_object_mut() {
+            obj.remove("embeddings");
+        }
+        let cortex_val: Value = serde_json::to_value(cortex).expect("serialize cortex");
+
+        #[derive(Serialize)]
+        struct BrainWeights { cortex: Value, regional: Value }
+        let brain_weights = BrainWeights { cortex: cortex_val, regional: weights_val };
+
+        let w_path = format!("{out_dir}/brain_solver_weights.json");
+        let r_path = format!("{out_dir}/brain_solver_reference.json");
+        let w_str = serde_json::to_string(&brain_weights).expect("serialize brain_weights");
+        let r_str = serde_json::to_string(&reference).expect("serialize reference");
+        std::fs::write(&w_path, &w_str).expect("write brain_solver_weights.json");
+        std::fs::write(&r_path, &r_str).expect("write brain_solver_reference.json");
+
+        eprintln!("--export: wrote {} ({} bytes) + {} ({} bytes)",
+            w_path, w_str.len(), r_path, r_str.len());
+        eprintln!("--export: held-out first-move acc embedded = {:.1}%",
+            heldout_first_move_acc * 100.0);
     }
 }
 

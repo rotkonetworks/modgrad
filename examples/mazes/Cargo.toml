@@ -28,6 +28,10 @@ path = "src/bin/brain_wide.rs"
 name = "brain_real"
 path = "src/bin/brain_real.rs"
 
+[[bin]]
+name = "vin_train"
+path = "src/bin/vin_train.rs"
+
 [features]
 # Opt-in GPU backends. ROCm is the supported path (rocBLAS SGEMM
 # dispatch). KFD has been retired — the hand-written gfx1102 ISA
