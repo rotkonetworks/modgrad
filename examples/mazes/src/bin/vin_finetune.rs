@@ -291,6 +291,14 @@ fn arg_val<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
         .and_then(|s| s.parse().ok())
 }
 
+/// splitmix64 — deterministic per-seed hash for sampling the training depth.
+fn splitmix(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let in_path = arg_val::<String>(&args, "--in")
@@ -301,6 +309,7 @@ fn main() {
     let lr = arg_val::<f32>(&args, "--lr").unwrap_or(3e-3);
     let batch = arg_val::<usize>(&args, "--batch").unwrap_or(32);
     let eval_every = arg_val::<usize>(&args, "--eval-every").unwrap_or(250);
+    let random_depth = args.iter().any(|a| a == "--random-depth");
 
     // ── warm-start from the trained VIN ───────────────────────────────────
     let json = std::fs::read_to_string(&in_path)
@@ -325,9 +334,7 @@ fn main() {
     println!("  batch |  size | trainCE | move_acc | (running)");
     for b in 0..n_batches {
         let size = SIZES[b % SIZES.len()];
-        let it = iters_for_size(size);
-        vin.config.iters = it;
-        vin.config.max_iters = vin.config.max_iters.max(it);
+        let base_it = iters_for_size(size);
 
         let mut grads = VinGradients::zeros(&vin);
         let (mut loss, mut correct, mut filled) = (0.0f32, 0usize, 0usize);
@@ -341,6 +348,20 @@ fn main() {
                 continue;
             }
             let toks = encode_tokens(&maze, raw_dim);
+
+            // ANYTIME / random-depth training (#22): sample the sweep count
+            // per maze so the move head learns to be correct (and confident
+            // ONLY when correct) at ANY depth. Then at inference, low
+            // move-entropy genuinely means "value has arrived" → entropy-gated
+            // ripples can stop early on easy cells and sweep more at junctions.
+            let depth = if random_depth {
+                let h = splitmix(train_seed);
+                6 + (h as usize % (base_it.saturating_sub(6) + 1))
+            } else {
+                base_it
+            };
+            vin.config.iters = depth;
+            vin.config.max_iters = vin.config.max_iters.max(depth);
 
             // DAgger: train on the planner's OWN visited cells (its mistakes
             // and loops), labelled by the BFS expert. Falls back to start.

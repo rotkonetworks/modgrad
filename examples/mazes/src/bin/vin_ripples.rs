@@ -208,8 +208,9 @@ fn main() {
         let (sf, wf, cf) = eval(&vin, raw_dim, size, n, false);
         let (sa, wa, ca) = eval(&vin, raw_dim, size, n, true);
         println!(
-            "  {:>2}x{:<2} | fixed    | {:5.1}% | {:8.2} | {:6.1}\n         | adaptive | {:5.1}% | {:8.2} | {:6.1}   (floor 0.5, {}..{} sweeps)",
-            size, size, 100.0 * sf, wf, cf, 100.0 * sa, wa, ca, 6, (iters_for_size(size) * 2).max(32),
+            "  {:>2}x{:<2} | fixed    | {:5.1}% | {:8.2} | {:6.1}\n         | adaptive | {:5.1}% | {:8.2} | {:6.1}   (additive ripples: {}..{} sweeps, floor 0.3)",
+            size, size, 100.0 * sf, wf, cf, 100.0 * sa, wa, ca,
+            iters_for_size(size), iters_for_size(size) * 2,
         );
     }
 }

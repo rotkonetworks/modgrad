@@ -349,7 +349,7 @@ impl VinReadout {
                 let readout =
                     self.gather_agent_readout(ar, ac, grid_h, grid_w, &value, &value_init, &gate, v);
                 let logits = self.move_head.forward(&readout);
-                if move_entropy(&logits) <= entropy_floor {
+                if softmax_entropy(&logits) <= entropy_floor {
                     break;
                 }
             }
@@ -589,22 +589,24 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Shannon entropy (nats) of the softmax over up-to-4 move logits. 0 = fully
-/// confident, ln(4) ≈ 1.386 = uniform. Used to gate adaptive value iteration
-/// ("ripples ↑ under uncertainty"): keep sweeping while the move is uncertain.
-fn move_entropy(logits: &[f32]) -> f32 {
-    let n = logits.len().min(4);
-    let m = logits[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut e = [0.0f32; 4];
+/// Shannon entropy (nats) of the softmax over an N-class logit vector. 0 =
+/// fully confident, ln(N) = uniform. Task-agnostic — used here to gate adaptive
+/// value iteration ("ripples ↑ under uncertainty"), but it is just the entropy
+/// of any decision distribution, so the same confidence-gated-halting idea
+/// applies to any iterative readout (cf. the CTM's `ExitStrategy::Certainty`).
+fn softmax_entropy(logits: &[f32]) -> f32 {
+    if logits.is_empty() {
+        return 0.0;
+    }
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut s = 0.0f32;
-    for i in 0..n {
-        e[i] = (logits[i] - m).exp();
-        s += e[i];
+    for &l in logits {
+        s += (l - m).exp();
     }
     let inv = 1.0 / s.max(1e-20);
     let mut h = 0.0f32;
-    for ei in e.iter().take(n) {
-        let p = ei * inv;
+    for &l in logits {
+        let p = (l - m).exp() * inv;
         if p > 1e-12 {
             h -= p * p.ln();
         }
