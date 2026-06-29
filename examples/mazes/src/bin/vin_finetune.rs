@@ -235,6 +235,45 @@ fn rollout_visited(vin: &VinReadout, maze: &Maze, raw_dim: usize) -> Vec<(usize,
     visited
 }
 
+/// Reverse-replay trace (#2, Foster & Wilson credit assignment): roll the
+/// planner out and return the (cell, chosen_move) sequence plus whether the
+/// rollout FAILED (looped / ran out of budget without reaching the goal).
+/// On failure the caller replays BACKWARD from the failure, focusing learning
+/// on the cells nearest where it went wrong.
+fn rollout_trace(vin: &VinReadout, maze: &Maze, raw_dim: usize) -> (Vec<((usize, usize), usize)>, bool) {
+    let s = maze.grid_size;
+    let toks = encode_tokens(maze, raw_dim);
+    let mut pos = maze.start;
+    let budget = (4 * maze.path_length.max(1)).max(40) as u32;
+    let mut trace = Vec::new();
+    let mut recent: VecDeque<(usize, usize)> = VecDeque::with_capacity(8);
+    let mut steps = 0u32;
+    while steps < budget {
+        if pos == maze.end {
+            return (trace, false);
+        }
+        let out = vin.forward(&toks, s, s, Some(pos));
+        let mv = argmax4(&out.move_logits);
+        trace.push((pos, mv));
+        let (dr, dc) = DIR_OFFSETS[mv];
+        let nr = pos.0 as i32 + dr;
+        let nc = pos.1 as i32 + dc;
+        steps += 1;
+        if nr < 0 || nc < 0 || nr >= s as i32 || nc >= s as i32 || maze.grid[nr as usize * s + nc as usize] {
+            continue; // wall-bump: stay, but the mistake is recorded at `pos`
+        }
+        pos = (nr as usize, nc as usize);
+        recent.push_back(pos);
+        if recent.len() > 6 {
+            recent.pop_front();
+        }
+        if recent.iter().filter(|&&p| p == pos).count() >= 3 {
+            return (trace, true); // stuck in a loop = failure
+        }
+    }
+    (trace, pos != maze.end)
+}
+
 struct EvalResult {
     solve_rate: f32,
     move_acc: f32,
@@ -301,8 +340,6 @@ fn splitmix(seed: u64) -> u64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let in_path = arg_val::<String>(&args, "--in")
-        .expect("--in <vin_solver_weights.json> required");
     let out_path = arg_val::<String>(&args, "--out")
         .expect("--out <vin_planner_v2_weights.json> required");
     let n_batches = arg_val::<usize>(&args, "--batches").unwrap_or(2000);
@@ -310,17 +347,36 @@ fn main() {
     let batch = arg_val::<usize>(&args, "--batch").unwrap_or(32);
     let eval_every = arg_val::<usize>(&args, "--eval-every").unwrap_or(250);
     let random_depth = args.iter().any(|a| a == "--random-depth");
+    let mistake_replay = args.iter().any(|a| a == "--mistake-replay");
 
-    // ── warm-start from the trained VIN ───────────────────────────────────
-    let json = std::fs::read_to_string(&in_path)
-        .unwrap_or_else(|e| panic!("read {in_path}: {e}"));
-    let mut vin: VinReadout = serde_json::from_str(&json)
-        .unwrap_or_else(|e| panic!("parse VIN {in_path}: {e}"));
+    // ── warm-start from a trained VIN, OR init fresh (--scratch) for scaling ──
+    let mut vin: VinReadout = match arg_val::<String>(&args, "--in") {
+        Some(in_path) => {
+            let json = std::fs::read_to_string(&in_path)
+                .unwrap_or_else(|e| panic!("read {in_path}: {e}"));
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse VIN {in_path}: {e}"))
+        }
+        None => {
+            // from-scratch (Phase-4 scale): bigger value_dim, fresh weights.
+            let value_dim = arg_val::<usize>(&args, "--value-dim").unwrap_or(16);
+            let cfg = modgrad_ctm::vin::VinConfig {
+                value_dim,
+                iters: iters_for_size(9),
+                max_iters: iters_for_size(13) * 2,
+                softmax_temp: 0.5,
+                highway_gate: true,
+                n_dirs: 4,
+            };
+            println!("(from scratch — value_dim={value_dim})");
+            VinReadout::new(cfg, 3)
+        }
+    };
     let raw_dim = vin.raw_dim;
     println!(
-        "fine-tune (DAgger + multi-size curriculum) — warm-start from {in_path}\n\
+        "fine-tune (DAgger + multi-size curriculum){}\n\
          config: value_dim={} base_iters={} temp={} raw_dim={} params={}\n\
          batches={n_batches} lr={lr} batch={batch}  sizes=[9,11,13] iters=2·s+2",
+        format!("{}{}", if random_depth { " + random-depth" } else { "" }, if mistake_replay { " + mistake-replay" } else { "" }),
         vin.config.value_dim, vin.config.iters, vin.config.softmax_temp, raw_dim, vin.num_params(),
     );
 
@@ -365,10 +421,39 @@ fn main() {
 
             // DAgger: train on the planner's OWN visited cells (its mistakes
             // and loops), labelled by the BFS expert. Falls back to start.
-            let visited = rollout_visited(&vin, &maze, raw_dim);
+            // With --mistake-replay (#2): focus on the cells where the planner
+            // ERRED, and on a failed rollout order them BACKWARD from the
+            // failure (reverse-replay credit assignment).
+            let (candidates, front_loaded) = if mistake_replay {
+                let (trace, failed) = rollout_trace(&vin, &maze, raw_dim);
+                let mut mistakes: Vec<(usize, usize)> = trace
+                    .iter()
+                    .filter(|(cell, mv)| optimal_move(&maze, &dist, *cell).is_some_and(|e| e != *mv))
+                    .map(|(cell, _)| *cell)
+                    .collect();
+                if failed {
+                    mistakes.reverse(); // credit from the failure point backward
+                }
+                if mistakes.is_empty() {
+                    (trace.iter().map(|(c, _)| *c).collect::<Vec<_>>(), false)
+                } else {
+                    (mistakes, true)
+                }
+            } else {
+                (rollout_visited(&vin, &maze, raw_dim), false)
+            };
+            if candidates.is_empty() {
+                continue;
+            }
             let per_maze = 4.min(batch - filled);
             for k in 0..per_maze {
-                let cell = visited[(train_seed as usize + k * 7) % visited.len()];
+                // front_loaded → take the highest-credit cells in order;
+                // otherwise spread deterministically across the trajectory.
+                let cell = if front_loaded {
+                    candidates[k % candidates.len()]
+                } else {
+                    candidates[(train_seed as usize + k * 7) % candidates.len()]
+                };
                 let label = match optimal_move(&maze, &dist, cell) {
                     Some(l) => l,
                     None => continue,
