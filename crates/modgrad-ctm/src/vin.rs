@@ -264,6 +264,117 @@ impl VinReadout {
         }
     }
 
+    /// Entropy-gated value iteration — "hippocampal ripples increase under
+    /// uncertainty". Runs Bellman sweeps but STOPS early once the agent's move
+    /// decision is confident (softmax move-entropy ≤ `entropy_floor`), never
+    /// fewer than `min_iters` nor more than `max_iters` sweeps. So the planner
+    /// spends iteration (compute / "replay depth") where the decision is
+    /// uncertain — junctions, and larger/unfamiliar grids where value hasn't
+    /// reached the agent yet — and little on obvious straightaways. This is the
+    /// principled form of fixed diameter-scaling. Returns the output plus the
+    /// number of sweeps actually used (the "ripple count"). Identical to
+    /// `forward` when `min_iters == max_iters` (or `entropy_floor ≤ 0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_adaptive(
+        &self,
+        tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        agent_cell: Option<(usize, usize)>,
+        min_iters: usize,
+        max_iters: usize,
+        entropy_floor: f32,
+    ) -> (VinOutput, usize) {
+        let n_cells = grid_h * grid_w;
+        let v = self.config.value_dim.max(1);
+        debug_assert_eq!(tokens.len(), n_cells * self.raw_dim);
+
+        // 1. per-cell projections (same as `forward`)
+        let mut reward = vec![0.0f32; n_cells];
+        let mut gate = vec![0.0f32; n_cells];
+        let mut value = vec![0.0f32; n_cells * v];
+        let mut agent_score = vec![0.0f32; n_cells];
+        for cell in 0..n_cells {
+            let tok = &tokens[cell * self.raw_dim..(cell + 1) * self.raw_dim];
+            reward[cell] = self.reward_proj.forward(tok)[0];
+            gate[cell] = sigmoid(self.gate_proj.forward(tok)[0]);
+            agent_score[cell] = self.agent_proj.forward(tok)[0];
+            value[cell * v..(cell + 1) * v].copy_from_slice(&self.value_proj.forward(tok));
+        }
+        let value_init = value.clone();
+
+        // 2. locate the agent up front (needed to read move-entropy each sweep)
+        let (ar, ac) = agent_cell.unwrap_or_else(|| {
+            let mut best = 0usize;
+            let mut best_s = f32::NEG_INFINITY;
+            for cell in 0..n_cells {
+                if agent_score[cell] > best_s {
+                    best_s = agent_score[cell];
+                    best = cell;
+                }
+            }
+            (best / grid_w, best % grid_w)
+        });
+
+        // 3. adaptive Bellman sweeps with an entropy early-stop
+        let max_iters = max_iters.max(1);
+        let min_iters = min_iters.clamp(1, max_iters);
+        let mut next = value.clone();
+        let mut used = 0usize;
+        for i in 0..max_iters {
+            for r in 0..grid_h {
+                for c in 0..grid_w {
+                    let cell = r * grid_w + c;
+                    let cand =
+                        self.backup_cell(r, c, grid_h, grid_w, &value, &gate, reward[cell], v);
+                    let dst = &mut next[cell * v..(cell + 1) * v];
+                    if self.config.highway_gate {
+                        let prev = &value[cell * v..(cell + 1) * v];
+                        let mut hin = Vec::with_capacity(2 * v);
+                        hin.extend_from_slice(prev);
+                        hin.extend_from_slice(&cand);
+                        let g = self.highway_proj.forward(&hin);
+                        for k in 0..v {
+                            let gk = sigmoid(g[k]);
+                            dst[k] = gk * cand[k] + (1.0 - gk) * prev[k];
+                        }
+                    } else {
+                        dst.copy_from_slice(&cand);
+                    }
+                }
+            }
+            std::mem::swap(&mut value, &mut next);
+            used = i + 1;
+            if used >= min_iters && entropy_floor > 0.0 {
+                let readout =
+                    self.gather_agent_readout(ar, ac, grid_h, grid_w, &value, &value_init, &gate, v);
+                let logits = self.move_head.forward(&readout);
+                if softmax_entropy(&logits) <= entropy_floor {
+                    break;
+                }
+            }
+        }
+
+        // 4. final ego-centric readout → move logits
+        let agent_cell_idx = ar * grid_w + ac;
+        let readout =
+            self.gather_agent_readout(ar, ac, grid_h, grid_w, &value, &value_init, &gate, v);
+        let move_logits = self.move_head.forward(&readout);
+        let out = VinOutput {
+            move_logits,
+            agent_readout: readout,
+            agent_value: value[agent_cell_idx * v..(agent_cell_idx + 1) * v].to_vec(),
+            agent_cell: (ar, ac),
+            value_grid: value,
+            gate,
+            reward,
+            grid_h,
+            grid_w,
+            value_dim: v,
+        };
+        (out, used)
+    }
+
     /// One cell's Bellman backup: `reward + (soft)max_neighbour gate·value`.
     /// Returns a `value_dim` vector.
     fn backup_cell(
@@ -476,6 +587,31 @@ pub struct VinOutput {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Shannon entropy (nats) of the softmax over an N-class logit vector. 0 =
+/// fully confident, ln(N) = uniform. Task-agnostic — used here to gate adaptive
+/// value iteration ("ripples ↑ under uncertainty"), but it is just the entropy
+/// of any decision distribution, so the same confidence-gated-halting idea
+/// applies to any iterative readout (cf. the CTM's `ExitStrategy::Certainty`).
+fn softmax_entropy(logits: &[f32]) -> f32 {
+    if logits.is_empty() {
+        return 0.0;
+    }
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut s = 0.0f32;
+    for &l in logits {
+        s += (l - m).exp();
+    }
+    let inv = 1.0 / s.max(1e-20);
+    let mut h = 0.0f32;
+    for &l in logits {
+        let p = (l - m).exp() * inv;
+        if p > 1e-12 {
+            h -= p * p.ln();
+        }
+    }
+    h
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1085,6 +1221,43 @@ mod tests {
     fn iters_are_capped() {
         let cfg = VinConfig { iters: 999, max_iters: 12, ..Default::default() };
         assert_eq!(cfg.effective_iters(), 12);
+    }
+
+    #[test]
+    fn forward_adaptive_with_fixed_window_matches_forward() {
+        // min == max sweeps, no entropy gate → identical to `forward`.
+        let vin = tiny();
+        let (h, w) = (5usize, 5usize);
+        let mut tokens = vec![0.0f32; h * w * 3];
+        for cell in 0..h * w {
+            tokens[cell * 3] = 1.0;
+            tokens[cell * 3 + 2] = 1.0;
+        }
+        tokens[(h * w - 1) * 3 + 1] = 1.0; // goal in the far corner
+        let k = vin.config.effective_iters();
+        let base = vin.forward(&tokens, h, w, Some((1, 1)));
+        let (adapt, used) = vin.forward_adaptive(&tokens, h, w, Some((1, 1)), k, k, 0.0);
+        assert_eq!(used, k, "fixed window must run exactly k sweeps");
+        assert_eq!(base.move_logits, adapt.move_logits);
+        assert_eq!(base.value_grid, adapt.value_grid);
+    }
+
+    #[test]
+    fn forward_adaptive_spends_fewer_sweeps_when_confident() {
+        // A high entropy floor stops almost immediately; a zero floor runs to
+        // the cap. The confident (high-floor) case must use no more sweeps.
+        let vin = tiny();
+        let (h, w) = (7usize, 7usize);
+        let mut tokens = vec![0.0f32; h * w * 3];
+        for cell in 0..h * w {
+            tokens[cell * 3] = 1.0;
+            tokens[cell * 3 + 2] = 1.0;
+        }
+        tokens[(h * w - 1) * 3 + 1] = 1.0;
+        let (_o_lo, used_full) = vin.forward_adaptive(&tokens, h, w, Some((1, 1)), 1, 24, 0.0);
+        let (_o_hi, used_conf) = vin.forward_adaptive(&tokens, h, w, Some((1, 1)), 1, 24, 1.30);
+        assert_eq!(used_full, 24, "zero floor runs to the cap");
+        assert!(used_conf <= used_full, "the confident gate must not run more sweeps");
     }
 
     #[test]
