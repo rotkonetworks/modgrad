@@ -8,6 +8,8 @@ pub mod trainer;
 pub mod trainer_loop;
 pub use trainer_loop::{TrainerLoop, TrainerConfig, StepReport, TrainerReport};
 pub mod dream;
+pub mod replay;
+pub use replay::{mistake_states, prioritized_replay, ReplayStep, Trajectory};
 pub mod inference;
 pub mod checkpoint;
 pub mod checkpoint_bundle;

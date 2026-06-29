@@ -28,6 +28,7 @@
 use std::collections::VecDeque;
 
 use modgrad_ctm::vin::{VinGradients, VinReadout, DIR_OFFSETS};
+use modgrad_training::{ReplayStep, Trajectory};
 
 #[path = "../maze_gen.rs"]
 mod maze_gen;
@@ -429,15 +430,16 @@ fn main() {
             // ERRED, and on a failed rollout order them BACKWARD from the
             // failure (reverse-replay credit assignment).
             let (candidates, front_loaded) = if mistake_replay {
+                // Env-specific rollout (here, a grid maze) → SDK credit
+                // assignment. The reverse-replay selection is now a first-class
+                // modgrad-training primitive, not bespoke maze code.
                 let (trace, failed) = rollout_trace(&vin, &maze, raw_dim);
-                let mut mistakes: Vec<(usize, usize)> = trace
-                    .iter()
-                    .filter(|(cell, mv)| optimal_move(&maze, &dist, *cell).is_some_and(|e| e != *mv))
-                    .map(|(cell, _)| *cell)
-                    .collect();
-                if failed {
-                    mistakes.reverse(); // credit from the failure point backward
-                }
+                let traj = Trajectory::new(
+                    trace.iter().map(|&(cell, mv)| ReplayStep::new(cell, mv)).collect(),
+                    failed,
+                );
+                let mistakes =
+                    modgrad_training::mistake_states(&traj, |cell| optimal_move(&maze, &dist, *cell));
                 if mistakes.is_empty() {
                     (trace.iter().map(|(c, _)| *c).collect::<Vec<_>>(), false)
                 } else {
