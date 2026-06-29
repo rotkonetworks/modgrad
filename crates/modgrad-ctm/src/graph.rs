@@ -1597,6 +1597,18 @@ pub struct RegionalWeights {
     /// Trains basal ganglia as a critic (temporal difference learning).
     pub bg_value: Option<Linear>,
 
+    /// Folded-in planner: the **hippocampus region's value-iteration core**
+    /// (`vin::VinReadout`). When `Some`, the brain *plans* by running explicit
+    /// value iteration over the decoded maze grid and reading the move
+    /// ego-centrically at the agent's own cell — so the planner is a component
+    /// OF the brain (region 7, already wired `{input,attn,output,motor} →
+    /// hippocampus → insula`) rather than a sibling module invoked alongside it.
+    /// Warm-started by loading the standalone trained VIN into this slot (zero
+    /// retraining); later distilled into the region's tick dynamics (M2).
+    /// `#[serde(default)]` so legacy brains (no planner) deserialize unchanged.
+    #[serde(default)]
+    pub planner: Option<crate::vin::VinReadout>,
+
     /// Learned inter-region router (MoS-style). None = fixed connections.
     #[serde(default)]
     pub router: Option<RegionalRouter>,
@@ -1773,6 +1785,7 @@ impl RegionalWeights {
             extra_heads,
             cereb_predict,
             bg_value,
+            planner: None,
             router,
             cereb_projection: None,
             cereb_blend_logit: None,
@@ -1784,6 +1797,63 @@ impl RegionalWeights {
     /// build time and on every dispatch; a divergence indicates a
     /// stale cache that must be refreshed.
     pub fn generation(&self) -> u64 { self.generation }
+
+    // ── Folded-in planner (hippocampus value-iteration core) ──────────────
+    // The brain *plans* through these: when a `VinReadout` is folded into the
+    // hippocampus slot, the maze move comes from the brain's own value
+    // iteration over the decoded grid — not a sibling module. See `planner`.
+
+    /// `true` when a planner is folded into the hippocampus slot.
+    pub fn has_planner(&self) -> bool { self.planner.is_some() }
+
+    /// Plan a move with the folded-in hippocampus value-iteration core.
+    /// `grid_tokens` is the decoded maze grid `[grid_h*grid_w × raw_dim]`
+    /// (row-major, the VIN's per-cell `[is_open, is_goal, bias]` features);
+    /// `agent_cell` is the agent's `(row, col)`. Returns the planner's full
+    /// output whose `move_logits` ARE the brain's decision, plus the per-cell
+    /// value field for visualisation. `None` when no planner is folded in.
+    pub fn plan(
+        &self,
+        grid_tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        agent_cell: Option<(usize, usize)>,
+    ) -> Option<crate::vin::VinOutput> {
+        self.planner
+            .as_ref()
+            .map(|p| p.forward(grid_tokens, grid_h, grid_w, agent_cell))
+    }
+
+    /// Test-time consolidation of the folded-in planner's move head
+    /// (mistake-replay / "sleep"): a single scale-invariant NLMS step toward
+    /// `target_move` at the agent cell. Returns the pre-step cross-entropy
+    /// (so `lr = 0` measures without mutating), or `None` if no planner.
+    /// Bumps `generation` so resident caches notice the weight change.
+    pub fn plan_consolidate_move(
+        &mut self,
+        grid_tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        agent_cell: (usize, usize),
+        target_move: usize,
+        lr: f32,
+    ) -> Option<f32> {
+        let loss = self.planner.as_mut().map(|p| {
+            p.consolidate_move(grid_tokens, grid_h, grid_w, agent_cell, target_move, lr)
+        });
+        if loss.is_some() && lr != 0.0 {
+            self.bump_generation();
+        }
+        loss
+    }
+
+    /// Fold a trained standalone `VinReadout` into the hippocampus slot
+    /// (the warm-start). Returns `self` for chaining at export time.
+    pub fn with_planner(mut self, planner: crate::vin::VinReadout) -> Self {
+        self.planner = Some(planner);
+        self.bump_generation();
+        self
+    }
 
     /// Increment the mutation counter. Called automatically by the
     /// in-tree optimizer paths (`RegionalAdamW::step`,
@@ -6118,6 +6188,36 @@ mod regional_weights_typed_tests {
     fn small_regional_cfg() -> RegionalConfig {
         // Smallest sensible 8-region brain.
         RegionalConfig::eight_region_small(16, 32, 2)
+    }
+
+    /// The fold (M1): a `VinReadout` folded into the hippocampus slot must make
+    /// the brain plan IDENTICALLY to the standalone VIN — the integration is a
+    /// rehoming, not a behaviour change. Guards `fold_vin`'s bit-exact contract
+    /// without needing the trained model files.
+    #[test]
+    fn folded_planner_matches_standalone_vin() {
+        use crate::vin::{VinConfig, VinReadout};
+        let vin = VinReadout::new(VinConfig::default(), 3);
+        let w = RegionalWeights::new(small_regional_cfg()).with_planner(vin.clone());
+        assert!(w.has_planner(), "planner must be folded in");
+
+        // synthetic 5x5 grid: all-open, goal at the far corner, agent near origin.
+        let (h, wd) = (5usize, 5usize);
+        let mut tokens = vec![0.0f32; h * wd * 3];
+        for cell in 0..h * wd {
+            tokens[cell * 3] = 1.0; // is_open
+            tokens[cell * 3 + 2] = 1.0; // bias
+        }
+        let goal = (h - 1) * wd + (wd - 1);
+        tokens[goal * 3 + 1] = 1.0; // is_goal
+        let agent = Some((1usize, 1usize));
+
+        let base = vin.forward(&tokens, h, wd, agent);
+        let fold = w.plan(&tokens, h, wd, agent).expect("planner present");
+        assert_eq!(
+            base.move_logits, fold.move_logits,
+            "folded planner must reproduce the standalone VIN bit-for-bit"
+        );
     }
 
     #[test]
