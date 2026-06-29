@@ -65,3 +65,4 @@ modgrad-device = { path = "../../crates/modgrad-device" }
 modgrad-substrate = { path = "../../crates/modgrad-substrate" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rayon = "1"

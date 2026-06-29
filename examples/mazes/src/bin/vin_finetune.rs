@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 
 use modgrad_ctm::vin::{VinGradients, VinReadout, DIR_OFFSETS};
 use modgrad_training::{ReplayStep, Trajectory};
+use rayon::prelude::*;
 
 #[path = "../maze_gen.rs"]
 mod maze_gen;
@@ -339,6 +340,88 @@ fn splitmix(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Process one maze for a training batch — runs entirely on its own thread.
+/// Returns (Σ CE loss, #argmax-correct, #samples, accumulated gradients), or
+/// None if the maze yields no trainable cells. Takes `&vin` read-only and clones
+/// it locally only to set the per-maze sweep depth, so threads share nothing
+/// mutable. The whole batch's mazes run concurrently via rayon.
+#[allow(clippy::too_many_arguments)]
+fn process_maze(
+    vin: &VinReadout,
+    size: usize,
+    raw_dim: usize,
+    seed: u64,
+    base_it: usize,
+    random_depth: bool,
+    mistake_replay: bool,
+    per_maze: usize,
+) -> Option<(f32, usize, usize, VinGradients)> {
+    let mut rng = MazeRng::new(seed);
+    let maze = generate_maze(size, &mut rng);
+    let dist = bfs_dist_to_goal(&maze);
+    if reachable_cells(&maze, &dist).is_empty() {
+        return None;
+    }
+    let toks = encode_tokens(&maze, raw_dim);
+
+    let depth = if random_depth {
+        let h = splitmix(seed);
+        6 + (h as usize % (base_it.saturating_sub(6) + 1))
+    } else {
+        base_it
+    };
+    let mut local = vin.clone();
+    local.config.iters = depth;
+    local.config.max_iters = local.config.max_iters.max(depth);
+
+    let (candidates, front_loaded) = if mistake_replay {
+        let (trace, failed) = rollout_trace(&local, &maze, raw_dim);
+        let traj = Trajectory::new(
+            trace.iter().map(|&(cell, mv)| ReplayStep::new(cell, mv)).collect(),
+            failed,
+        );
+        let mistakes =
+            modgrad_training::mistake_states(&traj, |cell| optimal_move(&maze, &dist, *cell));
+        if mistakes.is_empty() {
+            (trace.iter().map(|(c, _)| *c).collect::<Vec<_>>(), false)
+        } else {
+            (mistakes, true)
+        }
+    } else {
+        (rollout_visited(&local, &maze, raw_dim), false)
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut grads = VinGradients::zeros(&local);
+    let (mut loss, mut correct, mut count) = (0.0f32, 0usize, 0usize);
+    for k in 0..per_maze {
+        let cell = if front_loaded {
+            candidates[k % candidates.len()]
+        } else {
+            candidates[(seed as usize + k * 7) % candidates.len()]
+        };
+        let label = match optimal_move(&maze, &dist, cell) {
+            Some(l) => l,
+            None => continue,
+        };
+        let (out, cache) = local.forward_train(&toks, size, size, cell);
+        let probs = softmax4(&out.move_logits);
+        loss += -(probs[label].max(1e-20)).ln();
+        if argmax4(&out.move_logits) == label {
+            correct += 1;
+        }
+        let mut d_logits = vec![0.0f32; 4];
+        for i in 0..4 {
+            d_logits[i] = probs[i] - if i == label { 1.0 } else { 0.0 };
+        }
+        grads.add(&local.backward(&cache, &toks, size, size, &d_logits));
+        count += 1;
+    }
+    (count > 0).then_some((loss, correct, count, grads))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let out_path = arg_val::<String>(&args, "--out")
@@ -393,93 +476,42 @@ fn main() {
         .unwrap_or_else(|| vec![9, 11, 13]);
     let mut train_seed = 1u64;
     println!("  batch |  size | trainCE | move_acc | (running)");
+    let per_maze = 4usize;
     for b in 0..n_batches {
         let size = sizes[b % sizes.len()];
         let base_it = iters_for_size(size);
+        // deterministic, disjoint seeds for this batch's mazes.
+        let n_mazes = batch.div_ceil(per_maze);
+        let seeds: Vec<u64> = (0..n_mazes)
+            .map(|_| {
+                let s = train_seed;
+                train_seed = train_seed.wrapping_add(1);
+                s
+            })
+            .collect();
+
+        // ── PARALLEL: roll out + forward/backward every maze concurrently, then
+        // reduce the gradients. The trainer is CPU-bound on sequential rollouts;
+        // mazes are independent, so this scales near-linearly across cores
+        // (the genuine speedup — not GPU; the model is tiny + latency-bound).
+        // random-depth (#22) and mistake-replay (#2) are handled per-maze.
+        let results: Vec<(f32, usize, usize, VinGradients)> = seeds
+            .par_iter()
+            .filter_map(|&seed| {
+                process_maze(&vin, size, raw_dim, seed, base_it, random_depth, mistake_replay, per_maze)
+            })
+            .collect();
 
         let mut grads = VinGradients::zeros(&vin);
-        let (mut loss, mut correct, mut filled) = (0.0f32, 0usize, 0usize);
-
-        while filled < batch {
-            let mut rng = MazeRng::new(train_seed);
-            train_seed = train_seed.wrapping_add(1);
-            let maze = generate_maze(size, &mut rng);
-            let dist = bfs_dist_to_goal(&maze);
-            if reachable_cells(&maze, &dist).is_empty() {
-                continue;
-            }
-            let toks = encode_tokens(&maze, raw_dim);
-
-            // ANYTIME / random-depth training (#22): sample the sweep count
-            // per maze so the move head learns to be correct (and confident
-            // ONLY when correct) at ANY depth. Then at inference, low
-            // move-entropy genuinely means "value has arrived" → entropy-gated
-            // ripples can stop early on easy cells and sweep more at junctions.
-            let depth = if random_depth {
-                let h = splitmix(train_seed);
-                6 + (h as usize % (base_it.saturating_sub(6) + 1))
-            } else {
-                base_it
-            };
-            vin.config.iters = depth;
-            vin.config.max_iters = vin.config.max_iters.max(depth);
-
-            // DAgger: train on the planner's OWN visited cells (its mistakes
-            // and loops), labelled by the BFS expert. Falls back to start.
-            // With --mistake-replay (#2): focus on the cells where the planner
-            // ERRED, and on a failed rollout order them BACKWARD from the
-            // failure (reverse-replay credit assignment).
-            let (candidates, front_loaded) = if mistake_replay {
-                // Env-specific rollout (here, a grid maze) → SDK credit
-                // assignment. The reverse-replay selection is now a first-class
-                // modgrad-training primitive, not bespoke maze code.
-                let (trace, failed) = rollout_trace(&vin, &maze, raw_dim);
-                let traj = Trajectory::new(
-                    trace.iter().map(|&(cell, mv)| ReplayStep::new(cell, mv)).collect(),
-                    failed,
-                );
-                let mistakes =
-                    modgrad_training::mistake_states(&traj, |cell| optimal_move(&maze, &dist, *cell));
-                if mistakes.is_empty() {
-                    (trace.iter().map(|(c, _)| *c).collect::<Vec<_>>(), false)
-                } else {
-                    (mistakes, true)
-                }
-            } else {
-                (rollout_visited(&vin, &maze, raw_dim), false)
-            };
-            if candidates.is_empty() {
-                continue;
-            }
-            let per_maze = 4.min(batch - filled);
-            for k in 0..per_maze {
-                // front_loaded → take the highest-credit cells in order;
-                // otherwise spread deterministically across the trajectory.
-                let cell = if front_loaded {
-                    candidates[k % candidates.len()]
-                } else {
-                    candidates[(train_seed as usize + k * 7) % candidates.len()]
-                };
-                let label = match optimal_move(&maze, &dist, cell) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                let (out, cache) = vin.forward_train(&toks, size, size, cell);
-                let probs = softmax4(&out.move_logits);
-                loss += -(probs[label].max(1e-20)).ln();
-                if argmax4(&out.move_logits) == label {
-                    correct += 1;
-                }
-                let mut d_logits = vec![0.0f32; 4];
-                for i in 0..4 {
-                    d_logits[i] = probs[i] - if i == label { 1.0 } else { 0.0 };
-                }
-                grads.add(&vin.backward(&cache, &toks, size, size, &d_logits));
-                filled += 1;
-                if filled >= batch {
-                    break;
-                }
-            }
+        let (mut loss, mut correct, mut count) = (0.0f32, 0usize, 0usize);
+        for (l, c, n, g) in &results {
+            loss += *l;
+            correct += *c;
+            count += *n;
+            grads.add(g);
+        }
+        if count == 0 {
+            continue;
         }
 
         // gentle warmdown over the back half (consolidate, don't spike out).
@@ -490,12 +522,12 @@ fn main() {
             let t = (frac - 0.5) / 0.5;
             0.1 + 0.9 * 0.5 * (1.0 + (std::f32::consts::PI * t).cos())
         };
-        vin.apply_grads(&grads, lr_scale * lr / batch as f32);
+        vin.apply_grads(&grads, lr_scale * lr / count as f32);
 
         if b % eval_every == 0 || b == n_batches - 1 {
             println!(
                 "  {:5} | {:>3}x{:<2}| {:7.4} | {:6.1}% |",
-                b, size, size, loss / batch as f32, 100.0 * correct as f32 / batch as f32,
+                b, size, size, loss / count as f32, 100.0 * correct as f32 / count as f32,
             );
         }
     }
