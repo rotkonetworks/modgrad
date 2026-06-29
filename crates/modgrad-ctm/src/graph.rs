@@ -1824,6 +1824,28 @@ impl RegionalWeights {
             .map(|p| p.forward(grid_tokens, grid_h, grid_w, agent_cell))
     }
 
+    /// Plan with **entropy-gated value iteration** ("hippocampal ripples
+    /// increase under uncertainty"): the folded-in planner runs more Bellman
+    /// sweeps where the move is uncertain (junctions, larger grids) and stops
+    /// early once confident. Returns the planner output and the number of
+    /// sweeps used (the "ripple count"). `None` if no planner is folded in.
+    pub fn plan_adaptive(
+        &self,
+        grid_tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        agent_cell: Option<(usize, usize)>,
+        min_iters: usize,
+        max_iters: usize,
+        entropy_floor: f32,
+    ) -> Option<(crate::vin::VinOutput, usize)> {
+        self.planner.as_ref().map(|p| {
+            p.forward_adaptive(
+                grid_tokens, grid_h, grid_w, agent_cell, min_iters, max_iters, entropy_floor,
+            )
+        })
+    }
+
     /// Test-time consolidation of the folded-in planner's move head
     /// (mistake-replay / "sleep"): a single scale-invariant NLMS step toward
     /// `target_move` at the agent cell. Returns the pre-step cross-entropy
