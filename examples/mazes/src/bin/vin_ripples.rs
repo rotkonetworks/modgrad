@@ -163,13 +163,16 @@ fn solve(
     (pos == maze.end, wall_hits, sweeps, steps)
 }
 
-fn eval(vin: &VinReadout, raw_dim: usize, size: usize, n: usize, adaptive: bool) -> (f32, f32, f32) {
-    // ADDITIVE ripples: never sweep FEWER than the trained depth (so the move
-    // head always sees an in-distribution value field), only ADD sweeps while
-    // the move is still uncertain. "ripples ↑ under uncertainty", never ↓.
-    let min_it = iters_for_size(size);
-    let max_it = iters_for_size(size) * 2;
-    let floor = 0.3f32; // keep sweeping only while genuinely uncertain
+fn eval(
+    vin: &VinReadout,
+    raw_dim: usize,
+    size: usize,
+    n: usize,
+    adaptive: bool,
+    min_it: usize,
+    max_it: usize,
+    floor: f32,
+) -> (f32, f32, f32) {
     let (mut solved, mut wall_hits, mut total_sweeps, mut total_steps) = (0usize, 0u32, 0u64, 0u64);
     for i in 0..n {
         let mut rng = MazeRng::new(9_700_000 + size as u64 * 10_000 + i as u64);
@@ -202,15 +205,24 @@ fn main() {
     // ensure dist fn is considered used by the optimizer
     let _ = optimal_move;
 
-    println!("entropy-gated ripples vs fixed iteration — {in_path} ({n} mazes/size)\n");
+    // policy: "early" = stop early (6..trained), "additive" = go beyond (trained..2x)
+    let policy = arg_val::<String>(&args, "--policy").unwrap_or_else(|| "early".into());
+    let floor = arg_val::<f32>(&args, "--floor").unwrap_or(0.5);
+
+    println!("entropy-gated ripples ({policy}, floor {floor}) vs fixed — {in_path} ({n} mazes/size)\n");
     println!("  size  | policy   | solve  | wall_hits | sweeps/step");
     for &size in &[9usize, 11, 13] {
-        let (sf, wf, cf) = eval(&vin, raw_dim, size, n, false);
-        let (sa, wa, ca) = eval(&vin, raw_dim, size, n, true);
+        let trained = iters_for_size(size);
+        let (min_it, max_it) = if policy == "additive" {
+            (trained, trained * 2)
+        } else {
+            (6, trained) // early-stop: never MORE than the trained depth
+        };
+        let (sf, wf, cf) = eval(&vin, raw_dim, size, n, false, min_it, max_it, floor);
+        let (sa, wa, ca) = eval(&vin, raw_dim, size, n, true, min_it, max_it, floor);
         println!(
-            "  {:>2}x{:<2} | fixed    | {:5.1}% | {:8.2} | {:6.1}\n         | adaptive | {:5.1}% | {:8.2} | {:6.1}   (additive ripples: {}..{} sweeps, floor 0.3)",
-            size, size, 100.0 * sf, wf, cf, 100.0 * sa, wa, ca,
-            iters_for_size(size), iters_for_size(size) * 2,
+            "  {:>2}x{:<2} | fixed    | {:5.1}% | {:8.2} | {:6.1}\n         | adaptive | {:5.1}% | {:8.2} | {:6.1}   ({}..{} sweeps)",
+            size, size, 100.0 * sf, wf, cf, 100.0 * sa, wa, ca, min_it, max_it,
         );
     }
 }
