@@ -1,0 +1,21 @@
+[package]
+name = "modgrad-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WebAssembly bindings for the modgrad ML SDK"
+license = "MIT"
+
+[lib]
+# cdylib for the wasm artifact; rlib so native tests can exercise the same code.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+modgrad-ctm = { path = "../modgrad-ctm", default-features = false }
+modgrad-codec = { path = "../modgrad-codec", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

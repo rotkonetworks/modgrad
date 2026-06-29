@@ -8,6 +8,7 @@ members = [
     "crates/modgrad-persist",
     "crates/modgrad-compute",
     "crates/modgrad-ctm",
+    "crates/modgrad-wasm",
     "crates/modgrad-ffn",
     "crates/modgrad-memory",
     "crates/modgrad-codec",

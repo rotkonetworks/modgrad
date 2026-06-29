@@ -391,6 +391,64 @@ impl VinReadout {
             + p(&self.highway_proj)
             + p(&self.move_head)
     }
+
+    /// Single-step test-time consolidation of the move head toward `target_move`
+    /// at the agent cell. This is the planner's "sleep" / mistake-replay update:
+    /// run the forward, take the cross-entropy gradient on the move logits, and
+    /// apply an **NLMS-normalised** step to `move_head` only — the value-iteration
+    /// readout can be large, so dividing by `‖readout‖² + 1` keeps the step
+    /// scale-invariant and bounded (a plain SGD step diverges). The rest of the
+    /// VIN is frozen; only the ego-centric move readout adapts. Returns the
+    /// cross-entropy loss BEFORE the step (so `lr = 0` is a measure-only probe).
+    pub fn consolidate_move(
+        &mut self,
+        tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        agent: (usize, usize),
+        target_move: usize,
+        lr: f32,
+    ) -> f32 {
+        let out = self.forward(tokens, grid_h, grid_w, Some(agent));
+        let readout = out.agent_readout;
+        let logits = out.move_logits;
+        let n = logits.len();
+        if n == 0 || target_move >= n {
+            return 0.0;
+        }
+        // softmax over the move logits
+        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs = vec![0.0f32; n];
+        let mut sum = 0.0f32;
+        for o in 0..n {
+            let e = (logits[o] - maxl).exp();
+            probs[o] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum.max(1e-9);
+        for p in probs.iter_mut() {
+            *p *= inv;
+        }
+        let loss = -(probs[target_move].max(1e-9)).ln();
+
+        // cross-entropy gradient wrt logits is p − onehot(target); NLMS-normalise
+        // by the readout energy so the step is scale-invariant.
+        let in_dim = readout.len();
+        let mut rn2 = 0.0f32;
+        for &x in &readout {
+            rn2 += x * x;
+        }
+        let scale = lr / (rn2 + 1.0);
+        for o in 0..n {
+            let g = probs[o] - if o == target_move { 1.0 } else { 0.0 };
+            let row = o * in_dim;
+            for i in 0..in_dim {
+                self.move_head.weight[row + i] -= scale * g * readout[i];
+            }
+            self.move_head.bias[o] -= lr * 0.1 * g; // bias: small fixed step
+        }
+        loss
+    }
 }
 
 /// Output of one VIN readout forward pass.

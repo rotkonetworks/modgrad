@@ -1541,6 +1541,9 @@ pub struct RegionalWeights {
 
     /// Byte embedding table: [vocab_size × embed_dim].
     /// Maps token indices to dense vectors that feed into the CTM.
+    /// `#[serde(default)]` so vision brains — which feed pixels/obs rather than
+    /// token ids and carry an empty table — load from exports that omit it.
+    #[serde(default)]
     pub embeddings: Vec<f32>,
 
     /// Per-region CTM weights.
@@ -1956,10 +1959,49 @@ fn global_sync_backward(
 ///
 /// `observation`: raw input [raw_obs_dim].
 /// Returns predictions at each outer tick.
+/// One outer tick's worth of introspection, captured by
+/// [`regional_forward_trace`]. Mirrors what `RegionalOutput` returns, but for
+/// EVERY outer tick — the per-tick region activations and global sync a 3D
+/// viz/debugger animates, not just the final tick.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RegionalTick {
+    /// `[out_dims]` next-step prediction at this tick.
+    pub prediction: Vec<f32>,
+    /// `[n_regions][d_model]` per-region activated state this tick.
+    pub region_activations: Vec<Vec<f32>>,
+    /// `[n_global_sync]` global sync vector this tick.
+    pub global_sync: Vec<f32>,
+    /// Outer adaptive-compute gate λ this tick (None when no exit gate).
+    pub exit_lambda: Option<f32>,
+}
+
 pub fn regional_forward(
     w: &RegionalWeights,
     state: &mut RegionalState,
     observation: &[f32],
+) -> RegionalOutput {
+    regional_forward_inner(w, state, observation, None)
+}
+
+/// Like [`regional_forward`], but also returns a per-outer-tick trace
+/// (`region_activations`, `global_sync`, `prediction`, `exit_lambda`) for
+/// introspection — drives debuggers and the browser 3D-brain viz. Identical
+/// numerics to `regional_forward`; the trace is a read-out, not a fork.
+pub fn regional_forward_trace(
+    w: &RegionalWeights,
+    state: &mut RegionalState,
+    observation: &[f32],
+) -> (RegionalOutput, Vec<RegionalTick>) {
+    let mut trace = Vec::with_capacity(w.config.outer_ticks);
+    let out = regional_forward_inner(w, state, observation, Some(&mut trace));
+    (out, trace)
+}
+
+fn regional_forward_inner(
+    w: &RegionalWeights,
+    state: &mut RegionalState,
+    observation: &[f32],
+    mut trace: Option<&mut Vec<RegionalTick>>,
 ) -> RegionalOutput {
     let cfg = &w.config;
     let n_regions = cfg.regions.len();
@@ -2125,6 +2167,8 @@ pub fn regional_forward(
         predictions.push(prediction);
 
         // Phase 5: Exit decision
+        let mut this_lambda: Option<f32> = None;
+        let mut do_break = false;
         match &cfg.exit_strategy {
             crate::config::ExitStrategy::AdaptiveGate { threshold, .. } => {
                 if let Some(ref gate) = w.outer_exit_gate {
@@ -2133,14 +2177,27 @@ pub fn regional_forward(
                     let gate_logit = gate.forward(&gs_buf);
                     let lambda = 1.0 / (1.0 + (-gate_logit[0]).exp());
                     exit_lambdas.push(lambda);
+                    this_lambda = Some(lambda);
                     let p_exit = lambda * survival;
                     exit_cdf += p_exit;
                     survival *= 1.0 - lambda;
-                    if exit_cdf > *threshold { break; }
+                    if exit_cdf > *threshold { do_break = true; }
                 }
             }
             _ => {}
         }
+
+        // Per-tick trace snapshot (only when a caller asked for one).
+        if let Some(tr) = trace.as_deref_mut() {
+            tr.push(RegionalTick {
+                prediction: predictions.last().cloned().unwrap_or_default(),
+                region_activations: state.region_outputs.clone(),
+                global_sync: gs_buf.clone(),
+                exit_lambda: this_lambda,
+            });
+        }
+
+        if do_break { break; }
     }
 
     let ticks_used = predictions.len();
@@ -8400,5 +8457,31 @@ mod tests {
             "RegionalGradients flatten: dim = {}, nonzero = {} ({:.1}%)",
             len_a, nonzero, 100.0 * nonzero as f32 / len_a as f32,
         );
+    }
+
+    #[test]
+    fn forward_trace_matches_plain_forward_per_tick() {
+        let cfg = RegionalConfig::eight_region_small(16, 8, 3);
+        let raw = cfg.raw_obs_dim;
+        let w = RegionalWeights::new(cfg);
+        let obs: Vec<f32> = (0..raw).map(|i| (i as f32 * 0.013).sin()).collect();
+
+        // Plain forward and traced forward must produce identical numerics.
+        let mut s1 = RegionalState::new(&w);
+        let out_plain = regional_forward(&w, &mut s1, &obs);
+        let mut s2 = RegionalState::new(&w);
+        let (out_traced, trace) = regional_forward_trace(&w, &mut s2, &obs);
+
+        assert_eq!(out_plain.ticks_used, out_traced.ticks_used);
+        assert_eq!(trace.len(), out_traced.ticks_used,
+            "one trace entry per outer tick that ran");
+        // The trace's final tick must equal the forward's final readouts.
+        let last = trace.last().unwrap();
+        assert_eq!(last.global_sync, out_plain.global_sync,
+            "final tick global_sync matches the forward output");
+        assert_eq!(last.region_activations, out_plain.region_activations,
+            "final tick activations match the forward output");
+        assert_eq!(last.prediction, *out_plain.predictions.last().unwrap(),
+            "final tick prediction matches the forward output");
     }
 }
