@@ -9,6 +9,21 @@ license = "MIT"
 # cdylib for the wasm artifact; rlib so native tests can exercise the same code.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# parallel: the MULTITHREADED browser build. Lights up a wasm-bindgen-rayon +
+# SharedArrayBuffer thread pool and threads real rayon through modgrad-ctm
+# (its `wasm-threads` feature → rayon_shim re-exports rayon's prelude on
+# wasm32). OFF by default, so the default single-threaded engine and ALL
+# native builds/tests are byte-for-byte unchanged. Build it with
+# scripts/build-engine-parallel.sh (nightly + build-std + +atomics). The
+# `init_thread_pool` export below is gated on this feature.
+default = []
+parallel = [
+    "dep:rayon",
+    "dep:wasm-bindgen-rayon",
+    "modgrad-ctm/wasm-threads",
+]
+
 [dependencies]
 modgrad-ctm = { path = "../modgrad-ctm", default-features = false }
 modgrad-codec = { path = "../modgrad-codec", default-features = false }
@@ -16,6 +31,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
+
+# Multithreaded (`parallel` feature) only. `rayon` for the thread-pool API the
+# regional forward dispatches over; `wasm-bindgen-rayon` for the browser-side
+# `init_thread_pool` that wires rayon up to a SharedArrayBuffer-backed Web
+# Worker pool. wasm-bindgen stays 0.2 (workspace pins 0.2.117).
+rayon = { version = "1", optional = true }
+wasm-bindgen-rayon = { version = "1.2", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

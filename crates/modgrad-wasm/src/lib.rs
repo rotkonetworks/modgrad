@@ -14,6 +14,15 @@ use modgrad_ctm::graph::{RegionalState, RegionalTick, RegionalWeights, regional_
 use modgrad_ctm::vin::VinReadout;
 use wasm_bindgen::prelude::*;
 
+// MULTITHREADED build only (`parallel` feature). Re-exporting
+// `wasm_bindgen_rayon::init_thread_pool` makes the browser glue expose an
+// `init_thread_pool(num_threads)` JS function; the worker calls it once after
+// the wasm is instantiated to spin up a SharedArrayBuffer-backed rayon pool of
+// Web Workers. Absent (engine single-threaded) without the feature, so the
+// default build and all native tests are unchanged.
+#[cfg(feature = "parallel")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 thread_local! {
     /// The trained VIN planner, loaded from the SDK's serde JSON export.
     static LEARNED_VIN: RefCell<Option<VinReadout>> = const { RefCell::new(None) };

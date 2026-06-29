@@ -12,28 +12,36 @@
 //! adapters (`map`, `flat_map`, `filter_map`, `enumerate`, `for_each`,
 //! `collect`, `sum`, …), the call sites compile unchanged and just run
 //! single-threaded.
+//!
+//! When the `wasm-threads` feature is enabled (the parallel browser build,
+//! compiled with +atomics + build-std and a wasm-bindgen-rayon thread pool),
+//! wasm32 ALSO re-exports rayon's real prelude — the call sites then run in
+//! parallel across SharedArrayBuffer-backed Web Workers, exactly like native.
+//! The serial shim below is compiled only on wasm32 WITHOUT that feature.
 
-#[cfg(not(target_arch = "wasm32"))]
+// Real rayon: native always, or wasm32 with the `wasm-threads` feature.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 pub use rayon::prelude::*;
 
-/// Thread-count helper. Mirrors `rayon::current_num_threads()` on native;
-/// always 1 on wasm (single-threaded). Call sites use this instead of the
-/// fully-qualified `rayon::current_num_threads()` so they compile on both.
-#[cfg(not(target_arch = "wasm32"))]
+/// Thread-count helper. Mirrors `rayon::current_num_threads()` whenever real
+/// rayon is linked (native, or wasm32 + `wasm-threads`); always 1 on the
+/// serial wasm build. Call sites use this instead of the fully-qualified
+/// `rayon::current_num_threads()` so they compile on every target.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 #[inline]
 pub fn current_num_threads() -> usize {
     rayon::current_num_threads()
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 #[inline]
 pub fn current_num_threads() -> usize {
     1
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 pub use wasm_serial::*;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 mod wasm_serial {
     /// Serial stand-in for `rayon`'s `par_iter`/`par_iter_mut`.
     pub trait ParIterShim {

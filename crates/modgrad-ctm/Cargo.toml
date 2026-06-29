@@ -12,6 +12,14 @@ license = "MIT"
 # device-resident `GptModelResident` as a `FrozenCerebellum` — that's
 # why `modgrad-transformer` joins the gate as an optional dep.
 default = []
+# wasm-threads: on wasm32, light up REAL rayon (instead of the serial
+# rayon_shim) so the browser build can run the regional forward across a
+# wasm-bindgen-rayon + SharedArrayBuffer thread pool. OFF by default, so the
+# normal single-threaded wasm build keeps the serial shim and native is
+# entirely unaffected (native always links real rayon via the target dep
+# below; this feature only adds the wasm32 rayon dep). Enabled by
+# `crates/modgrad-wasm` `parallel` feature; see scripts/build-engine-parallel.sh.
+wasm-threads = ["dep:rayon"]
 kfd = ["modgrad-device/kfd"]
 rocm = [
     "modgrad-device/rocm",
@@ -43,10 +51,17 @@ bincode = "1"
 # for ~10-30x speedup over scalar rayon loops.
 matrixmultiply = "0.3"
 
-# rayon has no threads on wasm32; the rayon_shim provides a serial fallback
-# there, so rayon is native-only.
+# On native, rayon is always linked (the rayon_shim re-exports its prelude).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1"
+
+# On wasm32, rayon has no threads by default, so the rayon_shim provides a
+# serial fallback. This optional dep is pulled in ONLY by the `wasm-threads`
+# feature (the parallel browser build, compiled with +atomics + build-std and
+# a wasm-bindgen-rayon thread pool); without the feature it is absent and the
+# serial shim stays — keeping the default wasm build byte-for-byte unchanged.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
