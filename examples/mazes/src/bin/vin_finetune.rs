@@ -384,12 +384,16 @@ fn main() {
     eval_block("before", &vin, raw_dim);
     println!();
 
-    // curriculum sizes; cycle so each batch mixes scales.
-    const SIZES: [usize; 3] = [9, 11, 13];
+    // curriculum sizes; cycle so each batch mixes scales. --sizes "9,11,13,15"
+    // extends the curriculum to larger boards to push generalization further.
+    let sizes: Vec<usize> = arg_val::<String>(&args, "--sizes")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![9, 11, 13]);
     let mut train_seed = 1u64;
     println!("  batch |  size | trainCE | move_acc | (running)");
     for b in 0..n_batches {
-        let size = SIZES[b % SIZES.len()];
+        let size = sizes[b % sizes.len()];
         let base_it = iters_for_size(size);
 
         let mut grads = VinGradients::zeros(&vin);
