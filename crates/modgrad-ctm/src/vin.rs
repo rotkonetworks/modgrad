@@ -175,20 +175,14 @@ impl VinReadout {
             "VinReadout::forward: token buffer size mismatch"
         );
 
-        // ── 1. Per-cell projections: reward, traversability gate, value ──
-        let mut reward = vec![0.0f32; n_cells];
-        let mut gate = vec![0.0f32; n_cells]; // traversability ∈ [0,1]
-        let mut value = vec![0.0f32; n_cells * v]; // [n_cells × value_dim]
-        let mut agent_score = vec![0.0f32; n_cells];
-
-        for cell in 0..n_cells {
-            let tok = &tokens[cell * self.raw_dim..(cell + 1) * self.raw_dim];
-            reward[cell] = self.reward_proj.forward(tok)[0];
-            gate[cell] = sigmoid(self.gate_proj.forward(tok)[0]);
-            agent_score[cell] = self.agent_proj.forward(tok)[0];
-            let vproj = self.value_proj.forward(tok);
-            value[cell * v..(cell + 1) * v].copy_from_slice(&vproj);
-        }
+        // ── 1. Per-cell projections, grouped by the BRAIN REGION that owns each ──
+        // basal ganglia → reward + value head (`bg_value`); hippocampus → the
+        // traversability gate, i.e. the map's adjacency (`hippo_gate`); motor →
+        // agent-ness for localisation (`motor_agentness`). Distributing these is
+        // M2.3 of planning-in-the-brain — the VIN's pieces becoming region jobs.
+        let (reward, mut value) = self.bg_value(tokens, n_cells);
+        let gate = self.hippo_gate(tokens, n_cells);
+        let agent_score = self.motor_agentness(tokens, n_cells);
 
         // Keep the clean PRE-propagation per-cell value (the per-cell signal
         // that decodes walls at the agent cell); propagation mixes neighbour
@@ -355,6 +349,49 @@ impl VinReadout {
 
     /// One cell's Bellman backup: `reward + (soft)max_neighbour gate·value`.
     /// Returns a `value_dim` vector.
+    // ── Region phases (M2.3): the VIN's per-cell projections, split by the
+    // brain region each belongs to. Looping `bg_value → hippo_gate/bellman_step
+    // → motor (gather + move_head)` reproduces `forward` exactly; isolating them
+    // lets each move onto its region (basal ganglia / hippocampus / motor),
+    // warm-started from these weights, and then train end-to-end. ──
+
+    /// **Basal ganglia** phase: per-cell reward `r(s)` and the initial value
+    /// estimate `V(s)` — the value head. Returns `(reward[n_cells],
+    /// value[n_cells*value_dim])`.
+    pub fn bg_value(&self, tokens: &[f32], n_cells: usize) -> (Vec<f32>, Vec<f32>) {
+        let v = self.config.value_dim.max(1);
+        let mut reward = vec![0.0f32; n_cells];
+        let mut value = vec![0.0f32; n_cells * v];
+        for cell in 0..n_cells {
+            let tok = &tokens[cell * self.raw_dim..(cell + 1) * self.raw_dim];
+            reward[cell] = self.reward_proj.forward(tok)[0];
+            value[cell * v..(cell + 1) * v].copy_from_slice(&self.value_proj.forward(tok));
+        }
+        (reward, value)
+    }
+
+    /// **Hippocampus** phase: per-cell traversability gate — the cognitive map's
+    /// adjacency (which neighbours are reachable). Masks the replay propagation.
+    pub fn hippo_gate(&self, tokens: &[f32], n_cells: usize) -> Vec<f32> {
+        let mut gate = vec![0.0f32; n_cells];
+        for cell in 0..n_cells {
+            let tok = &tokens[cell * self.raw_dim..(cell + 1) * self.raw_dim];
+            gate[cell] = sigmoid(self.gate_proj.forward(tok)[0]);
+        }
+        gate
+    }
+
+    /// **Motor** phase (localisation half): per-cell agent-ness, used to find the
+    /// agent cell when it isn't supplied. The readout half is `move_head`.
+    pub fn motor_agentness(&self, tokens: &[f32], n_cells: usize) -> Vec<f32> {
+        let mut agent_score = vec![0.0f32; n_cells];
+        for cell in 0..n_cells {
+            let tok = &tokens[cell * self.raw_dim..(cell + 1) * self.raw_dim];
+            agent_score[cell] = self.agent_proj.forward(tok)[0];
+        }
+        agent_score
+    }
+
     /// ONE Bellman backup over the whole 4-neighbour grid — a single recurrent
     /// tick of the value-iteration recurrence. `value` is the current
     /// `[n_cells × value_dim]` grid; returns the next grid. Looping this
