@@ -1552,6 +1552,42 @@ fn nlm_forward_with_cache<D: TensorDevice>(
     Ok((final_host, cache))
 }
 
+/// BATCHED NLM forward saving the cache for the batched backward (M1 of the
+/// GPU-training engine). `trace` is `[batch × d_model × in_per]`; mirrors
+/// `nlm_forward_batched` but keeps the per-stage intermediates (each `[batch ×
+/// d_model × out_per]`) so `nlm_backward_batched` can walk reverse. Forward
+/// math is identical to `nlm_forward_batched` — verified bit-for-bit in tests.
+#[allow(dead_code)] // consumed by nlm_backward_batched / the batched cached forward
+fn nlm_forward_with_cache_batched<D: TensorDevice>(
+    trace: &Tensor<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_model: usize,
+    batch: usize,
+) -> Result<(Vec<f32>, NlmCacheTyped<D>), BackendError> {
+    let s1_t = stage1.forward_batched(trace, batch)?;
+    let s1_host: Vec<f32> = s1_t.to_vec()?;
+    let s1_glu_host = per_neuron_glu_batched(&s1_host, d_model, stage1.out_per, batch);
+    let s1_glu_t = Tensor::<D>::from_slice(&s1_glu_host)?;
+
+    let (final_host, s2_cache) = if let Some(s2) = stage2 {
+        let s2_t = s2.forward_batched(&s1_glu_t, batch)?;
+        let s2_host: Vec<f32> = s2_t.to_vec()?;
+        let final_glu = per_neuron_glu_batched(&s2_host, d_model, s2.out_per, batch);
+        (final_glu, Some(s2_t))
+    } else {
+        (s1_glu_host.clone(), None)
+    };
+
+    let cache = NlmCacheTyped {
+        trace: Tensor::<D>::from_slice(&trace.to_vec()?)?,
+        s1: s1_t,
+        s1_glu: s1_glu_t,
+        s2: s2_cache,
+    };
+    Ok((final_host, cache))
+}
+
 /// Reverse the sync_update / sync_init at one tick.
 ///
 /// Forward: `alpha[i] = r[i]·alpha_prev[i] + activated[left[i]]·activated[right[i]]`
@@ -2052,6 +2088,39 @@ mod typed_forward_tests {
                     assert!((pb[j] - exp).abs() < 1e-4,
                         "pred[tick{tick}][b{b}][{j}]: {} vs {}", pb[j], exp);
                 }
+            }
+        }
+    }
+
+    /// M1: the batched NLM forward-with-cache matches B per-sample calls
+    /// bit-for-bit (the cache/backward groundwork for GPU training).
+    #[test]
+    fn cpu_nlm_forward_with_cache_batched_matches_scalar() {
+        let cfg = small_cfg(); // shallow NLM (deep_nlms=false → stage2=None)
+        let raw = 6usize;
+        let batch = 4usize;
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let (d, m) = (cfg.d_model, cfg.memory_length);
+
+        let trace_b: Vec<f32> = (0..batch * d * m)
+            .map(|i| (((i * 5 % 11) as f32) - 5.0) * 0.1)
+            .collect();
+        let trace_b_t = Tensor::<Cpu>::from_slice(&trace_b).unwrap();
+        let (out_b, _cache) = nlm_forward_with_cache_batched::<Cpu>(
+            &trace_b_t, &typed.nlm_stage1, typed.nlm_stage2.as_ref(), d, batch,
+        ).unwrap();
+
+        for b in 0..batch {
+            let tr = &trace_b[b * d * m..(b + 1) * d * m];
+            let tr_t = Tensor::<Cpu>::from_slice(tr).unwrap();
+            let (out_s, _) = nlm_forward_with_cache::<Cpu>(
+                &tr_t, &typed.nlm_stage1, typed.nlm_stage2.as_ref(), d,
+            ).unwrap();
+            let per = out_s.len();
+            for j in 0..per {
+                assert!((out_b[b * per + j] - out_s[j]).abs() < 1e-5,
+                    "nlm[b{b}][{j}]: batched {} vs scalar {}", out_b[b * per + j], out_s[j]);
             }
         }
     }
