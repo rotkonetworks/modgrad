@@ -318,6 +318,8 @@ fn main() {
     let gsync_cap = env_usize("GSYNC", 512);
     let every = env_usize("EVERY", 25);
     let evaln = env_usize("EVALN", 40);
+    // SAVE=path.json → persist the brain on each new best solve (model availability).
+    let save_path = std::env::var("SAVE").ok();
     let n_cells = size * size;
     let od = n_cells * RAW_DIM;
     let log_path = std::env::var("LOG")
@@ -471,7 +473,18 @@ fn main() {
         if b % every == 0 || b == batches - 1 {
             let (mv, solve, base) = quick_eval(&w, size, evaln, 9999);
             let var = output_region_variation(&w, size, 7777);
-            if solve > best_solve { best_solve = solve; }
+            if solve > best_solve {
+                best_solve = solve;
+                // Save the brain on each new best solve, so the trained model is
+                // available (SAVE=path.json). Plain RegionalWeights (this brain
+                // has no separate visual cortex — `encode` hand-builds tokens).
+                if let Some(ref path) = save_path {
+                    match w.save(path) {
+                        Ok(()) => log(&format!("  [save] new best solve {:.1}% → {path}", solve * 100.0)),
+                        Err(e) => log(&format!("  [save] failed: {e}")),
+                    }
+                }
+            }
             if mv > best_move { best_move = mv; }
             log(&format!(
                 "  batch {b:4}/{batches}: loss={:.3}  move_acc={:.1}%  solve={:.1}%  \
