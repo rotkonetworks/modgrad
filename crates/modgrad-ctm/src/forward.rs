@@ -1588,6 +1588,56 @@ fn nlm_forward_with_cache_batched<D: TensorDevice>(
     Ok((final_host, cache))
 }
 
+/// BATCHED NLM backward (M1). Mirrors `nlm_backward_typed_helper` but threads
+/// `batch`: GLU is weight-free per-element, so it flattens batch×neurons; the
+/// SuperLinear stages use `backward_batched` (per-neuron weights are shared
+/// across the batch, so it sums grads over examples). `d_activated` is
+/// `[batch × n_neurons × out_per_final/2]`; `d_trace` (`[batch × n_neurons ×
+/// in_per_1]`) overwritten; stage grads ACCUMULATE (batch-summed).
+#[allow(dead_code)] // consumed by ctm_backward_typed_batched (next increment)
+#[allow(clippy::too_many_arguments)]
+fn nlm_backward_batched<D: TensorDevice>(
+    d_activated: &Tensor<D>,
+    cache: &NlmCacheTyped<D>,
+    stage1: &tensor_typed::SuperLinear<D>,
+    stage2: Option<&tensor_typed::SuperLinear<D>>,
+    d_stage1_w: &mut Tensor<D>,
+    d_stage1_b: &mut Tensor<D>,
+    d_stage2_w: Option<&mut Tensor<D>>,
+    d_stage2_b: Option<&mut Tensor<D>>,
+    d_trace: &mut Tensor<D>,
+    batch: usize,
+) -> Result<(), BackendError> {
+    let nn = stage1.n_neurons;
+    let bn = batch * nn; // flattened neuron count for the weight-free GLU
+
+    let d_s1_glu = if let Some(s2) = stage2 {
+        let s2_cache = cache.s2.as_ref().expect("deep NLM cache requires s2");
+        // d_s2 = glu_bwd(d_activated, s2)  — flatten batch×neurons.
+        let mut d_s2 = Tensor::<D>::zeros(bn * s2.out_per)?;
+        tensor_typed::glu_bwd(d_activated, s2_cache, &mut d_s2, bn, s2.out_per / 2)?;
+        // stage2 backward → d_W2/d_b2 (sum), d_s1_glu (= d_trace of stage2).
+        let mut d_s1_glu_buf = Tensor::<D>::zeros(batch * nn * s2.in_per)?;
+        match (d_stage2_w, d_stage2_b) {
+            (Some(dw), Some(db)) => {
+                s2.backward_batched(&d_s2, &cache.s1_glu, dw, db, &mut d_s1_glu_buf, batch)?;
+            }
+            _ => return Err(BackendError::Runtime(
+                "deep NLM backward needs stage2 grads".to_string())),
+        }
+        d_s1_glu_buf
+    } else {
+        // shallow: d_activated IS the gradient w.r.t. s1_glu.
+        Tensor::<D>::from_slice(&d_activated.to_vec()?)?
+    };
+
+    // d_s1 = glu_bwd(d_s1_glu, s1); stage1 backward → d_W1/d_b1 (sum), d_trace.
+    let mut d_s1 = Tensor::<D>::zeros(bn * stage1.out_per)?;
+    tensor_typed::glu_bwd(&d_s1_glu, &cache.s1, &mut d_s1, bn, stage1.out_per / 2)?;
+    stage1.backward_batched(&d_s1, &cache.trace, d_stage1_w, d_stage1_b, d_trace, batch)?;
+    Ok(())
+}
+
 /// Reverse the sync_update / sync_init at one tick.
 ///
 /// Forward: `alpha[i] = r[i]·alpha_prev[i] + activated[left[i]]·activated[right[i]]`
@@ -2123,6 +2173,54 @@ mod typed_forward_tests {
                     "nlm[b{b}][{j}]: batched {} vs scalar {}", out_b[b * per + j], out_s[j]);
             }
         }
+    }
+
+    /// M1: the batched NLM backward matches B per-sample backwards — d_trace
+    /// per-example and the summed weight/bias grads, bit-for-bit.
+    #[test]
+    fn cpu_nlm_backward_batched_matches_scalar() {
+        let cfg = small_cfg(); // shallow NLM
+        let (raw, batch) = (6usize, 4usize);
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let (d, m) = (cfg.d_model, cfg.memory_length);
+        let s1 = &typed.nlm_stage1;
+        let out_half = s1.out_per / 2; // shallow final width per neuron
+
+        let trace_b: Vec<f32> = (0..batch * d * m).map(|i| (((i * 5 % 11) as f32) - 5.0) * 0.1).collect();
+        let trace_b_t = Tensor::<Cpu>::from_slice(&trace_b).unwrap();
+        let (_o, cache_b) = nlm_forward_with_cache_batched::<Cpu>(&trace_b_t, s1, None, d, batch).unwrap();
+        let d_act_b: Vec<f32> = (0..batch * d * out_half).map(|i| (((i * 3 % 7) as f32) - 3.0) * 0.05).collect();
+        let d_act_b_t = Tensor::<Cpu>::from_slice(&d_act_b).unwrap();
+
+        let mut dw_b = Tensor::<Cpu>::zeros(s1.weights.len()).unwrap();
+        let mut db_b = Tensor::<Cpu>::zeros(s1.biases.len()).unwrap();
+        let mut dtr_b = Tensor::<Cpu>::zeros(batch * d * m).unwrap();
+        nlm_backward_batched::<Cpu>(&d_act_b_t, &cache_b, s1, None,
+            &mut dw_b, &mut db_b, None, None, &mut dtr_b, batch).unwrap();
+
+        // per-sample reference: sum grads, collect d_trace.
+        let mut dw_s = Tensor::<Cpu>::zeros(s1.weights.len()).unwrap();
+        let mut db_s = Tensor::<Cpu>::zeros(s1.biases.len()).unwrap();
+        let mut dtr_s = vec![0.0f32; batch * d * m];
+        for b in 0..batch {
+            let tr = &trace_b[b * d * m..(b + 1) * d * m];
+            let tr_t = Tensor::<Cpu>::from_slice(tr).unwrap();
+            let (_o, cache_s) = nlm_forward_with_cache::<Cpu>(&tr_t, s1, None, d).unwrap();
+            let da = &d_act_b[b * d * out_half..(b + 1) * d * out_half];
+            let da_t = Tensor::<Cpu>::from_slice(da).unwrap();
+            let mut dtrb = Tensor::<Cpu>::zeros(d * m).unwrap();
+            nlm_backward_typed_helper::<Cpu>(&da_t, &cache_s, s1, None,
+                &mut dw_s, &mut db_s, None, None, &mut dtrb).unwrap();
+            dtr_s[b * d * m..(b + 1) * d * m].copy_from_slice(&dtrb.to_vec().unwrap());
+        }
+
+        let (dw_bv, dw_sv) = (dw_b.to_vec().unwrap(), dw_s.to_vec().unwrap());
+        let (db_bv, db_sv) = (db_b.to_vec().unwrap(), db_s.to_vec().unwrap());
+        let dtr_bv = dtr_b.to_vec().unwrap();
+        for i in 0..dw_bv.len() { assert!((dw_bv[i] - dw_sv[i]).abs() < 1e-5, "dW[{i}]: {} vs {}", dw_bv[i], dw_sv[i]); }
+        for i in 0..db_bv.len() { assert!((db_bv[i] - db_sv[i]).abs() < 1e-5, "db[{i}]"); }
+        for i in 0..dtr_bv.len() { assert!((dtr_bv[i] - dtr_s[i]).abs() < 1e-5, "d_trace[{i}]: {} vs {}", dtr_bv[i], dtr_s[i]); }
     }
 
     /// Adaptive-exit halt mask: with a Certainty exit, each example's output
