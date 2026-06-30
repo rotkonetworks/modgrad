@@ -1023,6 +1023,186 @@ fn nlm_forward_batched<D: TensorDevice>(
     }
 }
 
+/// Per-tick batched cache (M1) — the batched analog of [`TickCacheTyped`].
+/// Host `Vec`s are `[batch × …]`; tensors carry the batch dim; `mha` is a
+/// per-example B-loop. Consumed by `ctm_backward_typed_batched`.
+pub struct BatchedTickCacheTyped<D: TensorDevice> {
+    pub sync_action: Vec<f32>,
+    pub mha: Vec<MhaCacheTyped<D>>,
+    pub attn_out: Vec<f32>,
+    pub activated_pre_tick: Vec<f32>,
+    pub activated_post: Vec<f32>,
+    pub trace_pre_tick: Vec<f32>,
+    pub synapse_input: Tensor<D>,
+    pub synapse_cache: super::synapse::SynapseUNetCacheTyped<D>,
+    pub trace_post_shift: Vec<f32>,
+    pub nlm: NlmCacheTyped<D>,
+    pub sync_out_for_pred: Vec<f32>,
+    pub alpha_out_post: Vec<f32>,
+    pub beta_out_post: Vec<f32>,
+    pub alpha_action_post: Vec<f32>,
+    pub beta_action_post: Vec<f32>,
+}
+
+/// Batched top-level cache (M1).
+pub struct BatchedCtmCacheTyped<D: TensorDevice> {
+    pub obs: Tensor<D>,
+    pub kv: Vec<f32>, // post-LN kv, [batch × d_input]
+    pub kv_pre_ln: Tensor<D>,
+    pub kv_ln_cache: Tensor<D>,
+    pub ticks: Vec<BatchedTickCacheTyped<D>>,
+    pub batch: usize,
+    pub d_input: usize,
+    pub d_model: usize,
+    pub memory_length: usize,
+}
+
+/// BATCHED forward WITH cache (M1 increment 1c) — same composition as
+/// `ctm_forward_typed_batched` but uses the with-cache variants
+/// (`synapse.forward_with_cache_batched`, `nlm_forward_with_cache_batched`,
+/// MHA B-loop caches) and records the per-tick intermediates a batched
+/// backward needs. Predictions are identical to the cache-free path (verified
+/// in tests). No halt-mask here (uniform K-tick shape for the backward).
+#[allow(dead_code, clippy::type_complexity)]
+pub fn ctm_forward_typed_batched_with_cache<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    activated: &mut Vec<f32>,
+    trace: &mut Vec<f32>,
+    obs: &[f32],
+    batch: usize,
+) -> Result<(Vec<Vec<f32>>, BatchedCtmCacheTyped<D>), BackendError> {
+    let cfg = &w.config;
+    let d = cfg.d_model;
+    let d_in = cfg.d_input;
+    let k = cfg.iterations;
+    let m = cfg.memory_length;
+    let n_tokens = 1;
+
+    let obs_t = Tensor::<D>::from_slice(obs)?;
+    let mut kv_pre = Tensor::<D>::zeros(batch * d_in)?;
+    w.kv_proj.forward_batched(&obs_t, &mut kv_pre, batch)?;
+    let mut kv_post = Tensor::<D>::zeros(batch * d_in)?;
+    let mut kv_ln_cache = Tensor::<D>::zeros(2 * batch)?;
+    tensor_typed::layer_norm_train(&kv_pre, &w.kv_ln_gamma, &w.kv_ln_beta,
+        &mut kv_post, &mut kv_ln_cache, batch, d_in)?;
+    let kv_host: Vec<f32> = kv_post.to_vec()?;
+
+    let decay_out: Vec<f32> = w.decay_params_out.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let decay_action: Vec<f32> = w.decay_params_action.to_vec()?
+        .iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+
+    let mut alpha_out = Vec::new();
+    let mut beta_out = Vec::new();
+    sync_init_batched(activated, &w.sync_out_left, &w.sync_out_right,
+        &mut alpha_out, &mut beta_out, batch, d);
+    let mut alpha_action = Vec::new();
+    let mut beta_action = Vec::new();
+    let mut action_init = false;
+
+    let mut predictions: Vec<Vec<f32>> = Vec::with_capacity(k);
+    let mut ticks: Vec<BatchedTickCacheTyped<D>> = Vec::with_capacity(k);
+
+    for _tick in 0..k {
+        let activated_pre_tick = activated.clone();
+        let trace_pre_tick = trace.clone();
+
+        let sync_action: Vec<f32> = if !action_init {
+            sync_init_batched(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, batch, d);
+            action_init = true;
+            sync_read(&alpha_action, &beta_action)
+        } else {
+            sync_update_batched(activated, &w.sync_action_left, &w.sync_action_right,
+                &mut alpha_action, &mut beta_action, &decay_action, batch, d)
+        };
+        let alpha_action_post = alpha_action.clone();
+        let beta_action_post = beta_action.clone();
+
+        let sa_t = Tensor::<D>::from_slice(&sync_action)?;
+        let mut q_t = Tensor::<D>::zeros(batch * d_in)?;
+        w.q_proj.forward_batched(&sa_t, &mut q_t, batch)?;
+        let q_host: Vec<f32> = q_t.to_vec()?;
+
+        // MHA B-loop, keeping per-example caches.
+        let mut attn_all = vec![0.0f32; batch * d_in];
+        let mut mha = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let (ao, c) = multihead_attention_with_cache_typed::<D>(
+                &q_host[b * d_in..(b + 1) * d_in],
+                &kv_host[b * d_in..(b + 1) * d_in],
+                n_tokens, d_in, cfg.heads, &w.mha_in_proj, &w.mha_out_proj,
+            )?;
+            attn_all[b * d_in..(b + 1) * d_in].copy_from_slice(&ao);
+            mha.push(c);
+        }
+
+        let mut pre_syn = vec![0.0f32; batch * (d_in + d)];
+        for b in 0..batch {
+            let o = b * (d_in + d);
+            pre_syn[o..o + d_in].copy_from_slice(&attn_all[b * d_in..(b + 1) * d_in]);
+            pre_syn[o + d_in..o + d_in + d].copy_from_slice(&activated[b * d..(b + 1) * d]);
+        }
+        let pre_syn_t = Tensor::<D>::from_slice(&pre_syn)?;
+        let (pre_act_t, synapse_cache) = w.synapse.forward_with_cache_batched(&pre_syn_t, batch)?;
+        let pre_act_host: Vec<f32> = pre_act_t.to_vec()?;
+
+        for b in 0..batch {
+            let (to, ao) = (b * d * m, b * d);
+            for n in 0..d {
+                let base = to + n * m;
+                trace.copy_within(base + 1..base + m, base);
+                trace[base + m - 1] = pre_act_host[ao + n];
+            }
+        }
+        let trace_post_shift = trace.clone();
+
+        let trace_t = Tensor::<D>::from_slice(trace)?;
+        let (activated_new, nlm) = nlm_forward_with_cache_batched::<D>(
+            &trace_t, &w.nlm_stage1, w.nlm_stage2.as_ref(), d, batch)?;
+        *activated = activated_new;
+        let activated_post = activated.clone();
+
+        let sync_out = sync_update_batched(activated, &w.sync_out_left, &w.sync_out_right,
+            &mut alpha_out, &mut beta_out, &decay_out, batch, d);
+        let so_t = Tensor::<D>::from_slice(&sync_out)?;
+        let mut pred_t = Tensor::<D>::zeros(batch * cfg.out_dims)?;
+        w.output_proj.forward_batched(&so_t, &mut pred_t, batch)?;
+        predictions.push(pred_t.to_vec()?);
+
+        ticks.push(BatchedTickCacheTyped {
+            sync_action,
+            mha,
+            attn_out: attn_all,
+            activated_pre_tick,
+            activated_post,
+            trace_pre_tick,
+            synapse_input: pre_syn_t,
+            synapse_cache,
+            trace_post_shift,
+            nlm,
+            sync_out_for_pred: sync_out,
+            alpha_out_post: alpha_out.clone(),
+            beta_out_post: beta_out.clone(),
+            alpha_action_post,
+            beta_action_post,
+        });
+    }
+
+    let cache = BatchedCtmCacheTyped {
+        obs: obs_t,
+        kv: kv_host,
+        kv_pre_ln: kv_pre,
+        kv_ln_cache,
+        ticks,
+        batch,
+        d_input: d_in,
+        d_model: d,
+        memory_length: m,
+    };
+    Ok((predictions, cache))
+}
+
 /// Batched forward tick loop — the wiring capstone. Threads `batch`
 /// through the whole per-tick op chain: GEMM-batched synapse / q_proj /
 /// output_proj / kv_proj, batched NLM + sync, B-loop attention (small).
@@ -2221,6 +2401,30 @@ mod typed_forward_tests {
         for i in 0..dw_bv.len() { assert!((dw_bv[i] - dw_sv[i]).abs() < 1e-5, "dW[{i}]: {} vs {}", dw_bv[i], dw_sv[i]); }
         for i in 0..db_bv.len() { assert!((db_bv[i] - db_sv[i]).abs() < 1e-5, "db[{i}]"); }
         for i in 0..dtr_bv.len() { assert!((dtr_bv[i] - dtr_s[i]).abs() < 1e-5, "d_trace[{i}]: {} vs {}", dtr_bv[i], dtr_s[i]); }
+    }
+
+    /// M1 1c: the cached batched forward gives identical predictions to the
+    /// plain batched forward (same math), and records K tick caches.
+    #[test]
+    fn cpu_ctm_forward_batched_with_cache_matches_plain() {
+        let cfg = small_cfg(); // exit None → all ticks run; halt-mask is a no-op
+        let (raw, batch) = (6usize, 3usize);
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let obs: Vec<f32> = (0..batch * raw).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
+        let mut a1: Vec<f32> = (0..batch).flat_map(|_| w.start_activated.clone()).collect();
+        let mut t1: Vec<f32> = (0..batch).flat_map(|_| w.start_trace.clone()).collect();
+        let (mut a2, mut t2) = (a1.clone(), t1.clone());
+        let (p_plain, _) = ctm_forward_typed_batched::<Cpu>(&typed, &mut a1, &mut t1, &obs, batch).unwrap();
+        let (p_cache, cache) = ctm_forward_typed_batched_with_cache::<Cpu>(&typed, &mut a2, &mut t2, &obs, batch).unwrap();
+        assert_eq!(p_plain.len(), p_cache.len());
+        for tick in 0..p_plain.len() {
+            for j in 0..p_plain[tick].len() {
+                assert!((p_plain[tick][j] - p_cache[tick][j]).abs() < 1e-5,
+                    "pred[{tick}][{j}]: {} vs {}", p_plain[tick][j], p_cache[tick][j]);
+            }
+        }
+        assert_eq!(cache.ticks.len(), cfg.iterations);
     }
 
     /// Adaptive-exit halt mask: with a Certainty exit, each example's output
