@@ -49,15 +49,28 @@ fn main() {
     let vin: VinReadout = serde_json::from_str(&vin_json)
         .unwrap_or_else(|e| { eprintln!("parse VIN {vin_in}: {e}"); exit(1) });
 
-    // ── inject the VIN into regional.planner (pure JSON, schema-faithful) ──
-    // serde encodes Some(vin) as the bare object, so setting
-    // regional.planner to the VIN value round-trips into Option<VinReadout>.
+    // ── fold the VIN into the HIPPOCAMPUS REGION as its value-iteration core ──
+    // JSON surgery (preserves every original brain byte; only relocates the
+    // planner): drop any legacy top-level `regional.planner`, and insert the VIN
+    // into `regional.regions[hippocampus].planner`. The planner becomes the
+    // region's own property, not a brain-level sibling.
     let mut brain_val: serde_json::Value = serde_json::from_str(&brain_json)
         .unwrap_or_else(|e| { eprintln!("parse brain {brain_in}: {e}"); exit(1) });
     let vin_val: serde_json::Value = serde_json::from_str(&vin_json).unwrap();
-    match brain_val.get_mut("regional").and_then(|r| r.as_object_mut()) {
-        Some(reg) => { reg.insert("planner".to_string(), vin_val); }
-        None => { eprintln!("brain export has no `regional` object"); exit(1); }
+    let regional = brain_val
+        .get_mut("regional")
+        .and_then(|r| r.as_object_mut())
+        .unwrap_or_else(|| { eprintln!("brain export has no `regional` object"); exit(1) });
+    regional.remove("planner"); // drop the legacy top-level (M1) slot if present
+    let hippo = regional
+        .get("config")
+        .and_then(|c| c.get("region_names"))
+        .and_then(|n| n.as_array())
+        .and_then(|names| names.iter().position(|n| n.as_str().is_some_and(|s| s.contains("hippocampus"))))
+        .unwrap_or_else(|| { eprintln!("no hippocampus region in region_names"); exit(1) });
+    match regional.get_mut("regions").and_then(|r| r.as_array_mut()).and_then(|a| a.get_mut(hippo)).and_then(|r| r.as_object_mut()) {
+        Some(region) => { region.insert("planner".to_string(), vin_val); }
+        None => { eprintln!("hippocampus region object not found at index {hippo}"); exit(1); }
     }
 
     // ── verify the combined export loads through the REAL SDK types ────────
@@ -65,7 +78,7 @@ fn main() {
     let bw: BrainWeights = serde_json::from_str(&combined)
         .unwrap_or_else(|e| { eprintln!("combined export failed to deserialize: {e}"); exit(1) });
     if !bw.regional.has_planner() {
-        eprintln!("fold failed: regional.planner is absent after injection");
+        eprintln!("fold failed: no region carries the planner after injection");
         exit(1);
     }
 
@@ -97,7 +110,7 @@ fn main() {
         exit(1);
     }
 
-    // ── write the combined brain ──────────────────────────────────────────
+    // ── write the combined brain (the byte-preserving surgery result) ─────
     std::fs::write(brain_out, &combined)
         .unwrap_or_else(|e| { eprintln!("write {brain_out}: {e}"); exit(1) });
 

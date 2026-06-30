@@ -54,8 +54,7 @@ fn load_learned_vin_inner(json: &str) -> Result<(), String> {
     if has_brain {
         BRAIN.with(|b| {
             if let Some(brain) = b.borrow_mut().as_mut() {
-                brain.planner = Some(vin);
-                brain.bump_generation();
+                brain.set_planner(vin); // folds into the hippocampus region
             }
         });
         LEARNED_VIN.with(|v| *v.borrow_mut() = None);
@@ -98,7 +97,7 @@ fn plan_forward(
 fn with_planner_mut<R>(f: impl FnOnce(&mut VinReadout) -> R) -> Result<R, String> {
     BRAIN.with(|b| {
         let mut bref = b.borrow_mut();
-        if let Some(p) = bref.as_mut().and_then(|brain| brain.planner.as_mut()) {
+        if let Some(p) = bref.as_mut().and_then(|brain| brain.planner_mut()) {
             return Ok(f(p));
         }
         drop(bref);
@@ -372,10 +371,9 @@ fn load_brain_weights_inner(json: &str) -> Result<(), String> {
     // If a standalone planner was loaded before the brain (either order is
     // valid), fold it into the hippocampus slot now so the planner lives in
     // exactly one place. An export that already carries its own planner wins.
-    if regional.planner.is_none() {
+    if !regional.has_planner() {
         if let Some(vin) = LEARNED_VIN.with(|v| v.borrow_mut().take()) {
-            regional.planner = Some(vin);
-            regional.bump_generation();
+            regional.set_planner(vin); // into the hippocampus region
         }
     }
     BRAIN.with(|b| *b.borrow_mut() = Some(regional));

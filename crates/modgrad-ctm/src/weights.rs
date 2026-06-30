@@ -53,6 +53,16 @@ pub struct CtmWeights {
     // sync_out → 1 → sigmoid → per-tick halting probability.
     #[serde(default)]
     pub exit_gate: Option<Linear>,     // synch_out_size → 1
+
+    // ── Value-iteration core (planning-in-the-brain) ──
+    // When set, THIS region plans: its recurrence is exact value iteration over
+    // a decoded grid (one Bellman backup per tick), read ego-centrically at the
+    // agent's own cell. Only the hippocampus region carries it; every other
+    // region leaves it `None`. The planner is therefore a property OF the region
+    // — the hippocampus's own dynamics — not a sibling module bolted onto the
+    // brain. `#[serde(default)]` so legacy regions deserialize unchanged.
+    #[serde(default)]
+    pub planner: Option<crate::vin::VinReadout>,
 }
 
 impl CtmWeights {
@@ -123,6 +133,7 @@ impl CtmWeights {
             } else {
                 None
             },
+            planner: None,
             config,
         }
     }
