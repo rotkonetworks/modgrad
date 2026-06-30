@@ -44,12 +44,74 @@ fn jserr(e: String) -> JsValue {
 fn load_learned_vin_inner(json: &str) -> Result<(), String> {
     let vin: VinReadout =
         serde_json::from_str(json).map_err(|e| format!("load_learned_vin: {e}"))?;
-    LEARNED_VIN.with(|v| *v.borrow_mut() = Some(vin));
     VIN_PRISTINE.with(|s| *s.borrow_mut() = None); // fresh model → drop old snapshot
+    // Fold the trained planner into the brain's hippocampus slot when a brain is
+    // loaded, so the brain itself plans (`RegionalWeights::plan` → the
+    // hippocampus value-iteration core) — the planner is a region OF the brain,
+    // not a sibling module. Without a brain, hold it standalone. Exactly ONE
+    // copy lives at a time, so test-time consolidation can never drift two.
+    let has_brain = BRAIN.with(|b| b.borrow().is_some());
+    if has_brain {
+        BRAIN.with(|b| {
+            if let Some(brain) = b.borrow_mut().as_mut() {
+                brain.planner = Some(vin);
+                brain.bump_generation();
+            }
+        });
+        LEARNED_VIN.with(|v| *v.borrow_mut() = None);
+    } else {
+        LEARNED_VIN.with(|v| *v.borrow_mut() = Some(vin));
+    }
     Ok(())
 }
 
-/// Run the learned VIN forward and return `[move_logits (n_dirs) | value-field
+/// Plan one move with the brain's folded-in hippocampus planner
+/// (`RegionalWeights::plan`); fall back to a standalone `VinReadout` only when no
+/// brain is loaded. Either path runs the identical value-iteration forward — the
+/// brain *is* the planner once folded.
+fn plan_forward(
+    tokens: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    agent_r: usize,
+    agent_c: usize,
+) -> Result<modgrad_ctm::vin::VinOutput, String> {
+    let agent = Some((agent_r, agent_c));
+    if let Some(out) = BRAIN.with(|b| {
+        b.borrow()
+            .as_ref()
+            .and_then(|brain| brain.plan(tokens, grid_h, grid_w, agent))
+    }) {
+        return Ok(out);
+    }
+    LEARNED_VIN.with(|v| {
+        v.borrow()
+            .as_ref()
+            .map(|vin| vin.forward(tokens, grid_h, grid_w, agent))
+            .ok_or_else(|| "plan_forward: no planner loaded".to_string())
+    })
+}
+
+/// A mutable handle to wherever the single planner lives — the brain's
+/// hippocampus slot when folded, else the standalone store. `Err` when no
+/// planner is loaded.
+fn with_planner_mut<R>(f: impl FnOnce(&mut VinReadout) -> R) -> Result<R, String> {
+    BRAIN.with(|b| {
+        let mut bref = b.borrow_mut();
+        if let Some(p) = bref.as_mut().and_then(|brain| brain.planner.as_mut()) {
+            return Ok(f(p));
+        }
+        drop(bref);
+        LEARNED_VIN.with(|v| {
+            v.borrow_mut()
+                .as_mut()
+                .map(f)
+                .ok_or_else(|| "with_planner_mut: no planner loaded".to_string())
+        })
+    })
+}
+
+/// Run the learned planner forward and return `[move_logits (n_dirs) | value-field
 /// compass (grid_h*grid_w)]`. The compass cell value is the L1 magnitude of that
 /// cell's value vector — the planner's own proximity-to-goal estimate.
 fn learned_vin_forward_compass_inner(
@@ -59,12 +121,8 @@ fn learned_vin_forward_compass_inner(
     agent_r: usize,
     agent_c: usize,
 ) -> Result<Vec<f32>, String> {
-    LEARNED_VIN.with(|v| {
-        let vref = v.borrow();
-        let vin = vref
-            .as_ref()
-            .ok_or_else(|| "learned_vin_forward_compass: no VIN loaded".to_string())?;
-        let out = vin.forward(tokens, grid_h, grid_w, Some((agent_r, agent_c)));
+    {
+        let out = plan_forward(tokens, grid_h, grid_w, agent_r, agent_c)?;
         let n = grid_h * grid_w;
         let vd = out.value_dim;
         let mut result = Vec::with_capacity(out.move_logits.len() + n);
@@ -78,7 +136,7 @@ fn learned_vin_forward_compass_inner(
             result.push(s);
         }
         Ok(result)
-    })
+    }
 }
 
 #[wasm_bindgen]
@@ -112,40 +170,33 @@ fn learned_vin_train_inner(
     if target_move < 0 {
         return Ok(0.0);
     }
-    LEARNED_VIN.with(|v| {
-        let mut vref = v.borrow_mut();
-        let vin = vref
-            .as_mut()
-            .ok_or_else(|| "learned_vin_train: no VIN loaded".to_string())?;
+    with_planner_mut(|vin| {
         VIN_PRISTINE.with(|s| {
             if s.borrow().is_none() {
                 *s.borrow_mut() =
                     Some((vin.move_head.weight.clone(), vin.move_head.bias.clone()));
             }
         });
-        Ok(vin.consolidate_move(
+        vin.consolidate_move(
             tokens,
             grid_h,
             grid_w,
             (agent_r, agent_c),
             target_move as usize,
             lr,
-        ))
+        )
     })
 }
 
 /// Restore the move head to its as-loaded weights, undoing every consolidation.
 fn learned_vin_reset_inner() {
-    VIN_PRISTINE.with(|s| {
-        if let Some((w, b)) = s.borrow().as_ref() {
-            LEARNED_VIN.with(|v| {
-                if let Some(vin) = v.borrow_mut().as_mut() {
-                    vin.move_head.weight = w.clone();
-                    vin.move_head.bias = b.clone();
-                }
-            });
-        }
-    });
+    let pristine = VIN_PRISTINE.with(|s| s.borrow().clone());
+    if let Some((w, b)) = pristine {
+        let _ = with_planner_mut(|vin| {
+            vin.move_head.weight = w.clone();
+            vin.move_head.bias = b.clone();
+        });
+    }
 }
 
 #[wasm_bindgen]
@@ -171,11 +222,10 @@ pub fn learned_vin_reset() {
 mod tests {
     use super::*;
 
-    // The demo ships the SDK's own serde export; the real VinReadout must
-    // deserialize it and produce a sane forward (4 move logits + a value field).
-    const VIN_JSON: &str = include_str!(
-        "../../../../modgrad.com/public/models/vin_solver_weights.json"
-    );
+    // A real trained planner export (the shipped champion), kept as an in-crate
+    // fixture so the tests don't reach across repos. The same weights are folded
+    // into the demo's brain export; here we exercise the standalone path.
+    const VIN_JSON: &str = include_str!("../testdata/planner_solver.json");
 
     #[test]
     fn loads_real_vin_export_and_runs_forward() {
@@ -251,6 +301,47 @@ mod tests {
             "predictions finite"
         );
     }
+
+    // Loading a brain THEN the planner must fold the planner into the brain's
+    // hippocampus slot (not leave it standalone), and navigation must route
+    // through `RegionalWeights::plan` — bit-identical to the standalone forward.
+    // This is the guarantee behind the demo's "the brain plans" claim.
+    #[test]
+    fn planner_folds_into_brain_and_nav_routes_through_it() {
+        let brain_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../modgrad.com/public/models/brain_solver_weights.json"
+        );
+        let brain_json = match std::fs::read_to_string(brain_path) {
+            Ok(j) => j,
+            Err(_) => return, // brain export not present in this checkout — skip
+        };
+        // brain first, then the planner — the demo's load order.
+        load_brain_weights_inner(&brain_json).expect("brain deserializes");
+        load_learned_vin_inner(VIN_JSON).expect("planner deserializes");
+
+        // single source of truth: planner now lives in the brain, not standalone.
+        assert!(
+            BRAIN.with(|b| b.borrow().as_ref().unwrap().has_planner()),
+            "planner folded into the hippocampus slot"
+        );
+        assert!(
+            LEARNED_VIN.with(|v| v.borrow().is_none()),
+            "no standalone copy left to drift"
+        );
+
+        // nav output must equal a standalone forward of the same weights.
+        let (h, w, raw_dim) = (3usize, 3usize, 3usize);
+        let tokens = vec![0.0f32; h * w * raw_dim];
+        let routed = learned_vin_forward_compass_inner(&tokens, h, w, 1, 1)
+            .expect("brain-routed forward runs");
+        let standalone: VinReadout = serde_json::from_str(VIN_JSON).unwrap();
+        let direct = standalone.forward(&tokens, h, w, Some((1, 1)));
+        assert_eq!(routed.len(), direct.move_logits.len() + h * w);
+        for (i, &m) in direct.move_logits.iter().enumerate() {
+            assert_eq!(routed[i], m, "brain.plan move logit {i} == standalone");
+        }
+    }
 }
 
 // ── 8-region brain + visual cortex ───────────────────────────────────────────
@@ -277,7 +368,17 @@ fn load_brain_weights_inner(json: &str) -> Result<(), String> {
     let bw: BrainWeights =
         serde_json::from_str(json).map_err(|e| format!("load_brain_weights: {e}"))?;
     CORTEX.with(|c| *c.borrow_mut() = bw.cortex);
-    BRAIN.with(|b| *b.borrow_mut() = Some(bw.regional));
+    let mut regional = bw.regional;
+    // If a standalone planner was loaded before the brain (either order is
+    // valid), fold it into the hippocampus slot now so the planner lives in
+    // exactly one place. An export that already carries its own planner wins.
+    if regional.planner.is_none() {
+        if let Some(vin) = LEARNED_VIN.with(|v| v.borrow_mut().take()) {
+            regional.planner = Some(vin);
+            regional.bump_generation();
+        }
+    }
+    BRAIN.with(|b| *b.borrow_mut() = Some(regional));
     Ok(())
 }
 
