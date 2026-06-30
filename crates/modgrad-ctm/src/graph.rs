@@ -696,6 +696,14 @@ impl RegionalConfig {
             Connection { from: vec![OUTPUT], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
             Connection { from: vec![HIPPOCAMPUS], to: INSULA, receives_observation: false, observation_scale: 0 },
             Connection { from: vec![INPUT, ATTENTION, OUTPUT, MOTOR], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
+            // ── basal ganglia ↔ hippocampus planning loop ──
+            // Model-based planning's read/write loop: the striatal value (basal
+            // ganglia) feeds the hippocampal cognitive map so its replay
+            // propagates value across it, and the hippocampus's propagated value
+            // returns to update the value head — value flowing both ways each
+            // tick (planning-in-the-brain).
+            Connection { from: vec![BASAL_GANGLIA], to: HIPPOCAMPUS, receives_observation: false, observation_scale: 0 },
+            Connection { from: vec![HIPPOCAMPUS], to: BASAL_GANGLIA, receives_observation: false, observation_scale: 0 },
         ];
 
         let total_neurons: usize = regions.iter().map(|r| r.d_model).sum();
