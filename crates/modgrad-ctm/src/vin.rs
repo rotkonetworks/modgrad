@@ -196,35 +196,13 @@ impl VinReadout {
         let value_init = value.clone();
 
         // ── 2. K capped Bellman backups over the 4-neighbour grid ────────
+        // Each backup is ONE recurrent tick (`bellman_step`). Looping it K times
+        // IS the value iteration — and is exactly the per-tick update the
+        // hippocampus region runs as its own recurrence in the folded brain
+        // (planning-in-the-brain M2), instead of calling a separate module.
         let iters = self.config.effective_iters();
-        let mut next = value.clone();
         for _ in 0..iters {
-            for r in 0..grid_h {
-                for c in 0..grid_w {
-                    let cell = r * grid_w + c;
-                    // Candidate value = local reward (broadcast) + (soft)max
-                    // over traversable neighbours' value vectors.
-                    let cand = self.backup_cell(
-                        r, c, grid_h, grid_w, &value, &gate, reward[cell], v,
-                    );
-                    let dst = &mut next[cell * v..(cell + 1) * v];
-                    if self.config.highway_gate {
-                        // h = g·cand + (1-g)·prev, g from [prev | cand].
-                        let prev = &value[cell * v..(cell + 1) * v];
-                        let mut hin = Vec::with_capacity(2 * v);
-                        hin.extend_from_slice(prev);
-                        hin.extend_from_slice(&cand);
-                        let g = self.highway_proj.forward(&hin);
-                        for k in 0..v {
-                            let gk = sigmoid(g[k]);
-                            dst[k] = gk * cand[k] + (1.0 - gk) * prev[k];
-                        }
-                    } else {
-                        dst.copy_from_slice(&cand);
-                    }
-                }
-            }
-            std::mem::swap(&mut value, &mut next);
+            value = self.bellman_step(&value, &gate, &reward, grid_h, grid_w);
         }
         // `value` now holds the post-propagation per-cell value grid.
 
@@ -377,6 +355,50 @@ impl VinReadout {
 
     /// One cell's Bellman backup: `reward + (soft)max_neighbour gate·value`.
     /// Returns a `value_dim` vector.
+    /// ONE Bellman backup over the whole 4-neighbour grid — a single recurrent
+    /// tick of the value-iteration recurrence. `value` is the current
+    /// `[n_cells × value_dim]` grid; returns the next grid. Looping this
+    /// `effective_iters()` times is precisely the value iteration in
+    /// [`Self::forward`]. Exposing the tick makes the recurrence a first-class,
+    /// reusable step: the hippocampus region runs value iteration AS its tick
+    /// dynamics (planning-in-the-brain M2) by calling this each outer tick,
+    /// rather than the brain invoking a separate planner module.
+    pub fn bellman_step(
+        &self,
+        value: &[f32],
+        gate: &[f32],
+        reward: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Vec<f32> {
+        let v = self.config.value_dim.max(1);
+        let mut next = value.to_vec();
+        for r in 0..grid_h {
+            for c in 0..grid_w {
+                let cell = r * grid_w + c;
+                // Candidate value = local reward (broadcast) + (soft)max over
+                // traversable neighbours' value vectors.
+                let cand = self.backup_cell(r, c, grid_h, grid_w, value, gate, reward[cell], v);
+                let dst = &mut next[cell * v..(cell + 1) * v];
+                if self.config.highway_gate {
+                    // h = g·cand + (1-g)·prev, g from [prev | cand].
+                    let prev = &value[cell * v..(cell + 1) * v];
+                    let mut hin = Vec::with_capacity(2 * v);
+                    hin.extend_from_slice(prev);
+                    hin.extend_from_slice(&cand);
+                    let g = self.highway_proj.forward(&hin);
+                    for k in 0..v {
+                        let gk = sigmoid(g[k]);
+                        dst[k] = gk * cand[k] + (1.0 - gk) * prev[k];
+                    }
+                } else {
+                    dst.copy_from_slice(&cand);
+                }
+            }
+        }
+        next
+    }
+
     fn backup_cell(
         &self,
         r: usize,
