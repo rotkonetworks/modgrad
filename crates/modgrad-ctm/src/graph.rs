@@ -1601,6 +1601,17 @@ pub struct RegionalWeights {
     #[serde(default)]
     pub router: Option<RegionalRouter>,
 
+    /// Sparse, region-index-keyed planning circuit (planning-in-the-brain).
+    /// When the basal-ganglia / hippocampus / motor regions each carry their
+    /// head ([`crate::planning`]), the brain *plans*: BG values states, the
+    /// hippocampus replays value across its map, motor reads the move out
+    /// ego-centrically. Task wiring lives HERE at the composition layer — beside
+    /// `connections`/`router` — so the generic per-region weights stay
+    /// task-agnostic. Empty for brains that don't plan. `#[serde(default)]` so
+    /// legacy exports deserialize unchanged.
+    #[serde(default)]
+    pub region_plugins: Vec<crate::planning::RegionPluginSlot>,
+
     /// Projection layers for frozen cerebellum (trained even when model is frozen).
     /// Present when cereb_mode != Ctm.
     #[serde(default)]
@@ -1774,6 +1785,7 @@ impl RegionalWeights {
             cereb_predict,
             bg_value,
             router,
+            region_plugins: Vec::new(),
             cereb_projection: None,
             cereb_blend_logit: None,
             generation: 0,
@@ -1790,42 +1802,18 @@ impl RegionalWeights {
     // hippocampus slot, the maze move comes from the brain's own value
     // iteration over the decoded grid — not a sibling module. See `planner`.
 
-    /// Borrow the value-iteration planner core — it lives ON the hippocampus
-    /// region (`regions[hippocampus].planner`), the region's OWN dynamics, not a
-    /// brain-level sibling. Returns the first region that carries one.
-    pub fn planner_ref(&self) -> Option<&crate::vin::VinReadout> {
-        self.regions.iter().find_map(|r| r.planner.as_ref())
-    }
-    pub fn planner_mut(&mut self) -> Option<&mut crate::vin::VinReadout> {
-        self.regions.iter_mut().find_map(|r| r.planner.as_mut())
-    }
-
-    /// In-place warm-start: fold a trained `VinReadout` into the hippocampus
-    /// region as its value-iteration core. The `&mut self` companion to
-    /// [`Self::with_planner`] (which consumes `self`).
-    pub fn set_planner(&mut self, planner: crate::vin::VinReadout) {
-        let idx = self
-            .config
-            .region_names
-            .iter()
-            .position(|n| n.contains("hippocampus"))
-            .or_else(|| self.regions.len().checked_sub(1))
-            .expect("brain has at least one region to host the planner");
-        self.regions[idx].planner = Some(planner);
-        self.bump_generation();
-    }
-
-    /// `true` when the hippocampus region carries a value-iteration planner.
+    /// `true` when the planning circuit is complete (BG value + hippocampus
+    /// map/replay + motor readout heads all present in `region_plugins`).
     pub fn has_planner(&self) -> bool {
-        self.regions.iter().any(|r| r.planner.is_some())
+        crate::planning::collect_heads(&self.region_plugins).is_some()
     }
 
-    /// Plan a move by running the **hippocampus region's** value-iteration
-    /// recurrence over the decoded maze grid `[grid_h*grid_w × raw_dim]`
-    /// (row-major `[is_open, is_goal, bias]` per cell) and reading the move
-    /// ego-centrically at `agent_cell`. The planner is the region's own
-    /// dynamics — the brain plans by ticking its hippocampus, not by calling a
-    /// sibling module. `None` when no region carries a planner.
+    /// Plan a move with the brain's **distributed** planning circuit: the
+    /// basal-ganglia value head, the hippocampus map+replay head, and the motor
+    /// readout head — each owned by its region (`region_plugins`) — composed
+    /// into the value-iteration sweep over the decoded grid `[grid_h*grid_w ×
+    /// raw_dim]` and read ego-centrically at `agent_cell`. `None` when the
+    /// circuit is incomplete.
     pub fn plan(
         &self,
         grid_tokens: &[f32],
@@ -1833,14 +1821,15 @@ impl RegionalWeights {
         grid_w: usize,
         agent_cell: Option<(usize, usize)>,
     ) -> Option<crate::vin::VinOutput> {
-        self.planner_ref()
-            .map(|p| p.forward(grid_tokens, grid_h, grid_w, agent_cell))
+        let (bg, hippo, motor) = crate::planning::collect_heads(&self.region_plugins)?;
+        let vin = crate::planning::assemble_vin(bg, hippo, motor);
+        Some(vin.forward(grid_tokens, grid_h, grid_w, agent_cell))
     }
 
     /// Plan with **entropy-gated value iteration** ("hippocampal ripples
-    /// increase under uncertainty"): the hippocampus runs more Bellman sweeps
-    /// where the move is uncertain and stops early once confident. Returns the
-    /// planner output and the number of sweeps used. `None` if no planner.
+    /// increase under uncertainty"): the hippocampus head runs more Bellman
+    /// sweeps where the move is uncertain and stops early once confident.
+    /// Returns the planner output and the sweep count. `None` if incomplete.
     pub fn plan_adaptive(
         &self,
         grid_tokens: &[f32],
@@ -1851,18 +1840,18 @@ impl RegionalWeights {
         max_iters: usize,
         entropy_floor: f32,
     ) -> Option<(crate::vin::VinOutput, usize)> {
-        self.planner_ref().map(|p| {
-            p.forward_adaptive(
-                grid_tokens, grid_h, grid_w, agent_cell, min_iters, max_iters, entropy_floor,
-            )
-        })
+        let (bg, hippo, motor) = crate::planning::collect_heads(&self.region_plugins)?;
+        let vin = crate::planning::assemble_vin(bg, hippo, motor);
+        Some(vin.forward_adaptive(
+            grid_tokens, grid_h, grid_w, agent_cell, min_iters, max_iters, entropy_floor,
+        ))
     }
 
-    /// Test-time consolidation of the hippocampus planner's move head
-    /// (mistake-replay / "sleep"): a single scale-invariant NLMS step toward
-    /// `target_move` at the agent cell. Returns the pre-step cross-entropy
-    /// (so `lr = 0` measures without mutating), or `None` if no planner.
-    /// Bumps `generation` so resident caches notice the weight change.
+    /// Test-time consolidation of the motor head's move readout (mistake-replay
+    /// / "sleep"): a single scale-invariant NLMS step toward `target_move`.
+    /// Returns the pre-step cross-entropy (`lr = 0` measures without mutating),
+    /// or `None` if the circuit is incomplete. Writes the updated weights back
+    /// into the heads and bumps `generation`.
     pub fn plan_consolidate_move(
         &mut self,
         grid_tokens: &[f32],
@@ -1872,29 +1861,87 @@ impl RegionalWeights {
         target_move: usize,
         lr: f32,
     ) -> Option<f32> {
-        let loss = self.planner_mut().map(|p| {
-            p.consolidate_move(grid_tokens, grid_h, grid_w, agent_cell, target_move, lr)
-        });
-        if loss.is_some() && lr != 0.0 {
+        let (bg, hippo, motor) = crate::planning::collect_heads(&self.region_plugins)?;
+        let mut vin = crate::planning::assemble_vin(bg, hippo, motor);
+        let loss = vin.consolidate_move(grid_tokens, grid_h, grid_w, agent_cell, target_move, lr);
+        if lr != 0.0 {
+            self.store_planner(&vin);
             self.bump_generation();
         }
-        loss
+        Some(loss)
     }
 
-    /// Fold a trained standalone `VinReadout` into the **hippocampus region**
-    /// as its value-iteration core (the warm-start). The planner becomes the
-    /// region's own dynamics — no separate brain-level field. Returns `self`
-    /// for chaining at export time.
-    pub fn with_planner(mut self, planner: crate::vin::VinReadout) -> Self {
-        let idx = self
-            .config
-            .region_names
-            .iter()
-            .position(|n| n.contains("hippocampus"))
-            .or_else(|| self.regions.len().checked_sub(1))
-            .expect("brain has at least one region to host the planner");
-        self.regions[idx].planner = Some(planner);
+    /// Read the motor head's move readout (for snapshot / reset by the host).
+    pub fn planner_move_head(&self) -> Option<&Linear> {
+        self.region_plugins.iter().find_map(|s| match &s.plugin {
+            crate::planning::RegionPlugin::Motor(h) => Some(&h.move_head),
+            _ => None,
+        })
+    }
+
+    /// Restore the motor head's move readout to the given pristine weights
+    /// (undo every consolidation). No-op if there is no motor head.
+    pub fn planner_restore_move_head(&mut self, weight: &[f32], bias: &[f32]) {
+        for s in &mut self.region_plugins {
+            if let crate::planning::RegionPlugin::Motor(h) = &mut s.plugin {
+                if h.move_head.weight.len() == weight.len() {
+                    h.move_head.weight.copy_from_slice(weight);
+                }
+                if h.move_head.bias.len() == bias.len() {
+                    h.move_head.bias.copy_from_slice(bias);
+                }
+                self.bump_generation();
+                return;
+            }
+        }
+    }
+
+    /// Re-split a `VinReadout` back into the three region heads in place,
+    /// preserving each slot's region binding. Used after a consolidation step.
+    fn store_planner(&mut self, vin: &crate::vin::VinReadout) {
+        let (bg, hippo, motor) = crate::planning::split_vin(vin);
+        for s in &mut self.region_plugins {
+            match &mut s.plugin {
+                crate::planning::RegionPlugin::BgValue(h) => *h = bg.clone(),
+                crate::planning::RegionPlugin::HippoGate(h) => *h = hippo.clone(),
+                crate::planning::RegionPlugin::Motor(h) => *h = motor.clone(),
+            }
+        }
+    }
+
+    /// In-place warm-start: split a trained `VinReadout` into its three heads
+    /// and bind each to its region (basal ganglia / hippocampus / motor, located
+    /// by name). The `&mut self` companion to [`Self::with_planner`].
+    pub fn set_planner(&mut self, planner: crate::vin::VinReadout) {
+        let (bg, hippo, motor) = crate::planning::split_vin(&planner);
+        let find = |needle: &str| self.config.region_names.iter().position(|n| n.contains(needle));
+        let last = self.regions.len().saturating_sub(1);
+        let bg_idx = find("basal").or_else(|| find("ganglia")).unwrap_or(last);
+        let hippo_idx = find("hippocampus").unwrap_or(last);
+        let motor_idx = find("motor").unwrap_or(last);
+        self.region_plugins = vec![
+            crate::planning::RegionPluginSlot {
+                region: bg_idx,
+                plugin: crate::planning::RegionPlugin::BgValue(bg),
+            },
+            crate::planning::RegionPluginSlot {
+                region: hippo_idx,
+                plugin: crate::planning::RegionPlugin::HippoGate(hippo),
+            },
+            crate::planning::RegionPluginSlot {
+                region: motor_idx,
+                plugin: crate::planning::RegionPlugin::Motor(motor),
+            },
+        ];
         self.bump_generation();
+    }
+
+    /// Fold a trained standalone `VinReadout` into the brain as its distributed
+    /// planning circuit (BG value / hippocampus map+replay / motor readout
+    /// heads). The planner becomes the regions' own components — no separate
+    /// brain-level planner field. Returns `self` for chaining at export time.
+    pub fn with_planner(mut self, planner: crate::vin::VinReadout) -> Self {
+        self.set_planner(planner);
         self
     }
 
@@ -1940,6 +1987,7 @@ impl RegionalWeights {
         if let Some(ref g) = self.outer_exit_gate { n += g.weight.len() + g.bias.len(); }
         for h in &self.extra_heads { n += h.weight.len() + h.bias.len(); }
         if let Some(ref r) = self.router { n += r.n_params(); }
+        for s in &self.region_plugins { n += s.plugin.n_params(); }
         n
     }
 

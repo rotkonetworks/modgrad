@@ -91,25 +91,6 @@ fn plan_forward(
     })
 }
 
-/// A mutable handle to wherever the single planner lives — the brain's
-/// hippocampus slot when folded, else the standalone store. `Err` when no
-/// planner is loaded.
-fn with_planner_mut<R>(f: impl FnOnce(&mut VinReadout) -> R) -> Result<R, String> {
-    BRAIN.with(|b| {
-        let mut bref = b.borrow_mut();
-        if let Some(p) = bref.as_mut().and_then(|brain| brain.planner_mut()) {
-            return Ok(f(p));
-        }
-        drop(bref);
-        LEARNED_VIN.with(|v| {
-            v.borrow_mut()
-                .as_mut()
-                .map(f)
-                .ok_or_else(|| "with_planner_mut: no planner loaded".to_string())
-        })
-    })
-}
-
 /// Run the learned planner forward and return `[move_logits (n_dirs) | value-field
 /// compass (grid_h*grid_w)]`. The compass cell value is the L1 magnitude of that
 /// cell's value vector — the planner's own proximity-to-goal estimate.
@@ -169,21 +150,46 @@ fn learned_vin_train_inner(
     if target_move < 0 {
         return Ok(0.0);
     }
-    with_planner_mut(|vin| {
+    let agent = (agent_r, agent_c);
+    let tgt = target_move as usize;
+    // Brain path: the planner is distributed across the BG/hippocampus/motor
+    // heads; consolidate through the brain (it reassembles, steps the motor
+    // move-head, and writes the heads back). Snapshot the pristine move-head once.
+    let brain_has = BRAIN.with(|b| b.borrow().as_ref().is_some_and(|br| br.has_planner()));
+    if brain_has {
+        BRAIN.with(|b| {
+            if let Some(brain) = b.borrow().as_ref() {
+                VIN_PRISTINE.with(|s| {
+                    if s.borrow().is_none() {
+                        if let Some(mh) = brain.planner_move_head() {
+                            *s.borrow_mut() = Some((mh.weight.clone(), mh.bias.clone()));
+                        }
+                    }
+                });
+            }
+        });
+        return BRAIN.with(|b| {
+            b.borrow_mut()
+                .as_mut()
+                .and_then(|brain| {
+                    brain.plan_consolidate_move(tokens, grid_h, grid_w, agent, tgt, lr)
+                })
+                .ok_or_else(|| "learned_vin_train: brain planning circuit incomplete".to_string())
+        });
+    }
+    // Standalone path (no brain loaded — tests / fallback).
+    LEARNED_VIN.with(|v| {
+        let mut vref = v.borrow_mut();
+        let vin = vref
+            .as_mut()
+            .ok_or_else(|| "learned_vin_train: no planner loaded".to_string())?;
         VIN_PRISTINE.with(|s| {
             if s.borrow().is_none() {
                 *s.borrow_mut() =
                     Some((vin.move_head.weight.clone(), vin.move_head.bias.clone()));
             }
         });
-        vin.consolidate_move(
-            tokens,
-            grid_h,
-            grid_w,
-            (agent_r, agent_c),
-            target_move as usize,
-            lr,
-        )
+        Ok(vin.consolidate_move(tokens, grid_h, grid_w, agent, tgt, lr))
     })
 }
 
@@ -191,10 +197,24 @@ fn learned_vin_train_inner(
 fn learned_vin_reset_inner() {
     let pristine = VIN_PRISTINE.with(|s| s.borrow().clone());
     if let Some((w, b)) = pristine {
-        let _ = with_planner_mut(|vin| {
-            vin.move_head.weight = w.clone();
-            vin.move_head.bias = b.clone();
+        // Brain path: restore the motor head's move readout. Standalone fallback.
+        let restored = BRAIN.with(|br| {
+            if let Some(brain) = br.borrow_mut().as_mut() {
+                if brain.has_planner() {
+                    brain.planner_restore_move_head(&w, &b);
+                    return true;
+                }
+            }
+            false
         });
+        if !restored {
+            LEARNED_VIN.with(|v| {
+                if let Some(vin) = v.borrow_mut().as_mut() {
+                    vin.move_head.weight = w.clone();
+                    vin.move_head.bias = b.clone();
+                }
+            });
+        }
     }
 }
 

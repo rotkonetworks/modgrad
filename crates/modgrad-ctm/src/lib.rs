@@ -21,6 +21,7 @@ pub mod pos;
 /// alternative readout that makes local walls linearly decodable. See
 /// module docs and `examples/mazes --vin-readout`.
 pub mod vin;
+pub mod planning;
 pub mod synapse;
 pub mod weights;
 pub mod forward;
