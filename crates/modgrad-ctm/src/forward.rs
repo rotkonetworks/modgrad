@@ -1506,6 +1506,119 @@ pub fn ctm_backward_typed<D: TensorDevice>(
     Ok(())
 }
 
+/// BATCHED CTM backward (M1 increment 2) — reverse-tick BPTT over
+/// [`BatchedCtmCacheTyped`], mirroring [`ctm_backward_typed`] with batched
+/// primitives (synapse/NLM/Linear `backward_batched`; MHA + trace-shift as
+/// B-loops). All weight grads ACCUMULATE (batch-summed); `d_obs` `[batch ×
+/// raw]` overwritten. Bit-for-bit equal to B per-sample `ctm_backward_typed`
+/// calls with grads summed — the parity rail for GPU training.
+#[allow(clippy::too_many_arguments)]
+pub fn ctm_backward_typed_batched<D: TensorDevice>(
+    w: &CtmWeightsTyped<D>,
+    cache: &BatchedCtmCacheTyped<D>,
+    d_predictions: &[Vec<f32>],
+    grads: &mut crate::weights::CtmGradientsTyped<D>,
+    unet_grads: &mut crate::synapse::UNetGradsTyped<D>,
+    d_obs: &mut Tensor<D>,
+) -> Result<(), BackendError> {
+    let cfg = &w.config;
+    let (d, d_in, m) = (cfg.d_model, cfg.d_input, cfg.memory_length);
+    let batch = cache.batch;
+
+    let mut d_kv = Tensor::<D>::zeros(batch * d_in)?;
+    let mut d_activated_carry = vec![0.0f32; batch * d];
+    let mut d_trace_carry = vec![0.0f32; batch * d * m];
+    let r_out: Vec<f32> = w.decay_params_out.to_vec()?.iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let r_action: Vec<f32> = w.decay_params_action.to_vec()?.iter().map(|&p| (-p.clamp(0.0, 15.0)).exp()).collect();
+    let mut d_alpha_out_carry = vec![0.0f32; batch * cfg.n_synch_out];
+    let mut d_alpha_action_carry = vec![0.0f32; batch * cfg.n_synch_action];
+
+    let n_ticks = d_predictions.len().min(cache.ticks.len());
+    for tick_idx in (0..n_ticks).rev() {
+        let tc = &cache.ticks[tick_idx];
+        let d_pred_t = Tensor::<D>::from_slice(&d_predictions[tick_idx])?;
+
+        // 1. output_proj backward → d_sync_out.
+        let so_t = Tensor::<D>::from_slice(&tc.sync_out_for_pred)?;
+        let mut d_sync_out = Tensor::<D>::zeros(batch * cfg.n_synch_out)?;
+        grads.backward_output_proj_batched(w, &d_pred_t, &so_t, &mut d_sync_out, batch)?;
+        let d_sync_out_h: Vec<f32> = d_sync_out.to_vec()?;
+
+        // 2. sync reverse → d_activated + cross-tick carry.
+        let mut d_activated = vec![0.0f32; batch * d];
+        sync_update_reverse_host_batched(
+            &d_sync_out_h, &tc.activated_post, &tc.alpha_out_post, &tc.beta_out_post,
+            &r_out, &w.sync_out_left, &w.sync_out_right,
+            &mut d_activated, &mut d_alpha_out_carry, batch, d);
+        for i in 0..batch * d { d_activated[i] += d_activated_carry[i]; }
+
+        // 3. NLM backward → d_trace.
+        let d_activated_t = Tensor::<D>::from_slice(&d_activated)?;
+        let mut d_trace = Tensor::<D>::zeros(batch * d * m)?;
+        let (s2w, s2b) = match (grads.nlm_s2_w.as_mut(), grads.nlm_s2_b.as_mut()) {
+            (Some(a), Some(b)) => (Some(a), Some(b)),
+            _ => (None, None),
+        };
+        nlm_backward_batched::<D>(&d_activated_t, &tc.nlm, &w.nlm_stage1, w.nlm_stage2.as_ref(),
+            &mut grads.nlm_s1_w, &mut grads.nlm_s1_b, s2w, s2b, &mut d_trace, batch)?;
+
+        // 4. trace-shift adjoint (B-loop) → d_pre_act + d_trace_old carry.
+        let mut d_trace_h: Vec<f32> = d_trace.to_vec()?;
+        for i in 0..batch * d * m { d_trace_h[i] += d_trace_carry[i]; }
+        let mut d_pre_act = vec![0.0f32; batch * d];
+        for b in 0..batch {
+            let mut dpa = vec![0.0f32; d];
+            let mut dto = vec![0.0f32; d * m];
+            trace_shift_adjoint_host(&d_trace_h[b * d * m..(b + 1) * d * m], &mut dpa, &mut dto, d, m);
+            d_pre_act[b * d..(b + 1) * d].copy_from_slice(&dpa);
+            d_trace_carry[b * d * m..(b + 1) * d * m].copy_from_slice(&dto);
+        }
+
+        // 5. synapse backward → d_synapse_input; split [d_in | d].
+        let d_pre_act_t = Tensor::<D>::from_slice(&d_pre_act)?;
+        let mut d_synapse_input = Tensor::<D>::zeros(batch * (d_in + d))?;
+        w.synapse.backward_batched(&d_pre_act_t, &tc.synapse_cache, unet_grads, &mut d_synapse_input, batch)?;
+        let d_syn_h: Vec<f32> = d_synapse_input.to_vec()?;
+        let mut d_attn = vec![0.0f32; batch * d_in];
+        for b in 0..batch {
+            let o = b * (d_in + d);
+            d_attn[b * d_in..(b + 1) * d_in].copy_from_slice(&d_syn_h[o..o + d_in]);
+            d_activated_carry[b * d..(b + 1) * d].copy_from_slice(&d_syn_h[o + d_in..o + d_in + d]);
+        }
+
+        // 6. MHA backward (B-loop) → d_q_in, accumulate d_kv.
+        let mut d_q_in_all = vec![0.0f32; batch * d_in];
+        let mut d_kv_h = d_kv.to_vec()?;
+        for b in 0..batch {
+            let d_attn_t = Tensor::<D>::from_slice(&d_attn[b * d_in..(b + 1) * d_in])?;
+            let (d_q_in, d_kv_tokens) = multihead_attention_backward_typed::<D>(
+                &d_attn_t, &tc.mha[b], 1, d_in, cfg.heads,
+                &w.mha_in_proj, &w.mha_out_proj,
+                &mut grads.mha_in_w, &mut grads.mha_in_b, &mut grads.mha_out_w, &mut grads.mha_out_b)?;
+            d_q_in_all[b * d_in..(b + 1) * d_in].copy_from_slice(&d_q_in);
+            for i in 0..d_in { d_kv_h[b * d_in + i] += d_kv_tokens[0][i]; }
+        }
+        d_kv = Tensor::<D>::from_slice(&d_kv_h)?;
+
+        // 7. q_proj backward → d_sync_action; sync reverse (action) → carry.
+        let d_q_t = Tensor::<D>::from_slice(&d_q_in_all)?;
+        let sa_t = Tensor::<D>::from_slice(&tc.sync_action)?;
+        let mut d_sync_action = Tensor::<D>::zeros(batch * cfg.n_synch_action)?;
+        grads.backward_q_proj_batched(w, &d_q_t, &sa_t, &mut d_sync_action, batch)?;
+        let d_sync_action_h: Vec<f32> = d_sync_action.to_vec()?;
+        sync_update_reverse_host_batched(
+            &d_sync_action_h, &tc.activated_pre_tick, &tc.alpha_action_post, &tc.beta_action_post,
+            &r_action, &w.sync_action_left, &w.sync_action_right,
+            &mut d_activated_carry, &mut d_alpha_action_carry, batch, d);
+    }
+
+    // kv_ln backward → d_kv_pre_ln, then kv_proj backward → d_obs.
+    let mut d_kv_pre_ln = Tensor::<D>::zeros(batch * d_in)?;
+    grads.backward_kv_ln_batched(w, &d_kv, &cache.kv_pre_ln, &cache.kv_ln_cache, &mut d_kv_pre_ln, d_in, batch)?;
+    grads.backward_kv_proj_batched(w, &d_kv_pre_ln, &cache.obs, d_obs, batch)?;
+    Ok(())
+}
+
 /// Alternate CTM backward entry point: gradient enters via the
 /// post-last-tick `activated[]` state, NOT via per-tick predictions.
 ///
@@ -2519,6 +2632,64 @@ mod typed_forward_tests {
         let do_h = d_obs.to_vec().unwrap();
         assert!(do_h.iter().any(|&x| x.abs() > 1e-6),
             "d_obs all zero — kv_proj backward did not flow");
+    }
+
+    /// M1 increment 2 — THE parity rail: the batched CTM backward's grads
+    /// (batch-summed) and d_obs match B per-sample ctm_backward_typed calls,
+    /// bit-for-bit. (kv_ln d_gamma/d_beta skipped — per-sample overwrites them;
+    /// the batched sum is the correct multi-example training grad. q_proj
+    /// skipped — zero with single-token KV.)
+    #[test]
+    fn cpu_ctm_backward_typed_batched_matches_scalar() {
+        use crate::weights::CtmGradientsTyped;
+        use crate::synapse::UNetGradsTyped;
+        let cfg = small_cfg();
+        let (raw, batch) = (6usize, 3usize);
+        let w = CtmWeights::new(cfg.clone(), raw);
+        let typed = CtmWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let obs: Vec<f32> = (0..batch * raw).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
+
+        // ── batched forward+backward ──
+        let mut a: Vec<f32> = (0..batch).flat_map(|_| w.start_activated.clone()).collect();
+        let mut t: Vec<f32> = (0..batch).flat_map(|_| w.start_trace.clone()).collect();
+        let (preds_b, cache_b) = ctm_forward_typed_batched_with_cache::<Cpu>(&typed, &mut a, &mut t, &obs, batch).unwrap();
+        let d_preds_b: Vec<Vec<f32>> = preds_b.iter().map(|p| vec![1.0; p.len()]).collect();
+        let mut g_b = CtmGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut ug_b = UNetGradsTyped::<Cpu>::zeros(&typed.synapse).unwrap();
+        let mut dobs_b = Tensor::<Cpu>::zeros(batch * raw).unwrap();
+        ctm_backward_typed_batched::<Cpu>(&typed, &cache_b, &d_preds_b, &mut g_b, &mut ug_b, &mut dobs_b).unwrap();
+
+        // ── per-sample reference (grads accumulate across B calls) ──
+        let mut g_s = CtmGradientsTyped::<Cpu>::zeros(&typed).unwrap();
+        let mut ug_s = UNetGradsTyped::<Cpu>::zeros(&typed.synapse).unwrap();
+        let mut dobs_s = vec![0.0f32; batch * raw];
+        for b in 0..batch {
+            let ob = &obs[b * raw..(b + 1) * raw];
+            let mut a1 = w.start_activated.clone();
+            let mut t1 = w.start_trace.clone();
+            let (out, cache) = ctm_forward_typed_with_cache::<Cpu>(&typed, &mut a1, &mut t1, ob).unwrap();
+            let d_preds: Vec<Vec<f32>> = out.predictions.iter().map(|p| vec![1.0; p.len()]).collect();
+            let mut dob = Tensor::<Cpu>::zeros(raw).unwrap();
+            ctm_backward_typed::<Cpu>(&typed, &cache, &d_preds, &mut g_s, &mut ug_s, &mut dob).unwrap();
+            dobs_s[b * raw..(b + 1) * raw].copy_from_slice(&dob.to_vec().unwrap());
+        }
+
+        let cmp = |name: &str, a: &Tensor<Cpu>, b: &Tensor<Cpu>| {
+            let (av, bv) = (a.to_vec().unwrap(), b.to_vec().unwrap());
+            for i in 0..av.len() {
+                assert!((av[i] - bv[i]).abs() < 1e-4, "{name}[{i}]: batched {} vs scalar {}", av[i], bv[i]);
+            }
+        };
+        cmp("out_proj_w", &g_b.out_proj_w, &g_s.out_proj_w);
+        cmp("kv_proj_w", &g_b.kv_proj_w, &g_s.kv_proj_w);
+        cmp("mha_in_w", &g_b.mha_in_w, &g_s.mha_in_w);
+        cmp("mha_out_w", &g_b.mha_out_w, &g_s.mha_out_w);
+        cmp("nlm_s1_w", &g_b.nlm_s1_w, &g_s.nlm_s1_w);
+        cmp("unet_first_dw", &ug_b.first.d_w, &ug_s.first.d_w);
+        let dob_bv = dobs_b.to_vec().unwrap();
+        for i in 0..dob_bv.len() {
+            assert!((dob_bv[i] - dobs_s[i]).abs() < 1e-4, "d_obs[{i}]: {} vs {}", dob_bv[i], dobs_s[i]);
+        }
     }
 
     /// Finite-difference gradcheck for the typed CTM backward.

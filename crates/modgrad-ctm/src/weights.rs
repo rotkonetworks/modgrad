@@ -486,6 +486,47 @@ impl<D: Device> CtmGradientsTyped<D> {
             1, d_in,
         )
     }
+
+    // ── Batched variants (M1 GPU engine) — same accumulation as the per-sample
+    // methods above, threading `batch`. All `[batch × …]`. ──
+
+    pub fn backward_output_proj_batched(
+        &mut self, w: &CtmWeightsTyped<D>, d_pred: &Tensor<D>, sync_out: &Tensor<D>,
+        d_sync_out: &mut Tensor<D>, batch: usize,
+    ) -> Result<(), BackendError> {
+        w.output_proj.backward_batched(d_pred, sync_out,
+            &mut self.out_proj_w, &mut self.out_proj_b, d_sync_out, batch)
+    }
+
+    pub fn backward_q_proj_batched(
+        &mut self, w: &CtmWeightsTyped<D>, d_q: &Tensor<D>, sync_action: &Tensor<D>,
+        d_sync_action: &mut Tensor<D>, batch: usize,
+    ) -> Result<(), BackendError> {
+        w.q_proj.backward_batched(d_q, sync_action,
+            &mut self.q_proj_w, &mut self.q_proj_b, d_sync_action, batch)
+    }
+
+    pub fn backward_kv_proj_batched(
+        &mut self, w: &CtmWeightsTyped<D>, d_kv_pre_ln: &Tensor<D>, obs: &Tensor<D>,
+        d_obs: &mut Tensor<D>, batch: usize,
+    ) -> Result<(), BackendError> {
+        w.kv_proj.backward_batched(d_kv_pre_ln, obs,
+            &mut self.kv_proj_w, &mut self.kv_proj_b, d_obs, batch)
+    }
+
+    pub fn backward_kv_ln_batched(
+        &mut self, w: &CtmWeightsTyped<D>, d_kv_post_ln: &Tensor<D>, kv_pre_ln: &Tensor<D>,
+        ln_cache: &Tensor<D>, d_kv_pre_ln: &mut Tensor<D>, d_in: usize, batch: usize,
+    ) -> Result<(), BackendError> {
+        // kv_ln runs once (pre-loop), so overwrite of d_gamma/d_beta = the
+        // batch-summed grad, matching the single per-sample call.
+        tensor_api::layer_norm_bwd(
+            d_kv_post_ln, kv_pre_ln, &w.kv_ln_gamma, ln_cache,
+            d_kv_pre_ln,
+            &mut self.kv_ln_d_gamma, &mut self.kv_ln_d_beta,
+            batch, d_in,
+        )
+    }
 }
 
 #[cfg(test)]
