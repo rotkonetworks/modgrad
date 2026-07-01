@@ -5610,6 +5610,26 @@ pub struct RegionCacheTyped<D: TensorDeviceG> {
     pub ticks: Vec<RegionTickCacheTyped<D>>,
 }
 
+/// Batched analog of [`RegionTickCacheTyped`] (M1 GPU engine). Host `Vec`s are
+/// `[batch × …]`; per-region CTM caches are batched.
+pub struct BatchedRegionTickCacheTyped<D: TensorDeviceG> {
+    pub prev_outputs_pre_tick: Vec<Vec<f32>>, // per region [batch × d_model_r]
+    pub conn_inputs: Vec<Vec<f32>>,           // per connection [batch × src_dim]
+    pub region_ctm_caches: Vec<crate::forward::BatchedCtmCacheTyped<D>>,
+    pub all_act: Vec<f32>,                    // [batch × total_neurons]
+    pub global_alpha_pre: Vec<f32>,           // [batch × n_sync]
+    pub global_beta_pre: Vec<f32>,
+    pub gs_post_update: Vec<f32>,             // [batch × n_sync]
+}
+
+/// Batched top-level regional cache (M1 GPU engine).
+pub struct BatchedRegionCacheTyped<D: TensorDeviceG> {
+    pub obs: TensorG<D>,
+    pub obs_proj_host: Vec<f32>, // [batch × d_input_0]
+    pub ticks: Vec<BatchedRegionTickCacheTyped<D>>,
+    pub batch: usize,
+}
+
 // ─── RegionalWeightsTyped<D> — Path C JAX-style port ─────────
 //
 // Top-level brain data container. Mirrors `RegionalWeights`
@@ -5976,6 +5996,160 @@ impl<D: TensorDeviceG> RegionalWeightsTyped<D> {
             ticks: tick_caches,
         };
         Ok((output, cache))
+    }
+
+    /// BATCHED regional forward WITH cache (M1 increment 4). Mirrors
+    /// `regional_forward_typed_with_cache`, threading `batch` through all four
+    /// phases: connection synapses (`forward_batched` + per-example concat),
+    /// per-region `ctm_forward_typed_batched_with_cache`, global-sync B-loop,
+    /// batched `output_proj`. `observation`/state are `[batch × …]`; per-region
+    /// `region_activated[r]` is `[batch × d_model_r]`. Returns per-tick
+    /// predictions `[batch × out_dims]` + the batched cache. Predictions equal
+    /// B per-sample calls (verified in tests).
+    #[allow(clippy::type_complexity)]
+    pub fn regional_forward_typed_batched_with_cache(
+        &self,
+        observation: &[f32],
+        region_activated: &mut [Vec<f32>],
+        region_trace: &mut [Vec<f32>],
+        global_alpha: &mut [f32],
+        global_beta: &mut [f32],
+        batch: usize,
+    ) -> Result<(Vec<Vec<f32>>, BatchedRegionCacheTyped<D>), BackendErrorG> {
+        let cfg = &self.config;
+        let n_regions = cfg.regions.len();
+        let n_sync = cfg.n_global_sync;
+        let n_outer = cfg.outer_ticks;
+        let obs_dim = observation.len() / batch;
+
+        let obs_t = TensorG::<D>::from_slice(observation)?;
+        let d_in0 = self.regions[0].config.d_input;
+        let mut obs_proj = TensorG::<D>::zeros(batch * d_in0)?;
+        self.obs_proj.forward_batched(&obs_t, &mut obs_proj, batch)?;
+        let obs_proj_h: Vec<f32> = obs_proj.to_vec()?;
+
+        let mut prev_outputs: Vec<Vec<f32>> = region_activated.to_vec();
+        let total_neurons: usize = cfg.regions.iter().map(|r| r.d_model).sum();
+        let global_decay_h: Vec<f32> = self.global_decay.to_vec()?;
+
+        let mut predictions = Vec::with_capacity(n_outer);
+        let mut ticks: Vec<BatchedRegionTickCacheTyped<D>> = Vec::with_capacity(n_outer);
+
+        for _ot in 0..n_outer {
+            let prev_snapshot = prev_outputs.clone();
+            let global_alpha_pre = global_alpha.to_vec();
+            let global_beta_pre = global_beta.to_vec();
+
+            // Phase A: connection synapses → region_obs.
+            let mut conn_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.connections.len());
+            let mut region_obs: Vec<Vec<f32>> = vec![Vec::new(); n_regions];
+            for (ci, conn) in cfg.connections.iter().enumerate() {
+                let src_dim: usize = conn.from.iter().map(|&fi| prev_outputs[fi].len() / batch).sum();
+                let obs_slice = if conn.receives_observation {
+                    Some(cfg.obs_scale_slice(conn.observation_scale))
+                } else { None };
+                let obs_len = obs_slice.map(|(_, l)| l).unwrap_or(0);
+                let full = src_dim + obs_len;
+                let mut src = vec![0.0f32; batch * full];
+                for b in 0..batch {
+                    let mut off = b * full;
+                    for &fi in &conn.from {
+                        let d = prev_outputs[fi].len() / batch;
+                        src[off..off + d].copy_from_slice(&prev_outputs[fi][b * d..(b + 1) * d]);
+                        off += d;
+                    }
+                    if let Some((s, len)) = obs_slice {
+                        let end = (s + len).min(obs_dim);
+                        if s < end {
+                            src[off..off + (end - s)]
+                                .copy_from_slice(&observation[b * obs_dim + s..b * obs_dim + end]);
+                        }
+                    }
+                }
+                conn_inputs.push(src.clone());
+                if full == 0 { continue; }
+                let src_t = TensorG::<D>::from_slice(&src)?;
+                let tgt = self.connection_synapses[ci].out_dim;
+                let mut proj = TensorG::<D>::zeros(batch * tgt)?;
+                self.connection_synapses[ci].forward_batched(&src_t, &mut proj, batch)?;
+                let proj_h: Vec<f32> = proj.to_vec()?;
+                let slot = &mut region_obs[conn.to];
+                if slot.is_empty() {
+                    *slot = proj_h;
+                } else {
+                    let n = slot.len().min(proj_h.len());
+                    for i in 0..n { slot[i] += proj_h[i]; }
+                }
+            }
+            for r in 0..n_regions {
+                if region_obs[r].is_empty() { region_obs[r] = obs_proj_h.clone(); }
+            }
+
+            // Phase B: per-region batched CTM forward with cache.
+            let mut region_ctm_caches = Vec::with_capacity(n_regions);
+            let mut new_outputs = Vec::with_capacity(n_regions);
+            for r in 0..n_regions {
+                let (_p, cache) = crate::forward::ctm_forward_typed_batched_with_cache::<D>(
+                    &self.regions[r], &mut region_activated[r], &mut region_trace[r],
+                    &region_obs[r], batch,
+                )?;
+                region_ctm_caches.push(cache);
+                new_outputs.push(region_activated[r].clone());
+            }
+            prev_outputs = new_outputs;
+
+            // Phase C: global-sync recurrence (per example).
+            let mut all_act = vec![0.0f32; batch * total_neurons];
+            for b in 0..batch {
+                let mut off = 0;
+                for r in 0..n_regions {
+                    let d = prev_outputs[r].len() / batch;
+                    all_act[b * total_neurons + off..b * total_neurons + off + d]
+                        .copy_from_slice(&prev_outputs[r][b * d..(b + 1) * d]);
+                    off += d;
+                }
+            }
+            for b in 0..batch {
+                for i in 0..n_sync {
+                    let (l, rr) = (self.global_sync_left[i], self.global_sync_right[i]);
+                    if l < total_neurons && rr < total_neurons {
+                        let pw = all_act[b * total_neurons + l] * all_act[b * total_neurons + rr];
+                        let decay = (-global_decay_h[i].clamp(0.0, 15.0)).exp();
+                        global_alpha[b * n_sync + i] = decay * global_alpha[b * n_sync + i] + pw;
+                        global_beta[b * n_sync + i] = decay * global_beta[b * n_sync + i] + 1.0;
+                    }
+                }
+            }
+            let gs: Vec<f32> = (0..batch * n_sync)
+                .map(|bi| global_alpha[bi] / global_beta[bi].sqrt().max(1e-8))
+                .collect();
+
+            // Phase D: output projection (batched).
+            let gs_t = TensorG::<D>::from_slice(&gs)?;
+            let od = self.output_proj.out_dim;
+            let mut pred = TensorG::<D>::zeros(batch * od)?;
+            self.output_proj.forward_batched(&gs_t, &mut pred, batch)?;
+            let pred_h: Vec<f32> = pred.to_vec()?;
+
+            ticks.push(BatchedRegionTickCacheTyped {
+                prev_outputs_pre_tick: prev_snapshot,
+                conn_inputs,
+                region_ctm_caches,
+                all_act,
+                global_alpha_pre,
+                global_beta_pre,
+                gs_post_update: gs,
+            });
+            predictions.push(pred_h);
+        }
+
+        let cache = BatchedRegionCacheTyped {
+            obs: obs_t,
+            obs_proj_host: obs_proj_h,
+            ticks,
+            batch,
+        };
+        Ok((predictions, cache))
     }
 
     /// Multi-region backward — composes everything in reverse-tick.
@@ -6433,6 +6607,49 @@ mod regional_weights_typed_tests {
                 "prediction all zero — multi-region forward did not produce output");
         }
         assert_eq!(out.sync_out.len(), n_sync);
+    }
+
+    /// M1 increment 4: the batched regional forward's predictions match B
+    /// per-sample regional_forward_typed calls, bit-for-bit.
+    #[test]
+    fn cpu_regional_forward_typed_batched_matches_scalar() {
+        let cfg = small_regional_cfg();
+        let w = RegionalWeights::new(cfg);
+        let typed = RegionalWeightsTyped::<Cpu>::from_untyped(&w).unwrap();
+        let obs_dim = typed.config.raw_obs_dim;
+        let n_sync = typed.config.n_global_sync;
+        let od = typed.config.out_dims;
+        let batch = 3usize;
+        let obs: Vec<f32> = (0..batch * obs_dim)
+            .map(|i| ((i + 1) as f32 * 0.137).sin() * 0.5).collect();
+
+        // batched state = B copies of the start states.
+        let mut ra: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| (0..batch).flat_map(|_| r.start_activated.clone()).collect()).collect();
+        let mut rt: Vec<Vec<f32>> = w.regions.iter()
+            .map(|r| (0..batch).flat_map(|_| r.start_trace.clone()).collect()).collect();
+        let mut ga = vec![0.0f32; batch * n_sync];
+        let mut gb = vec![1.0f32; batch * n_sync];
+        let (preds_b, _cache) = typed.regional_forward_typed_batched_with_cache(
+            &obs, &mut ra, &mut rt, &mut ga, &mut gb, batch,
+        ).unwrap();
+
+        for b in 0..batch {
+            let ob = &obs[b * obs_dim..(b + 1) * obs_dim];
+            let mut a1: Vec<Vec<f32>> = w.regions.iter().map(|r| r.start_activated.clone()).collect();
+            let mut t1: Vec<Vec<f32>> = w.regions.iter().map(|r| r.start_trace.clone()).collect();
+            let mut ga1 = vec![0.0f32; n_sync];
+            let mut gb1 = vec![1.0f32; n_sync];
+            let out = typed.regional_forward_typed(ob, &mut a1, &mut t1, &mut ga1, &mut gb1).unwrap();
+            for tick in 0..out.predictions.len() {
+                for j in 0..od {
+                    let got = preds_b[tick][b * od + j];
+                    let exp = out.predictions[tick][j];
+                    assert!((got - exp).abs() < 1e-4,
+                        "pred[t{tick}][b{b}][{j}]: batched {got} vs scalar {exp}");
+                }
+            }
+        }
     }
 
     #[test]
